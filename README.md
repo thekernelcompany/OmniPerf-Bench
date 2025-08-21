@@ -1,17 +1,27 @@
 # OmniPerf-Bench
 
 ## 👋 overview
-gso evaluates language models on software performance optimization. each task provides:
+This evaluates language models on software performance optimization. each task provides:
 - a *codebase* with a specific performance bottleneck
 - a *performance test* as a precise specification
 - an agent must generate a *patch* that improves runtime efficiency
 - success is measured against expert developer optimizations
 
-to access gso, copy and run the following code:
+to access, copy and run the following code:
 ```python
 from datasets import load_dataset
 gso = load_dataset('gso-bench/gso', split='test')
 ```
+
+## 📁 repository structure
+This repository has been reorganized for better maintainability. See [docs/repository_structure.md](docs/repository_structure.md) for a detailed overview of the new structure. Key directories:
+
+- `src/` - Main source code (collection framework, harness, data models)
+- `experiments/` - Experiment configurations and datasets (vLLM, SGLang)
+- `benchmarks/effibench/` - EffiBench integration for code efficiency evaluation
+- `tools/` - Utility scripts and patches
+- `results/` - Logs, reviews, and analysis outputs
+- `misc/` - Archived files and legacy content (preserved, not deleted)
 
 ## 🚀 setup
 
@@ -79,16 +89,16 @@ uv run src/gso/harness/opt_at_k.py \
     --model <modelname>
 ```
 
-for detailed instructions and options, see the [harness documentation](src/gso/harness/readme.md).
+for detailed instructions and options, see the [harness documentation](src/harness/README.md).
 
 ### gso collection framework
 
 the collection framework enables you to create your own gso tasks through a four-step pipeline:
 
-1. **[commit extraction & filtering](src/gso/collect/readme.md#overview)**: extract performance-related commits using llms
-2. **[api identification](src/gso/collect/readme.md#2-commit-analysis-pipeline)**: identify affected high-level apis for each commit
-3. **[performance test generation](src/gso/collect/readme.md#3-generate-performance-tests)**: generate tests for api-commit pairs
-4. **[test execution](src/gso/collect/readme.md#4-execute-performance-tests)**: execute tests to identify performance improvements
+1. **[commit extraction & filtering](src/collect/README.md#overview)**: extract performance-related commits using llms
+2. **[api identification](src/collect/README.md#2-commit-analysis-pipeline)**: identify affected high-level apis for each commit
+3. **[performance test generation](src/collect/README.md#3-generate-performance-tests)**: generate tests for api-commit pairs
+4. **[test execution](src/collect/README.md#4-execute-performance-tests)**: execute tests to identify performance improvements
 
 <!-- required tokens:
 ```bash
@@ -97,11 +107,31 @@ export openai_api_key="openai_key"
 export hf_token="huggingface_token"
 ``` -->
 
-for detailed instructions and usage, see the [collection framework documentation](src/gso/collect/readme.md).
+for detailed instructions and usage, see the [collection framework documentation](src/collect/README.md).
 
+### benchmarks
+
+#### effibench integration
+EffiBench is integrated as a benchmark for evaluating code efficiency. To use EffiBench:
+
+```bash
+cd benchmarks/effibench
+pip install -r requirements.txt
+# Follow EffiBench README for specific usage
+```
+
+See [benchmarks/effibench/README.md](benchmarks/effibench/README.md) for detailed EffiBench documentation.
+
+### experiments
+
+Pre-configured experiments are available in the `experiments/` directory:
+- `experiments/vllm/` - vLLM performance optimization dataset with 282 problems
+- `experiments/sglang.yaml` - SGLang experiment configuration
+- `experiments/vllm.yaml` - vLLM experiment configuration
 
 ## ⬇️ artifacts
 | datasets | tools | dockers |
 | - | - | - |
-| [💿 gso](https://huggingface.co/datasets/gso-bench/gso) | [🔧 evaluation harness](src/gso/harness/) | [🐳 docker hub](https://hub.docker.com/repository/docker/slimshetty/gso/general) |
-| | [🔧 collection framework](src/gso/collect/readme.md) | |
+| [💿 gso](https://huggingface.co/datasets/gso-bench/gso) | [🔧 evaluation harness](src/harness/) | [🐳 docker hub](https://hub.docker.com/repository/docker/slimshetty/gso/general) |
+| [💿 vllm dataset](experiments/vllm/) | [🔧 collection framework](src/collect/) | |
+| [💿 effibench](benchmarks/effibench/) | [🔧 utility tools](tools/) | |

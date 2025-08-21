@@ -1,0 +1,138 @@
+- **Primary extractor**: `PerfCommitAnalyzer.llm_get_apis` calls an LLM to identify high-level APIs affected by each performance commit, using repo context prepared by the retriever and prompts.
+
+```221:257:src/gso/collect/analysis/commits.py
+    @staticmethod
+    def llm_get_apis(commits: list[PerformanceCommit], retriever: Retriever):
+
+        if SKIP_API_ANALYSIS:
+            for commit in commits:
+                commit.add_apis(["SkippedAPIAnalysis"])
+                commit.add_llm_api_reason(
+                    "Skipped API analysis likely due to non python repo"
+                )
+            return
+
+        prompts = [
+            PerfCommitAnalyzer.identify_api_prompt(commit, retriever)
+            for commit in commits
+        ]
+
+        args = LLMArgs(
+            model_name="o3-mini",
+            cache_batch_size=100,
+            multiprocess=60,
+            use_cache=False,
+            max_tokens=24000,
+        )  # type: ignore
+
+        responses = LLMCompletions.get_llm_completions(args, prompts)
+
+        for commit, response in zip(commits, responses):
+            response = response[0]
+            try:
+                reasoning = response.split("[/REASON]")[0].split("[REASON]")[1].strip()
+                apis = response.split("[/APIS]")[0].split("[APIS]")[1].strip()
+                apis = [api.strip() for api in apis.split(",")]
+            except:
+                apis = []
+                reasoning = "No APIs found"
+            commit.add_apis(apis)
+            commit.add_llm_api_reason(reasoning)
+```
+
+- **Prompts used for API extraction**: System and task prompts that instruct the LLM to return Python high-level APIs in `[APIS]...[/APIS]`.
+
+```26:50:src/gso/collect/analysis/prompt.py
+PERF_IDENTIFY_API_SYSTEM = """You are an expert programmer who is annotating data for training and testing code language models.
+
+You will be given a performance or optimization related GitHub commit patch content. Your goal is to identify a list of APIs (functions or methods of a class) that are affected by the commit. Some additional instructions:
+1. The APIs should be high-level or top-level APIs in the repo. E.g., pd.read_csv (pandas), requests.get (requests), model.generate (transformers), etc.
+2. By high/top-level, we mean APIs that are not internal helper functions.
+3. If the commit affects multiple APIs, list them all separated by commas.
+4. For methods, use the format "ClassName.method_name" (e.g., DataFrame.dropna).
+5. NOTE: Find Affected PYTHON APIs only
+    - Do not add backend APIs like C/C++/Rust functions. Instead, you MUST add the Python APIs that call them.
+    - IMPORTANT: Just because a commit does not directly mention or update python APIs, does not mean changes to internal code do not affect any python APIs.
+    - So, if any backend (e.g., C/C++/Rust) code affects any Python API or bindings, YOU MUST include that Python API in the list.
+    - Especially in the case of repos with interfaces via python bindings (e.g., huggingface/tokenizers), find and include the python APIs affected by the commit.
+6. Finally, if all else, and the commit does not affect any APIs, write "None".
+"""
+PERF_IDENTIFY_API_TASK = """Analyze the commit using natural language reasoning enclosed in [REASON] [/REASON] tags.
+Then list the affected APIs (max 5 comma separated) enclosed in [APIS] [/APIS] tags.
+Remember to close all tags properly.
+
+Commit Information:
+{diff_text}
+
+Commit Message:
+{message}
+"""
+```
+
+- **Repo context collection for the prompt**: The retriever builds a file-structure-and-content-aware prompt to give the LLM enough code context (it walks the repo, reads source files, and composes a prompt).
+
+```137:170:src/gso/collect/analysis/retriever.py
+    def build_prompt(self, commit: PerformanceCommit) -> list[dict]:
+        system_prompt = (
+            f"You are an expert software engineer analyzing a performance-related commit "
+            f"in a Python repository. Your task is to identify the most likely files "
+            f"that contain high-level APIs (functions or methods) affected by this performance optimization. "
+            f"By high/top-level, we mean APIs that are not internal helper functions. "
+            f"E.g., pd.read_csv (pandas), requests.get (requests), model.generate (transformers), etc."
+        )
+
+        system_prompt += "\nNOTE: If the repo uses python bindings to C/C++/Rust (e.g., huggingface/tokenizers), make sure to identify ALL (1) Python files, (2) Interface files (e.g., .pyi), (3) C/C++/Rust files affected by the commit."
+
+        if count_tokens(commit.diff_text) > MAX_COMMIT_TOKENS:
+            diff_text = commit.diff_text[:MAX_COMMIT_TOKENS] + "...(truncated)..."
+        else:
+            diff_text = commit.diff_text
+
+        user_prompt = (
+            f"Commit message: {commit.message}\n\n"
+            f"Commit diff:\n: {diff_text}\n\n"
+            f"File structure of the repository at this commit:\n"
+            f"{self.indented_file_structure}\n\n"
+            f"Please list the top {self.n_files} most likely files that contain high-level APIs affected by this optimization. "
+            f"Enclose the file names in a list in a markdown code block as shown below:\n"
+            f"```\n"
+            f"1. file1.py\n"
+            f"2. file2.py\n"
+            f"```\n"
+            f"Think step-by-step about which files are most likely to contain the affected APIs "
+            f"based on the commit and file structure."
+        )
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+```
+
+- **Mapping APIs to commits for summaries/visualization**: Once APIs are attached to `PerformanceCommit`s, this builds and sorts the API→commits map.
+
+```20:39:src/gso/collect/analysis/apis.py
+    def create_api_to_commits_map(self, analysis: PerfAnalysis) -> APICommitMap:
+        self.commit_analysis = analysis
+        for commit in analysis.performance_commits:
+            for api in commit.apis:
+                if api == "None":
+                    continue
+                self.api_to_commits[api].append(commit)
+
+        # Sort by number of commits
+        self.api_to_commits = dict(
+            sorted(
+                self.api_to_commits.items(), key=lambda item: len(item[1]), reverse=True
+            )
+        )
+
+        return APICommitMap(
+            repo_url=analysis.repo_url,
+            repo_owner=analysis.repo_owner,
+            repo_name=analysis.repo_name,
+            api_to_commits=self.api_to_commits,
+        )
+```
+
+In short: APIs are extracted per commit via an LLM in `PerfCommitAnalyzer.llm_get_apis` using prompts from `prompt.py` and repo context assembled by `Retriever`; then `APIAnalyzer` aggregates those into an API→commits map.
