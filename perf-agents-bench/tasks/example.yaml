@@ -1,0 +1,63 @@
+id: "image_decode"
+name: "Image preprocessing throughput"
+description: "Optimize image preprocessing pipeline for better throughput"
+
+repo:
+  url: "${REPO_URL}"                    # REQUIRED; no hard-coded default
+  human_commit: "${HUMAN_COMMIT}"       # REQUIRED; the expert optimization commit
+  # Choose exactly one of the two:
+  pre_commit: "${PRE_COMMIT}"           # explicit pre-commit (preferred)
+  # OR
+  # pre_parent_index: 1                 # parent to use if human is a merge commit (1..N)
+
+runner:
+  requires_gpu: false                   # true for CUDA tasks, else false
+  cuda_version: null                    # e.g., "12.1" IF requires_gpu is true
+  python_version: null                  # e.g., "3.11"; if null we read from repo
+  allow_network_during_prepare: true    # fixtures/build only; candidate runs locked
+  allowed_env:
+    - "OMP_NUM_THREADS"
+    - "MKL_NUM_THREADS"
+
+env_build:
+  # Declare allowed strategies in order; builder picks the first that matches repo
+  allowed_strategies:
+    - "dockerfile"        # use repo Dockerfile as-is (no assumptions)
+    - "requirements"      # requirements*.txt (+ setup)
+  # If strategy needs extra data, supply here explicitly:
+  params:
+    dockerfile_path: null
+    requirements_file: null
+
+optimization_contract:
+  strict_targets: true
+  target_files:                         # REQUIRED list; if empty, agent edits are rejected
+    - "src/image_processing.py"
+    - "src/utils/preprocessing.py"
+  constraints:
+    - "No public API breakage"
+    - "All TestPack checks must pass"
+
+testpack:
+  # Either a python entrypoint "package.module:function" OR a local path
+  entrypoint: "${TESTPACK_ENTRYPOINT}"  # e.g., "vlm_bench_image:pack" or "../vlm-bench-generic"
+  version_constraint: ">=0.1.0"
+
+metrics:
+  - name: "throughput_img_per_s"
+    using: "runtime:throughput"
+    args:
+      # This string can come from TestPack.discovery to avoid hard-coding
+      cmd: "python benchmark.py --input fixtures/val --output out/results.json"
+      warmups: 3
+      trials: 10
+      duration_s: 3
+  - name: "functional_match"
+    using: "quality:hash_match"
+    args:
+      ref: "out/human.json"
+      candidate: "out/{candidate}.json"
+
+scoring:
+  primary: "throughput_img_per_s"
+  tie_breaker: "functional_match"
