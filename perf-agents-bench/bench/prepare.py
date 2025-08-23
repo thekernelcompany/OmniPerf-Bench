@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import time
+import os
 import subprocess
 import concurrent.futures as futures
 from pathlib import Path
@@ -34,6 +35,26 @@ class PrepareExecutor:
         rm = RepoManager(self.work_root, repo_url, repo_name)
         rm.ensure_base()
 
+        def _load_env_vars() -> Dict[str, str]:
+            env: Dict[str, str] = {}
+            # Prefer project-level .env at perf-agents-bench/.env; fallback to repo root .env
+            candidates = [
+                Path(__file__).resolve().parents[2] / ".env",
+                Path.cwd() / ".env",
+            ]
+            for p in candidates:
+                if p.exists():
+                    for line in p.read_text().splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+                    break
+            return env
+
+        env_vars = _load_env_vars()
+
         def process(item: Dict[str, Any]):
             item_id = item["item_id"]
             run_dir = self.state_root / "runs" / self.run_id
@@ -66,22 +87,64 @@ class PrepareExecutor:
             }
             jw.write_prompt(prompt)
 
+            # Create a headless task file (text) from the prompt for -f usage
+            task_lines = [
+                f"Task: {prompt['task']}",
+                f"Description: {prompt['description']}",
+            ]
+            if prompt["constraints"]:
+                task_lines.append("Constraints:")
+                task_lines += [f"- {c}" for c in prompt["constraints"]]
+            if prompt["target_files"]:
+                task_lines.append("Target files:")
+                task_lines += [f"- {t}" for t in prompt["target_files"]]
+            task_lines.append(f"Primary metric: {prompt['success']['primary_metric']}")
+            task_text = "\n".join(task_lines) + "\n"
+            task_file = jw.dir / "task.txt"
+            task_file.write_text(task_text)
+
             # Run OpenHands locally
             agent_cfg = self.cfg["agents"]["openhands"]
-            agent = OpenHandsAgent(cli=agent_cfg["cli"], time_budget_minutes=agent_cfg["time_budget_minutes"], container_image=None)
+            cli = agent_cfg["cli"]
+            time_budget = agent_cfg["time_budget_minutes"]
+            container_image = agent_cfg.get("container_image") or None
+            args_cfg = agent_cfg.get("args", {})
+            subcmd = args_cfg.get("subcommand", ["run"]) if isinstance(args_cfg.get("subcommand", ["run"]), list) else ["run"]
+            iterations = args_cfg.get("iterations")
             branch = f"agent/{task_cfg['id']}/{human[:8]}"
 
-            # Execute and capture logs
-            cmd = [
-                agent.cli, "run",
-                "--repo", str(wt_dir),
-                "--prompt-file", str((jw.dir / "prompt.json")),
-                "--time", str(agent.time_budget_minutes),
-                "--branch", branch,
-            ]
+            # Execute and capture logs (containerized if container_image provided)
+            if container_image:
+                cmd = [
+                    "docker", "run", "--rm",
+                    "-v", f"{wt_dir}:/workspace:rw",
+                    "-v", f"{task_file}:/task.txt:ro",
+                    "-w", "/workspace",
+                    container_image,
+                    "python", "-m", "openhands.core.main",
+                    "-d", "/workspace",
+                    "-f", "/task.txt",
+                ]
+            else:
+                cmd = [
+                    cli, *subcmd,
+                    "-d", str(wt_dir),
+                    "-f", str(task_file),
+                ]
+            if iterations:
+                cmd += ["-i", str(iterations)]
+
+            # Pre-create branch to capture agent edits on it
+            try:
+                subprocess.run(["git", "checkout", "-B", branch], cwd=wt_dir, check=True)
+            except Exception:
+                pass
             t0 = time.time()
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True)
+                # Merge env vars from .env into subprocess environment
+                env = os.environ.copy()
+                env.update(env_vars)
+                proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
                 dur = time.time() - t0
                 jw.write_openhands_logs(proc.stdout or "", proc.stderr or "")
                 status = "success" if proc.returncode == 0 else "error"
@@ -99,8 +162,9 @@ class PrepareExecutor:
                     "agent_branch": branch,
                     "status": status,
                     "openhands": {
-                        "cli": agent.cli,
-                        "time_budget_minutes": agent.time_budget_minutes,
+                        "cli": cli,
+                        "container_image": container_image,
+                        "time_budget_minutes": time_budget,
                         "returncode": proc.returncode,
                         "duration_s": dur,
                     },

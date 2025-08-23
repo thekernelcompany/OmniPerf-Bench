@@ -5,6 +5,7 @@ import json
 import os
 import re
 import uuid
+import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -249,12 +250,17 @@ def doctor(bench_cfg: str = "bench.yaml"):
     try:
         cfg = _load_bench_cfg(Path(bench_cfg))
         cli = cfg["agents"]["openhands"]["cli"]
-        res = subprocess.run([cli, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode == 0:
-            typer.echo(f"✓ OpenHands CLI available: {cli}")
+        cli_path = shutil.which(cli) or cli
+        # Accept either an executable path or a successful --help invocation
+        if Path(cli_path).exists() and os.access(cli_path, os.X_OK):
+            typer.echo(f"✓ OpenHands CLI found: {cli_path}")
         else:
-            ok = False
-            typer.echo(f"✗ OpenHands CLI not available: {cli}")
+            res = subprocess.run([cli, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0:
+                typer.echo(f"✓ OpenHands CLI available: {cli}")
+            else:
+                ok = False
+                typer.echo(f"✗ OpenHands CLI not available: {cli}")
     except Exception as e:
         ok = False
         typer.echo(f"✗ OpenHands CLI not found: {e}")
