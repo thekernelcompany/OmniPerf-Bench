@@ -50,6 +50,8 @@ metrics:
 
 ### 2. Stage A (Prepare) Workflow
 
+Prerequisite: OpenHands CLI installed and accessible. See `https://docs.all-hands.dev/`.
+
 Commands:
 
 ```bash

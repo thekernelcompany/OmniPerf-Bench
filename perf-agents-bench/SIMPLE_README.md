@@ -8,6 +8,12 @@ The absolute simplest way to compare performance across commits.
 2. Plans the work items, prepares agent branches with OpenHands (host-only)
 3. Summarizes results from journals
 
+## Prerequisite
+
+OpenHands CLI installed and on PATH (or set `OPENHANDS_CLI` to its executable). See `https://docs.all-hands.dev/`.
+
+For smoke tests only, you may temporarily set `OPENHANDS_CLI=/bin/true` to bypass real agent execution.
+
 ## Quick Start (no Docker)
 
 ```bash
@@ -24,8 +30,6 @@ PYTHONPATH=perf-agents-bench python3 -m bench.cli plan \
   --out state/plan.json
 
 # 4. Prepare (runs OpenHands locally; resumable)
-# If OpenHands is not installed yet, you can smoke-test with a no-op:
-# export OPENHANDS_CLI=/bin/true
 PYTHONPATH=perf-agents-bench python3 -m bench.cli prepare \
   perf-agents-bench/tasks/example.yaml \
   --from-plan state/plan.json \

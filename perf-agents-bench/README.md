@@ -14,6 +14,8 @@ A modular, engine-agnostic performance benchmarking system for evaluating AI age
 
 This path scales to 100+ commits without containers. It plans commit pairs and runs OpenHands locally to produce agent branches with journals.
 
+Prerequisite: OpenHands CLI installed and on PATH (or set `OPENHANDS_CLI`), see `https://docs.all-hands.dev/`.
+
 1. Initialize scaffolding:
    ```bash
    PYTHONPATH=perf-agents-bench python3 -m bench.cli init --out perf-agents-bench

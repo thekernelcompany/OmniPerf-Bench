@@ -249,10 +249,15 @@ def doctor(bench_cfg: str = "bench.yaml"):
     try:
         cfg = _load_bench_cfg(Path(bench_cfg))
         cli = cfg["agents"]["openhands"]["cli"]
-        subprocess.run([cli, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        typer.echo(f"✓ OpenHands CLI available: {cli}")
+        res = subprocess.run([cli, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            typer.echo(f"✓ OpenHands CLI available: {cli}")
+        else:
+            ok = False
+            typer.echo(f"✗ OpenHands CLI not available: {cli}")
     except Exception as e:
-        typer.echo(f"! OpenHands CLI check skipped/failed: {e}")
+        ok = False
+        typer.echo(f"✗ OpenHands CLI not found: {e}")
 
     try:
         subprocess.check_output(["docker", "--version"])  # type: ignore[arg-type]
