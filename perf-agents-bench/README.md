@@ -9,13 +9,9 @@ Minimal, local-first workflow to plan commit pairs, run OpenHands headless to ge
 
 ## One-time setup
 ```bash
-# Put your model creds in perf-agents-bench/.env
-cat > perf-agents-bench/.env <<'ENV'
-LLM_MODEL=anthropic/claude-3-7-sonnet-20250219
-LLM_API_KEY=sk-...
-# Optional for provider-backed repo ops
-# GITHUB_TOKEN=ghp_...
-ENV
+# Copy and fill env
+cp perf-agents-bench/.env.example perf-agents-bench/.env
+# Edit perf-agents-bench/.env with your creds (LLM_MODEL, LLM_API_KEY, optional GITHUB_TOKEN)
 
 # Create local venv and install CLI deps (once)
 cd perf-agents-bench
