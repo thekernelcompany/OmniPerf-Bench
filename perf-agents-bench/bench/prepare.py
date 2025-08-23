@@ -120,6 +120,12 @@ class PrepareExecutor:
                     "-v", f"{wt_dir}:/workspace:rw",
                     "-v", f"{task_file}:/task.txt:ro",
                     "-w", "/workspace",
+                ]
+                # Propagate key env vars into container for headless
+                for k in ["LLM_MODEL", "LLM_API_KEY", "GITHUB_TOKEN"]:
+                    if env_vars.get(k):
+                        cmd += ["-e", f"{k}={env_vars[k]}"]
+                cmd += [
                     container_image,
                     "python", "-m", "openhands.core.main",
                     "-d", "/workspace",
