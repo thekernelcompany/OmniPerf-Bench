@@ -10,6 +10,46 @@ A modular, engine-agnostic performance benchmarking system for evaluating AI age
 - **Hermetic execution**: Identical container constraints for all candidates
 - **Config-driven**: Repository URLs, commits, and tools specified via environment variables
 
+## Stage A Quickstart (no Docker; prepare-only)
+
+This path scales to 100+ commits without containers. It plans commit pairs and runs OpenHands locally to produce agent branches with journals.
+
+1. Initialize scaffolding:
+   ```bash
+   PYTHONPATH=perf-agents-bench python3 -m bench.cli init --out perf-agents-bench
+   ```
+
+2. Create a commits file (human and optional pre or parent index):
+   ```text
+   # perf-agents-bench/.work/commits.txt
+   <40hex-human> [<40hex-pre>|parent=1]
+   ```
+
+3. Set minimal env for the task, then plan:
+   ```bash
+   export REPO_URL=/path/to/local/or/remote/repo
+   export HUMAN_COMMIT=<40hex>
+   export PRE_COMMIT=<40hex>   # or omit if using parent=1 in commits.txt
+   PYTHONPATH=perf-agents-bench python3 -m bench.cli plan \
+     perf-agents-bench/tasks/example.yaml \
+     --commits perf-agents-bench/.work/commits.txt \
+     --out state/plan.json
+   ```
+
+4. Prepare across all items (runs OpenHands locally; resumable):
+   ```bash
+   # If OpenHands is not installed yet, you can smoke-test with a no-op:
+   # export OPENHANDS_CLI=/bin/true
+   PYTHONPATH=perf-agents-bench python3 -m bench.cli prepare \
+     perf-agents-bench/tasks/example.yaml \
+     --from-plan state/plan.json \
+     --max-workers 4 --resume
+   ```
+
+Artifacts:
+- `state/plan.json` — array of `{item_id, human, pre|pre_parent_index}`
+- `state/runs/<run_id>/<item_id>/` — `prompt.json`, `journal.json`, `diff_targets.json`, logs
+
 ## Quick Start (literal YAML, no env exports)
 
 1. **Install CLI (editable or via PYTHONPATH)**:
@@ -86,6 +126,16 @@ A modular, engine-agnostic performance benchmarking system for evaluating AI age
 4. **Collect metrics** and generate comparison report
 5. **Enforce constraints** (target file restrictions, etc.)
 
+### CLI Overview
+
+- `bench init` — scaffold example task and commits file
+- `bench plan` — produce `state/plan.json` from commits file or YAML pairs
+- `bench prepare` — run OpenHands locally per plan item; write journals; resumable
+- `bench validate` — validate a task file (with env expansion)
+- `bench run` — full benchmark (Stage B; containers)
+- `bench smoke` — build/run images for quick sanity (Stage B)
+- `bench doctor` — check `git`, `docker` (for Stage B), and OpenHands CLI
+
 ## Configuration
 
 ### Task Configuration (`tasks/example.yaml`)
@@ -119,6 +169,15 @@ metrics:
       cmd: "python benchmark.py"
       trials: 10
 ```
+
+### Commits file format (`.work/commits.txt`)
+
+```text
+# One line per item:
+<40hex-human> [<40hex-pre>|parent=1]
+```
+
+If `pre` is omitted and `parent=K` is provided, the K-th parent of `human` will be used (useful for merge commits).
 
 ### Global Configuration (`bench.yaml`)
 

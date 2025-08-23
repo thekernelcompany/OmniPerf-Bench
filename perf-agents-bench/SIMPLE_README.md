@@ -1,96 +1,63 @@
 # Simple Performance Benchmark
 
-The absolute simplest way to compare performance between two git commits.
+The absolute simplest way to compare performance across commits.
 
 ## What it does
 
-1. Takes two git commit hashes (baseline vs optimized)
-2. Runs your `benchmark.py` on both commits  
-3. Compares the results
+1. Takes one or more human commits (and pre-commits via parent index or explicit SHA)
+2. Plans the work items, prepares agent branches with OpenHands (host-only)
+3. Summarizes results from journals
 
-## Quick Start
+## Quick Start (no Docker)
 
 ```bash
-# 1. Install 
-cd perf-agents-bench
-pip install -e .
+# 1. Scaffold example files
+PYTHONPATH=perf-agents-bench python3 -m bench.cli init --out perf-agents-bench
 
-# 2. Use literal YAML (no env exports)
-cat > /path/to/perf-agents-bench/tasks/simple.yaml <<'YAML'
-id: simple
-name: Simple benchmark
-repo:
-  url: "https://github.com/your/repo.git"
-  human_commit: "<40hex>"
-runner:
-  platform: "linux/amd64"   # recommended on Apple Silicon
-env_build:
-  allowed_strategies: [dockerfile, requirements]
-testpack:
-  entrypoint: "../vlm-bench-generic"
-metrics: []
-scoring:
-  primary: "functional_match"
-  tie_breaker: "functional_match"
-YAML
+# 2. Add commits to perf-agents-bench/.work/commits.txt
+# Format: <40hex-human> [<40hex-pre>|parent=1]
 
-# 3. Smoke run (build & run containers only)
-PYTHONPATH=/path/to/perf-agents-bench python3 -m bench.cli smoke \
-  /path/to/perf-agents-bench/tasks/simple.yaml \
-  --bench-cfg /path/to/perf-agents-bench/bench.yaml \
-  --human-only \
-  --cmd "python -c 'print(\"OK\")'"
+# 3. Plan
+PYTHONPATH=perf-agents-bench python3 -m bench.cli plan \
+  perf-agents-bench/tasks/example.yaml \
+  --commits perf-agents-bench/.work/commits.txt \
+  --out state/plan.json
+
+# 4. Prepare (runs OpenHands locally; resumable)
+# If OpenHands is not installed yet, you can smoke-test with a no-op:
+# export OPENHANDS_CLI=/bin/true
+PYTHONPATH=perf-agents-bench python3 -m bench.cli prepare \
+  perf-agents-bench/tasks/example.yaml \
+  --from-plan state/plan.json \
+  --max-workers 2 --resume
+
+# 5. Report (prints JSON summary)
+PYTHONPATH=perf-agents-bench python3 -m bench.cli report state/runs/<run_id>
 ```
 
-## What you need in your project
+## Minimal requirement in your project
 
-Just a `benchmark.py` that:
-- Measures your performance 
-- Outputs JSON with `--output filename.json`
+Nothing special for Stage A. Your repo just needs to be a git repository that OpenHands can modify under the specified `target_files`.
 
-Example:
-```python
-#!/usr/bin/env python3
-import json, sys
+## Later (optional, Docker)
 
-# Your performance test here
-result = {"throughput": 123.45}
+You can build and run containerized evaluations:
+```bash
+# Build canonical images for baseline/human (and agent optionally)
+bench build perf-agents-bench/tasks/example.yaml
 
-if "--output" in sys.argv:
-    with open(sys.argv[sys.argv.index("--output") + 1], 'w') as f:
-        json.dump(result, f)
+# Smoke test inside containers
+PYTHONPATH=perf-agents-bench python3 -m bench.cli smoke \
+  perf-agents-bench/tasks/example.yaml \
+  --bench-cfg perf-agents-bench/bench.yaml \
+  --human-only \
+  --cmd "python -c 'print(\"OK\")'"
 ```
 
 ## What happens
 
 ```
-Running benchmark: Simple performance benchmark
-Baseline commit: def789ab
-Human commit: abc12345
-
-=== Running baseline (def789ab) ===
-✓ baseline completed
-
-=== Running human (abc12345) ===  
-✓ human completed
-
-=== Running agent optimization ===
-(Agent optimization skipped - would run OpenHands here)
-✓ agent completed
-
-=== Results ===
-Baseline: 85.2
-Human:    127.8  
-Agent:    85.2
-
-Report saved: ./results/simple_benchmark/report.json
-```
-
-That's it! No containers, no complex config, just git + your benchmark script.
-
-## Demo
-
-Run the included demo from any git repo:
-```bash
-python /path/to/perf-agents-bench/demo.py
+Planning commit pairs -> state/plan.json
+Preparing items with OpenHands -> state/runs/<run_id>/<item_id>/{prompt,journal,diff_targets}.json
+Summarizing journals -> JSON report
 ```

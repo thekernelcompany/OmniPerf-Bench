@@ -13,10 +13,7 @@ from .metrics.registry import run_metric
 from .agents.openhands import OpenHandsAgent
 
 
-def run_task(task_file: Path, bench_cfg: Dict[str, Any]):
-    import yaml
-    
-    task = yaml.safe_load(task_file.read_text())
+def run_task(task: Dict[str, Any], bench_cfg: Dict[str, Any]):
     run_id = f"{task['id']}-{uuid.uuid4().hex[:8]}"
     
     work_root = Path(bench_cfg["paths"]["work_root"]).resolve()
@@ -28,6 +25,7 @@ def run_task(task_file: Path, bench_cfg: Dict[str, Any]):
 
     # Clone and resolve commits
     repo_dir = work_root / f"{task['id']}-repo"
+    work_root.mkdir(parents=True, exist_ok=True)
     clone_or_update(task["repo"]["url"], repo_dir)
     
     human = task["repo"]["human_commit"]
@@ -117,14 +115,12 @@ def run_task(task_file: Path, bench_cfg: Dict[str, Any]):
     print(f"Done: {run_dir}")
 
 
-def smoke_task(task_file: Path, bench_cfg: Dict[str, Any], cmd: str | None = None, include_agent: bool = True, use_human_for_all: bool = False):
+def smoke_task(task: Dict[str, Any], bench_cfg: Dict[str, Any], cmd: str | None = None, include_agent: bool = True, use_human_for_all: bool = False):
     """Build and run per-commit containers (baseline, human, optional agent) and execute a simple command.
     Does not run TestPack or metrics. Intended as a quick sanity check.
     """
-    import yaml
-    task = yaml.safe_load(task_file.read_text())
-
     work_root = Path(bench_cfg["paths"]["work_root"]).resolve()
+    work_root.mkdir(parents=True, exist_ok=True)
     repo_dir = work_root / f"{task['id']}-repo"
     clone_or_update(task["repo"]["url"], repo_dir)
 

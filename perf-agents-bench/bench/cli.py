@@ -1,13 +1,19 @@
 from __future__ import annotations
 import typer
 import yaml
+import json
 import os
 import re
+import uuid
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from .pipeline import run_task
 from .pipeline import smoke_task
+from .planner import MatrixPlanner
+from .prepare import PrepareExecutor
+from .report import summarize_stage_a
+from .build_cmd import build_images
 # Ensure metrics registry is populated by importing builtins
 from . import metrics as _metrics_autoload  # noqa: F401
 
@@ -42,6 +48,12 @@ def _load_bench_cfg(path: Path) -> Dict[str, Any]:
     return _expand_env_vars(cfg)
 
 
+def _load_task_cfg(path: Path) -> Dict[str, Any]:
+    """Load and expand environment variables in task config."""
+    cfg = yaml.safe_load(path.read_text())
+    return _expand_env_vars(cfg)
+
+
 @app.command()
 def run(task: str, bench_cfg: str = "bench.yaml"):
     """Run a performance benchmarking task."""
@@ -58,7 +70,8 @@ def run(task: str, bench_cfg: str = "bench.yaml"):
     
     try:
         config = _load_bench_cfg(bench_cfg_path)
-        run_task(task_path, config)
+        task_cfg = _load_task_cfg(task_path)
+        run_task(task_cfg, config)
     except Exception as e:
         typer.echo(f"Error: {e}")
         raise typer.Exit(1)
@@ -120,7 +133,166 @@ def smoke(task: str, bench_cfg: str = "bench.yaml", cmd: str = "", human_only: b
         typer.echo(f"Bench config not found: {bench_cfg_path}")
         raise typer.Exit(1)
     config = _load_bench_cfg(bench_cfg_path)
-    smoke_task(task_path, config, cmd or None, use_human_for_all=human_only)
+    task_cfg = _load_task_cfg(task_path)
+    smoke_task(task_cfg, config, cmd or None, use_human_for_all=human_only)
+
+
+@app.command()
+def plan(task: str, commits: Optional[str] = typer.Option(None, help="Path to commits.txt or YAML with pairs"), out: str = typer.Option("state/plan.json", help="Path to write plan JSON")):
+    """Resolve commit pairs (human/pre) into a plan file for bulk preparation."""
+    task_path = Path(task)
+    if not task_path.exists():
+        typer.echo(f"Task file not found: {task_path}")
+        raise typer.Exit(1)
+    try:
+        task_cfg = _load_task_cfg(task_path)
+        planner = MatrixPlanner()
+        plan = planner.build_plan(task_cfg, commits_path=Path(commits) if commits else None)
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.suffix == ".json":
+            out_path.write_text(json.dumps(plan, indent=2))
+        else:
+            out_path.write_text(yaml.safe_dump(plan))
+        typer.echo(f"✓ Wrote plan to {out_path}")
+    except Exception as e:
+        typer.echo(f"Planning error: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def prepare(task: str, from_plan: str = typer.Option("state/plan.json", "--from-plan", "-p"), bench_cfg: str = "bench.yaml", max_workers: int = 4, resume: bool = True):
+    """Run OpenHands (host) for each plan item, enforce targets, and write journals."""
+    task_p = Path(task)
+    plan_p = Path(from_plan)
+    bench_cfg_path = Path(bench_cfg)
+    if not task_p.exists():
+        typer.echo(f"Task file not found: {task_p}")
+        raise typer.Exit(1)
+    if not plan_p.exists():
+        typer.echo(f"Plan file not found: {plan_p}")
+        raise typer.Exit(1)
+    if not bench_cfg_path.exists():
+        typer.echo(f"Bench config not found: {bench_cfg_path}")
+        raise typer.Exit(1)
+
+    try:
+        task_cfg = _load_task_cfg(task_p)
+        cfg = _load_bench_cfg(bench_cfg_path)
+        run_id = f"{task_cfg['id']}-{uuid.uuid4().hex[:8]}"
+        executor = PrepareExecutor(cfg, run_id=run_id)
+        executor.execute(task_cfg, plan_p, max_workers=max_workers, resume=resume)
+        typer.echo(f"✓ Prepare completed: state/runs/{run_id}")
+    except Exception as e:
+        typer.echo(f"Prepare error: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def init(out: str = typer.Option(".", help="Directory to write scaffolding into")):
+    """Scaffold a minimal Stage A setup: example task and commits.txt."""
+    out_dir = Path(out)
+    tasks_dir = out_dir / "tasks"
+    work_dir = out_dir / ".work"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    example_task = {
+        "id": "sample_task",
+        "name": "Sample optimization",
+        "description": "Optimize selected files",
+        "repo": {
+            "url": "${REPO_URL}",
+            "human_commit": "${HUMAN_COMMIT}",
+            "pre_commit": "${PRE_COMMIT}",
+        },
+        "runner": {
+            "requires_gpu": False,
+            "python_version": None,
+            "allow_network_during_prepare": True,
+        },
+        "env_build": {
+            "allowed_strategies": ["dockerfile", "requirements"],
+            "params": {"dockerfile_path": None, "requirements_file": None},
+        },
+        "optimization_contract": {
+            "strict_targets": True,
+            "target_files": ["src/module.py"],
+            "constraints": ["No public API breakage"],
+        },
+        "testpack": {"entrypoint": "../vlm-bench-generic"},
+        "metrics": [],
+        "scoring": {"primary": "throughput", "tie_breaker": "functional"},
+    }
+    example_path = tasks_dir / "example.yaml"
+    example_path.write_text(yaml.safe_dump(example_task))
+
+    commits_file = work_dir / "commits.txt"
+    if not commits_file.exists():
+        commits_file.write_text("# <human_sha> [<pre_sha>|parent=1]\n")
+
+    typer.echo(f"✓ Wrote {example_path} and {commits_file}")
+
+
+@app.command()
+def doctor(bench_cfg: str = "bench.yaml"):
+    """Check environment prerequisites for Stage A and Stage B (optional)."""
+    import subprocess
+    ok = True
+    try:
+        subprocess.check_output(["git", "--version"])  # type: ignore[arg-type]
+        typer.echo("✓ git found")
+    except Exception as e:
+        ok = False
+        typer.echo(f"✗ git not found: {e}")
+
+    try:
+        cfg = _load_bench_cfg(Path(bench_cfg))
+        cli = cfg["agents"]["openhands"]["cli"]
+        subprocess.run([cli, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        typer.echo(f"✓ OpenHands CLI available: {cli}")
+    except Exception as e:
+        typer.echo(f"! OpenHands CLI check skipped/failed: {e}")
+
+    try:
+        subprocess.check_output(["docker", "--version"])  # type: ignore[arg-type]
+        typer.echo("✓ docker found (for Stage B)")
+    except Exception as e:
+        typer.echo(f"! docker not found (needed for Stage B): {e}")
+
+    raise typer.Exit(0 if ok else 1)
+
+
+@app.command()
+def report(run_dir: str = typer.Argument(..., help="Path to state/runs/<run_id>")):
+    """Summarize Stage A journals into a compact JSON report printed to stdout."""
+    try:
+        out = summarize_stage_a(Path(run_dir))
+        typer.echo(json.dumps(out, indent=2))
+    except Exception as e:
+        typer.echo(f"Report error: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def build(task: str, bench_cfg: str = "bench.yaml", include_agent: bool = False):
+    """Docker-only: build baseline/human (and optional agent) images with canonical tags."""
+    task_path = Path(task)
+    bench_cfg_path = Path(bench_cfg)
+    if not task_path.exists():
+        typer.echo(f"Task file not found: {task_path}")
+        raise typer.Exit(1)
+    if not bench_cfg_path.exists():
+        typer.echo(f"Bench config not found: {bench_cfg_path}")
+        raise typer.Exit(1)
+    try:
+        cfg = _load_bench_cfg(bench_cfg_path)
+        task_cfg = _load_task_cfg(task_path)
+        tags = build_images(task_cfg, cfg, include_agent=include_agent)
+        typer.echo(json.dumps(tags, indent=2))
+    except Exception as e:
+        typer.echo(f"Build error: {e}")
+        raise typer.Exit(1)
 
 if __name__ == "__main__":
     app()
