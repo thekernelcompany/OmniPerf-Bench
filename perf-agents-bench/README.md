@@ -3,7 +3,7 @@
 Minimal, local-first workflow to plan commit pairs, run OpenHands headless to generate agent branches, and summarize results.
 
 ## Requirements
-- Python 3.12+
+- Python 3.12+ (OpenHands requires 3.12)
 - uv (for OpenHands): `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Docker (Stage B later)
 
@@ -15,8 +15,8 @@ cp perf-agents-bench/.env.example perf-agents-bench/.env
 
 # Create local venv and install CLI deps (once)
 cd perf-agents-bench
-# Create venv with uv and install deps into it
-uv venv .venv
+# Create venv with uv (explicit Python 3.12) and install deps into it
+uv venv --python 3.12 .venv
 uv pip install -r requirements.txt -p .venv/bin/python
 cd -
 ```
