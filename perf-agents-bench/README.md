@@ -15,9 +15,9 @@ cp perf-agents-bench/.env.example perf-agents-bench/.env
 
 # Create local venv and install CLI deps (once)
 cd perf-agents-bench
-python3 -m venv .venv
-.venv/bin/pip install -U pip
-.venv/bin/pip install -r requirements.txt
+# Create venv with uv and install deps into it
+uv venv .venv
+uv pip install -r requirements.txt -p .venv/bin/python
 cd -
 ```
 
@@ -29,12 +29,12 @@ cd perf-agents-bench
 .venv/bin/python -m bench.cli plan \
   tasks/vllm.yaml \
   --commits .work/vllm_commits.txt \
-  --out ../state/plan.json
+  --out ./state/plan.json
 
 # 2) Prepare (headless; loads .env automatically)
 .venv/bin/python -m bench.cli prepare \
   tasks/vllm.yaml \
-  --from-plan ../state/plan.json \
+  --from-plan ./state/plan.json \
   --bench-cfg bench.yaml \
   --max-workers 1 --resume
 
