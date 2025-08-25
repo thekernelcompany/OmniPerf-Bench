@@ -70,12 +70,24 @@ class PrepareExecutor:
 
             wt_dir = rm.create_worktree(pre, item_id)
 
+            # Determine target files: if none provided, derive from pre..human diff
+            provided_targets = task_cfg["optimization_contract"].get("target_files", [])
+            derived_targets = []
+            if not provided_targets:
+                try:
+                    # Use the base repo (not the worktree) to diff pre..human
+                    # This captures the exact change surface of the human commit
+                    derived_targets = get_changed_files(rm.base_dir, pre, human)
+                except Exception:
+                    derived_targets = []
+            target_files = provided_targets or derived_targets
+
             # Build OpenHands prompt
             prompt = {
                 "task": task_cfg["name"],
                 "description": task_cfg.get("description", ""),
                 "constraints": task_cfg["optimization_contract"].get("constraints", []),
-                "target_files": task_cfg["optimization_contract"]["target_files"],
+                "target_files": target_files,
                 "success": {
                     "primary_metric": task_cfg["scoring"]["primary"],
                     "rules": [
@@ -88,17 +100,90 @@ class PrepareExecutor:
             jw.write_prompt(prompt)
 
             # Create a headless task file (text) from the prompt for -f usage
+            # Add richer context to guide the agent
+            try:
+                import subprocess as _sp
+                commit_msg = _sp.check_output(["git", "show", "--no-patch", "--pretty=%B", human], cwd=rm.base_dir).decode().strip()
+            except Exception:
+                commit_msg = ""
+            try:
+                diff_stat = _sp.check_output(["git", "diff", "--stat", pre, human], cwd=rm.base_dir).decode().strip()
+            except Exception:
+                diff_stat = ""
+
+            # Enhanced task file with better structure for OpenHands
             task_lines = [
-                f"Task: {prompt['task']}",
-                f"Description: {prompt['description']}",
+                "# Performance Optimization Task",
+                "",
+                f"## Task: {prompt['task']}",
+                f"## Description: {prompt['description']}",
+                "",
+                "## Objective",
+                "Your goal is to optimize the performance of the target files while preserving their functionality.",
+                "The human developer has already made optimizations (see reference commit below).",
+                "Your task is to independently arrive at similar or better optimizations.",
+                "",
+                "## Instructions",
+                "1. Analyze the target files to identify performance bottlenecks",
+                "2. Apply concrete optimizations such as:",
+                "   - Reducing memory allocations and unnecessary copies",
+                "   - Caching frequently computed results",
+                "   - Optimizing loops and data structures",
+                "   - Eliminating redundant operations",
+                "   - Using more efficient algorithms or libraries",
+                "3. Ensure all changes preserve the public API and existing behavior",
+                "4. Test that the code still runs correctly after modifications",
+                "5. Commit your changes with a descriptive message",
+                "",
+                "## Important Guidelines",
+                "- Focus ONLY on the target files listed below",
+                "- Do NOT modify test files or benchmark harnesses",
+                "- Ensure backward compatibility",
+                "- Prioritize safety and correctness over aggressive optimizations",
             ]
+            
             if prompt["constraints"]:
-                task_lines.append("Constraints:")
+                task_lines.append("")
+                task_lines.append("## Constraints")
                 task_lines += [f"- {c}" for c in prompt["constraints"]]
+            
             if prompt["target_files"]:
-                task_lines.append("Target files:")
-                task_lines += [f"- {t}" for t in prompt["target_files"]]
-            task_lines.append(f"Primary metric: {prompt['success']['primary_metric']}")
+                task_lines.append("")
+                task_lines.append("## Target Files (ONLY modify these)")
+                task_lines += [f"- `{t}`" for t in prompt["target_files"]]
+            
+            # Add reference information about the human's optimization
+            if commit_msg or diff_stat:
+                task_lines.append("")
+                task_lines.append("## Reference Information")
+                task_lines.append("The following shows what the human developer optimized:")
+                
+            if commit_msg:
+                task_lines.append("")
+                task_lines.append("### Human's Commit Message:")
+                task_lines.append("```")
+                task_lines += commit_msg.splitlines()
+                task_lines.append("```")
+                
+            if diff_stat:
+                task_lines.append("")
+                task_lines.append("### Files Changed (statistics):")
+                task_lines.append("```")
+                task_lines += diff_stat.splitlines()
+                task_lines.append("```")
+            
+            task_lines.append("")
+            task_lines.append("## Success Criteria")
+            task_lines.append(f"- Primary metric to optimize: {prompt['success']['primary_metric']}")
+            task_lines.append("- All existing tests must pass")
+            task_lines.append("- No regression in functionality")
+            task_lines.append("")
+            task_lines.append("## Final Steps")
+            task_lines.append("After implementing your optimizations:")
+            task_lines.append("1. Run any existing tests to verify correctness")
+            task_lines.append("2. Commit your changes with: `git add -A && git commit -m 'Optimize performance in target files'`")
+            task_lines.append("3. The task will be complete when you've successfully committed your changes")
+            
             task_text = "\n".join(task_lines) + "\n"
             task_file = jw.dir / "task.txt"
             task_file.write_text(task_text)
@@ -109,41 +194,66 @@ class PrepareExecutor:
             time_budget = agent_cfg["time_budget_minutes"]
             container_image = agent_cfg.get("container_image") or None
             args_cfg = agent_cfg.get("args", {})
-            subcmd = args_cfg.get("subcommand", ["run"]) if isinstance(args_cfg.get("subcommand", ["run"]), list) else ["run"]
-            iterations = args_cfg.get("iterations")
+            iterations = args_cfg.get("iterations", 30)
+            max_budget = args_cfg.get("max_budget_per_task", 10.0)
             branch = f"agent/{task_cfg['id']}/{human[:8]}"
 
             # Execute and capture logs (containerized if container_image provided)
             if container_image:
+                # Use proper OpenHands headless mode with Docker
                 cmd = [
                     "docker", "run", "--rm",
                     "-v", f"{wt_dir}:/workspace:rw",
                     "-v", f"{task_file}:/task.txt:ro",
-                    # Allow containerized OpenHands to access host Docker daemon
+                    # Security: set user ID to match host user
+                    "-e", f"SANDBOX_USER_ID={os.getuid()}",
+                    # Enable full event logging for debugging
+                    "-e", "LOG_ALL_EVENTS=true",
+                    # Set the runtime container image
+                    "-e", f"SANDBOX_RUNTIME_CONTAINER_IMAGE={agent_cfg.get('runtime_image', 'docker.all-hands.dev/all-hands-ai/runtime:0.54-nikolaik')}",
+                    # Ensure Linux containers can resolve host.docker.internal (host-gateway)
+                    "--add-host=host.docker.internal:host-gateway",
+                    # Allow containerized OpenHands to access host Docker daemon for nested containers
                     "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                    "-v", f"{Path.home()}/.openhands:/.openhands",
                     "-w", "/workspace",
                 ]
                 # Propagate key env vars into container for headless
-                for k in ["LLM_MODEL", "LLM_API_KEY", "GITHUB_TOKEN"]:
+                for k in ["LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL", "GITHUB_TOKEN", "GITLAB_TOKEN", "BITBUCKET_TOKEN"]:
                     if env_vars.get(k):
                         cmd += ["-e", f"{k}={env_vars[k]}"]
-                # If DOCKER_HOST is set on the host, propagate it too
-                if env_vars.get("DOCKER_HOST"):
-                    cmd += ["-e", f"DOCKER_HOST={env_vars['DOCKER_HOST']}"]
+                # Add timeout as environment variable
+                cmd += ["-e", f"OPENHANDS_TIMEOUT_MINUTES={time_budget}"]
                 cmd += [
                     container_image,
                     "python", "-m", "openhands.core.main",
                     "-d", "/workspace",
                     "-f", "/task.txt",
+                    "-i", str(iterations),
+                    "-b", str(max_budget),
                 ]
             else:
-                cmd = [
-                    cli, *subcmd,
-                    "-d", str(wt_dir),
-                    "-f", str(task_file),
-                ]
-            if iterations:
-                cmd += ["-i", str(iterations)]
+                # Run with proper headless mode arguments (not uvx)
+                # Assume 'cli' is the path to python with OpenHands installed
+                if cli == "uvx":
+                    # If using uvx, construct proper command
+                    cmd = [
+                        "uvx", "--python", "3.12", "--from", "openhands-ai",
+                        "python", "-m", "openhands.core.main",
+                        "-d", str(wt_dir),
+                        "-f", str(task_file),
+                        "-i", str(iterations),
+                        "-b", str(max_budget),
+                    ]
+                else:
+                    # Direct Python execution
+                    cmd = [
+                        cli, "-m", "openhands.core.main",
+                        "-d", str(wt_dir),
+                        "-f", str(task_file),
+                        "-i", str(iterations),
+                        "-b", str(max_budget),
+                    ]
 
             # Pre-create branch to capture agent edits on it
             try:
@@ -161,7 +271,7 @@ class PrepareExecutor:
                 status = "success" if proc.returncode == 0 else "error"
                 # Enforce targets
                 changed = get_changed_files(wt_dir, pre, "HEAD")
-                targets = set(task_cfg["optimization_contract"]["target_files"])
+                targets = set(target_files)
                 disallowed = [p for p in changed if p not in targets]
                 ok = len(disallowed) == 0
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
