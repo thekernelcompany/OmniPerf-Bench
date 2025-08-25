@@ -119,12 +119,17 @@ class PrepareExecutor:
                     "docker", "run", "--rm",
                     "-v", f"{wt_dir}:/workspace:rw",
                     "-v", f"{task_file}:/task.txt:ro",
+                    # Allow containerized OpenHands to access host Docker daemon
+                    "-v", "/var/run/docker.sock:/var/run/docker.sock",
                     "-w", "/workspace",
                 ]
                 # Propagate key env vars into container for headless
                 for k in ["LLM_MODEL", "LLM_API_KEY", "GITHUB_TOKEN"]:
                     if env_vars.get(k):
                         cmd += ["-e", f"{k}={env_vars[k]}"]
+                # If DOCKER_HOST is set on the host, propagate it too
+                if env_vars.get("DOCKER_HOST"):
+                    cmd += ["-e", f"DOCKER_HOST={env_vars['DOCKER_HOST']}"]
                 cmd += [
                     container_image,
                     "python", "-m", "openhands.core.main",
