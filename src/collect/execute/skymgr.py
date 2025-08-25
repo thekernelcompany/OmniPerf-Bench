@@ -124,14 +124,14 @@ class SkyManager:
     @staticmethod
     def get_results(workspace, cluster="sky-gso"):
         subprocess.run(
-            ["rsync", "-Pavz", f"{cluster}:~/sky_workdir/results/*", "./results/"],
+            ["rsync", "-Pavz", f"{cluster}:~/sky_workdir/results/*", "./misc/results/"],
             cwd=workspace,
         )
 
-        if not (workspace / "results").exists():
+        if not (workspace / "misc/results").exists():
             return f"Cluster: {cluster}: no results!", []
 
-        file_groups = zip_results(workspace / "results")
+        file_groups = zip_results(workspace / "misc/results")
         results = []
 
         for identifier, files in file_groups.items():
