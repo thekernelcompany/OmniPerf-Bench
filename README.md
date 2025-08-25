@@ -14,14 +14,74 @@ gso = load_dataset('gso-bench/gso', split='test')
 ```
 
 ## 📁 repository structure
-This repository has been reorganized for better maintainability. See [docs/repository_structure.md](docs/repository_structure.md) for a detailed overview of the new structure. Key directories:
 
-- `src/` - Main source code (collection framework, harness, data models)
-- `experiments/` - Experiment configurations and datasets (vLLM, SGLang)
-- `benchmarks/effibench/` - EffiBench integration for code efficiency evaluation
+```
+OmniPerf-Bench/
+├── README.md                    # Main project documentation
+├── CLAUDE.md                    # Claude AI development guidance
+├── LICENSE                      # Project license  
+├── pyproject.toml              # Python project configuration
+├── uv.lock                     # Lock file for uv package manager
+├── requirements.txt            # Python dependencies
+│
+├── src/                        # Main OmniPerf-Bench source code
+│   ├── collect/                # Collection framework for dataset generation
+│   │   ├── analysis/           # Commit and API analysis modules
+│   │   ├── execute/            # Test execution and evaluation
+│   │   ├── generate/           # Performance test generation
+│   │   ├── scripts/            # Collection utility scripts
+│   │   └── build_dataset.py    # Main dataset building script
+│   ├── data/                   # Data models and parsing utilities
+│   ├── harness/                # Evaluation harness for performance testing
+│   │   ├── environment/        # Docker environment management
+│   │   ├── grading/            # Grading and metrics evaluation
+│   │   ├── plot/               # Visualization and plotting tools
+│   │   └── scripts/            # Harness utility scripts
+│   ├── test_scripts/           # Test generation and analysis scripts
+│   │   ├── commit_analyzer.py  # Commit analysis utilities
+│   │   ├── performance_analyzer.py # Performance analysis tools
+│   │   └── test_llm_generator.py   # LLM-based test generators
+│   ├── utils/                  # General utility functions
+│   ├── constants.py            # Project constants
+│   └── logger.py              # Logging configuration
+│
+├── third-party/               # External dependencies
+│   └── effibench/             # Original EffiBench repository clone
+│       ├── src/               # EffiBench source code
+│       ├── data/              # EffiBench datasets  
+│       ├── prompts/           # LLM prompts for EffiBench
+│       ├── results/           # EffiBench evaluation results
+│       ├── requirements.txt   # EffiBench dependencies
+│       └── README.md          # EffiBench documentation
+│
+├── tools/                     # Utility scripts and patches
+│   ├── manual_review.py       # Manual review utilities
+│   └── openrouter_patch.py    # OpenRouter API patches
+│
+└── misc/                      # Experiment outputs and results
+    ├── experiments/           # Experimental data and legacy outputs
+    │   ├── commit_extractions/ # Extracted commit data (64 JSON files)
+    │   ├── generated_test_generators_v*/ # Test generator iterations
+    │   ├── gso-duplicate/     # Duplicate GSO analysis implementation
+    │   ├── vllm/              # vLLM experiment data and results
+    │   │   ├── data/          # vLLM training data (parquet files)
+    │   │   ├── divided/       # Split result files for parallel processing
+    │   │   └── *.json         # vLLM experiment configurations and results
+    │   ├── sglang.yaml        # SGLang experiment configuration
+    │   ├── vllm.yaml          # vLLM experiment configuration
+    │   └── README.md          # Documentation for experiments
+    └── results/               # Analysis results, logs, and reviews
+        ├── analysis/          # Performance analysis outputs
+        ├── logs/              # Execution and system logs
+        └── reviews/           # Manual review files (CSV format)
+```
+
+Key directories:
+- `src/` - Main source code (collection framework, evaluation harness, data models, test scripts)
+- `third-party/effibench/` - Original EffiBench repository clone (external dependency)
 - `tools/` - Utility scripts and patches
-- `results/` - Logs, reviews, and analysis outputs
-- `misc/` - Archived files and legacy content (with results for test generation files)
+- `misc/experiments/` - Experimental data including vLLM/SGLang configs and generated outputs
+- `misc/results/` - Analysis results, execution logs, and manual reviews
 
 ## 🚀 setup
 
@@ -73,7 +133,7 @@ For token setup:
 ```bash
 docker login
 
-uv run src/gso/harness/prepare_images.py \
+uv run src/harness/prepare_images.py \
     --push_to_registry true \
     --dockerhub_username <dockerhub_username> \
     --dockerhub_repo <dockerhub_repo>
@@ -81,7 +141,7 @@ uv run src/gso/harness/prepare_images.py \
 
 2. **running evaluations**:
 ```bash
-uv run src/gso/harness/opt_at_k.py \
+uv run src/harness/opt_at_k.py \
     --prediction_paths <prediction_paths> \
     --timeout 3600 \
     --run_id <run_id> \
@@ -112,26 +172,34 @@ for detailed instructions and usage, see the [collection framework documentation
 ### benchmarks
 
 #### effibench integration
-EffiBench is integrated as a benchmark for evaluating code efficiency. To use EffiBench:
+EffiBench is integrated as a benchmark for evaluating code efficiency. The original EffiBench repository is in `third-party/effibench/` and analysis/test scripts are available in `src/test_scripts/`:
 
 ```bash
-cd benchmarks/effibench
+# To use the original EffiBench
+cd third-party/effibench
 pip install -r requirements.txt
-# Follow EffiBench README for specific usage
+
+# To use EffiBench-related scripts from our integration
+cd src/test_scripts
+python test_llm_generator.py  # LLM-based test generation
+python performance_analyzer.py  # Performance analysis
 ```
 
-See [benchmarks/effibench/README.md](benchmarks/effibench/README.md) for detailed EffiBench documentation.
+See [third-party/effibench/README.md](third-party/effibench/README.md) for detailed EffiBench documentation and [src/test_scripts/README.md](src/test_scripts/README.md) for script usage.
 
 ### experiments
 
-Pre-configured experiments are available in the `experiments/` directory:
-- `experiments/vllm/` - vLLM performance optimization dataset with 282 problems
-- `experiments/sglang.yaml` - SGLang experiment configuration
-- `experiments/vllm.yaml` - vLLM experiment configuration
+Pre-configured experiments are available in the `misc/experiments/` directory:
+- `misc/experiments/vllm/` - vLLM performance optimization dataset with 282 problems  
+- `misc/experiments/sglang.yaml` - SGLang experiment configuration
+- `misc/experiments/vllm.yaml` - vLLM experiment configuration
+- `misc/experiments/commit_extractions/` - Extracted performance-related commits (64 JSON files)
+- `misc/experiments/generated_test_generators_v*/` - Various iterations of LLM test generators
 
 ## ⬇️ artifacts
 | datasets | tools | dockers |
 | - | - | - |
 | [💿 gso](https://huggingface.co/datasets/gso-bench/gso) | [🔧 evaluation harness](src/harness/) | [🐳 docker hub](https://hub.docker.com/repository/docker/slimshetty/gso/general) |
-| [💿 vllm dataset](experiments/vllm/) | [🔧 collection framework](src/collect/) | |
-| [💿 effibench](benchmarks/effibench/) | [🔧 utility tools](tools/) | |
+| [💿 vllm dataset](misc/experiments/vllm/) | [🔧 collection framework](src/collect/) | |
+| [💿 effibench](third-party/effibench/) | [🔧 test scripts](src/test_scripts/) | |
+| | [🔧 utility tools](tools/) | |
