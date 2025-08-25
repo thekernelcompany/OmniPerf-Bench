@@ -1,0 +1,192 @@
+{
+  "commit_hash": "f8ecb84c0283a7f1ba02ee732c9f044f8f9d36ee",
+  "parent_hash": "5f036d2bcc5244ca431212167c94700e5ae7a8e0",
+  "message": "Speed up Punica compilation (#2632)",
+  "author": "Woosuk Kwon <woosuk.kwon@berkeley.edu>",
+  "date": "2024-01-27 17:46:56 -0800",
+  "files_changed": [
+    {
+      "file_path": ".buildkite/test-template.j2",
+      "old_content": "{% set docker_image = \"us-central1-docker.pkg.dev/vllm-405802/vllm-ci-test-repo/vllm-test:$BUILDKITE_COMMIT\" %}\n{% set default_num_gpu = 1 %}\n{% set default_working_dir = \"/vllm-workspace/tests\" %}\n\nsteps:\n  - label: \":docker: build image\"\n    commands:\n      - \"docker build --tag {{ docker_image }} --target test --progress plain .\"\n      - \"docker push {{ docker_image }}\"\n    env:\n      DOCKER_BUILDKIT: \"1\"\n    retry:\n      automatic:\n        - exit_status: -1  # Agent was lost\n          limit: 5\n  - wait\n\n  {% for step in steps %}\n  - label: \"{{ step.label }}\"\n    agents:\n      queue: kubernetes\n    soft_fail: {{ step.soft_fail or false }}\n    retry:\n      automatic:\n        - exit_status: -1  # Agent was lost\n          limit: 5\n    plugins:\n      - kubernetes:\n          podSpec:\n            volumes:\n              - name: dshm\n                emptyDir:\n                  medium: Memory\n            containers:\n              - image: \"{{ docker_image }}\"\n                command: [\"bash\"]\n                args:\n                - \"-c\"\n                - \"'cd {{ (step.working_dir or default_working_dir) | safe  }} && {{ step.command  or (step.commands | join(' && ')) | safe }}'\"\n                resources:\n                  requests:\n                    nvidia.com/gpu: \"{{ step.num_gpus or default_num_gpu }}\"\n                  limits:\n                    nvidia.com/gpu: \"{{ step.num_gpus or default_num_gpu }}\"\n                env:\n                  - name: HF_TOKEN\n                    valueFrom:\n                      secretKeyRef:\n                        name: hf-token-secret\n                        key: token\n                volumeMounts:\n                  - mountPath: /dev/shm\n                    name: dshm\n  {% endfor %}\n",
+      "diff": "diff --git a/.buildkite/test-template.j2 b/.buildkite/test-template.j2\nindex b35511293..7c709b609 100644\n--- a/.buildkite/test-template.j2\n+++ b/.buildkite/test-template.j2\n@@ -5,7 +5,7 @@\n steps:\n   - label: \":docker: build image\"\n     commands:\n-      - \"docker build --tag {{ docker_image }} --target test --progress plain .\"\n+      - \"docker build --build-arg max_jobs=16 --tag {{ docker_image }} --target test --progress plain .\"\n       - \"docker push {{ docker_image }}\"\n     env:\n       DOCKER_BUILDKIT: \"1\"",
+      "change_type": "modified",
+      "lines_added": 2,
+      "lines_removed": 2
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_all.cu",
+      "old_content": "#include \"bgmv_config.h\"\n#include \"bgmv_impl.cuh\"\n\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_bfloat16)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_half)\nFOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_bfloat16)\n",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_all.cu b/csrc/punica/bgmv/bgmv_all.cu\ndeleted file mode 100644\nindex 2502a67e3..000000000\n--- a/csrc/punica/bgmv/bgmv_all.cu\n+++ /dev/null\n@@ -1,21 +0,0 @@\n-#include \"bgmv_config.h\"\n-#include \"bgmv_impl.cuh\"\n-\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_bfloat16)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_half)\n-FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_bfloat16)",
+      "change_type": "deleted",
+      "lines_added": 1,
+      "lines_removed": 22
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_bf16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_bf16_bf16.cu b/csrc/punica/bgmv/bgmv_bf16_bf16_bf16.cu\nnew file mode 100644\nindex 000000000..c642e9492\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_bf16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_bf16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_bf16_fp16.cu b/csrc/punica/bgmv/bgmv_bf16_bf16_fp16.cu\nnew file mode 100644\nindex 000000000..e8202dff5\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_bf16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_bfloat16, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_fp16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_fp16_bf16.cu b/csrc/punica/bgmv/bgmv_bf16_fp16_bf16.cu\nnew file mode 100644\nindex 000000000..3e7cf31de\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_fp16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_fp16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_fp16_fp16.cu b/csrc/punica/bgmv/bgmv_bf16_fp16_fp16.cu\nnew file mode 100644\nindex 000000000..68277fa6b\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_fp16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, nv_half, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_fp32_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_fp32_bf16.cu b/csrc/punica/bgmv/bgmv_bf16_fp32_bf16.cu\nnew file mode 100644\nindex 000000000..0607cebfe\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_fp32_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_bf16_fp32_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_bf16_fp32_fp16.cu b/csrc/punica/bgmv/bgmv_bf16_fp32_fp16.cu\nnew file mode 100644\nindex 000000000..3b7531b8f\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_bf16_fp32_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_bfloat16, float, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_bf16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_bf16_bf16.cu b/csrc/punica/bgmv/bgmv_fp16_bf16_bf16.cu\nnew file mode 100644\nindex 000000000..b3b74aa3e\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_bf16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_bf16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_bf16_fp16.cu b/csrc/punica/bgmv/bgmv_fp16_bf16_fp16.cu\nnew file mode 100644\nindex 000000000..3cc87f5df\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_bf16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_bfloat16, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_fp16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_fp16_bf16.cu b/csrc/punica/bgmv/bgmv_fp16_fp16_bf16.cu\nnew file mode 100644\nindex 000000000..9eda98bd8\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_fp16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_fp16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_fp16_fp16.cu b/csrc/punica/bgmv/bgmv_fp16_fp16_fp16.cu\nnew file mode 100644\nindex 000000000..f1db6df5f\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_fp16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, nv_half, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_fp32_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_fp32_bf16.cu b/csrc/punica/bgmv/bgmv_fp16_fp32_bf16.cu\nnew file mode 100644\nindex 000000000..060f9ebb8\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_fp32_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp16_fp32_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp16_fp32_fp16.cu b/csrc/punica/bgmv/bgmv_fp16_fp32_fp16.cu\nnew file mode 100644\nindex 000000000..c01ddd009\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp16_fp32_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, nv_half, float, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_bf16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_bf16_bf16.cu b/csrc/punica/bgmv/bgmv_fp32_bf16_bf16.cu\nnew file mode 100644\nindex 000000000..f45183ffd\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_bf16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_bf16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_bf16_fp16.cu b/csrc/punica/bgmv/bgmv_fp32_bf16_fp16.cu\nnew file mode 100644\nindex 000000000..b37e44570\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_bf16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_bfloat16, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_fp16_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_fp16_bf16.cu b/csrc/punica/bgmv/bgmv_fp32_fp16_bf16.cu\nnew file mode 100644\nindex 000000000..06718cbb0\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_fp16_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_fp16_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_fp16_fp16.cu b/csrc/punica/bgmv/bgmv_fp32_fp16_fp16.cu\nnew file mode 100644\nindex 000000000..409774348\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_fp16_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, nv_half, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_fp32_bf16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_fp32_bf16.cu b/csrc/punica/bgmv/bgmv_fp32_fp32_bf16.cu\nnew file mode 100644\nindex 000000000..41fb0e45e\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_fp32_bf16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_bfloat16)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/bgmv_fp32_fp32_fp16.cu",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/bgmv_fp32_fp32_fp16.cu b/csrc/punica/bgmv/bgmv_fp32_fp32_fp16.cu\nnew file mode 100644\nindex 000000000..50b7ead9f\n--- /dev/null\n+++ b/csrc/punica/bgmv/bgmv_fp32_fp32_fp16.cu\n@@ -0,0 +1,4 @@\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, float, float, nv_half)",
+      "change_type": "added",
+      "lines_added": 5,
+      "lines_removed": 1
+    },
+    {
+      "file_path": "csrc/punica/bgmv/generator.py",
+      "old_content": "",
+      "diff": "diff --git a/csrc/punica/bgmv/generator.py b/csrc/punica/bgmv/generator.py\nnew file mode 100644\nindex 000000000..66de56d74\n--- /dev/null\n+++ b/csrc/punica/bgmv/generator.py\n@@ -0,0 +1,27 @@\n+DTYPES = [\"fp16\", \"bf16\", \"fp32\"]\n+DTYPE_MAP = {\n+    \"fp16\": \"nv_half\",\n+    \"bf16\": \"nv_bfloat16\",\n+    \"fp32\": \"float\",\n+}\n+\n+TEMPLATE = \"\"\"\n+#include \"bgmv_config.h\"\n+#include \"bgmv_impl.cuh\"\n+\n+FOR_BGMV_WIDE_NARROW(INST_BGMV_TWOSIDE, {input_dtype}, {output_dtype}, {weight_dtype})\n+\"\"\".lstrip()\n+\n+for input_dtype in DTYPES:\n+    for output_dtype in DTYPES:\n+        for weight_dtype in DTYPES:\n+            if weight_dtype == \"fp32\":\n+                # FP32 weights are not supported.\n+                continue\n+            kernel_definition = TEMPLATE.format(\n+                input_dtype=DTYPE_MAP[input_dtype],\n+                output_dtype=DTYPE_MAP[output_dtype],\n+                weight_dtype=DTYPE_MAP[weight_dtype])\n+            filename = f\"bgmv_{input_dtype}_{output_dtype}_{weight_dtype}.cu\"\n+            with open(filename, \"w\") as f:\n+                f.write(kernel_definition)",
+      "change_type": "added",
+      "lines_added": 28,
+      "lines_removed": 1
+    }
+  ],
+  "affected_apis": [],
+  "summary": {
+    "total_files": 21,
+    "files_added": 19,
+    "files_deleted": 1,
+    "files_modified": 1
+  },
+  "csv_metadata": {
+    "category": "kernel-based",
+    "json_has_tests": "TRUE",
+    "json_has_benchmarks": "FALSE",
+    "is_test_actually_there": "Yes (too much BS)",
+    "is_benchmark_actually_there": "",
+    "sample_clues": "bgmv_all, bgmv_bf16_bf16_bf16, bgmv_bf16_bf16_fp16"
+  }
+}

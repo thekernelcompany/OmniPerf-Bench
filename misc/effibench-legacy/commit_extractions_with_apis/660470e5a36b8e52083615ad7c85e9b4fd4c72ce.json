@@ -1,0 +1,35 @@
+{
+  "commit_hash": "660470e5a36b8e52083615ad7c85e9b4fd4c72ce",
+  "parent_hash": "8d59dbb00044a588cab96bcdc028006ed922eb06",
+  "message": "[Core] Optimize evictor-v2 performance (#7193)",
+  "author": "xiaobochen123 <35516720+xiaobochen123@users.noreply.github.com>",
+  "date": "2024-08-06 12:34:25 -0700",
+  "files_changed": [
+    {
+      "file_path": "vllm/core/evictor_v2.py",
+      "old_content": "import enum\nfrom abc import ABC, abstractmethod\nfrom typing import OrderedDict, Tuple\n\n\nclass EvictionPolicy(enum.Enum):\n    \"\"\"Enum for eviction policy used by make_evictor to instantiate the correct\n       Evictor subclass.\n    \"\"\"\n    LRU = enum.auto()\n\n\nclass Evictor(ABC):\n    \"\"\"The Evictor subclasses should be used by the BlockAllocator class to\n    handle eviction of freed PhysicalTokenBlocks.\n    \"\"\"\n\n    @abstractmethod\n    def __init__(self):\n        pass\n\n    @abstractmethod\n    def __contains__(self, block_id: int) -> bool:\n        pass\n\n    @abstractmethod\n    def evict(self) -> Tuple[int, int]:\n        \"\"\"Runs the eviction algorithm and returns the evicted block's\n        content hash along with physical block id along with physical block id\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,\n            last_accessed: float):\n        \"\"\"Adds block to the evictor, making it a candidate for eviction\"\"\"\n        pass\n\n    @abstractmethod\n    def update(self, block_id: int, last_accessed: float):\n        \"\"\"Update corresponding block's access time in metadata\"\"\"\n        pass\n\n    @abstractmethod\n    def remove(self, block_id: int):\n        \"\"\"Remove a given block id from the cache.\"\"\"\n        pass\n\n    @property\n    @abstractmethod\n    def num_blocks(self) -> int:\n        pass\n\n\nclass BlockMetaData():\n    \"\"\"Data structure for storing key data describe cached block, so that\n    evitor could use to make its decision which one to choose for eviction\n\n    Here we use physical block id as the dict key, as there maybe several\n    blocks with the same content hash, but their physical id is unique.\n    \"\"\"\n\n    def __init__(self, content_hash: int, num_hashed_tokens: int,\n                 last_accessed: float):\n        self.content_hash = content_hash\n        self.num_hashed_tokens = num_hashed_tokens\n        self.last_accessed = last_accessed\n\n\nclass LRUEvictor(Evictor):\n    \"\"\"Evicts in a least-recently-used order using the last_accessed timestamp\n    that's recorded in the PhysicalTokenBlock. If there are multiple blocks with\n    the same last_accessed time, then the one with the largest num_hashed_tokens\n    will be evicted. If two blocks each have the lowest last_accessed time and\n    highest num_hashed_tokens value, then one will be chose arbitrarily\n    \"\"\"\n\n    def __init__(self):\n        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()\n\n    def __contains__(self, block_id: int) -> bool:\n        return block_id in self.free_table\n\n    def evict(self) -> Tuple[int, int]:\n        if len(self.free_table) == 0:\n            raise ValueError(\"No usable cache memory left\")\n\n        evicted_block = next(iter(self.free_table.values()))\n        evicted_block_id = next(iter(self.free_table.keys()))\n        # The blocks with the lowest timestamps should be placed consecutively\n        # at the start of OrderedDict. Loop through all these blocks to\n        # find the one with maximum number of hashed tokens.\n        for _id, block in self.free_table.items():\n            if evicted_block.last_accessed > block.last_accessed or (\n                    evicted_block.last_accessed == block.last_accessed and\n                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):\n                evicted_block = block\n                evicted_block_id = _id\n\n        self.free_table.pop(evicted_block_id)\n\n        return evicted_block_id, evicted_block.content_hash\n\n    def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,\n            last_accessed: float):\n        self.free_table[block_id] = BlockMetaData(content_hash,\n                                                  num_hashed_tokens,\n                                                  last_accessed)\n\n    def update(self, block_id: int, last_accessed: float):\n        self.free_table[block_id].last_accessed = last_accessed\n\n    def remove(self, block_id: int):\n        if block_id not in self.free_table:\n            raise ValueError(\n                \"Attempting to remove block that's not in the evictor\")\n        self.free_table.pop(block_id)\n\n    @property\n    def num_blocks(self) -> int:\n        return len(self.free_table)\n\n\ndef make_evictor(eviction_policy: EvictionPolicy) -> Evictor:\n    if eviction_policy == EvictionPolicy.LRU:\n        return LRUEvictor()\n    else:\n        raise ValueError(f\"Unknown cache eviction policy: {eviction_policy}\")\n",
+      "diff": "diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py\nindex 3dd12e2e2..5b1a208b7 100644\n--- a/vllm/core/evictor_v2.py\n+++ b/vllm/core/evictor_v2.py\n@@ -91,8 +91,9 @@ class LRUEvictor(Evictor):\n         # at the start of OrderedDict. Loop through all these blocks to\n         # find the one with maximum number of hashed tokens.\n         for _id, block in self.free_table.items():\n-            if evicted_block.last_accessed > block.last_accessed or (\n-                    evicted_block.last_accessed == block.last_accessed and\n+            if evicted_block.last_accessed < block.last_accessed:\n+                break\n+            if (evicted_block.last_accessed == block.last_accessed and\n                     evicted_block.num_hashed_tokens < block.num_hashed_tokens):\n                 evicted_block = block\n                 evicted_block_id = _id\n@@ -109,6 +110,7 @@ class LRUEvictor(Evictor):\n \n     def update(self, block_id: int, last_accessed: float):\n         self.free_table[block_id].last_accessed = last_accessed\n+        self.free_table.move_to_end(block_id)\n \n     def remove(self, block_id: int):\n         if block_id not in self.free_table:",
+      "change_type": "modified",
+      "lines_added": 5,
+      "lines_removed": 3
+    }
+  ],
+  "affected_apis": [
+    "LRUEvictor.evict",
+    "LRUEvictor.update"
+  ],
+  "summary": {
+    "total_files": 1,
+    "files_added": 0,
+    "files_deleted": 0,
+    "files_modified": 1
+  },
+  "csv_metadata": {
+    "category": "miscellaneous",
+    "json_has_tests": "FALSE",
+    "json_has_benchmarks": "FALSE",
+    "is_test_actually_there": "Yes (prob test_block_manager, or just latency)",
+    "is_benchmark_actually_there": "",
+    "sample_clues": "evictor_v2, none"
+  }
+}
