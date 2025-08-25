@@ -21,7 +21,7 @@ This repository has been reorganized for better maintainability. See [docs/repos
 - `benchmarks/effibench/` - EffiBench integration for code efficiency evaluation
 - `tools/` - Utility scripts and patches
 - `results/` - Logs, reviews, and analysis outputs
-- `misc/` - Archived files and legacy content (preserved, not deleted)
+- `misc/` - Archived files and legacy content (with results for test generation files)
 
 ## 🚀 setup
 
