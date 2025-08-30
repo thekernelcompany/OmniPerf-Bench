@@ -99,13 +99,49 @@ def validate_python_syntax(code: str) -> Tuple[bool, Optional[str]]:
         return False, str(e)
 
 
+def is_nontrivial_code(code: str) -> bool:
+    if not code or not code.strip():
+        return False
+    s = code.strip()
+    if len(s) < 40:
+        return False
+    tokens = ("def ", "class ", "import ", "from ", "if __name__ == \"__main__\":")
+    return any(t in s for t in tokens)
+
+
+def build_repair_prompt(original_code: str, error_message: str) -> str:
+    return (
+        "You produced a Python script that fails to parse.\n"
+        "Task: Fix ONLY the syntax/structural issues to make it valid Python.\n"
+        "- Keep the intent and behavior; do not add placeholders.\n"
+        "- Output a single, complete Python file.\n"
+        "- Do NOT include markdown fences.\n"
+        "- Ensure all try blocks have matching except/finally.\n"
+        f"Compiler error: {error_message}\n\n"
+        "Here is the code to repair:\n\n"
+        f"{original_code}\n"
+    )
+
+
 class LLMClient:
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None,
-                 temperature: float = 0.1, max_tokens: int = 8000) -> None:
+                 temperature: float = 0.1, max_tokens: int = 4096,
+                 reasoning_effort: Optional[str] = None) -> None:
         self.provider = provider or os.getenv("LLM_PROVIDER") or ("openai" if os.getenv("OPENAI_API_KEY") else "anthropic")
-        self.model = model or os.getenv("OPENAI_MODEL") or os.getenv("ANTHROPIC_MODEL") or "gpt-5-mini-2025-08-07"
+        # Use GPT-5 for simple tasks, GPT-4-turbo for complex test generation
+        default_model = "gpt-5-2025-08-07"  # GPT-5 may not handle complex prompts well
+        if os.getenv("FORCE_GPT5"):
+            default_model = "gpt-5-2025-08-07"
+        self.model = model or os.getenv("OPENAI_MODEL") or os.getenv("ANTHROPIC_MODEL") or default_model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Note: reasoning_effort is not used in current OpenAI API, keeping for compatibility
+        self.reasoning_effort = (
+            reasoning_effort
+            or os.getenv("OPENAI_REASONING_EFFORT")
+            or os.getenv("REASONING_EFFORT")
+            or "high"
+        )
 
         self._openai_client = None
         self._anthropic_client = None
@@ -115,93 +151,65 @@ class LLMClient:
             self._anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     def generate(self, prompt: str) -> str:
+        print(f"LLMClient.generate called with provider: {self.provider}, model: {self.model}")
+        print(f"Prompt length: {len(prompt)} characters")
+
         if self.provider == "openai":
-            return self._call_openai(prompt)
+            result = self._call_openai(prompt)
+            print(f"OpenAI response length: {len(result)} characters")
+            return result
         if self.provider == "anthropic":
-            return self._call_anthropic(prompt)
+            result = self._call_anthropic(prompt)
+            print(f"Anthropic response length: {len(result)} characters")
+            return result
         # Fallbacks
         if self._openai_client is not None:
-            return self._call_openai(prompt)
+            print("Falling back to OpenAI")
+            result = self._call_openai(prompt)
+            print(f"OpenAI fallback response length: {len(result)} characters")
+            return result
         if self._anthropic_client is not None:
-            return self._call_anthropic(prompt)
+            print("Falling back to Anthropic")
+            result = self._call_anthropic(prompt)
+            print(f"Anthropic fallback response length: {len(result)} characters")
+            return result
         raise RuntimeError("No usable LLM provider configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY.")
 
     def _call_openai(self, prompt: str) -> str:
         if self._openai_client is None:
+            print("OpenAI client not initialized")
             return ""
 
-        def responses_call(include_temperature: bool, tokens_param: Optional[str]) -> str:
-            kwargs: Dict[str, Any] = {"model": self.model, "input": prompt}
-            if tokens_param:
-                kwargs[tokens_param] = self.max_tokens
-            if include_temperature:
-                kwargs["temperature"] = self.temperature
-            resp = self._openai_client.responses.create(**kwargs)
-            content = getattr(resp, "output_text", None)
-            if content:
-                return content
-            chunks: List[str] = []
-            for item in getattr(resp, "output", []) or []:
-                for c in getattr(item, "content", []) or []:
-                    t = getattr(getattr(c, "text", None), "value", None)
-                    if t:
-                        chunks.append(t)
-            return "".join(chunks)
+        try:
+            print(f"Attempting to use model: {self.model}")
 
-        def chat_call(include_temperature: bool) -> str:
-            kwargs: Dict[str, Any] = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            if include_temperature:
-                kwargs["temperature"] = self.temperature
-            # Ensure older chat API also respects output length
-            kwargs["max_tokens"] = self.max_tokens
-            chat = self._openai_client.chat.completions.create(**kwargs)
-            return chat.choices[0].message.content or ""
+            # Check if this is GPT-5 which uses different parameter names
+            if "gpt-5" in self.model:
+                print("Using GPT-5 specific parameters")
+                response = self._openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    # GPT-5 doesn't support temperature parameter, only default (1)
+                    max_completion_tokens=self.max_tokens,  # GPT-5 uses max_completion_tokens
+                )
+            else:
+                # Standard GPT models
+                response = self._openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
 
-        # Try Responses API with different parameter variants and gracefully
-        # retry when temperature is unsupported by the model.
-        last_err: Optional[Exception] = None
-        for tokens_param in ("max_output_tokens", "max_completion_tokens", "max_tokens", None):
-            for include_temperature in (True, False):
-                try:
-                    return responses_call(include_temperature, tokens_param)
-                except Exception as e:  # noqa: BLE001
-                    msg = str(e)
-                    # Retry without temperature if model disallows it
-                    if include_temperature and (
-                        "unsupported_value" in msg
-                        or "does not support" in msg
-                        or "temperature" in msg
-                    ):
-                        continue
-                    # If invalid kw, try next tokens param variant
-                    if (
-                        "unexpected keyword" in msg
-                        or "invalid_request_error" in msg and "max_" in msg
-                    ):
-                        last_err = e
-                        break
-                    last_err = e
-            # proceed to next tokens_param
-
-        # Fallback to Chat Completions (older API) if Responses consistently fails
-        for include_temperature in (True, False):
-            try:
-                return chat_call(include_temperature)
-            except Exception as e:  # noqa: BLE001
-                msg = str(e)
-                if include_temperature and (
-                    "unsupported_value" in msg or "does not support" in msg
-                ):
-                    continue
-                last_err = e
-                break
-
-        if last_err is not None:
-            print(f"Error calling OpenAI: {last_err}")
-        return ""
+            content = response.choices[0].message.content
+            print(f"Successfully got response from {self.model}")
+            print(f"Raw response content: '{content}'")
+            print(f"Response object details: {response.choices[0].message}")
+            return content or ""
+        except Exception as e:
+            print(f"Error calling OpenAI with model {self.model}: {e}")
+            print(f"Available models may include: gpt-4, gpt-4-turbo, gpt-3.5-turbo, gpt-5-2025-08-07, etc.")
+            return ""
 
     def _call_anthropic(self, prompt: str) -> str:
         if self._anthropic_client is None:
@@ -256,12 +264,69 @@ def process_extraction_file(path: str, out_dir: str, client: LLMClient) -> Optio
             f.write(prompt)
     except Exception as e:
         print(f"Warning: failed to write prompt to eg_test_generator.txt: {e}")
+    print(f"Generating LLM response for commit {commit_hash[:8]}")
     llm_text = client.generate(prompt)
+    print(f"Raw LLM response length: {len(llm_text)}")
+    print(f"Raw LLM response preview: {llm_text[:200]}...")
+
     code = clean_llm_code_response(llm_text)
+    print(f"Cleaned code length: {len(code)}")
+    print(f"Cleaned code preview: {code[:200]}...")
+
+    # If the code is empty or clearly nontrivial, attempt regeneration before syntax validation
+    if not is_nontrivial_code(code):
+        print(f"Empty or trivial code produced for {commit_hash[:8]}; attempting regeneration")
+        # Try up to two regenerations with the same prompt
+        for attempt in range(1, 3):
+            print(f"Regeneration attempt {attempt} for {commit_hash[:8]}")
+            regen_text = client.generate(prompt)
+            regen_code = clean_llm_code_response(regen_text)
+            print(f"Regeneration attempt {attempt} code length: {len(regen_code)}")
+            if is_nontrivial_code(regen_code):
+                print(f"Regenerated nontrivial code on attempt {attempt} for {commit_hash[:8]}")
+                code = regen_code
+                break
+            else:
+                print(f"Regeneration attempt {attempt} still trivial for {commit_hash[:8]}")
+        # If still trivial, force an explicit instruction to output full python file
+        if not is_nontrivial_code(code):
+            print(f"Code still trivial, trying forced regeneration for {commit_hash[:8]}")
+            force_prompt = (
+                prompt
+                + "\n\nYour previous response was empty or incomplete. Output ONLY a complete, executable Python file implementing the requested test-case generator."
+            )
+            forced_text = client.generate(force_prompt)
+            forced_code = clean_llm_code_response(forced_text)
+            print(f"Forced regeneration code length: {len(forced_code)}")
+            if is_nontrivial_code(forced_code):
+                print(f"Forced regeneration produced nontrivial code for {commit_hash[:8]}")
+                code = forced_code
+            else:
+                print(f"Forced regeneration still trivial for {commit_hash[:8]}")
 
     ok, err = validate_python_syntax(code)
     if not ok:
         print(f"Syntax error for {commit_hash[:8]}: {err}")
+        # Attempt up to two repair passes by providing the exact error and code back to the model
+        for attempt in range(1, 3):
+            repair_prompt = build_repair_prompt(code, err or "")
+            repaired_text = client.generate(repair_prompt)
+            repaired_code = clean_llm_code_response(repaired_text)
+            ok2, err2 = validate_python_syntax(repaired_code)
+            if ok2:
+                print(f"Repaired syntax on attempt {attempt} for {commit_hash[:8]}")
+                code = repaired_code
+                err = None
+                break
+            else:
+                print(f"Repair attempt {attempt} failed for {commit_hash[:8]}: {err2}")
+                err = err2
+        if err is not None:
+            return None
+
+    # Final sanity: ensure code is still nontrivial before saving
+    if not is_nontrivial_code(code):
+        print(f"Generated code is still trivial/empty for {commit_hash[:8]} after attempts; skipping")
         return None
 
     script_path = save_script(out_dir, commit_hash, code)
