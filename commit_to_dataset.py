@@ -1,20 +1,19 @@
 """
-Create a canonical OmniPerf-Bench dataset record for a single commit and (optionally)
-export SWE-Perf/GSO compatible views, with optional push to Hugging Face.
+Create canonical OmniPerf-Bench dataset records for all commits in the extractions directory
+and (optionally) export SWE-Perf/GSO compatible views, with optional push to Hugging Face.
 
-Pipeline (commit-centric):
-1) Collect commit metadata (reuses collect.analysis.commits.PerfCommitAnalyzer)
-2) Build code-change fields (unified diff; split into patch vs test_patch; function names)
-3) Tests and timings (read/generate tests; run on base/head; parse times)
-4) Environment/version (compose version string; record setup/install commands if provided)
-5) Assemble and export (canonical JSONL/Parquet; optional SWE-Perf/GSO views; push to HF)
+Pipeline (batch commit processing):
+1) Scan all JSON files in extractions_dir to discover commits
+2) For each commit: Collect commit metadata (reuses collect.analysis.commits.PerfCommitAnalyzer)
+3) For each commit: Build code-change fields (unified diff; split into patch vs test_patch; function names)
+4) For each commit: Tests and timings (read/generate tests; run on base/head; parse times)
+5) For each commit: Environment/version (compose version string; record setup/install commands if provided)
+6) Assemble all records and export (canonical JSONL/Parquet; optional SWE-Perf/GSO views; push to HF)
 
 Usage example (YAML config):
   # commit_to_dataset.yaml
   repo_path: /home/you/coding-mess/vllm
-  head_commit: 0f40557af6141ced118b81f2a04e651a0c6c9dbd
-  base_commit: null  # optional; defaults to head^ if omitted
-  extractions_dir: misc/experiments/commit_extractions_with_apis
+  extractions_dir: misc/experiments/commit_extractions_with_apis  # directory containing commit JSONs
   use_docker: false
   docker_image: ayushnangia16/nvidia-vllm-docker:latest
   hf_repo: yourname/omni-commit-dataset  # optional
@@ -23,6 +22,9 @@ Usage example (YAML config):
 Run:
   PYTHONPATH=src python src/collect/commit_to_dataset.py commit_to_dataset.yaml
 
+The script will automatically process all JSON files in the extractions_dir (except extraction_summary.json),
+extract commit hashes and parent hashes from each file, and create dataset records for all commits.
+
 Requires:
 - docs/dataset_schema.md for the canonical schema (this script does a minimal structural validation).
 
@@ -30,14 +32,15 @@ Requires:
 
 - Running locally right now. Need to test on docker yet.
 - Paths are changed everywhere because they are hardcoded everywhere (YAML & generate_test_generators.py).
-- Need to change the test generation prompt. Running it on `device=CPU` need GPU, 
-    there are `DummyLayers`, unavailable APIs & attributes like `custom_ops, input_scale, cutlass_fp8_supported`, 
+- Need to change the test generation prompt. Running it on `device=CPU` need GPU,
+    there are `DummyLayers`, unavailable APIs & attributes like `custom_ops, input_scale, cutlass_fp8_supported`,
     simplified functionality tests instead of complex internal mocking etc.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -54,6 +57,17 @@ _ROOT_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT_DIR / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('commit_to_dataset.log', mode='w')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Prefer local imports from repo
 try:
@@ -170,39 +184,122 @@ def write_tests_to_tmp(tests: List[str], tmp_dir: Path) -> List[Path]:
 
 
 def run_tests_locally(repo_path: Path, commit_hash: str, test_entry: Path) -> List[float]:
-    """Checkout commit and run pytest on the provided test entry; return wall-clock seconds as a single-item list."""
+    """Checkout commit and run prob_script with CUDA event timing for precise GPU measurement."""
+    import torch
     import time as _time
+    import subprocess
+
     checkout_commit(repo_path, commit_hash)
-    start = _time.time()
+
     try:
-        # Run from repo root so imports resolve, passing test path relative to repo root
+        # Run from repo root so imports resolve
         rel = str(test_entry.relative_to(repo_path))
-        run(["pytest", "-q", rel], cwd=repo_path)
-    except Exception:
-        # Even on failure, measure duration to capture behavior
-        pass
-    end = _time.time()
-    return [end - start]
+
+        # Use CUDA events for precise GPU timing if GPU available
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Ensure GPU is ready
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
+
+            # Run the prob_script - it will execute the performance test
+            result = subprocess.run(["python", rel], cwd=str(repo_path),
+                                  capture_output=True, text=True, timeout=300)
+
+            end_event.record()
+            torch.cuda.synchronize()
+
+            # Get precise GPU execution time in milliseconds
+            execution_time = start_event.elapsed_time(end_event)
+
+        else:
+            # Fallback to CPU timing if no GPU available
+            start = _time.time()
+            result = subprocess.run(["python", rel], cwd=str(repo_path),
+                                  capture_output=True, text=True, timeout=300)
+            end = _time.time()
+            execution_time = (end - start) * 1000  # Convert to milliseconds
+
+        # Check for script errors and print output for debugging
+        if result.returncode != 0:
+            print(f"Script exited with code {result.returncode}")
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+            return [float('inf')]
+
+        return [execution_time]
+
+    except subprocess.TimeoutExpired:
+        print(f"Script execution timed out after 300 seconds: {test_entry}")
+        return [300000.0]  # 5 minutes in milliseconds
+    except Exception as e:
+        print(f"Error running script: {e}")
+        return [float('inf')]
 
 
 def run_tests_in_docker(repo_path: Path, commit_hash: str, test_entry: Path, docker_image: str) -> List[float]:
+    """Checkout commit and run prob_script in docker with CUDA event timing for precise GPU measurement."""
+    import torch
     import time as _time
+    import subprocess
+
     checkout_commit(repo_path, commit_hash)
-    cmd = [
-        "docker", "run", "--rm", "-t",
-        "--gpus", "all",
-        "-v", f"{repo_path}:/workspace",
-        "-w", "/workspace",
-        docker_image,
-        "bash", "-lc", f"pytest -q {test_entry.relative_to(repo_path)} | cat",
-    ]
-    start = _time.time()
+
     try:
-        run(cmd)
-    except Exception:
-        pass
-    end = _time.time()
-    return [end - start]
+        rel_path = test_entry.relative_to(repo_path)
+
+        # Prepare docker command to run the prob_script
+        docker_cmd = [
+            "docker", "run", "--rm", "-t",
+            "--gpus", "all",
+            "-v", f"{repo_path}:/workspace",
+            "-w", "/workspace",
+            docker_image,
+            "python", str(rel_path)
+        ]
+
+        # Use CUDA events for precise GPU timing if GPU available
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Ensure GPU is ready
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            start_event.record()
+
+            # Run the prob_script in docker
+            result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=600)
+
+            end_event.record()
+            torch.cuda.synchronize()
+
+            # Get precise GPU execution time in milliseconds
+            execution_time = start_event.elapsed_time(end_event)
+
+        else:
+            # Fallback to wall clock timing if no GPU available
+            start = _time.time()
+            result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=600)
+            end = _time.time()
+            execution_time = (end - start) * 1000  # Convert to milliseconds
+
+        # Check for script errors and print output for debugging
+        if result.returncode != 0:
+            print(f"Docker script exited with code {result.returncode}")
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+            return [float('inf')]
+
+        return [execution_time]
+
+    except subprocess.TimeoutExpired:
+        print(f"Docker script execution timed out after 600 seconds: {test_entry}")
+        return [600000.0]  # 10 minutes in milliseconds
+    except Exception as e:
+        print(f"Error running docker script: {e}")
+        return [float('inf')]
 
 
 def _parse_times(stdout: str) -> List[float]:
@@ -221,38 +318,89 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
 
     Returns path to the generated test module file, or None if unavailable.
     """
+    logger.info(f"Starting test script generation/lookup for commit {commit_hash}")
+
     # Always generate on-the-fly per workflow (do not use pre-generated files)
     hash8 = commit_hash[:8]
+    logger.info(f"Using hash8: {hash8}")
+
     # Validate inputs
     if not extractions_dir.exists() or not extractions_dir.is_dir():
+        logger.error(f"extractions_dir not found or not a directory: {extractions_dir}")
         raise RuntimeError(f"extractions_dir not found or not a directory: {extractions_dir}")
+
     if process_extraction_file is None or LLMClient is None:
+        logger.error("LLM generator utilities not importable. Ensure 'src' is on sys.path and dependencies are installed.")
         raise RuntimeError(
             "LLM generator utilities not importable. Ensure 'src' is on sys.path and dependencies are installed."
         )
+
     # Find matching extraction JSON by full or prefix hash
     json_path = None
+    logger.info(f"Searching for extraction JSON in {extractions_dir}")
     for p in extractions_dir.glob("*.json"):
         name = p.stem
+        logger.debug(f"Checking JSON file: {name}")
         if name.startswith(commit_hash) or commit_hash.startswith(name) or name.startswith(hash8):
             json_path = p
+            logger.info(f"Found matching extraction JSON: {json_path}")
             break
+
     if json_path is None:
+        logger.error(f"No commit extraction JSON found for commit {commit_hash} in {extractions_dir}")
         raise RuntimeError(
             f"No commit extraction JSON found for commit {commit_hash} in {extractions_dir}"
         )
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory created/verified: {out_dir}")
+
     # Require API credentials
-    if not (os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+    has_openai = bool(os.getenv("OPENAI_API_KEY"))
+    has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
+    logger.info(f"API credentials - OpenAI: {'present' if has_openai else 'missing'}, Anthropic: {'present' if has_anthropic else 'missing'}")
+
+    if not (has_openai or has_anthropic):
+        logger.error("Missing LLM credentials. Set OPENAI_API_KEY or ANTHROPIC_API_KEY to generate tests.")
         raise RuntimeError(
             "Missing LLM credentials. Set OPENAI_API_KEY or ANTHROPIC_API_KEY to generate tests."
         )
-    client = LLMClient()
-    result = process_extraction_file(str(json_path), str(out_dir), client)  # type: ignore
+
+    try:
+        logger.info("Initializing LLM client")
+        client = LLMClient()
+        logger.info(f"LLM client initialized with provider: {client.provider}, model: {client.model}")
+    except Exception as e:
+        logger.error(f"Failed to initialize LLM client: {e}")
+        raise
+
+    try:
+        logger.info(f"Processing extraction file: {json_path}")
+        result = process_extraction_file(str(json_path), str(out_dir), client)  # type: ignore
+        logger.info(f"process_extraction_file result: {result}")
+    except Exception as e:
+        logger.error(f"Error during process_extraction_file: {e}")
+        raise
+
     if result and "script_path" in result:
         path = Path(result["script_path"])  # type: ignore
+        logger.info(f"Generated script path: {path}")
         if path.exists():
+            logger.info(f"Script file exists and is accessible: {path}")
+            # Read and log the script content for debugging
+            try:
+                content = path.read_text()
+                logger.info(f"Generated script content length: {len(content)} characters")
+                logger.debug(f"Generated script content preview: {content[:500]}...")
+            except Exception as e:
+                logger.error(f"Failed to read generated script content: {e}")
             return path
+        else:
+            logger.error(f"Generated script path does not exist: {path}")
+    else:
+        logger.error("LLM generation did not return a valid script_path")
+
+    logger.error("LLM generation did not return a valid script_path.")
     raise RuntimeError("LLM generation did not return a valid script_path.")
 
 
@@ -308,10 +456,10 @@ def build_instance_id(repo_owner: str, repo_name: str, repo_path: Path, head_com
 def assemble_canonical(
     repo_path_arg: str,
     head_commit: str,
-    base_commit: Optional[str],
+    base_commit: str,
     use_docker: bool,
     docker_image: str,
-    extractions_dir: Optional[str] = None,
+    extractions_dir: str,
     setup_commands: List[str] = None,
     install_commands: List[str] = None,
     api: Optional[str] = None,
@@ -346,8 +494,6 @@ def assemble_canonical(
     # Collect commit metadata (must use PerfCommitAnalyzer)
     if PerfCommitAnalyzer is None:
         raise RuntimeError("PerfCommitAnalyzer is required but not available")
-    if base_commit is None:
-        base_commit = f"{head_commit}^"
     created_at_iso = datetime.now(timezone.utc).isoformat()
     perf_commit = PerfCommitAnalyzer.process_commit(head_commit, repo_path, max_year=None)  # type: ignore
     if perf_commit is None:
@@ -364,17 +510,56 @@ def assemble_canonical(
     test_patch = ""
 
     # Obtain a test script for this commit via existing/generated test-case generator
+    logger.info("Starting test script generation process")
     extr_dir = Path(extractions_dir) if extractions_dir else Path("misc/experiments/commit_extractions_with_apis")
     gen_out_dir = Path("misc/experiments/generated_test_generators_v4")
+    logger.info(f"Extraction directory: {extr_dir}")
+    logger.info(f"Generator output directory: {gen_out_dir}")
+
     test_script = find_or_generate_test_script(head_commit, extr_dir, gen_out_dir)
     if test_script is None:
+        logger.error("Unable to locate or generate a test script for this commit.")
         raise RuntimeError("Unable to locate or generate a test script for this commit.")
+
+    logger.info(f"Successfully obtained test script: {test_script}")
 
     # Materialize test into repo workspace and run via pytest across base/head/main
     tests_root = repo_path / "_generated_perf_tests"
     tests_root.mkdir(parents=True, exist_ok=True)
     target_test = tests_root / "test_generated.py"
-    target_test.write_text(Path(test_script).read_text())
+    logger.info(f"Target test file: {target_test}")
+
+    try:
+        test_code_text = Path(test_script).read_text()
+        logger.info(f"Read test script content, length: {len(test_code_text)} characters")
+    except Exception as e:
+        logger.error(f"Failed to read test script content from {test_script}: {e}")
+        raise
+
+    if not test_code_text or not test_code_text.strip():
+        logger.error("Generated efficiency_test script is empty. Aborting.")
+        logger.error(f"Script path: {test_script}")
+        logger.error(f"Script exists: {test_script.exists()}")
+        logger.error(f"Script size: {test_script.stat().st_size if test_script.exists() else 'N/A'}")
+        raise RuntimeError("Generated efficiency_test script is empty. Aborting.")
+
+    logger.info(f"Writing test code to target file: {target_test}")
+    target_test.write_text(test_code_text)
+
+    # Log efficiency_test content characteristics to stdout for traceability
+    newline_count = test_code_text.count('\n') + 1
+    logger.info(f"Generated efficiency_test script: chars={len(test_code_text)}; lines={newline_count}")
+    print(
+        f"Generated efficiency_test script: chars={len(test_code_text)}; lines={newline_count}"
+    )
+    preview = test_code_text[:400]
+    if preview:
+        logger.info(f"efficiency_test preview (first 400 chars): {preview}")
+        print("efficiency_test preview (first 400 chars):\n" + preview)
+
+    # Log the efficiency_test field that will be set
+    logger.info("Setting efficiency_test field in CanonicalRecord")
+    logger.info(f"efficiency_test will contain: {len(test_code_text)} characters")
 
     if use_docker:
         base_times_arr = run_tests_in_docker(repo_path, base_commit, target_test, docker_image)
@@ -404,6 +589,9 @@ def assemble_canonical(
 
     instance_id = build_instance_id(repo_owner, repo_name, repo_path, head_commit)
 
+    logger.info("Creating CanonicalRecord")
+    logger.info(f"efficiency_test field will be set with list containing 1 item of {len(test_code_text)} characters")
+
     record = CanonicalRecord(
         repo=f"{repo_owner}/{repo_name}",
         instance_id=instance_id,
@@ -412,7 +600,7 @@ def assemble_canonical(
         head_commit=head_commit,
         patch=patch,
         test_patch=test_patch,
-        efficiency_test=[target_test.read_text()],
+        efficiency_test=[test_code_text],
         duration_changes=duration_changes,
         human_performance=human_perf,
         version=version,
@@ -425,6 +613,15 @@ def assemble_canonical(
         # notes=notes,
     )
 
+    # Verify the record was created correctly
+    logger.info(f"CanonicalRecord created successfully")
+    logger.info(f"Record efficiency_test field has {len(record.efficiency_test)} items")
+    if record.efficiency_test:
+        logger.info(f"First efficiency_test item length: {len(record.efficiency_test[0])}")
+        logger.debug(f"First efficiency_test item preview: {record.efficiency_test[0][:200]}...")
+    else:
+        logger.error("CRITICAL: efficiency_test field is empty after record creation!")
+
     # Cleanup generated tests from repo tree
     try:
         shutil.rmtree(tests_root, ignore_errors=True)
@@ -435,52 +632,199 @@ def assemble_canonical(
 
 
 def save_and_push(records: List[CanonicalRecord], out_dir: Path, dataset_file_name: str, push_to_hf: bool, hf_repo_id: Optional[str] = None) -> None:
+    logger.info(f"Starting save_and_push with {len(records)} records")
+    logger.info(f"Output directory: {out_dir}, dataset name: {dataset_file_name}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     # Use a safe filename for local output
     safe_file = dataset_file_name.replace("/", "__")
     jsonl_path = out_dir / f"{safe_file}.jsonl"
+    logger.info(f"Output JSONL path: {jsonl_path}")
+
     with open(jsonl_path, "w") as f:
-        for r in records:
-            f.write(json.dumps(asdict(r)) + "\n")
+        for i, r in enumerate(records):
+            logger.info(f"Processing record {i+1}/{len(records)}")
+            logger.info(f"Record efficiency_test field has {len(r.efficiency_test) if r.efficiency_test else 0} items")
+
+            record_dict = asdict(r)
+            logger.info(f"Serialized record has efficiency_test with {len(record_dict.get('efficiency_test', []))} items")
+
+            # Check if efficiency_test is being serialized properly
+            if 'efficiency_test' in record_dict:
+                eff_test = record_dict['efficiency_test']
+                if isinstance(eff_test, list) and len(eff_test) > 0:
+                    logger.info(f"efficiency_test[0] length: {len(eff_test[0])}")
+                else:
+                    logger.error(f"efficiency_test is empty or not a list: {type(eff_test)}")
+            else:
+                logger.error("efficiency_test key missing from serialized record!")
+
+            f.write(json.dumps(record_dict) + "\n")
+
+    logger.info(f"Wrote {jsonl_path}")
     print(f"Wrote {jsonl_path}")
 
     try:
-        import pandas as pd  # type: ignore
-        from datasets import Dataset  # type: ignore
+        from datasets import Dataset, load_dataset, concatenate_datasets  # type: ignore
     except Exception:
-        pd = None  # type: ignore
         Dataset = None  # type: ignore
+        load_dataset = None  # type: ignore
+        concatenate_datasets = None  # type: ignore
 
     if push_to_hf and Dataset is not None:
-        import pandas as pd  # type: ignore
-        df = pd.DataFrame([asdict(r) for r in records])
-        ds = Dataset.from_pandas(df)
         repo_id = hf_repo_id or dataset_file_name
+
+        # Prepare new records as pure Python dicts (avoid pandas to preserve nested types like lists)
+        new_records = [asdict(r) for r in records]
+
+        # Verbose logging for debugging nested payloads
+        if records:
+            r0 = records[0]
+            et_list = getattr(r0, "efficiency_test", None)
+            et_len = len(et_list) if isinstance(et_list, list) else 0
+            first_snippet = ""
+            if et_len > 0 and isinstance(et_list[0], str):
+                first_snippet = et_list[0][:400]
+            print(
+                f"Preparing push → repo_id={repo_id}; new_records={len(new_records)}; "
+                f"efficiency_test_entries={et_len}; first_entry_chars={len(et_list[0]) if et_len > 0 and isinstance(et_list[0], str) else 0}"
+            )
+            if first_snippet:
+                print("efficiency_test[0] preview:\n" + first_snippet)
+
+        # Load existing split (if any)
+        existing_records: List[Dict[str, Any]] = []
+        if load_dataset is not None:
+            try:
+                existing_ds = load_dataset(repo_id, split="test")  # type: ignore
+                # Iterate to avoid conversions that may strip nested fields
+                existing_records = [row for row in existing_ds]  # type: ignore
+                print(f"Loaded existing split: {len(existing_records)} rows")
+            except Exception as e:
+                print(f"No existing split found or failed to load ('test'): {e}")
+
+        # Merge and de-duplicate by (repo, head_commit), keeping the new record on conflict
+        by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for rec in existing_records:
+            repo_val = str(rec.get("repo", ""))
+            head_val = str(rec.get("head_commit", ""))
+            by_key[(repo_val, head_val)] = rec
+        for rec in new_records:
+            repo_val = str(rec.get("repo", ""))
+            head_val = str(rec.get("head_commit", ""))
+            by_key[(repo_val, head_val)] = rec  # overwrite to keep latest
+
+        combined_records: List[Dict[str, Any]] = list(by_key.values())
+        print(f"Combined rows (post-dedup): {len(combined_records)}")
+
+        ds = Dataset.from_list(combined_records)  # type: ignore
         ds.push_to_hub(repo_id, split="test")
-        print(f"Pushed to HF: {repo_id} (split=test)")
+        print(f"Pushed to HF (appended): {repo_id} (split=test, rows={len(ds)})")
+
+
+def scan_extraction_files(extractions_dir: Path) -> List[Tuple[str, str]]:
+    """Scan all JSON files in extractions directory and return list of (commit_hash, parent_hash) tuples."""
+    logger.info(f"Scanning extraction files in {extractions_dir}")
+    extraction_files = []
+
+    if not extractions_dir.exists() or not extractions_dir.is_dir():
+        logger.error(f"Extractions directory not found or not a directory: {extractions_dir}")
+        raise RuntimeError(f"Extractions directory not found or not a directory: {extractions_dir}")
+
+    for json_file in extractions_dir.glob("*.json"):
+        if json_file.name == "extraction_summary.json":
+            continue  # Skip the summary file
+
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+
+            commit_hash = data.get("commit_hash")
+            parent_hash = data.get("parent_hash")
+
+            if commit_hash and parent_hash:
+                extraction_files.append((commit_hash, parent_hash))
+                logger.debug(f"Found commit {commit_hash} with parent {parent_hash}")
+            else:
+                logger.warning(f"Missing commit_hash or parent_hash in {json_file}")
+
+        except Exception as e:
+            logger.warning(f"Error reading {json_file}: {e}")
+            continue
+
+    logger.info(f"Found {len(extraction_files)} valid extraction files")
+    return extraction_files
+
+
+def process_batch_commits(
+    repo_path: str,
+    extraction_files: List[Tuple[str, str]],
+    use_docker: bool,
+    docker_image: str,
+    extractions_dir: str,
+    setup_commands: Optional[List[str]] = None,
+    install_commands: Optional[List[str]] = None,
+    api: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> List[CanonicalRecord]:
+    """Process all commits in batch and return list of CanonicalRecords."""
+    logger.info(f"Starting batch processing of {len(extraction_files)} commits")
+    records = []
+
+    for i, (head_commit, base_commit) in enumerate(extraction_files):
+        logger.info(f"Processing commit {i+1}/{len(extraction_files)}: {head_commit}")
+
+        try:
+            record = assemble_canonical(
+                repo_path_arg=repo_path,
+                head_commit=head_commit,
+                base_commit=base_commit,
+                use_docker=use_docker,
+                docker_image=docker_image,
+                extractions_dir=extractions_dir,
+                setup_commands=setup_commands,
+                install_commands=install_commands,
+                api=api,
+                notes=notes,
+            )
+            records.append(record)
+            logger.info(f"Successfully processed commit {head_commit}")
+
+        except Exception as e:
+            logger.error(f"Failed to process commit {head_commit}: {e}")
+            # Continue processing other commits even if one fails
+            continue
+
+    logger.info(f"Batch processing completed. Successfully processed {len(records)}/{len(extraction_files)} commits")
+    return records
 
 
 def main() -> None:
+    logger.info("Starting commit_to_dataset main function")
+
     # Determine config path: env OMNIPERF_CONFIG, CLI arg 1, or default
     cfg_path = os.environ.get("OMNIPERF_CONFIG") or (sys.argv[1] if len(sys.argv) > 1 else "commit_to_dataset.yaml")
+    logger.info(f"Using config path: {cfg_path}")
     cfg_file = Path(cfg_path)
     if not cfg_file.exists():
+        logger.error(f"Config file not found: {cfg_file}")
         raise FileNotFoundError(f"Config file not found: {cfg_file}")
 
     if yaml is None:
+        logger.error("PyYAML is required. Please install pyyaml.")
         raise RuntimeError("PyYAML is required. Please install pyyaml.")
 
     with open(cfg_file, "r") as f:
         config: Dict[str, Any] = yaml.safe_load(f)
+    logger.info(f"Loaded config: {config}")
 
     # Required
     repo_path = config.get("repo_path")
-    head_commit = config.get("head_commit")
-    if not repo_path or not head_commit:
-        raise ValueError("Config must include 'repo_path' and 'head_commit'")
+    if not repo_path:
+        logger.error("Config must include 'repo_path'")
+        raise ValueError("Config must include 'repo_path'")
 
     # Optional
-    base_commit = config.get("base_commit")
     extractions_dir = config.get("extractions_dir", "misc/experiments/commit_extractions_with_apis")
     use_docker = bool(config.get("use_docker", False))
     docker_image = config.get("docker_image", "ayushnangia16/nvidia-vllm-docker:latest")
@@ -491,10 +835,20 @@ def main() -> None:
     api = config.get("api")
     notes = config.get("notes")
 
-    record = assemble_canonical(
-        repo_path_arg=repo_path,
-        head_commit=head_commit,
-        base_commit=base_commit,
+    logger.info(f"Configuration: repo_path={repo_path}")
+    logger.info(f"Test generation settings: extractions_dir={extractions_dir}, use_docker={use_docker}")
+
+    # Scan all extraction files
+    extraction_files = scan_extraction_files(Path(extractions_dir))
+
+    if not extraction_files:
+        logger.error("No valid extraction files found. Exiting.")
+        return
+
+    # Process all commits in batch
+    records = process_batch_commits(
+        repo_path=repo_path,
+        extraction_files=extraction_files,
         use_docker=use_docker,
         docker_image=docker_image,
         extractions_dir=extractions_dir,
@@ -504,11 +858,20 @@ def main() -> None:
         notes=notes,
     )
 
+    if not records:
+        logger.error("No records were successfully processed. Exiting.")
+        return
+
+    logger.info(f"Batch processing completed. Generated {len(records)} records")
+
     default_repo_nm = str(config.get("dataset_name", "omni_commit_dataset"))
     hf_repo_id = _extract_hf_repo_id(hf_repo, default_repo_nm)
     dataset_name = (hf_repo_id.split("/", 1)[1] if hf_repo_id and "/" in hf_repo_id else default_repo_nm)
     out_dir = Path("data")
-    save_and_push([record], out_dir, dataset_name, push_to_hf=bool(push_to_hf and hf_repo), hf_repo_id=hf_repo_id)
+    logger.info(f"Saving to dataset: {dataset_name}, output dir: {out_dir}")
+
+    save_and_push(records, out_dir, dataset_name, push_to_hf=bool(push_to_hf and hf_repo), hf_repo_id=hf_repo_id)
+    logger.info("save_and_push completed successfully")
 
 
 if __name__ == "__main__":
