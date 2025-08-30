@@ -1,16 +1,25 @@
 # OmniPerf-Bench
 
 ## 👋 overview
-This evaluates language models on software performance optimization. each task provides:
-- a *codebase* with a specific performance bottleneck
-- a *performance test* as a precise specification
-- an agent must generate a *patch* that improves runtime efficiency
-- success is measured against expert developer optimizations
+OmniPerf-Bench is a comprehensive framework for evaluating language models on software performance optimization tasks. The project provides:
 
-to access, copy and run the following code:
+- **Performance-focused dataset generation**: Extract real-world performance optimizations from commit histories
+- **Automated test generation**: LLM-powered creation of performance tests for optimization tasks  
+- **Evaluation harness**: Docker-based evaluation system for measuring optimization effectiveness
+- **Multiple dataset views**: Compatible with GSO and SWE-Perf benchmark formats
+- **Commit-to-dataset pipeline**: Streamlined conversion of individual commits to benchmark instances
+
+Each task provides a codebase with performance bottlenecks, precise performance tests, and requires agents to generate patches that improve runtime efficiency. Success is measured against expert developer optimizations using wall-clock timing comparisons.
+
+### Available Datasets
 ```python
 from datasets import load_dataset
+
+# Load GSO-compatible dataset
 gso = load_dataset('gso-bench/gso', split='test')
+
+# Load vLLM performance optimization dataset (282 problems)
+vllm_data = load_dataset('Inferencebench/vllm_dataset_with_test', split='test')
 ```
 
 ## 📁 repository structure
@@ -18,188 +27,403 @@ gso = load_dataset('gso-bench/gso', split='test')
 ```
 OmniPerf-Bench/
 ├── README.md                    # Main project documentation
-├── CLAUDE.md                    # Claude AI development guidance
-├── LICENSE                      # Project license  
-├── pyproject.toml              # Python project configuration
+├── LICENSE                      # Project license
+├── pyproject.toml              # Python project configuration (gso package)
 ├── uv.lock                     # Lock file for uv package manager
 ├── requirements.txt            # Python dependencies
+├── commit_to_dataset.py        # Commit-to-dataset conversion pipeline
+├── experiments.yaml            # Example experiment configuration
 │
 ├── src/                        # Main OmniPerf-Bench source code
 │   ├── collect/                # Collection framework for dataset generation
 │   │   ├── analysis/           # Commit and API analysis modules
+│   │   │   ├── commits.py      # Performance commit extraction
+│   │   │   ├── apis.py         # API identification and mapping
+│   │   │   ├── parser.py       # Code parsing utilities
+│   │   │   └── retriever.py    # RAG-based code retrieval
 │   │   ├── execute/            # Test execution and evaluation
+│   │   │   ├── execute.py      # SkyPilot-based distributed execution
+│   │   │   ├── evaluate.py     # Performance evaluation and metrics
+│   │   │   └── skymgr.py       # Sky cluster management
 │   │   ├── generate/           # Performance test generation
+│   │   │   ├── generate.py     # Main test generation pipeline
+│   │   │   ├── context.py      # Context extraction for tests
+│   │   │   └── prompt.py       # LLM prompts for test generation
 │   │   ├── scripts/            # Collection utility scripts
 │   │   └── build_dataset.py    # Main dataset building script
 │   ├── data/                   # Data models and parsing utilities
+│   │   ├── commit.py           # Commit data structures
+│   │   ├── dataset.py          # Dataset handling and validation
+│   │   ├── problem.py          # Problem instance definitions
+│   │   └── perf.py             # Performance measurement utilities
 │   ├── harness/                # Evaluation harness for performance testing
 │   │   ├── environment/        # Docker environment management
+│   │   │   ├── docker_build.py # Docker image building
+│   │   │   └── patches.py      # Environment patches
 │   │   ├── grading/            # Grading and metrics evaluation
+│   │   │   ├── grade.py        # Performance grading logic
+│   │   │   └── metrics.py      # Evaluation metrics
 │   │   ├── plot/               # Visualization and plotting tools
-│   │   └── scripts/            # Harness utility scripts
+│   │   │   ├── plot_opt_k.py   # Opt@K performance plots
+│   │   │   └── plot_speedups.py # Speedup visualization
+│   │   ├── opt_at_k.py         # Main evaluation runner (Opt@K)
+│   │   ├── prepare_images.py   # Docker image preparation
+│   │   └── run_evaluation.py   # Evaluation orchestration
 │   ├── test_scripts/           # Test generation and analysis scripts
-│   │   ├── commit_analyzer.py  # Commit analysis utilities
-│   │   ├── performance_analyzer.py # Performance analysis tools
-│   │   └── test_llm_generator.py   # LLM-based test generators
+│   │   ├── generate_test_generators.py # LLM test generator creation
+│   │   ├── performance_analyzer.py     # Performance analysis tools
+│   │   └── commit_analyzer.py          # Commit analysis utilities
 │   ├── utils/                  # General utility functions
+│   │   ├── io.py               # I/O utilities
+│   │   ├── multiprocess.py     # Multiprocessing helpers
+│   │   └── patch_parser.py     # Patch parsing utilities
 │   ├── constants.py            # Project constants
 │   └── logger.py              # Logging configuration
 │
+├── data/                       # Generated datasets
+│   ├── Inferencebench.jsonl    # Inference benchmark dataset
+│   └── vllm_dataset_with_test.jsonl # vLLM performance dataset (282 problems)
+│
+├── docs/                       # Documentation
+│   └── dataset_schema.md       # Canonical dataset schema specification
+│
 ├── third-party/               # External dependencies
-│   └── effibench/             # Original EffiBench repository clone
+│   └── effibench/             # Original EffiBench repository integration
 │       ├── src/               # EffiBench source code
-│       ├── data/              # EffiBench datasets  
+│       ├── data/              # EffiBench datasets
 │       ├── prompts/           # LLM prompts for EffiBench
-│       ├── results/           # EffiBench evaluation results
-│       ├── requirements.txt   # EffiBench dependencies
-│       └── README.md          # EffiBench documentation
+│       └── requirements.txt   # EffiBench dependencies
 │
 ├── tools/                     # Utility scripts and patches
-│   ├── manual_review.py       # Manual review utilities
+│   ├── manual_review.py       # Manual dataset review utilities
 │   └── openrouter_patch.py    # OpenRouter API patches
 │
-└── misc/                      # Experiment outputs and results
-    ├── experiments/           # Experimental data and legacy outputs
+└── misc/                      # Experimental data and results
+    ├── experiments/           # Experimental data and configurations
     │   ├── commit_extractions/ # Extracted commit data (64 JSON files)
-    │   ├── generated_test_generators_v*/ # Test generator iterations
-    │   ├── gso-duplicate/     # Duplicate GSO analysis implementation
+    │   ├── commit_extractions_with_apis/ # Commit data with API mappings
+    │   ├── generated_test_generators_v4/ # Latest LLM test generators
     │   ├── vllm/              # vLLM experiment data and results
     │   │   ├── data/          # vLLM training data (parquet files)
     │   │   ├── divided/       # Split result files for parallel processing
     │   │   └── *.json         # vLLM experiment configurations and results
     │   ├── sglang.yaml        # SGLang experiment configuration
-    │   ├── vllm.yaml          # vLLM experiment configuration
-    │   └── README.md          # Documentation for experiments
+    │   └── vllm.yaml          # vLLM experiment configuration
     └── results/               # Analysis results, logs, and reviews
-        ├── analysis/          # Performance analysis outputs
         ├── logs/              # Execution and system logs
         └── reviews/           # Manual review files (CSV format)
 ```
 
-Key directories:
-- `src/` - Main source code (collection framework, evaluation harness, data models, test scripts)
-- `third-party/effibench/` - Original EffiBench repository clone (external dependency)
-- `tools/` - Utility scripts and patches
-- `misc/experiments/` - Experimental data including vLLM/SGLang configs and generated outputs
-- `misc/results/` - Analysis results, execution logs, and manual reviews
+**Key Components:**
+- **`src/collect/`** - Multi-stage dataset generation pipeline (commit extraction → API mapping → test generation → execution)
+- **`src/harness/`** - Docker-based evaluation system with Opt@K metrics and visualization
+- **`src/data/`** - Core data models and schema validation
+- **`commit_to_dataset.py`** - Streamlined single-commit to dataset conversion
+- **`data/`** - Generated benchmark datasets ready for use
+- **`docs/dataset_schema.md`** - Canonical schema supporting GSO/SWE-Perf export views
+- **`misc/experiments/`** - Real experimental data including 64 extracted commits and vLLM dataset (282 problems)
 
 ## 🚀 setup
 
+### Prerequisites
+- Python ≥ 3.12 (specified in pyproject.toml)
+- CUDA-capable GPU (for performance testing)
+- Docker (for containerized evaluation)
+- Git with LFS support
+
 ### Option 1: Using uv (recommended)
 ```bash
-curl -lssf https://astral.sh/uv/install.sh | sh
-source $home/.local/bin/env
+# Install uv package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.local/bin/env
 
-git clone --recursive https://github.com/gso-bench/gso.git
-cd gso && uv venv && source .venv/bin/activate
+# Clone repository
+git clone https://github.com/your-org/OmniPerf-Bench.git
+cd OmniPerf-Bench
+
+# Create virtual environment and install dependencies
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv sync
 ```
 
 ### Option 2: Using pip
 ```bash
-git clone --recursive https://github.com/gso-bench/gso.git
-cd gso
-python -m venv .venv && source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+git clone https://github.com/your-org/OmniPerf-Bench.git
+cd OmniPerf-Bench
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
 ### Environment Setup
 
-1. Create a `.env` file in the project root:
+**Required API Keys:**
 ```bash
-OPENAI_API_KEY="your_openai_api_key"
-GHAPI_TOKEN="your_github_token"
-HF_TOKEN="your_huggingface_token"
+# Create .env file or export environment variables
+export OPENAI_API_KEY="your_openai_api_key"           # For LLM test generation
+export ANTHROPIC_API_KEY="your_anthropic_api_key"     # Alternative to OpenAI
+export GHAPI_TOKEN="your_github_token"                # For commit extraction
+export HF_TOKEN="your_huggingface_token"              # For dataset uploads
 ```
 
-2. Or export environment variables:
+**Optional for Cloud Execution:**
 ```bash
-export OPENAI_API_KEY="your_openai_api_key"
-export GHAPI_TOKEN="your_github_token"
-export HF_TOKEN="your_huggingface_token"
+# For SkyPilot distributed execution
+export AWS_ACCESS_KEY_ID="your_aws_key"
+export AWS_SECRET_ACCESS_KEY="your_aws_secret"
+# OR configure other cloud providers (GCP, Azure)
 ```
 
-For token setup:
+**Token Setup Links:**
 - [OpenAI API Key](https://platform.openai.com/api-keys)
-- [GitHub Token](https://github.com/settings/tokens)
+- [Anthropic API Key](https://console.anthropic.com/)
+- [GitHub Token](https://github.com/settings/tokens) (needs repo access)
 - [HuggingFace Token](https://huggingface.co/docs/hub/en/security-tokens)
+
+### Verify Installation
+```bash
+# Check Python path setup
+PYTHONPATH=src python -c "from collect.analysis.commits import PerfCommitAnalyzer; print('✓ Import successful')"
+
+# Check Docker availability (for evaluation)
+docker --version
+
+# Check CUDA availability (for performance testing)
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+```
 
 
 ## 💽 usage
 
-### evaluation harness
+### 1. evaluation harness
 
-1. **building dockers for gso tasks**:
+The evaluation harness provides Docker-based performance testing with Opt@K metrics.
+
+#### building docker images
 ```bash
+# Login to Docker Hub
 docker login
 
+# Build and push Docker images for all dataset tasks
 uv run src/harness/prepare_images.py \
+    --dataset_name data/vllm_dataset_with_test.jsonl \
     --push_to_registry true \
-    --dockerhub_username <dockerhub_username> \
-    --dockerhub_repo <dockerhub_repo>
+    --dockerhub_username <your_username> \
+    --dockerhub_repo <your_repo> \
+    --max_workers 4
 ```
 
-2. **running evaluations**:
+#### running evaluations
 ```bash
+# Evaluate model predictions with Opt@K metrics
 uv run src/harness/opt_at_k.py \
-    --prediction_paths <prediction_paths> \
+    --model <model_name> \
+    --prediction_paths <path_to_predictions.jsonl> \
     --timeout 3600 \
-    --run_id <run_id> \
+    --run_id <unique_run_id> \
     --k 10 \
-    --model <modelname>
+    --dataset_name data/vllm_dataset_with_test.jsonl
 ```
 
-for detailed instructions and options, see the [harness documentation](src/harness/README.md).
+**Prediction format:** Your model's predictions should be a JSONL file with:
+```json
+{
+    "instance_id": "task_identifier",
+    "model_patch": "generated_patch_content",
+    "model_name_or_path": "model_identifier"
+}
+```
 
-### gso collection framework
+For detailed options, see the [harness documentation](src/harness/README.md).
 
-the collection framework enables you to create your own gso tasks through a four-step pipeline:
+### 2. collection framework
 
-1. **[commit extraction & filtering](src/collect/README.md#overview)**: extract performance-related commits using llms
-2. **[api identification](src/collect/README.md#2-commit-analysis-pipeline)**: identify affected high-level apis for each commit
-3. **[performance test generation](src/collect/README.md#3-generate-performance-tests)**: generate tests for api-commit pairs
-4. **[test execution](src/collect/README.md#4-execute-performance-tests)**: execute tests to identify performance improvements
+The collection framework enables you to create your own performance optimization datasets through a four-stage pipeline:
 
-<!-- required tokens:
+#### stage 1: commit extraction & filtering
+Extract performance-related commits from repositories using LLM analysis:
 ```bash
-export ghapi_token="github_token"
-export openai_api_key="openai_key"
-export hf_token="huggingface_token"
-``` -->
+# Configure experiment (see experiments.yaml for example)
+PYTHONPATH=src python src/collect/analysis/commits.py experiments.yaml
+```
 
-for detailed instructions and usage, see the [collection framework documentation](src/collect/README.md).
+#### stage 2: api identification  
+Map commits to affected high-level APIs using RAG-based retrieval:
+```bash
+PYTHONPATH=src python src/collect/analysis/apis.py <experiment_id>
+```
 
-### benchmarks
+#### stage 3: performance test generation
+Generate LLM-powered performance tests for API-commit pairs:
+```bash
+PYTHONPATH=src python src/collect/generate/generate.py experiments.yaml
+```
+
+#### stage 4: test execution
+Execute tests on cloud infrastructure using SkyPilot:
+```bash
+# Setup cloud credentials first: sky check
+PYTHONPATH=src python src/collect/execute/execute.py --exp_id <experiment_id> --machines 4
+
+# Evaluate results
+PYTHONPATH=src python src/collect/execute/evaluate.py --exp_id <experiment_id>
+```
+
+**Experiment Configuration (experiments.yaml):**
+```yaml
+exp_id: "my_experiment"
+repo_url: "https://github.com/user/repo"
+py_version: 3.12
+target_commit: "main"
+install_commands:
+  - "pip install -e ."
+api_docs: "Focus on torch.nn and optimization APIs"
+repo_instr: "Look for CUDA kernel optimizations"
+```
+
+For detailed instructions, see the [collection framework documentation](src/collect/README.md).
+
+### 3. commit-to-dataset pipeline
+
+The `commit_to_dataset.py` script provides a streamlined way to create canonical OmniPerf-Bench dataset records from individual performance optimization commits.
+
+#### quick start
+1. **Create configuration file** (`commit_config.yaml`):
+```yaml
+repo_path: "/path/to/your/repo"
+head_commit: "abc123def456"  # The optimized commit
+base_commit: null            # Optional: defaults to head_commit^
+extractions_dir: "misc/experiments/commit_extractions_with_apis"
+use_docker: false            # Set true for reproducible environments
+docker_image: "ayushnangia16/nvidia-vllm-docker:latest"
+dataset_name: "my_perf_dataset"
+hf_repo: "your_username/dataset_repo"  # Optional HF upload
+push_to_hf: false
+```
+
+2. **Run pipeline**:
+```bash
+# Ensure API keys are set
+export OPENAI_API_KEY="your_key" # or ANTHROPIC_API_KEY
+
+# Execute pipeline
+PYTHONPATH=src python commit_to_dataset.py commit_config.yaml
+```
+
+3. **Output**: Creates `data/my_perf_dataset.jsonl` with canonical dataset record
+
+#### performance measurement methodology
+
+the script measures performance by:
+
+1. **generating llm-based performance tests** for the specific commit optimization
+2. **running tests on three commits**:
+   - `base_commit`: the commit before optimization
+   - `head_commit`: the commit with optimization
+   - `main`: latest main branch commit
+3. **measuring wall-clock execution time** using python's `time.time()`
+4. **calculating performance metrics**:
+   - `duration_changes`: raw timing data for all commits
+   - `human_performance`: improvement ratio = `base_time / head_time`
+     - `> 1.0` = performance improvement (head is faster)
+     - `< 1.0` = performance regression (head is slower)
+     - `= 1.0` = no performance change
+     - `inf` = infinite improvement (near-zero head time)
+     - `nan` = invalid/missing timing data
+
+#### output format
+
+the script generates:
+- **jsonl file**: canonical dataset record in `data/` directory
+- **optional huggingface push**: if `push_to_hf: true` and `hf_repo` specified
+- **structured data** with fields:
+  ```json
+  {
+    "repo": "owner/name",
+    "instance_id": "owner__name-PR-123",
+    "head_commit": "commit_hash",
+    "patch": "unified_diff",
+    "efficiency_test": ["generated_test_code"],
+    "duration_changes": [{"base": [1.2], "head": [0.8], "main": [1.1]}],
+    "human_performance": 1.5,
+    "version": "python==3.11;arch=x86_64;image=local"
+  }
+  ```
+
+#### requirements
+
+- **llm api access**: openai or anthropic api key
+- **commit extractions**: pre-extracted commit data in `extractions_dir`
+- **docker (optional)**: for containerized test execution
+- **python dependencies**: `pyyaml`, `datasets`, `pandas` (for hf push)
+
+### 4. available datasets and experiments
+
+#### pre-built datasets
+- **vLLM Dataset** (`data/vllm_dataset_with_test.jsonl`): 282 real-world performance optimization problems from vLLM repository
+- **Inference Benchmark** (`data/Inferencebench.jsonl`): Additional inference-focused performance tasks
+
+#### experimental data
+The `misc/experiments/` directory contains:
+- **`commit_extractions/`** - 64 extracted performance-related commits (JSON format)
+- **`commit_extractions_with_apis/`** - Same commits with API mapping annotations
+- **`generated_test_generators_v4/`** - Latest LLM-generated test generators
+- **`vllm/`** - Complete vLLM experiment data including:
+  - Training data (parquet format)
+  - Experiment configurations and results
+  - Performance analysis outputs
+
+#### experiment configurations
+- **`vllm.yaml`** - vLLM repository analysis configuration
+- **`sglang.yaml`** - SGLang repository analysis configuration  
+- **`experiments.yaml`** - Example experiment template
 
 #### effibench integration
-EffiBench is integrated as a benchmark for evaluating code efficiency. The original EffiBench repository is in `third-party/effibench/` and analysis/test scripts are available in `src/test_scripts/`:
-
+EffiBench is integrated for additional code efficiency evaluation:
 ```bash
-# To use the original EffiBench
+# Use original EffiBench
 cd third-party/effibench
 pip install -r requirements.txt
+python src/open_source_model_completion.py  # Run efficiency evaluation
 
-# To use EffiBench-related scripts from our integration
+# Use OmniPerf-Bench test scripts
 cd src/test_scripts
-python test_llm_generator.py  # LLM-based test generation
-python performance_analyzer.py  # Performance analysis
+python performance_analyzer.py  # Analyze performance patterns
+python generate_test_generators.py  # Create new test generators
 ```
 
-See [third-party/effibench/README.md](third-party/effibench/README.md) for detailed EffiBench documentation and [src/test_scripts/README.md](src/test_scripts/README.md) for script usage.
+## ⬇️ artifacts & resources
 
-### experiments
+### 📊 datasets
+| Dataset | Size | Description | Access |
+|---------|------|-------------|--------|
+| [GSO Benchmark](https://huggingface.co/datasets/gso-bench/gso) | Variable | General software optimization benchmark | `load_dataset('gso-bench/gso')` |
+| [vLLM Performance Dataset](data/vllm_dataset_with_test.jsonl) | 282 problems | Real-world vLLM optimizations with tests | `load_dataset('Inferencebench/vllm_dataset_with_test')` |
+| [Inference Benchmark](data/Inferencebench.jsonl) | Variable | Inference-focused performance tasks | Local file |
+| [EffiBench Integration](third-party/effibench/) | Variable | Code efficiency benchmark | Local integration |
 
-Pre-configured experiments are available in the `misc/experiments/` directory:
-- `misc/experiments/vllm/` - vLLM performance optimization dataset with 282 problems  
-- `misc/experiments/sglang.yaml` - SGLang experiment configuration
-- `misc/experiments/vllm.yaml` - vLLM experiment configuration
-- `misc/experiments/commit_extractions/` - Extracted performance-related commits (64 JSON files)
-- `misc/experiments/generated_test_generators_v*/` - Various iterations of LLM test generators
+### 🛠️ tools & frameworks
+| Component | Purpose | Entry Point |
+|-----------|---------|-------------|
+| **Evaluation Harness** | Docker-based Opt@K evaluation | `src/harness/opt_at_k.py` |
+| **Collection Framework** | Multi-stage dataset generation | `src/collect/` |
+| **Commit-to-Dataset Pipeline** | Single commit conversion | `commit_to_dataset.py` |
+| **Performance Analysis** | Performance pattern analysis | `src/test_scripts/performance_analyzer.py` |
+| **Test Generation** | LLM-powered test creation | `src/test_scripts/generate_test_generators.py` |
+| **Manual Review Tools** | Dataset quality control | `tools/manual_review.py` |
 
-## ⬇️ artifacts
-| datasets | tools | dockers |
-| - | - | - |
-| [💿 gso](https://huggingface.co/datasets/gso-bench/gso) | [🔧 evaluation harness](src/harness/) | [🐳 docker hub](https://hub.docker.com/repository/docker/slimshetty/gso/general) |
-| [💿 vllm dataset](misc/experiments/vllm/) | [🔧 collection framework](src/collect/) | |
-| [💿 effibench](third-party/effibench/) | [🔧 test scripts](src/test_scripts/) | |
-| | [🔧 utility tools](tools/) | |
+### 🐳 docker resources
+- **Docker Hub Repository**: [slimshetty/gso](https://hub.docker.com/repository/docker/slimshetty/gso/general)
+- **Image Building**: `src/harness/prepare_images.py`
+- **Pre-built Images**: `src/harness/scripts/pull_images.sh`
+
+### 📚 documentation
+- **Dataset Schema**: [docs/dataset_schema.md](docs/dataset_schema.md) - Canonical schema specification
+- **Collection Framework**: [src/collect/README.md](src/collect/README.md) - Detailed pipeline documentation
+- **Evaluation Harness**: [src/harness/README.md](src/harness/README.md) - Evaluation system guide
+- **Test Scripts**: [src/test_scripts/README.md](src/test_scripts/README.md) - Analysis tools documentation
