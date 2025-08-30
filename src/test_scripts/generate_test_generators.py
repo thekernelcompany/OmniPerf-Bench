@@ -50,7 +50,7 @@ def load_extraction(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", "prompts/focused_test_case_generator_prompt.md")
+PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", "/root/OmniPerf-Bench/third-party/effibench/prompts/focused_test_case_generator_prompt.md")
 
 
 def read_prompt_template(path: str = PROMPT_TEMPLATE_PATH) -> str:
