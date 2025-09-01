@@ -325,7 +325,7 @@ def process_extraction_file(path: str, out_dir: str, client: LLMClient) -> Optio
         # Try up to two regenerations with the same prompt
         for attempt in range(1, 3):
             print(f"Regeneration attempt {attempt} for {commit_hash[:8]}")
-            regen_text = client.generate(prompt)
+            regen_text = client.generate(messages)
             regen_code = clean_llm_code_response(regen_text)
             print(f"Regeneration attempt {attempt} code length: {len(regen_code)}")
             if is_nontrivial_code(regen_code):
@@ -337,11 +337,16 @@ def process_extraction_file(path: str, out_dir: str, client: LLMClient) -> Optio
         # If still trivial, force an explicit instruction to output full python file
         if not is_nontrivial_code(code):
             print(f"Code still trivial, trying forced regeneration for {commit_hash[:8]}")
-            force_prompt = (
-                prompt
-                + "\n\nYour previous response was empty or incomplete. Output ONLY a complete, executable Python file implementing the requested test-case generator."
-            )
-            forced_text = client.generate(force_prompt)
+            # Create a forced user message appended to the prior messages
+            forced_messages = list(messages)
+            forced_messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response was empty or incomplete. "
+                    "Output ONLY a complete, executable Python file implementing the requested test-case generator."
+                ),
+            })
+            forced_text = client.generate(forced_messages)
             forced_code = clean_llm_code_response(forced_text)
             print(f"Forced regeneration code length: {len(forced_code)}")
             if is_nontrivial_code(forced_code):
@@ -356,7 +361,9 @@ def process_extraction_file(path: str, out_dir: str, client: LLMClient) -> Optio
         # Attempt up to two repair passes by providing the exact error and code back to the model
         for attempt in range(1, 3):
             repair_prompt = build_repair_prompt(code, err or "")
-            repaired_text = client.generate(repair_prompt)
+            # Send repair as user while preserving original system context
+            repair_messages = [messages[0], {"role": "user", "content": repair_prompt}]
+            repaired_text = client.generate(repair_messages)
             repaired_code = clean_llm_code_response(repaired_text)
             ok2, err2 = validate_python_syntax(repaired_code)
             if ok2:
@@ -393,7 +400,7 @@ def main() -> None:
     parser.add_argument("--provider", choices=["openai", "anthropic"], default=None, help="LLM provider")
     parser.add_argument("--model", default=None, help="Model name override")
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--max-tokens", type=int, default=8000)
+    parser.add_argument("--max-tokens", type=int, default=65536)
     args = parser.parse_args()
 
     if not os.getenv("OPENAI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
