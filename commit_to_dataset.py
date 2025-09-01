@@ -205,7 +205,7 @@ def run_tests_locally(repo_path: Path, commit_hash: str, test_entry: Path) -> Li
             start_event.record()
 
             # Run the prob_script - it will execute the performance test
-            result = subprocess.run(["python", rel], cwd=str(repo_path),
+            result = subprocess.run([sys.executable, rel], cwd=str(repo_path),
                                   capture_output=True, text=True, timeout=300)
 
             end_event.record()
@@ -217,7 +217,7 @@ def run_tests_locally(repo_path: Path, commit_hash: str, test_entry: Path) -> Li
         else:
             # Fallback to CPU timing if no GPU available
             start = _time.time()
-            result = subprocess.run(["python", rel], cwd=str(repo_path),
+            result = subprocess.run([sys.executable, rel], cwd=str(repo_path),
                                   capture_output=True, text=True, timeout=300)
             end = _time.time()
             execution_time = (end - start) * 1000  # Convert to milliseconds
@@ -314,13 +314,11 @@ def _parse_times(stdout: str) -> List[float]:
 
 
 def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_dir: Path) -> Optional[Path]:
-    """Locate an existing generated test-case-generator for the commit, or generate one via LLM.
+    """Locate a pre-generated test-case-generator for the commit, or generate one via LLM.
 
     Returns path to the generated test module file, or None if unavailable.
     """
-    logger.info(f"Starting test script generation/lookup for commit {commit_hash}")
-
-    # Always generate on-the-fly per workflow (do not use pre-generated files)
+    logger.info(f"Starting test script resolution for commit {commit_hash}")
     hash8 = commit_hash[:8]
     logger.info(f"Using hash8: {hash8}")
 
@@ -329,11 +327,23 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
         logger.error(f"extractions_dir not found or not a directory: {extractions_dir}")
         raise RuntimeError(f"extractions_dir not found or not a directory: {extractions_dir}")
 
+    # 1) Prefer pre-generated test generators if available
+    pregenerated_root = Path("misc/experiments/generated_test_generators_v4")
+    candidates = [
+        pregenerated_root / f"{commit_hash}_test_case_generator.py",
+        pregenerated_root / f"{hash8}_test_case_generator.py",
+    ]
+    for c in candidates:
+        if c.exists():
+            logger.info(f"Using pre-generated test generator: {c}")
+            return c
+
+    # 2) If not found, attempt on-the-fly generation via LLM
     if process_extraction_file is None or LLMClient is None:
-        logger.error("LLM generator utilities not importable. Ensure 'src' is on sys.path and dependencies are installed.")
-        raise RuntimeError(
-            "LLM generator utilities not importable. Ensure 'src' is on sys.path and dependencies are installed."
+        logger.warning(
+            "LLM utilities unavailable and no pre-generated script found; cannot generate tests dynamically."
         )
+        raise RuntimeError("No test generator available (missing pre-generated file and LLM utilities)")
 
     # Find matching extraction JSON by full or prefix hash
     json_path = None
@@ -355,16 +365,15 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory created/verified: {out_dir}")
 
-    # Require API credentials
+    # Require API credentials for generation
     has_openai = bool(os.getenv("OPENAI_API_KEY"))
     has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
-    logger.info(f"API credentials - OpenAI: {'present' if has_openai else 'missing'}, Anthropic: {'present' if has_anthropic else 'missing'}")
-
+    logger.info(
+        f"API credentials - OpenAI: {'present' if has_openai else 'missing'}, Anthropic: {'present' if has_anthropic else 'missing'}"
+    )
     if not (has_openai or has_anthropic):
-        logger.error("Missing LLM credentials. Set OPENAI_API_KEY or ANTHROPIC_API_KEY to generate tests.")
-        raise RuntimeError(
-            "Missing LLM credentials. Set OPENAI_API_KEY or ANTHROPIC_API_KEY to generate tests."
-        )
+        logger.warning("Missing LLM credentials; skipping dynamic generation.")
+        raise RuntimeError("Missing LLM credentials and no pre-generated script available")
 
     try:
         logger.info("Initializing LLM client")
@@ -387,7 +396,6 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
         logger.info(f"Generated script path: {path}")
         if path.exists():
             logger.info(f"Script file exists and is accessible: {path}")
-            # Read and log the script content for debugging
             try:
                 content = path.read_text()
                 logger.info(f"Generated script content length: {len(content)} characters")

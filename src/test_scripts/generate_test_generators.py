@@ -62,13 +62,30 @@ def read_prompt_template(path: str = PROMPT_TEMPLATE_PATH) -> str:
 
 
 def build_prompt_from_template(prompt_template: str, full_json_text: str, commit_hash: str) -> str:
-    # Compose final prompt per the provided comprehensive template: include the JSON input explicitly.
+    # Backward-compatible: a single-message prompt body (as user) constructed from template + JSON.
     return (
         f"{prompt_template}\n\n"
         f"<!-- Commit: {commit_hash} -->\n"
         f"Here is the commit extraction JSON you must base the tests on:\n\n"
         f"```json\n{full_json_text}\n```\n"
     )
+
+
+def build_system_and_user_messages(prompt_template: str, full_json_text: str, commit_hash: str) -> List[Dict[str, str]]:
+    """Construct a two-message chat: system carries policy/instructions; user carries commit context.
+
+    Returns a list of messages appropriate for Chat Completions APIs.
+    """
+    system_text = prompt_template
+    user_text = (
+        f"<!-- Commit: {commit_hash} -->\n"
+        "Here is the commit extraction JSON you must base the tests on:\n\n"
+        f"```json\n{full_json_text}\n```\n"
+    )
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
 
 
 def clean_llm_code_response(text: str) -> str:
@@ -150,32 +167,45 @@ class LLMClient:
         if self.provider == "anthropic" and anthropic is not None and os.getenv("ANTHROPIC_API_KEY"):
             self._anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt_or_messages) -> str:
+        """Generate a completion.
+
+        Accepts either:
+        - str: treated as a single user message
+        - list[{"role": str, "content": str}]: passed as-is
+        """
         print(f"LLMClient.generate called with provider: {self.provider}, model: {self.model}")
-        print(f"Prompt length: {len(prompt)} characters")
+        try:
+            if isinstance(prompt_or_messages, str):
+                approx_len = len(prompt_or_messages)
+            else:
+                approx_len = sum(len(m.get("content", "")) for m in prompt_or_messages)
+        except Exception:
+            approx_len = 0
+        print(f"Prompt/messages approx length: {approx_len} characters")
 
         if self.provider == "openai":
-            result = self._call_openai(prompt)
+            result = self._call_openai(prompt_or_messages)
             print(f"OpenAI response length: {len(result)} characters")
             return result
         if self.provider == "anthropic":
-            result = self._call_anthropic(prompt)
+            result = self._call_anthropic(prompt_or_messages)
             print(f"Anthropic response length: {len(result)} characters")
             return result
         # Fallbacks
         if self._openai_client is not None:
             print("Falling back to OpenAI")
-            result = self._call_openai(prompt)
+            result = self._call_openai(prompt_or_messages)
             print(f"OpenAI fallback response length: {len(result)} characters")
             return result
         if self._anthropic_client is not None:
             print("Falling back to Anthropic")
-            result = self._call_anthropic(prompt)
+            result = self._call_anthropic(prompt_or_messages)
             print(f"Anthropic fallback response length: {len(result)} characters")
             return result
         raise RuntimeError("No usable LLM provider configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY.")
 
-    def _call_openai(self, prompt: str) -> str:
+    def _call_openai(self, prompt_or_messages) -> str:
         if self._openai_client is None:
             print("OpenAI client not initialized")
             return ""
@@ -186,17 +216,26 @@ class LLMClient:
             # Check if this is GPT-5 which uses different parameter names
             if "gpt-5" in self.model:
                 print("Using GPT-5 specific parameters")
+                # Build messages
+                if isinstance(prompt_or_messages, str):
+                    messages = [{"role": "user", "content": prompt_or_messages}]
+                else:
+                    messages = prompt_or_messages
                 response = self._openai_client.chat.completions.create(
                     model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     # GPT-5 doesn't support temperature parameter, only default (1)
-                    max_completion_tokens=self.max_tokens,  # GPT-5 uses max_completion_tokens
+                    max_completion_tokens=self.max_tokens,
                 )
             else:
                 # Standard GPT models
+                if isinstance(prompt_or_messages, str):
+                    messages = [{"role": "user", "content": prompt_or_messages}]
+                else:
+                    messages = prompt_or_messages
                 response = self._openai_client.chat.completions.create(
                     model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
@@ -211,15 +250,19 @@ class LLMClient:
             print(f"Available models may include: gpt-4, gpt-4-turbo, gpt-3.5-turbo, gpt-5-2025-08-07, etc.")
             return ""
 
-    def _call_anthropic(self, prompt: str) -> str:
+    def _call_anthropic(self, prompt_or_messages) -> str:
         if self._anthropic_client is None:
             return ""
         try:
+            if isinstance(prompt_or_messages, str):
+                messages = [{"role": "user", "content": prompt_or_messages}]
+            else:
+                messages = prompt_or_messages
             message = self._anthropic_client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
             )
             if hasattr(message, "content") and message.content:
                 blk = message.content[0]
@@ -256,16 +299,19 @@ def process_extraction_file(path: str, out_dir: str, client: LLMClient) -> Optio
         print(f"Failed to read JSON text from {path}: {e}")
         return None
 
-    # Build prompt using the comprehensive template and write it to eg_test_generator.txt for transparency.
+    # Build prompt messages (system + user) and write them to eg_test_generator.txt for transparency.
     template_text = read_prompt_template()
-    prompt = build_prompt_from_template(template_text, full_json_text, commit_hash)
+    messages = build_system_and_user_messages(template_text, full_json_text, commit_hash)
     try:
         with open("./eg_test_generator.txt", "w") as f:
-            f.write(prompt)
+            f.write("--- system ---\n")
+            f.write(messages[0]["content"])  # system
+            f.write("\n\n--- user ---\n")
+            f.write(messages[1]["content"])  # user
     except Exception as e:
         print(f"Warning: failed to write prompt to eg_test_generator.txt: {e}")
     print(f"Generating LLM response for commit {commit_hash[:8]}")
-    llm_text = client.generate(prompt)
+    llm_text = client.generate(messages)
     print(f"Raw LLM response length: {len(llm_text)}")
     print(f"Raw LLM response preview: {llm_text[:200]}...")
 
