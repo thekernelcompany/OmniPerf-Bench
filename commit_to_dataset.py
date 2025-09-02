@@ -313,7 +313,15 @@ def _parse_times(stdout: str) -> List[float]:
     return [float(m.group(1)) for m in pattern.finditer(stdout or "")]
 
 
-def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_dir: Path) -> Optional[Path]:
+def find_or_generate_test_script(
+    commit_hash: str,
+    extractions_dir: Path,
+    out_dir: Path,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_temperature: Optional[float] = None,
+    llm_max_tokens: Optional[int] = None,
+) -> Tuple[Optional[Path], Optional[Path]]:
     """Locate a pre-generated test-case-generator for the commit, or generate one via LLM.
 
     Returns path to the generated test module file, or None if unavailable.
@@ -336,7 +344,8 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
     for c in candidates:
         if c.exists():
             logger.info(f"Using pre-generated test generator: {c}")
-            return c
+            # No JSON needed in this branch; return None for json_path
+            return c, None
 
     # 2) If not found, attempt on-the-fly generation via LLM
     if process_extraction_file is None or LLMClient is None:
@@ -377,7 +386,16 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
 
     try:
         logger.info("Initializing LLM client")
-        client = LLMClient()
+        client_kwargs: Dict[str, Any] = {}
+        if llm_provider is not None:
+            client_kwargs["provider"] = llm_provider
+        if llm_model is not None:
+            client_kwargs["model"] = llm_model
+        if llm_temperature is not None:
+            client_kwargs["temperature"] = llm_temperature
+        if llm_max_tokens is not None:
+            client_kwargs["max_tokens"] = int(llm_max_tokens)
+        client = LLMClient(**client_kwargs)
         logger.info(f"LLM client initialized with provider: {client.provider}, model: {client.model}")
     except Exception as e:
         logger.error(f"Failed to initialize LLM client: {e}")
@@ -402,7 +420,7 @@ def find_or_generate_test_script(commit_hash: str, extractions_dir: Path, out_di
                 logger.debug(f"Generated script content preview: {content[:500]}...")
             except Exception as e:
                 logger.error(f"Failed to read generated script content: {e}")
-            return path
+            return path, json_path
         else:
             logger.error(f"Generated script path does not exist: {path}")
     else:
@@ -524,7 +542,23 @@ def assemble_canonical(
     logger.info(f"Extraction directory: {extr_dir}")
     logger.info(f"Generator output directory: {gen_out_dir}")
 
-    test_script = find_or_generate_test_script(head_commit, extr_dir, gen_out_dir)
+    # LLM config overrides via environment variables (set upstream in main)
+    llm_provider = os.getenv("OMNIPERF_LLM_PROVIDER")
+    llm_model = os.getenv("OMNIPERF_LLM_MODEL")
+    llm_temperature_env = os.getenv("OMNIPERF_LLM_TEMPERATURE")
+    llm_max_tokens_env = os.getenv("OMNIPERF_LLM_MAX_TOKENS")
+    llm_temperature_val = float(llm_temperature_env) if llm_temperature_env else None
+    llm_max_tokens_val = int(llm_max_tokens_env) if llm_max_tokens_env else None
+
+    test_script, json_path = find_or_generate_test_script(
+        head_commit,
+        extr_dir,
+        gen_out_dir,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_temperature=llm_temperature_val,
+        llm_max_tokens=llm_max_tokens_val,
+    )
     if test_script is None:
         logger.error("Unable to locate or generate a test script for this commit.")
         raise RuntimeError("Unable to locate or generate a test script for this commit.")
@@ -842,6 +876,20 @@ def main() -> None:
     install_commands = config.get("install_commands")
     api = config.get("api")
     notes = config.get("notes")
+
+    # LLM overrides from config (propagated via env so downstream utilities can read them too)
+    llm_provider = config.get("llm_provider")
+    llm_model = config.get("llm_model")
+    llm_temperature = config.get("llm_temperature")
+    llm_max_tokens = config.get("llm_max_tokens")
+    if llm_provider:
+        os.environ["OMNIPERF_LLM_PROVIDER"] = str(llm_provider)
+    if llm_model:
+        os.environ["OMNIPERF_LLM_MODEL"] = str(llm_model)
+    if llm_temperature is not None:
+        os.environ["OMNIPERF_LLM_TEMPERATURE"] = str(llm_temperature)
+    if llm_max_tokens is not None:
+        os.environ["OMNIPERF_LLM_MAX_TOKENS"] = str(llm_max_tokens)
 
     logger.info(f"Configuration: repo_path={repo_path}")
     logger.info(f"Test generation settings: extractions_dir={extractions_dir}, use_docker={use_docker}")
