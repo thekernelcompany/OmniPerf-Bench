@@ -31,8 +31,11 @@ OmniPerf-Bench/
 ├── pyproject.toml              # Python project configuration (gso package)
 ├── uv.lock                     # Lock file for uv package manager
 ├── requirements.txt            # Python dependencies
-├── commit_to_dataset.py        # Commit-to-dataset conversion pipeline
+│
+├── 🚀 commit_to_dataset.py     # 🔥 Main entry point: Single-commit dataset pipeline
 ├── experiments.yaml            # Example experiment configuration
+├── 8d75fe48_test_case_generator_v2.py  # Example test generator script
+├── eg_test_generator.txt       # Example prompt template
 │
 ├── src/                        # Main OmniPerf-Bench source code
 │   ├── collect/                # Collection framework for dataset generation
@@ -114,11 +117,23 @@ OmniPerf-Bench/
         └── reviews/           # Manual review files (CSV format)
 ```
 
+**🎯 Repository Organization Philosophy:**
+
+This repository follows a **"no duplicates, clear entry points"** structure:
+
+- **Root level** - Main entry points and configuration files
+- **`commit_to_dataset.py`** - 🔥 **PRIMARY ENTRY POINT** for single-commit dataset creation
+- **`src/`** - Organized source code by functionality (collect, harness, data, utils)  
+- **`misc/`** - Experimental data and working files (preserved as-is for research)
+- **`data/`** - Generated datasets ready for consumption
+- **`docs/`** - Documentation and schemas
+
 **Key Components:**
+- **`commit_to_dataset.py`** - 🚀 **Main script**: Streamlined single-commit to dataset conversion  
 - **`src/collect/`** - Multi-stage dataset generation pipeline (commit extraction → API mapping → test generation → execution)
 - **`src/harness/`** - Docker-based evaluation system with Opt@K metrics and visualization
 - **`src/data/`** - Core data models and schema validation
-- **`commit_to_dataset.py`** - Streamlined single-commit to dataset conversion
+- **`experiments.yaml`** - Example configuration that works out-of-the-box
 - **`data/`** - Generated benchmark datasets ready for use
 - **`docs/dataset_schema.md`** - Canonical schema supporting GSO/SWE-Perf export views
 - **`misc/experiments/`** - Real experimental data including 64 extracted commits and vLLM dataset (282 problems)
@@ -199,6 +214,13 @@ python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 
 
 ## 💽 usage
+
+**🔥 TL;DR - Quick Start:**
+```bash
+export OPENAI_API_KEY="your_key"
+python commit_to_dataset.py experiments.yaml
+# Your dataset appears in data/vllm_dataset_with_test.jsonl
+```
 
 ### 1. evaluation harness
 
@@ -288,34 +310,47 @@ repo_instr: "Look for CUDA kernel optimizations"
 
 For detailed instructions, see the [collection framework documentation](src/collect/README.md).
 
-### 3. commit-to-dataset pipeline
+### 3. 🚀 commit-to-dataset pipeline (quickest start)
 
-The `commit_to_dataset.py` script provides a streamlined way to create canonical OmniPerf-Bench dataset records from individual performance optimization commits.
+The `commit_to_dataset.py` script is the **main entry point** for creating performance optimization datasets from individual commits. This is the simplest way to get started!
 
-#### quick start
-1. **Create configuration file** (`commit_config.yaml`):
+#### ⚡ super quick start
+```bash
+# 1. Set up API keys
+export OPENAI_API_KEY="your_openai_key"  # or ANTHROPIC_API_KEY
+
+# 2. Run the pipeline on the provided example configuration
+python commit_to_dataset.py experiments.yaml
+
+# 3. Your dataset will be created in data/vllm_dataset_with_test.jsonl
+```
+
+#### 📝 custom configuration
+Create your own configuration file (`my_config.yaml`):
 ```yaml
 repo_path: "/path/to/your/repo"
-head_commit: "abc123def456"  # The optimized commit
-base_commit: null            # Optional: defaults to head_commit^
 extractions_dir: "misc/experiments/commit_extractions_with_apis"
 use_docker: false            # Set true for reproducible environments
 docker_image: "ayushnangia16/nvidia-vllm-docker:latest"
 dataset_name: "my_perf_dataset"
 hf_repo: "your_username/dataset_repo"  # Optional HF upload
 push_to_hf: false
+
+# LLM Configuration
+llm_provider: "openai"       # or "anthropic"
+llm_model: "gpt-4o-mini"     # or "claude-3-sonnet-20240229"
+llm_temperature: 0.1
+llm_max_tokens: 4096
 ```
 
-2. **Run pipeline**:
+Then run:
 ```bash
-# Ensure API keys are set
-export OPENAI_API_KEY="your_key" # or ANTHROPIC_API_KEY
-
-# Execute pipeline
-PYTHONPATH=src python commit_to_dataset.py commit_config.yaml
+python commit_to_dataset.py my_config.yaml
 ```
 
-3. **Output**: Creates `data/my_perf_dataset.jsonl` with canonical dataset record
+#### 📤 output
+- **Local file**: `data/{dataset_name}.jsonl` with canonical dataset records
+- **Optional HF upload**: Pushes to HuggingFace if `push_to_hf: true`
 
 #### performance measurement methodology
 
@@ -361,6 +396,45 @@ the script generates:
 - **commit extractions**: pre-extracted commit data in `extractions_dir`
 - **docker (optional)**: for containerized test execution
 - **python dependencies**: `pyyaml`, `datasets`, `pandas` (for hf push)
+
+#### 🔧 troubleshooting
+
+**Common Issues:**
+
+1. **"No such file or directory: commit_to_dataset.py"**
+   ```bash
+   # Make sure you're in the repository root
+   cd /path/to/OmniPerf-Bench
+   ls commit_to_dataset.py  # Should exist
+   ```
+
+2. **"ModuleNotFoundError: No module named 'collect'"**
+   ```bash
+   # Always run from the repository root, script handles PYTHONPATH automatically
+   python commit_to_dataset.py experiments.yaml
+   ```
+
+3. **"Config file not found"**
+   ```bash
+   # Use the provided example configuration
+   python commit_to_dataset.py experiments.yaml
+   # Or specify full path to your config
+   python commit_to_dataset.py /full/path/to/my_config.yaml
+   ```
+
+4. **"Missing LLM credentials"**
+   ```bash
+   # Set at least one API key
+   export OPENAI_API_KEY="sk-your-key-here"
+   # OR
+   export ANTHROPIC_API_KEY="your-anthropic-key"
+   ```
+
+5. **"No valid extraction files found"**
+   ```bash
+   # Check that the extractions directory exists and has JSON files
+   ls misc/experiments/commit_extractions_with_apis/*.json
+   ```
 
 ### 4. available datasets and experiments
 
