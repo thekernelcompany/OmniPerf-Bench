@@ -82,6 +82,9 @@ try:
 except Exception:
     parse_times = None  # type: ignore
 
+# Simple commit-hopping approach for vLLM API compatibility
+# No complex environment managers needed - just checkout, install, test
+
 # Optional: import the LLM test generator utilities
 try:
     from test_scripts.generate_test_generators import process_extraction_file, LLMClient  # type: ignore
@@ -239,6 +242,260 @@ def run_tests_locally(repo_path: Path, commit_hash: str, test_entry: Path) -> Li
         return [float('inf')]
 
 
+def check_capability_requirements(test_script: Path) -> bool:
+    """Check if current hardware meets test requirements."""
+    capabilities = detect_capabilities()
+
+    if not capabilities["cuda_available"]:
+        logger.warning("CUDA not available - skipping GPU tests")
+        return False
+
+    # Check specific generator requirements
+    generator_name = test_script.stem
+
+    # FP8-related tests require SM90+ (Hopper GPUs)
+    fp8_tests = ["8d75fe48", "2a052011"]  # Add more FP8 tests as needed
+    if any(fp8_test in generator_name for fp8_test in fp8_tests):
+        if not capabilities.get("supports_fp8", False):
+            logger.warning(f"FP8 not supported (SM{capabilities['sm_version']}, CUDA {capabilities['cuda_version']}) - skipping {generator_name}")
+            return False
+
+    return True
+
+
+def detect_capabilities() -> Dict[str, Any]:
+    """Detect GPU and CUDA capabilities for hardware filtering."""
+    capabilities = {
+        "cuda_available": False,
+        "gpu_name": None,
+        "cuda_version": None,
+        "gpu_memory_gb": 0,
+        "sm_version": None,
+        "supports_fp8": False
+    }
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            capabilities["cuda_available"] = True
+            capabilities["gpu_name"] = torch.cuda.get_device_name(0)
+            capabilities["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+            # Get CUDA version
+            try:
+                cuda_version = torch.version.cuda
+                if cuda_version:
+                    capabilities["cuda_version"] = cuda_version
+            except:
+                pass
+
+            # Get SM version for FP8 requirements
+            try:
+                sm_version = torch.cuda.get_device_capability(0)
+                capabilities["sm_version"] = f"{sm_version[0]}{sm_version[1]}"
+                # FP8 requires SM90+ (not SM89) and CUDA 12.x
+                if sm_version[0] >= 9 and cuda_version and cuda_version.startswith("12"):
+                    capabilities["supports_fp8"] = True
+                else:
+                    capabilities["supports_fp8"] = False
+            except:
+                capabilities["supports_fp8"] = False
+
+    except ImportError:
+        pass
+
+    logger.info(f"Detected capabilities: {capabilities}")
+    return capabilities
+
+
+def run_tests_with_commit_hopping(
+    test_script: Path,
+    commit_hash: str,
+    repo_path: Path,
+    work_dir: Path
+) -> List[float]:
+    """Run test using simple commit-hopping approach with uv.
+
+    This is the winning approach: checkout commit, install with uv, run test.
+    Much simpler than complex environment isolation.
+    """
+    logger.info(f"Running test with commit-hopping for {commit_hash}")
+
+    # Check hardware capabilities first
+    if not check_capability_requirements(test_script):
+        logger.warning(f"Hardware requirements not met for {test_script}")
+        return [float('inf')]
+
+    # Determine Python version for this commit
+    python_version = get_python_version_for_commit(commit_hash)
+
+    try:
+        # Save current commit to restore later
+        current_commit = run(["git", "rev-parse", "HEAD"], cwd=repo_path).strip()
+
+        # Checkout target commit
+        logger.info(f"Checking out commit {commit_hash}")
+        checkout_commit(repo_path, commit_hash)
+
+        # Create venv with appropriate Python version
+        venv_path = work_dir / f"venv_{commit_hash[:8]}"
+        logger.info(f"Creating venv with Python {python_version}")
+
+        # Clean up any existing venv
+        if venv_path.exists():
+            import shutil
+            shutil.rmtree(venv_path)
+
+        result = subprocess.run([
+            "uv", "venv", "--python", python_version, str(venv_path)
+        ], capture_output=True, text=True, cwd=str(work_dir))
+
+        if result.returncode != 0:
+            logger.error(f"Failed to create venv: {result.stderr}")
+            return [float('inf')]
+
+        # Install vLLM using pre-built wheels from vLLM wheel index
+        venv_python = venv_path / "bin" / "python"
+        logger.info(f"Installing vLLM pre-built wheel for commit {commit_hash}...")
+        
+        # Use vLLM's wheel index for the specific commit
+        wheel_index_url = f"https://wheels.vllm.ai/{commit_hash}"
+        result = subprocess.run([
+            "uv", "pip", "install", "vllm", 
+            "--torch-backend=auto",
+            "--extra-index-url", wheel_index_url,
+            "--python", str(venv_python)
+        ], capture_output=True, text=True, cwd=str(work_dir))
+
+        if result.returncode != 0:
+            logger.warning(f"Failed to install vLLM wheel for commit {commit_hash}: {result.stderr}")
+            logger.info("Falling back to source installation...")
+            
+            # Fallback: install from source if wheel not available
+            requirements_file = repo_path / "requirements.txt"
+            if requirements_file.exists():
+                logger.info("Installing requirements.txt with uv...")
+                result = subprocess.run([
+                    "uv", "pip", "install", "-r", "requirements.txt", "--python", str(venv_python)
+                ], capture_output=True, text=True, cwd=str(repo_path))
+                
+                if result.returncode != 0:
+                    logger.error(f"Failed to install requirements.txt: {result.stderr}")
+                    return [float('inf')]
+            
+            # Install build tools
+            result = subprocess.run([
+                "uv", "pip", "install", "setuptools", "wheel", "build", "--python", str(venv_python)
+            ], capture_output=True, text=True, cwd=str(work_dir))
+            
+            # Install from source
+            result = subprocess.run([
+                "uv", "pip", "install", "-e", ".", "--python", str(venv_python)
+            ], capture_output=True, text=True, cwd=str(repo_path))
+
+            if result.returncode != 0:
+                logger.error(f"Failed to install vLLM from source: {result.stderr}")
+                return [float('inf')]
+        else:
+            logger.info(f"Successfully installed vLLM wheel for commit {commit_hash}")
+
+        # Copy test script to repo for execution
+        test_dest = repo_path / f"test_{commit_hash[:8]}.py"
+        import shutil
+        shutil.copy2(test_script, test_dest)
+
+        # Run the test
+        logger.info("Running test...")
+        result = subprocess.run([
+            str(venv_python), str(test_dest.relative_to(repo_path))
+        ], capture_output=True, text=True, cwd=str(repo_path), timeout=300)
+
+        # Parse timing from output
+        timing = parse_execution_time(result.stdout)
+        if timing is not None:
+            logger.info(f"Test completed successfully: {timing:.6f}s")
+            return [timing * 1000]  # Convert to milliseconds
+
+        # Check for errors
+        if result.returncode != 0:
+            logger.error(f"Test execution failed: {result.stderr}")
+            return [float('inf')]
+
+        logger.warning("Could not parse execution time from test output")
+        return [float('inf')]
+
+    except subprocess.TimeoutExpired:
+        logger.error("Test execution timed out")
+        return [300000.0]  # 5 minutes in milliseconds
+    except Exception as e:
+        logger.error(f"Error during commit-hopping test execution: {e}")
+        return [float('inf')]
+    finally:
+        # Always restore original commit
+        try:
+            checkout_commit(repo_path, current_commit)
+        except Exception as e:
+            logger.warning(f"Failed to restore original commit: {e}")
+
+        # Clean up test file
+        test_dest = repo_path / f"test_{commit_hash[:8]}.py"
+        if test_dest.exists():
+            test_dest.unlink()
+
+
+def get_python_version_for_commit(commit_hash: str) -> str:
+    """Determine appropriate Python version for a commit."""
+    # vLLM currently supports Python 3.9-3.12, not 3.13+
+    # Try to use the most compatible version available
+    
+    # Older commits requiring PyTorch 2.3.x need Python 3.11
+    old_commits = [
+        "2a052011", "2bb0489c", "2deb029d", "8d75fe48", "0f40557a",
+        "2f192835", "3a243095"
+    ]
+
+    if any(commit_hash.startswith(old) for old in old_commits):
+        # Try Python 3.11 first for old commits
+        if os.path.exists("/usr/bin/python3.11"):
+            return "/usr/bin/python3.11"
+        elif os.path.exists("python3.11"):
+            return "python3.11"
+
+    # For newer commits, prefer Python 3.11 (most stable for vLLM)
+    # But fall back to other compatible versions if needed
+    for python_version in ["python3.11", "python3.10", "python3.9", "python3.12"]:
+        if os.path.exists(f"/usr/bin/{python_version}"):
+            return f"/usr/bin/{python_version}"
+        elif os.path.exists(python_version):
+            return python_version
+    
+    # Last resort: use python3 (but this might fail on Python 3.13+)
+    return "python3"
+
+
+def parse_execution_time(output: str) -> Optional[float]:
+    """Parse execution time from test output."""
+    import re
+    # Look for timing patterns in output
+    patterns = [
+        r"Execution time:\s*([0-9]+\.?[0-9]*)s",
+        r"Time:\s*([0-9]+\.?[0-9]*)s",
+        r"([0-9]+\.?[0-9]*)\s*ms",
+        r"([0-9]+\.?[0-9]*)\s*seconds"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            time_value = float(match.group(1))
+            # Convert ms to seconds if needed
+            if "ms" in pattern:
+                time_value /= 1000
+            return time_value
+
+    return None
+
+
 def run_tests_in_docker(repo_path: Path, commit_hash: str, test_entry: Path, docker_image: str) -> List[float]:
     """Checkout commit and run prob_script in docker with CUDA event timing for precise GPU measurement."""
     import torch
@@ -331,35 +588,45 @@ def find_or_generate_test_script(
     logger.info(f"Using hash8: {hash8}")
 
     # Validate inputs
+    logger.info(f"Validating extractions_dir: {extractions_dir}")
     if not extractions_dir.exists() or not extractions_dir.is_dir():
         logger.error(f"extractions_dir not found or not a directory: {extractions_dir}")
         raise RuntimeError(f"extractions_dir not found or not a directory: {extractions_dir}")
+    logger.info("extractions_dir validation passed")
 
     # 1) Prefer pre-generated test generators if available
+    logger.info("Checking for pre-generated test generators")
     pregenerated_root = Path("misc/experiments/generated_test_generators_v4")
     candidates = [
         pregenerated_root / f"{commit_hash}_test_case_generator.py",
         pregenerated_root / f"{hash8}_test_case_generator.py",
     ]
+    logger.info(f"Checking candidates: {candidates}")
     for c in candidates:
+        logger.info(f"Checking if exists: {c}")
         if c.exists():
             logger.info(f"Using pre-generated test generator: {c}")
             # No JSON needed in this branch; return None for json_path
             return c, None
+    logger.info("No pre-generated test generators found")
 
     # 2) If not found, attempt on-the-fly generation via LLM
+    logger.info("Attempting on-the-fly generation via LLM")
     if process_extraction_file is None or LLMClient is None:
         logger.warning(
             "LLM utilities unavailable and no pre-generated script found; cannot generate tests dynamically."
         )
+        logger.warning(f"process_extraction_file: {process_extraction_file}, LLMClient: {LLMClient}")
         raise RuntimeError("No test generator available (missing pre-generated file and LLM utilities)")
 
     # Find matching extraction JSON by full or prefix hash
     json_path = None
     logger.info(f"Searching for extraction JSON in {extractions_dir}")
-    for p in extractions_dir.glob("*.json"):
+    json_files = list(extractions_dir.glob("*.json"))
+    logger.info(f"Found {len(json_files)} JSON files: {[p.name for p in json_files]}")
+    for p in json_files:
         name = p.stem
-        logger.debug(f"Checking JSON file: {name}")
+        logger.info(f"Checking JSON file: {name} against commit_hash: {commit_hash} (hash8: {hash8})")
         if name.startswith(commit_hash) or commit_hash.startswith(name) or name.startswith(hash8):
             json_path = p
             logger.info(f"Found matching extraction JSON: {json_path}")
@@ -367,6 +634,7 @@ def find_or_generate_test_script(
 
     if json_path is None:
         logger.error(f"No commit extraction JSON found for commit {commit_hash} in {extractions_dir}")
+        logger.error(f"Available JSON files: {[p.stem for p in json_files]}")
         raise RuntimeError(
             f"No commit extraction JSON found for commit {commit_hash} in {extractions_dir}"
         )
@@ -375,6 +643,7 @@ def find_or_generate_test_script(
     logger.info(f"Output directory created/verified: {out_dir}")
 
     # Require API credentials for generation
+    logger.info("Checking LLM API credentials")
     has_openai = bool(os.getenv("OPENAI_API_KEY"))
     has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
     logger.info(
@@ -395,6 +664,7 @@ def find_or_generate_test_script(
             client_kwargs["temperature"] = llm_temperature
         if llm_max_tokens is not None:
             client_kwargs["max_tokens"] = int(llm_max_tokens)
+        logger.info(f"LLM client kwargs: {client_kwargs}")
         client = LLMClient(**client_kwargs)
         logger.info(f"LLM client initialized with provider: {client.provider}, model: {client.model}")
     except Exception as e:
@@ -402,11 +672,15 @@ def find_or_generate_test_script(
         raise
 
     try:
-        logger.info(f"Processing extraction file: {json_path}")
+        logger.info(f"About to call process_extraction_file with: {json_path}, {out_dir}")
+        logger.info("This may take a while as it involves LLM generation...")
         result = process_extraction_file(str(json_path), str(out_dir), client)  # type: ignore
-        logger.info(f"process_extraction_file result: {result}")
+        logger.info(f"process_extraction_file completed successfully, result: {result}")
     except Exception as e:
         logger.error(f"Error during process_extraction_file: {e}")
+        logger.error(f"Exception type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise
 
     if result and "script_path" in result:
@@ -491,19 +765,26 @@ def assemble_canonical(
     api: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> CanonicalRecord:
+    logger.info(f"Starting assemble_canonical for commit {head_commit}")
+    
     # Prepare workspace
     # Always use local repo path; clone to temp workspace to avoid mutating the user's checkout
     # Derive a provisional repo_name from the source; refine after cloning via origin URL if available
+    logger.info(f"Preparing workspace for repo: {repo_path_arg}")
     provisional_name = os.path.basename(repo_path_arg.rstrip("/")) or "repo"
     if provisional_name.endswith(".git"):
         provisional_name = provisional_name[:-4]
     work_root = Path(tempfile.mkdtemp(prefix="omni_commit_"))
     repo_path = work_root / provisional_name
+    logger.info(f"Cloning repo to temp workspace: {repo_path}")
     clone_or_update_repo(repo_path_arg, repo_path)
+    logger.info(f"Repository cloned successfully to {repo_path}")
 
     # Derive repo owner/name from git origin if possible; otherwise fall back
+    logger.info("Deriving repo owner/name from git origin")
     try:
         origin_url = run(["git", "config", "--get", "remote.origin.url"], cwd=repo_path).strip()
+        logger.info(f"Found origin URL: {origin_url}")
         # Handle common URL formats (HTTPS/SSH/local)
         cleaned = origin_url
         if cleaned.endswith(".git"):
@@ -514,23 +795,31 @@ def assemble_canonical(
             pass
         parts = cleaned.replace(":", "/").split("/")
         repo_owner, repo_name = parts[-2], parts[-1]
-    except Exception:
+        logger.info(f"Derived repo info: {repo_owner}/{repo_name}")
+    except Exception as e:
+        logger.warning(f"Failed to derive repo info from origin: {e}")
         repo_owner, repo_name = "local", provisional_name
+        logger.info(f"Using fallback repo info: {repo_owner}/{repo_name}")
 
     # Collect commit metadata (must use PerfCommitAnalyzer)
+    logger.info("Starting PerfCommitAnalyzer processing")
     if PerfCommitAnalyzer is None:
         raise RuntimeError("PerfCommitAnalyzer is required but not available")
     created_at_iso = datetime.now(timezone.utc).isoformat()
+    logger.info(f"Processing commit {head_commit} with PerfCommitAnalyzer")
     perf_commit = PerfCommitAnalyzer.process_commit(head_commit, repo_path, max_year=None)  # type: ignore
+    logger.info("PerfCommitAnalyzer.process_commit completed")
     if perf_commit is None:
         raise RuntimeError("PerfCommitAnalyzer returned None for the specified commit")
     gt_commit_message = perf_commit.message
+    logger.info(f"Got commit message: {gt_commit_message[:100]}...")
     if getattr(perf_commit, "date", None) is not None:
         try:
             created_at_iso = perf_commit.date.astimezone(timezone.utc).isoformat()
         except Exception:
             pass
     unified = perf_commit.diff_text or git_unified_diff(repo_path, base_commit, head_commit)
+    logger.info(f"Got unified diff, length: {len(unified) if unified else 0}")
 
     patch = unified or ""
     test_patch = ""
@@ -549,6 +838,9 @@ def assemble_canonical(
     llm_max_tokens_env = os.getenv("OMNIPERF_LLM_MAX_TOKENS")
     llm_temperature_val = float(llm_temperature_env) if llm_temperature_env else None
     llm_max_tokens_val = int(llm_max_tokens_env) if llm_max_tokens_env else None
+    
+    logger.info(f"LLM config - provider: {llm_provider}, model: {llm_model}, temp: {llm_temperature_val}, max_tokens: {llm_max_tokens_val}")
+    logger.info(f"About to call find_or_generate_test_script for commit {head_commit}")
 
     test_script, json_path = find_or_generate_test_script(
         head_commit,
@@ -559,6 +851,7 @@ def assemble_canonical(
         llm_temperature=llm_temperature_val,
         llm_max_tokens=llm_max_tokens_val,
     )
+    logger.info(f"find_or_generate_test_script completed, returned test_script: {test_script}")
     if test_script is None:
         logger.error("Unable to locate or generate a test script for this commit.")
         raise RuntimeError("Unable to locate or generate a test script for this commit.")
@@ -603,16 +896,38 @@ def assemble_canonical(
     logger.info("Setting efficiency_test field in CanonicalRecord")
     logger.info(f"efficiency_test will contain: {len(test_code_text)} characters")
 
-    if use_docker:
-        base_times_arr = run_tests_in_docker(repo_path, base_commit, target_test, docker_image)
-        head_times_arr = run_tests_in_docker(repo_path, head_commit, target_test, docker_image)
-        main_head = get_main_branch_head(repo_path)
-        main_times_arr = run_tests_in_docker(repo_path, main_head, target_test, docker_image)
-    else:
-        base_times_arr = run_tests_locally(repo_path, base_commit, target_test)
-        head_times_arr = run_tests_locally(repo_path, head_commit, target_test)
-        main_head = get_main_branch_head(repo_path)
-        main_times_arr = run_tests_locally(repo_path, main_head, target_test)
+    # Use simple commit-hopping approach for vLLM API compatibility
+    logger.info("Using simple commit-hopping approach for test execution")
+    work_dir = Path.cwd() / ".test_work"
+    work_dir.mkdir(exist_ok=True)
+
+    # Test base commit
+    logger.info(f"Testing base commit: {base_commit}")
+    base_times_arr = run_tests_with_commit_hopping(
+        test_script=test_script,
+        commit_hash=base_commit,
+        repo_path=repo_path,
+        work_dir=work_dir
+    )
+
+    # Test head commit
+    logger.info(f"Testing head commit: {head_commit}")
+    head_times_arr = run_tests_with_commit_hopping(
+        test_script=test_script,
+        commit_hash=head_commit,
+        repo_path=repo_path,
+        work_dir=work_dir
+    )
+
+    # Test main branch
+    main_head = get_main_branch_head(repo_path)
+    logger.info(f"Testing main branch: {main_head}")
+    main_times_arr = run_tests_with_commit_hopping(
+        test_script=test_script,
+        commit_hash=main_head,
+        repo_path=repo_path,
+        work_dir=work_dir
+    )
 
     duration_changes: List[Dict[str, List[float]]] = []
     duration_changes.append({"base": base_times_arr, "head": head_times_arr, "main": main_times_arr})
