@@ -52,6 +52,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sys
 
+# Load environment variables from .env if present (so OPENROUTER_API_KEY is available)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
 # Ensure local src/ is importable (for collect.* and test_scripts.*)
 _ROOT_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _ROOT_DIR / "src"
@@ -107,6 +114,469 @@ def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDERR:\n{result.stderr}")
     return result.stdout
+_API_MANIFESTS: Dict[str, Dict[str, Any]] = {}
+
+def _read_text_safe(path: Path) -> str:
+    try:
+        return path.read_text()
+    except Exception:
+        return ""
+
+def _guess_project_name_from_pyproject(repo_path: Path) -> Optional[str]:
+    """Best-effort parse of [project] name from pyproject.toml without adding deps."""
+    try:
+        pp = repo_path / "pyproject.toml"
+        if not pp.exists():
+            return None
+        content = pp.read_text(encoding="utf-8", errors="ignore")
+        # crude parse: find [project] section and name = "..."
+        section_start = content.find("[project]")
+        if section_start == -1:
+            return None
+        section = content[section_start:]
+        # stop at next section
+        for delim in ("\n[", "\r["):
+            idx = section.find(delim)
+            if idx != -1:
+                section = section[:idx]
+                break
+        m = re.search(r"^\s*name\s*=\s*['\"]([^'\"]+)['\"]", section, re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        return None
+    return None
+
+def _candidate_import_names(repo_path: Path) -> List[str]:
+    """Generate candidate top-level import names for the installed project."""
+    candidates: List[str] = []
+    # Common case for this repo's target
+    candidates.append("vllm")
+    project_name = _guess_project_name_from_pyproject(repo_path)
+    if project_name:
+        candidates.append(project_name)
+        candidates.append(project_name.replace('-', '_'))
+    repo_basename = repo_path.name
+    if repo_basename:
+        candidates.append(repo_basename)
+        candidates.append(repo_basename.replace('-', '_'))
+    # Deduplicate while preserving order
+    seen: set = set()
+    unique: List[str] = []
+    for c in candidates:
+        if c and c not in seen:
+            unique.append(c)
+            seen.add(c)
+    return unique
+
+def _select_import_name_via_venv(venv_python: Path, repo_path: Path, prefer: Optional[str] = None) -> Optional[str]:
+    """Attempt to import candidate names inside venv and return the first that succeeds."""
+    if prefer:
+        candidates = [prefer] + [c for c in _candidate_import_names(repo_path) if c != prefer]
+    else:
+        candidates = _candidate_import_names(repo_path)
+    for name in candidates:
+        try:
+            r = subprocess.run(
+                [str(venv_python), "-c", "import importlib,sys; importlib.import_module(sys.argv[1])", name],
+                capture_output=True, text=True
+            )
+            if r.returncode == 0:
+                return name
+        except Exception:
+            continue
+    return None
+
+def _write_api_dump_script(script_path: Path) -> None:
+    """Write a small script that imports a package and emits a JSON manifest of public symbols."""
+    script = """
+import importlib, inspect, json, pkgutil, sys, types, traceback
+
+def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict:
+    manifest = {"package": import_name, "symbols": []}
+    summary = {"modules_scanned": 0, "symbols_collected": 0, "errors": []}
+    try:
+        pkg = importlib.import_module(import_name)
+    except Exception as e:
+        summary["errors"].append({"stage": "import_root", "error": repr(e)})
+        return {"manifest": manifest, "summary": summary}
+
+    modules = [pkg.__name__]
+    if hasattr(pkg, "__path__"):
+        try:
+            discovered = [m.name for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + '.')]
+            modules.extend(discovered)
+        except Exception as e:
+            summary["errors"].append({"stage": "walk", "error": repr(e)})
+
+    if not walk_all and max_modules is not None:
+        modules = modules[:max_modules]
+
+    for mod_name in modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as e:
+            summary["errors"].append({"stage": "import_module", "module": mod_name, "error": repr(e)})
+            continue
+        summary["modules_scanned"] += 1
+
+        names = None
+        try:
+            names = getattr(mod, "__all__", None)
+        except Exception:
+            names = None
+        if names is None:
+            try:
+                names = [n for n in dir(mod) if not n.startswith('_')]
+            except Exception:
+                names = []
+
+        for n in names:
+            try:
+                obj = getattr(mod, n)
+            except Exception:
+                continue
+            kind = None
+            sig = None
+            try:
+                if inspect.isclass(obj):
+                    kind = "class"
+                    try:
+                        sig = str(inspect.signature(obj))
+                    except Exception:
+                        sig = None
+                elif inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isbuiltin(obj):
+                    kind = "function"
+                    try:
+                        sig = str(inspect.signature(obj))
+                    except Exception:
+                        sig = None
+                elif inspect.ismodule(obj):
+                    kind = "module"
+                elif callable(obj):
+                    kind = "callable"
+                    try:
+                        sig = str(inspect.signature(obj))
+                    except Exception:
+                        sig = None
+                else:
+                    kind = "attribute"
+            except Exception:
+                kind = "unknown"
+            manifest["symbols"].append({
+                "module": mod_name,
+                "name": n,
+                "qualname": f"{mod_name}.{n}",
+                "kind": kind,
+                "signature": sig,
+            })
+            summary["symbols_collected"] += 1
+
+    return {"manifest": manifest, "summary": summary}
+
+def main():
+    if len(sys.argv) < 5:
+        print("{}", flush=True)
+        return
+    import_name = sys.argv[1]
+    out_path = sys.argv[2]
+    max_modules = int(sys.argv[3]) if sys.argv[3] else 200
+    walk_all = sys.argv[4] == "1"
+    payload = collect_manifest(import_name, max_modules, walk_all)
+    with open(out_path, 'w') as f:
+        json.dump(payload, f)
+    print(out_path, flush=True)
+
+if __name__ == "__main__":
+    main()
+"""
+    script_path.write_text(script)
+
+def snapshot_public_api(venv_python: Path, repo_path: Path, commit_hash: str, prefer_import_name: Optional[str] = None, work_dir: Optional[Path] = None) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    """Generate API manifest for installed package inside venv and return (path, summary)."""
+    try:
+        import_name = _select_import_name_via_venv(venv_python, repo_path, prefer=prefer_import_name)
+        if not import_name:
+            logger.warning(f"Could not determine import name for API snapshot at {commit_hash}")
+            return None
+        out_root = (work_dir or Path.cwd()) / "api_manifests"
+        out_root.mkdir(parents=True, exist_ok=True)
+        out_path = out_root / f"{commit_hash[:8]}_{import_name}_api.json"
+
+        script_path = (work_dir or Path.cwd()) / f"_api_dump_{commit_hash[:8]}.py"
+        _write_api_dump_script(script_path)
+
+        max_modules = int(os.getenv("OMNIPERF_API_MAX_MODULES", "200"))
+        walk_all = "1" if os.getenv("OMNIPERF_API_WALK_ALL", "0") in ("1", "true", "True") else "0"
+
+        r = subprocess.run(
+            [str(venv_python), str(script_path), import_name, str(out_path), str(max_modules), walk_all],
+            capture_output=True, text=True, cwd=str(repo_path)
+        )
+        if r.returncode != 0:
+            logger.warning(f"API snapshot script failed for {commit_hash}: {r.stderr}")
+            try:
+                script_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
+            return None
+        # Read summary
+        try:
+            data = json.loads(_read_text_safe(out_path))
+            summary = data.get("summary", {}) if isinstance(data, dict) else {}
+        except Exception:
+            summary = {}
+        try:
+            script_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        return out_path, summary
+    except Exception as e:
+        logger.warning(f"Failed to snapshot API for {commit_hash}: {e}")
+        return None
+
+def _load_manifest_sets(manifest_path: Path) -> Optional[Tuple[str, set, Dict[str, List[str]]]]:
+    try:
+        payload = json.loads(_read_text_safe(manifest_path))
+        manifest = payload.get("manifest", {}) if isinstance(payload, dict) else {}
+        package_root = manifest.get("package", "")
+        symbols = manifest.get("symbols", [])
+        available: set = set()
+        leaf_to_quals: Dict[str, List[str]] = {}
+        for s in symbols:
+            q = s.get("qualname")
+            n = s.get("name")
+            if isinstance(q, str) and isinstance(n, str):
+                available.add(q)
+                leaf_to_quals.setdefault(n, []).append(q)
+        return package_root, available, leaf_to_quals
+    except Exception as e:
+        logger.warning(f"Failed to load API manifest sets from {manifest_path}: {e}")
+        return None
+
+def _parse_imports_and_aliases(code: str) -> Tuple[Dict[str, str], Dict[str, List[Tuple[str, Optional[str]]]]]:
+    alias_to_module: Dict[str, str] = {}
+    from_imports: Dict[str, List[Tuple[str, Optional[str]]]] = {}
+    lines = code.splitlines()
+    import_re = re.compile(r"^\s*import\s+([\w\.]+)(?:\s+as\s+(\w+))?\s*$")
+    from_re = re.compile(r"^\s*from\s+([\w\.]+)\s+import\s+(.+)$")
+    for line in lines:
+        m = import_re.match(line)
+        if m:
+            mod, alias = m.group(1), m.group(2)
+            alias_to_module[alias or mod.split('.')[-1]] = mod
+            continue
+        m = from_re.match(line)
+        if m:
+            mod = m.group(1)
+            names_part = m.group(2)
+            # remove parentheses and split by commas
+            names_part = names_part.strip().strip('()')
+            parts = [p.strip() for p in names_part.split(',') if p.strip()]
+            entries: List[Tuple[str, Optional[str]]] = []
+            for p in parts:
+                segs = p.split()
+                if len(segs) == 1:
+                    entries.append((segs[0], None))
+                elif len(segs) == 3 and segs[1] == 'as':
+                    entries.append((segs[0], segs[2]))
+            from_imports.setdefault(mod, []).extend(entries)
+    return alias_to_module, from_imports
+
+def _extract_dotted_refs(code: str, alias_to_module: Dict[str, str], package_root: str) -> List[Tuple[str, str]]:
+    refs: List[Tuple[str, str]] = []
+    dotted = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b")
+    for m in dotted.finditer(code):
+        left, right = m.group(1), m.group(2)
+        mod = alias_to_module.get(left)
+        if not mod:
+            continue
+        if not (mod == package_root or mod.startswith(package_root + '.')):
+            continue
+        refs.append((left, right))
+    return refs
+
+def _choose_best_qual(target_leaf: str, origin_module: str, candidates: List[str]) -> Optional[str]:
+    if not candidates:
+        return None
+    # Prefer within same module path or closest path by longest common prefix
+    best = None
+    best_score = -1
+    for q in candidates:
+        try:
+            module_path = q.rsplit('.', 1)[0]
+        except Exception:
+            module_path = q
+        score = 0
+        # exact module match
+        if module_path == origin_module:
+            score = 100
+        else:
+            # common prefix length on segments
+            a = origin_module.split('.')
+            b = module_path.split('.')
+            k = 0
+            for x, y in zip(a, b):
+                if x == y:
+                    k += 1
+                else:
+                    break
+            score = k
+        if score > best_score:
+            best = q
+            best_score = score
+    return best
+
+def _insert_additional_imports(code: str, new_import_lines: List[str]) -> str:
+    if not new_import_lines:
+        return code
+    lines = code.splitlines()
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith(('import ', 'from ')):
+            insert_idx = i + 1
+        else:
+            if insert_idx != 0:
+                break
+    return "\n".join(lines[:insert_idx] + new_import_lines + lines[insert_idx:])
+
+def rewrite_test_script_against_manifest(test_script: Path, manifest_path: Path) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"rewrites": [], "added_imports": []}
+    s = _load_manifest_sets(manifest_path)
+    if s is None:
+        return summary
+    package_root, available, leaf_to_quals = s
+    code = _read_text_safe(test_script)
+    if not code:
+        return summary
+    alias_to_module, from_imports = _parse_imports_and_aliases(code)
+    # Only consider aliases mapping to our package root
+    alias_to_module = {a: m for a, m in alias_to_module.items() if m == package_root or m.startswith(package_root + '.')}
+
+    # 1) Fix from-imports where module.path symbol no longer exists
+    from_rewrites: Dict[Tuple[str, str], str] = {}
+    for mod, entries in from_imports.items():
+        if not (mod == package_root or mod.startswith(package_root + '.')):
+            continue
+        for name, alias in entries:
+            qual = f"{mod}.{name}"
+            if qual in available:
+                continue
+            cands = leaf_to_quals.get(name, [])
+            best = _choose_best_qual(name, mod, cands)
+            if best and best != qual:
+                new_mod = best.rsplit('.', 1)[0]
+                from_rewrites[(mod, name)] = new_mod
+                summary["rewrites"].append({"type": "from", "old": qual, "new": f"{new_mod}.{name}"})
+
+    if from_rewrites:
+        def _rewrite_from_line(line: str) -> str:
+            m = re.match(r"^(\s*from\s+)([\w\.]+)(\s+import\s+)(.+)$", line)
+            if not m:
+                return line
+            prefix, mod, mid, tail = m.group(1), m.group(2), m.group(3), m.group(4)
+            # rebuild tail respecting commas and aliases
+            parts = [p.strip() for p in tail.strip().strip('()').split(',') if p.strip()]
+            new_parts: List[str] = []
+
+            # Check if any symbols need rewriting to different modules
+            needs_rewrite = False
+            dest_modules = set()
+            changed_symbols = set()
+            for p in parts:
+                segs = p.split()
+                if len(segs) == 1:
+                    name, alias = segs[0], None
+                elif len(segs) == 3 and segs[1] == 'as':
+                    name, alias = segs[0], segs[2]
+                else:
+                    continue
+                key = (mod, name)
+                dest_mod = from_rewrites.get(key)
+                if dest_mod:
+                    needs_rewrite = True
+                    dest_modules.add(dest_mod)
+                    changed_symbols.add(name)
+
+            if not needs_rewrite:
+                # No rewrites needed for this line
+                return line
+
+            # Count symbols that don't need rewriting
+            unchanged_count = sum(1 for p in parts if p.split() and p.split()[0] not in changed_symbols)
+
+            # If all symbols that need rewriting go to the same module AND there are no unchanged symbols, rewrite the whole line
+            if len(dest_modules) == 1 and unchanged_count == 0:
+                new_mod = dest_modules.pop()
+                return f"{prefix}{new_mod}{mid}{tail}"
+            # Otherwise, split into separate import lines
+            else:
+                new_import_lines = []
+                # Group symbols by their target module
+                module_groups = {}
+                for p in parts:
+                    segs = p.split()
+                    if len(segs) == 1:
+                        name, alias = segs[0], None
+                    elif len(segs) == 3 and segs[1] == 'as':
+                        name, alias = segs[0], segs[2]
+                    else:
+                        # Invalid import part, skip
+                        continue
+                    key = (mod, name)
+                    dest_mod = from_rewrites.get(key, mod)
+                    if dest_mod not in module_groups:
+                        module_groups[dest_mod] = []
+                    module_groups[dest_mod].append(p)
+
+                # Create import lines for each module
+                for target_mod, symbols in module_groups.items():
+                    new_import_lines.append(f"{prefix}{target_mod}{mid}{', '.join(symbols)}")
+
+                return "\n".join(new_import_lines)
+
+        code_lines = code.splitlines()
+        code_lines = [_rewrite_from_line(ln) for ln in code_lines]
+        code = "\n".join(code_lines)
+
+    # 2) For dotted refs alias.symbol, add explicit from-imports and replace usage
+    dotted_refs = _extract_dotted_refs(code, alias_to_module, package_root)
+    additions: Dict[str, str] = {}  # name -> module
+    replacements: List[Tuple[str, str]] = []  # (pattern, replacement)
+    for alias, name in dotted_refs:
+        origin_module = alias_to_module.get(alias)
+        if not origin_module:
+            continue
+        qual = f"{origin_module}.{name}"
+        if qual in available:
+            continue
+        cands = leaf_to_quals.get(name, [])
+        best = _choose_best_qual(name, origin_module, cands)
+        if not best:
+            continue
+        new_module = best.rsplit('.', 1)[0]
+        additions[name] = new_module
+        # replace only this exact token pattern
+        pattern = rf"\b{re.escape(alias)}\.{re.escape(name)}\b"
+        replacements.append((pattern, name))
+        summary["rewrites"].append({"type": "dotted", "old": qual, "new": f"{new_module}.{name}"})
+
+    # Insert new imports if any
+    new_import_lines = [f"from {mod} import {name}" for name, mod in sorted(additions.items())]
+    if new_import_lines:
+        code = _insert_additional_imports(code, new_import_lines)
+        summary["added_imports"] = new_import_lines
+
+    # Apply replacements
+    if replacements:
+        for pattern, repl in replacements:
+            code = re.sub(pattern, repl, code)
+
+    try:
+        test_script.write_text(code)
+    except Exception as e:
+        logger.warning(f"Failed to write rewritten test to {test_script}: {e}")
+    return summary
 def _extract_hf_repo_id(hf_repo: Optional[str], default_repo_name: str = "omni_commit_dataset") -> Optional[str]:
     """Normalize various HF repo formats to a repo id suitable for push_to_hub.
 
@@ -312,7 +782,8 @@ def run_tests_with_commit_hopping(
     test_script: Path,
     commit_hash: str,
     repo_path: Path,
-    work_dir: Path
+    work_dir: Path,
+    api_rewrite: bool = False
 ) -> List[float]:
     """Run test using simple commit-hopping approach with uv.
 
@@ -370,6 +841,7 @@ def run_tests_with_commit_hopping(
         if result.returncode != 0:
             logger.warning(f"Failed to install vLLM wheel for commit {commit_hash}: {result.stderr}")
             logger.info("Falling back to source installation...")
+            wheel_ok = False
             
             # Fallback: install from source if wheel not available
             requirements_file = repo_path / "requirements.txt"
@@ -398,17 +870,39 @@ def run_tests_with_commit_hopping(
                 return [float('inf')]
         else:
             logger.info(f"Successfully installed vLLM wheel for commit {commit_hash}")
+            wheel_ok = True
 
-        # Copy test script to repo for execution
-        test_dest = repo_path / f"test_{commit_hash[:8]}.py"
+        # Snapshot public API after installation
+        prefer_name = "vllm" if wheel_ok else None
+        api_snapshot = snapshot_public_api(venv_python=venv_python, repo_path=repo_path, commit_hash=commit_hash, prefer_import_name=prefer_name, work_dir=work_dir)
+        if api_snapshot is not None:
+            manifest_path, summary = api_snapshot
+            _API_MANIFESTS[commit_hash] = {"path": str(manifest_path), "summary": summary}
+            logger.info(f"API manifest written: {manifest_path}")
+        else:
+            logger.warning(f"API manifest not generated for {commit_hash}")
+
+        # Optionally rewrite the generated test code to align with available API
+        if api_rewrite and api_snapshot is not None:
+            try:
+                manifest_path = Path(_API_MANIFESTS[commit_hash]["path"])  # type: ignore[index]
+                rewrite_summary = rewrite_test_script_against_manifest(test_script, manifest_path)
+                logger.info(f"API rewrite summary: {rewrite_summary}")
+            except Exception as e:
+                logger.warning(f"Failed to rewrite test script against manifest: {e}")
+
+        # Copy test script to work_dir (NOT repo) to avoid import conflicts
+        test_dest = work_dir / f"test_{commit_hash[:8]}.py"
         import shutil
         shutil.copy2(test_script, test_dest)
 
-        # Run the test
+        # Run the test from work_dir to avoid local vLLM source interference
         logger.info("Running test...")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = ""  # Clear PYTHONPATH to avoid local repo interference
         result = subprocess.run([
-            str(venv_python), str(test_dest.relative_to(repo_path))
-        ], capture_output=True, text=True, cwd=str(repo_path), timeout=300)
+            str(venv_python), str(test_dest)
+        ], capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300)
 
         # Parse timing from output
         timing = parse_execution_time(result.stdout)
@@ -438,7 +932,7 @@ def run_tests_with_commit_hopping(
             logger.warning(f"Failed to restore original commit: {e}")
 
         # Clean up test file
-        test_dest = repo_path / f"test_{commit_hash[:8]}.py"
+        test_dest = work_dir / f"test_{commit_hash[:8]}.py"
         if test_dest.exists():
             test_dest.unlink()
 
@@ -476,6 +970,7 @@ def get_python_version_for_commit(commit_hash: str) -> str:
 def parse_execution_time(output: str) -> Optional[float]:
     """Parse execution time from test output."""
     import re
+    import json as _json
     # Look for timing patterns in output
     patterns = [
         r"Execution time:\s*([0-9]+\.?[0-9]*)s",
@@ -483,6 +978,23 @@ def parse_execution_time(output: str) -> Optional[float]:
         r"([0-9]+\.?[0-9]*)\s*ms",
         r"([0-9]+\.?[0-9]*)\s*seconds"
     ]
+
+    # First, attempt to parse JSON summaries printed by generators
+    try:
+        for line in (output or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{") and line.endswith("}") and "avg_ms" in line:
+                try:
+                    payload = _json.loads(line)
+                    if isinstance(payload, dict) and "avg_ms" in payload:
+                        avg_ms_val = float(payload["avg_ms"])  # already in milliseconds
+                        return avg_ms_val / 1000.0  # convert to seconds
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
     for pattern in patterns:
         match = re.search(pattern, output, re.IGNORECASE)
@@ -646,10 +1158,15 @@ def find_or_generate_test_script(
     logger.info("Checking LLM API credentials")
     has_openai = bool(os.getenv("OPENAI_API_KEY"))
     has_anthropic = bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_openrouter = bool(os.getenv("OPENROUTER_API_KEY"))
     logger.info(
-        f"API credentials - OpenAI: {'present' if has_openai else 'missing'}, Anthropic: {'present' if has_anthropic else 'missing'}"
+        "API credentials - OpenAI: %s, Anthropic: %s, OpenRouter: %s" % (
+            'present' if has_openai else 'missing',
+            'present' if has_anthropic else 'missing',
+            'present' if has_openrouter else 'missing',
+        )
     )
-    if not (has_openai or has_anthropic):
+    if not (has_openai or has_anthropic or has_openrouter):
         logger.warning("Missing LLM credentials; skipping dynamic generation.")
         raise RuntimeError("Missing LLM credentials and no pre-generated script available")
 
@@ -733,6 +1250,8 @@ class CanonicalRecord:
     setup_commands: List[str] = None
     install_commands: List[str] = None
     notes: Optional[str] = None
+    api_manifest_paths: Optional[Dict[str, str]] = None
+    api_manifest_summaries: Optional[Dict[str, Any]] = None
 
 
 def build_instance_id(repo_owner: str, repo_name: str, repo_path: Path, head_commit: str) -> str:
@@ -907,7 +1426,8 @@ def assemble_canonical(
         test_script=test_script,
         commit_hash=base_commit,
         repo_path=repo_path,
-        work_dir=work_dir
+        work_dir=work_dir,
+        api_rewrite=False
     )
 
     # Test head commit
@@ -916,7 +1436,8 @@ def assemble_canonical(
         test_script=test_script,
         commit_hash=head_commit,
         repo_path=repo_path,
-        work_dir=work_dir
+        work_dir=work_dir,
+        api_rewrite=True
     )
 
     # Test main branch
@@ -926,7 +1447,8 @@ def assemble_canonical(
         test_script=test_script,
         commit_hash=main_head,
         repo_path=repo_path,
-        work_dir=work_dir
+        work_dir=work_dir,
+        api_rewrite=False
     )
 
     duration_changes: List[Dict[str, List[float]]] = []
@@ -949,6 +1471,15 @@ def assemble_canonical(
     logger.info("Creating CanonicalRecord")
     logger.info(f"efficiency_test field will be set with list containing 1 item of {len(test_code_text)} characters")
 
+    # Gather API manifest metadata if present
+    api_manifest_paths: Dict[str, str] = {}
+    api_manifest_summaries: Dict[str, Any] = {}
+    for label, ch in (("base", base_commit), ("head", head_commit), ("main", main_head)):
+        entry = _API_MANIFESTS.get(ch)
+        if entry and isinstance(entry, dict) and "path" in entry:
+            api_manifest_paths[label] = str(entry.get("path"))
+            api_manifest_summaries[label] = entry.get("summary", {})
+
     record = CanonicalRecord(
         repo=f"{repo_owner}/{repo_name}",
         instance_id=instance_id,
@@ -968,6 +1499,8 @@ def assemble_canonical(
         setup_commands=setup_commands,
         install_commands=install_commands,
         # notes=notes,
+        api_manifest_paths=api_manifest_paths or None,
+        api_manifest_summaries=api_manifest_summaries or None,
     )
 
     # Verify the record was created correctly
@@ -1247,5 +1780,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
