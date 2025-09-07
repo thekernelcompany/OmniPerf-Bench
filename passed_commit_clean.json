@@ -1,0 +1,149 @@
+{
+  "repo": "OmniPerf-Bench/vllm",
+  "instance_id": "OmniPerf-Bench__vllm-ad8d696",
+  "created_at": "2024-04-22T21:11:06+00:00",
+  "base_commit": "3d925165f2b18379640a63fbb42de95440d63b64",
+  "head_commit": "ad8d696a99ca1eee19f1404e16e8e82df592ff85",
+  "patch": "diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py\nindex 9588a1bea..a25112385 100644\n--- a/tests/core/test_scheduler.py\n+++ b/tests/core/test_scheduler.py\n@@ -540,7 +540,7 @@ def test_decode_schedule_preempted():\n     curr_loras = None\n     for i in range(3):\n         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         running.append(seq_group)\n     scheduler.block_manager.can_append_slots = MagicMock()\n@@ -581,7 +581,7 @@ def test_decode_swap_beam_search():\n     budget = create_token_budget()\n     for i in range(3):\n         _, seq_group = create_dummy_prompt(str(i), prompt_length=60, best_of=2)\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         running.append(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         budget.add_num_seqs(seq_group.request_id,\n@@ -629,7 +629,7 @@ def test_schedule_decode_blocks_to_copy_update():\n     running = deque()\n     policy = PolicyFactory.get_policy(policy_name=\"fcfs\")\n     curr_loras = None\n-    scheduler._allocate_and_set_running(seq_group, 60)\n+    scheduler._allocate_and_set_running(seq_group)\n     append_new_token_seq_group(60, seq_group, 1)\n     running.append(seq_group)\n \n@@ -659,7 +659,7 @@ def test_schedule_swapped_simple():\n     curr_loras = None\n     blocks_to_swap_out = {}\n     _, seq_group = create_dummy_prompt(\"1\", prompt_length=60, best_of=2)\n-    scheduler._allocate_and_set_running(seq_group, 60)\n+    scheduler._allocate_and_set_running(seq_group)\n     append_new_token_seq_group(60, seq_group, 1)\n     scheduler._swap_out(seq_group, blocks_to_swap_out)\n     swapped.append(seq_group)\n@@ -687,7 +687,7 @@ def test_schedule_swapped_max_token_budget():\n     blocks_to_swap_out = {}\n     for _ in range(2):\n         _, seq_group = create_dummy_prompt(\"1\", prompt_length=60, best_of=2)\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         scheduler._swap_out(seq_group, blocks_to_swap_out)\n         swapped.append(seq_group)\n@@ -721,7 +721,7 @@ def test_schedule_swapped_max_seqs():\n     blocks_to_swap_out = {}\n     for i in range(4):\n         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         scheduler._swap_out(seq_group, blocks_to_swap_out)\n         swapped.append(seq_group)\n@@ -759,7 +759,7 @@ def test_schedule_swapped_max_loras():\n                                                lora_name=str(i),\n                                                lora_int_id=i + 1,\n                                                lora_local_path=\"abc\"))\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         scheduler._swap_out(seq_group, blocks_to_swap_out)\n         swapped.append(seq_group)\n@@ -783,7 +783,7 @@ def test_schedule_swapped_cannot_swap_in():\n     blocks_to_swap_out = {}\n     for _ in range(2):\n         _, seq_group = create_dummy_prompt(\"1\", prompt_length=60, best_of=2)\n-        scheduler._allocate_and_set_running(seq_group, 60)\n+        scheduler._allocate_and_set_running(seq_group)\n         append_new_token_seq_group(60, seq_group, 1)\n         scheduler._swap_out(seq_group, blocks_to_swap_out)\n         swapped.append(seq_group)\n@@ -808,7 +808,7 @@ def test_schedule_swapped_blocks_to_copy():\n     policy = PolicyFactory.get_policy(policy_name=\"fcfs\")\n     curr_loras = None\n     _, seq_group = create_dummy_prompt(\"1\", prompt_length=60, best_of=2)\n-    scheduler._allocate_and_set_running(seq_group, 60)\n+    scheduler._allocate_and_set_running(seq_group)\n     append_new_token_seq_group(60, seq_group, 1)\n     blocks_to_swap_out = {}\n     scheduler._swap_out(seq_group, blocks_to_swap_out)\ndiff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py\nindex 419855062..8d7db09bb 100644\n--- a/vllm/core/scheduler.py\n+++ b/vllm/core/scheduler.py\n@@ -297,7 +297,6 @@ class Scheduler:\n \n     def add_seq_group(self, seq_group: SequenceGroup) -> None:\n         # Add sequence groups to the waiting queue.\n-        logger.debug(f\"add_seq_group {seq_group.request_id}\")\n         self.waiting.append(seq_group)\n \n     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:\n@@ -427,7 +426,6 @@ class Scheduler:\n                         swapped_out.append(seq_group)\n                     break\n             else:\n-                logger.debug(f\"append slot for {seq_group}\")\n                 self._append_slots(seq_group, blocks_to_copy)\n                 is_prefill = seq_group.is_prefill()\n                 if is_prefill:\n@@ -659,7 +657,7 @@ class Scheduler:\n             if curr_loras is not None and lora_int_id > 0:\n                 curr_loras.add(lora_int_id)\n             waiting_queue.popleft()\n-            self._allocate_and_set_running(seq_group, num_new_tokens)\n+            self._allocate_and_set_running(seq_group)\n             seq_groups.append(\n                 ScheduledSequenceGroup(seq_group=seq_group,\n                                        token_chunk_size=num_new_tokens))\n@@ -952,8 +950,7 @@ class Scheduler:\n         self.running = deque(seq_group for seq_group in self.running\n                              if not seq_group.is_finished())\n \n-    def _allocate_and_set_running(self, seq_group: SequenceGroup,\n-                                  num_new_tokens: int) -> None:\n+    def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:\n         self.block_manager.allocate(seq_group)\n         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):\n             seq.status = SequenceStatus.RUNNING",
+  "test_patch": "",
+  "efficiency_test": [
+    "#!/usr/bin/env python3\n\"\"\"\nPerformance test for commit: ad8d696a99ca1eee19f1404e16e8e82df592ff85\nMessage: [Core] Scheduler perf fix (#4270)\n\nThis script measures the performance impact of removing the unused num_new_tokens\nparameter from _allocate_and_set_running method in the vLLM scheduler.\n\"\"\"\n\nimport os\nimport sys\nimport json\nimport time\nimport importlib\nfrom typing import Dict, Any, Tuple, Optional, List\nfrom collections import deque\nfrom unittest.mock import MagicMock\n\nimport numpy as np\nimport torch\n\n# =======================\n# Determinism Setup\n# =======================\ndef ensure_determinism():\n    torch.manual_seed(42)\n    np.random.seed(42)\n    if torch.cuda.is_available():\n        torch.cuda.manual_seed_all(42)\n        torch.backends.cudnn.deterministic = True\n        torch.backends.cudnn.benchmark = False\n        torch.backends.cuda.matmul.allow_tf32 = False\n        torch.backends.cudnn.allow_tf32 = False\n\n# =======================\n# Hardware Detection\n# =======================\ndef detect_hardware() -> Dict[str, Any]:\n    hw_info = {}\n    if torch.cuda.is_available():\n        hw_info[\"device\"] = \"cuda\"\n        hw_info[\"device_name\"] = torch.cuda.get_device_name()\n        hw_info[\"capability\"] = torch.cuda.get_device_capability()\n        hw_info[\"memory_gb\"] = torch.cuda.get_device_properties(0).total_memory / 1e9\n    else:\n        hw_info[\"device\"] = \"cpu\"\n        hw_info[\"device_name\"] = \"CPU\"\n        hw_info[\"memory_gb\"] = 0\n    return hw_info\n\n# =======================\n# Import Resolution\n# =======================\ndef resolve_target() -> Tuple[Any, str]:\n    \"\"\"Resolve the optimization target from environment or metadata.\"\"\"\n    \n    # Priority 1: Environment variables\n    module_path = os.getenv(\"PROB_MODULE\", \"vllm.core.scheduler\")\n    symbol_name = os.getenv(\"PROB_SYMBOL\", \"Scheduler\")\n    \n    # Import with error handling\n    try:\n        module = importlib.import_module(module_path)\n        target = getattr(module, symbol_name)\n        \n        fq_name = f\"{module_path}.{symbol_name}\"\n        return target, fq_name\n        \n    except (ImportError, AttributeError) as e:\n        error_data = {\n            \"target_resolved\": False,\n            \"error\": str(e),\n            \"attempted_module\": module_path,\n            \"attempted_symbol\": symbol_name\n        }\n        print(json.dumps(error_data))\n        sys.exit(1)\n\n# =======================\n# Workload Setup\n# =======================\ndef setup() -> Dict[str, Any]:\n    \"\"\"Create realistic workload for the scheduler optimization.\"\"\"\n    ensure_determinism()\n    hw_info = detect_hardware()\n    \n    # Import required vLLM components\n    try:\n        from vllm.config import CacheConfig, SchedulerConfig\n        from vllm.core.scheduler import Scheduler\n        from vllm.sequence import SequenceGroup, Sequence, SequenceData, SequenceStatus\n        from vllm.sampling_params import SamplingParams\n        from vllm.block import LogicalTokenBlock\n    except ImportError as e:\n        print(json.dumps({\"target_resolved\": False, \"error\": f\"Failed to import vLLM components: {e}\"}))\n        sys.exit(1)\n    \n    device = torch.device(hw_info[\"device\"])\n    dtype = torch.float16 if hw_info[\"device\"] == \"cuda\" else torch.float32\n    \n    # Create scheduler configuration\n    block_size = 16\n    num_gpu_blocks = 1024\n    num_cpu_blocks = 512\n    max_num_seqs = 256\n    max_model_len = 2048\n    max_num_batched_tokens = 2048\n    \n    scheduler_config = SchedulerConfig(\n        max_num_batched_tokens=max_num_batched_tokens,\n        max_num_seqs=max_num_seqs,\n        max_model_len=max_model_len\n    )\n    \n    cache_config = CacheConfig(\n        block_size=block_size,\n        gpu_memory_utilization=0.9,\n        swap_space_bytes=0,\n        cache_dtype=\"auto\"\n    )\n    cache_config.num_gpu_blocks = num_gpu_blocks\n    cache_config.num_cpu_blocks = num_cpu_blocks\n    \n    # Create scheduler instance\n    scheduler = Scheduler(scheduler_config, cache_config, None)\n    \n    # Create sequence groups to simulate realistic workload\n    seq_groups = []\n    num_requests = 64  # Simulate many concurrent requests\n    \n    for i in range(num_requests):\n        # Create sequence with varying prompt lengths\n        prompt_length = 128 + (i % 8) * 64  # Vary from 128 to 640 tokens\n        seq_id = i\n        \n        # Create sequence data\n        prompt_token_ids = list(range(prompt_length))\n        seq_data = SequenceData(prompt_token_ids)\n        \n        # Create sequence\n        seq = Sequence(\n            seq_id=seq_id,\n            prompt=prompt_token_ids,\n            prompt_token_ids=prompt_token_ids,\n            block_size=block_size\n        )\n        seq.data = seq_data\n        seq.status = SequenceStatus.WAITING\n        \n        # Create sampling params\n        sampling_params = SamplingParams(\n            temperature=0.7,\n            top_p=0.9,\n            max_tokens=128\n        )\n        \n        # Create sequence group\n        seq_group = SequenceGroup(\n            request_id=str(i),\n            seqs=[seq],\n            sampling_params=sampling_params,\n            arrival_time=time.time() - (num_requests - i) * 0.01  # Stagger arrival times\n        )\n        \n        seq_groups.append(seq_group)\n    \n    data = {\n        \"device\": device,\n        \"dtype\": dtype,\n        \"hw_info\": hw_info,\n        \"scheduler\": scheduler,\n        \"seq_groups\": seq_groups,\n        \"scheduler_config\": scheduler_config,\n        \"cache_config\": cache_config\n    }\n    \n    return data\n\n# =======================\n# Experiment Execution\n# =======================\ndef experiment(data: Dict[str, Any]) -> Any:\n    \"\"\"Execute the optimized _allocate_and_set_running operation.\"\"\"\n    scheduler = data[\"scheduler\"]\n    seq_groups = data[\"seq_groups\"]\n    \n    # Clear scheduler state\n    scheduler.waiting.clear()\n    scheduler.running.clear()\n    scheduler.swapped.clear()\n    \n    # Add sequence groups to waiting queue\n    for seq_group in seq_groups:\n        # Reset sequence status\n        for seq in seq_group.get_seqs():\n            seq.status = SequenceStatus.WAITING\n        scheduler.waiting.append(seq_group)\n    \n    # Measure the performance of _allocate_and_set_running calls\n    # This happens during scheduling when moving sequences from waiting to running\n    allocated_groups = []\n    \n    while scheduler.waiting and len(allocated_groups) < 32:  # Process batch of requests\n        seq_group = scheduler.waiting.popleft()\n        \n        # This is the optimized method - no longer takes num_new_tokens parameter\n        scheduler._allocate_and_set_running(seq_group)\n        \n        allocated_groups.append(seq_group)\n        scheduler.running.append(seq_group)\n    \n    return {\n        \"num_allocated\": len(allocated_groups),\n        \"num_remaining\": len(scheduler.waiting),\n        \"num_running\": len(scheduler.running)\n    }\n\n# =======================\n# Result I/O\n# =======================\ndef store_result(result: Any, filepath: str) -> None:\n    \"\"\"Store result for reference comparison.\"\"\"\n    torch.save({\"type\": \"dict\", \"data\": result}, filepath)\n\ndef load_result(filepath: str) -> Any:\n    \"\"\"Load reference result.\"\"\"\n    data = torch.load(filepath)\n    return data.get(\"data\", data)\n\n# =======================\n# Equivalence Checking\n# =======================\ndef check_equivalence(current_result: Any, reference_result: Any) -> None:\n    \"\"\"Verify functional equivalence.\"\"\"\n    assert isinstance(current_result, dict)\n    assert isinstance(reference_result, dict)\n    \n    # Check that the same number of sequences were allocated\n    assert current_result[\"num_allocated\"] == reference_result[\"num_allocated\"], \n        f\"Allocated count mismatch: {current_result['num_allocated']} vs {reference_result['num_allocated']}\"\n    \n    assert current_result[\"num_remaining\"] == reference_result[\"num_remaining\"], \n        f\"Remaining count mismatch: {current_result['num_remaining']} vs {reference_result['num_remaining']}\"\n    \n    assert current_result[\"num_running\"] == reference_result[\"num_running\"], \n        f\"Running count mismatch: {current_result['num_running']} vs {reference_result['num_running']}\"\n\n# =======================\n# Timing Implementation\n# =======================\ndef time_cpu(func, warmup=3, iterations=10) -> Tuple[Any, Dict[str, float]]:\n    \"\"\"Time CPU operations.\"\"\"\n    # Warmup\n    for _ in range(warmup):\n        _ = func()\n    \n    # Timing\n    times_ms = []\n    for _ in range(iterations):\n        start = time.perf_counter()\n        result = func()\n        end = time.perf_counter()\n        times_ms.append((end - start) * 1000)\n    \n    # Statistics\n    times_ms.sort()\n    stats = {\n        \"avg_ms\": sum(times_ms) / len(times_ms),\n        \"p50_ms\": times_ms[len(times_ms) // 2],\n        \"p95_ms\": times_ms[int(len(times_ms) * 0.95) - 1] if len(times_ms) > 1 else times_ms[0],\n        \"p99_ms\": times_ms[int(len(times_ms) * 0.99) - 1] if len(times_ms) > 1 else times_ms[0],\n        \"min_ms\": times_ms[0],\n        \"max_ms\": times_ms[-1],\n        \"std_ms\": np.std(times_ms) if len(times_ms) > 1 else 0.0\n    }\n    \n    return result, stats\n\n# =======================\n# Main Test Function\n# =======================\ndef run_test(eqcheck: bool = False, reference: bool = False, prefix: str = '') -> float:\n    \"\"\"Main test entry point.\"\"\"\n    \n    # Setup\n    data = setup()\n    hw_info = data[\"hw_info\"]\n    \n    # Since this is a CPU-bound scheduler operation, we always use CPU timing\n    warmup = 5\n    iters = 20\n    \n    result, timing_stats = time_cpu(lambda: experiment(data), warmup=warmup, iterations=iters)\n    avg_ms = timing_stats[\"avg_ms\"]\n    p50_ms = timing_stats[\"p50_ms\"]\n    p95_ms = timing_stats[\"p95_ms\"]\n    \n    # Reference handling\n    commit_hash = os.getenv(\"COMMIT_HASH\", \"ad8d696a99ca1eee19f1404e16e8e82df592ff85\")\n    impl_tag = os.getenv(\"IMPL_TAG\", \"child\")\n    ref_file = f\"{prefix}_{impl_tag}_{commit_hash}_reference.pt\"\n    \n    if reference:\n        store_result(result, ref_file)\n    \n    if eqcheck and os.path.exists(ref_file):\n        ref_result = load_result(ref_file)\n        check_equivalence(result, ref_result)\n    \n    # Output compact JSON schema\n    summary = {\n        \"impl_tag\": impl_tag,\n        \"commit_hash\": commit_hash,\n        \"device\": \"cpu\",  # Scheduler operations are CPU-bound\n        \"dtype\": str(data[\"dtype\"]),\n        \"iters\": iters,\n        \"warmup\": warmup,\n        \"avg_ms\": avg_ms,\n        \"p50_ms\": p50_ms,\n        \"p95_ms\": p95_ms,\n        \"eq_level\": os.getenv(\"PROB_EQ_LEVEL\", \"exact\"),\n        \"opt_path_hit\": True\n    }\n    print(json.dumps(summary))\n    \n    return avg_ms / 1000.0\n\n# =======================\n# Entry Point\n# =======================\nif __name__ == \"__main__\":\n    import argparse\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"--eqcheck\", action=\"store_true\")\n    parser.add_argument(\"--reference\", action=\"store_true\")\n    parser.add_argument(\"--prefix\", type=str, default=\"\")\n    args = parser.parse_args()\n    \n    run_test(args.eqcheck, args.reference, args.prefix)"
+  ],
+  "duration_changes": [
+    {
+      "base": [
+        Infinity
+      ],
+      "head": [
+        Infinity
+      ],
+      "main": [
+        Infinity
+      ]
+    }
+  ],
+  "human_performance": NaN,
+  "version": "python==unknown;arch=x86_64;image=local;install_sha=na",
+  "patch_functions": null,
+  "test_functions": [],
+  "api": null,
+  "gt_commit_message": "[Core] Scheduler perf fix (#4270)",
+  "setup_commands": null,
+  "install_commands": null,
+  "notes": null,
+  "api_manifest_paths": {
+    "base": "/root/OmniPerf-Bench/.test_work/api_manifests/3d925165_vllm_api.json",
+    "head": "/root/OmniPerf-Bench/.test_work/api_manifests/ad8d696a_vllm_api.json",
+    "main": "/root/OmniPerf-Bench/.test_work/api_manifests/5490d633_vllm_api.json"
+  },
+  "api_manifest_summaries": {
+    "base": {
+      "modules_scanned": 194,
+      "symbols_collected": 3668,
+      "errors": [
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.backends.flashinfer",
+          "error": "ImportError('FlashInfer is not installed. Please install it from https://github.com/flashinfer-ai/flashinfer')"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.nki_flash_attn",
+          "error": "ModuleNotFoundError(\"No module named 'neuronxcc'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.pallas_kv_cache_update",
+          "error": "ModuleNotFoundError(\"No module named 'jax'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.rocm_aiter_paged_attn",
+          "error": "ModuleNotFoundError(\"No module named 'aiter'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
+          "error": "ModuleNotFoundError(\"No module named 'lmcache'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.tpu_distributed_utils",
+          "error": "ModuleNotFoundError(\"No module named 'torch_xla'\")"
+        }
+      ]
+    },
+    "head": {
+      "modules_scanned": 194,
+      "symbols_collected": 3668,
+      "errors": [
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.backends.flashinfer",
+          "error": "ImportError('FlashInfer is not installed. Please install it from https://github.com/flashinfer-ai/flashinfer')"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.nki_flash_attn",
+          "error": "ModuleNotFoundError(\"No module named 'neuronxcc'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.pallas_kv_cache_update",
+          "error": "ModuleNotFoundError(\"No module named 'jax'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.rocm_aiter_paged_attn",
+          "error": "ModuleNotFoundError(\"No module named 'aiter'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
+          "error": "ModuleNotFoundError(\"No module named 'lmcache'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.tpu_distributed_utils",
+          "error": "ModuleNotFoundError(\"No module named 'torch_xla'\")"
+        }
+      ]
+    },
+    "main": {
+      "modules_scanned": 194,
+      "symbols_collected": 3693,
+      "errors": [
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.nki_flash_attn",
+          "error": "ModuleNotFoundError(\"No module named 'neuronxcc'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.pallas_kv_cache_update",
+          "error": "ModuleNotFoundError(\"No module named 'jax'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.attention.ops.rocm_aiter_paged_attn",
+          "error": "ModuleNotFoundError(\"No module named 'aiter'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.device_communicators.tpu_communicator",
+          "error": "ModuleNotFoundError(\"No module named 'tpu_info'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
+          "error": "ModuleNotFoundError(\"No module named 'lmcache'\")"
+        },
+        {
+          "stage": "import_module",
+          "module": "vllm.distributed.tpu_distributed_utils",
+          "error": "ModuleNotFoundError(\"No module named 'torch_xla'\")"
+        }
+      ]
+    }
+  }
+}
