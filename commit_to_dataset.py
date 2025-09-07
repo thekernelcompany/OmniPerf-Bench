@@ -188,10 +188,45 @@ def _select_import_name_via_venv(venv_python: Path, repo_path: Path, prefer: Opt
     return None
 
 def _write_api_dump_script(script_path: Path) -> None:
+<<<<<<< HEAD
     """Write a small script that imports a package and emits a JSON manifest of public symbols."""
     script = """
 import importlib, inspect, json, pkgutil, sys, types, traceback
 
+=======
+    """Write a small script that imports a package and emits a JSON manifest of public symbols with signatures."""
+    script = """
+import importlib, inspect, json, pkgutil, sys, types, traceback
+
+def extract_parameter_info(obj):
+    \"\"\"Extract detailed parameter information for a callable object.\"\"\"
+    try:
+        sig = inspect.signature(obj)
+        params = {}
+        defaults = {}
+        for param_name, param in sig.parameters.items():
+            if param_name == 'self':
+                continue
+            params[param_name] = {
+                'kind': param.kind.name,
+                'annotation': str(param.annotation) if param.annotation != inspect.Parameter.empty else None,
+                'has_default': param.default != inspect.Parameter.empty
+            }
+            if param.default != inspect.Parameter.empty:
+                try:
+                    defaults[param_name] = str(param.default)
+                except Exception:
+                    defaults[param_name] = "<unprintable>"
+        return {
+            'parameters': list(params.keys()),
+            'parameter_details': params,
+            'defaults': defaults,
+            'signature_str': str(sig)
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict:
     manifest = {"package": import_name, "symbols": []}
     summary = {"modules_scanned": 0, "symbols_collected": 0, "errors": []}
@@ -238,17 +273,29 @@ def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict
                 continue
             kind = None
             sig = None
+<<<<<<< HEAD
+=======
+            param_info = None
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
             try:
                 if inspect.isclass(obj):
                     kind = "class"
                     try:
                         sig = str(inspect.signature(obj))
+<<<<<<< HEAD
+=======
+                        param_info = extract_parameter_info(obj)
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 elif inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isbuiltin(obj):
                     kind = "function"
                     try:
                         sig = str(inspect.signature(obj))
+<<<<<<< HEAD
+=======
+                        param_info = extract_parameter_info(obj)
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 elif inspect.ismodule(obj):
@@ -257,19 +304,38 @@ def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict
                     kind = "callable"
                     try:
                         sig = str(inspect.signature(obj))
+<<<<<<< HEAD
+=======
+                        param_info = extract_parameter_info(obj)
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 else:
                     kind = "attribute"
             except Exception:
                 kind = "unknown"
+<<<<<<< HEAD
             manifest["symbols"].append({
+=======
+            
+            symbol_entry = {
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                 "module": mod_name,
                 "name": n,
                 "qualname": f"{mod_name}.{n}",
                 "kind": kind,
                 "signature": sig,
+<<<<<<< HEAD
             })
+=======
+            }
+            
+            # Add detailed parameter info for callable objects
+            if param_info is not None:
+                symbol_entry["param_info"] = param_info
+                
+            manifest["symbols"].append(symbol_entry)
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
             summary["symbols_collected"] += 1
 
     return {"manifest": manifest, "summary": summary}
@@ -440,6 +506,161 @@ def _insert_additional_imports(code: str, new_import_lines: List[str]) -> str:
                 break
     return "\n".join(lines[:insert_idx] + new_import_lines + lines[insert_idx:])
 
+<<<<<<< HEAD
+=======
+def _load_param_info_from_manifest(manifest_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load parameter information for key classes from the manifest."""
+    try:
+        payload = json.loads(_read_text_safe(manifest_path))
+        manifest = payload.get("manifest", {}) if isinstance(payload, dict) else {}
+        symbols = manifest.get("symbols", [])
+        
+        param_info = {}
+        for symbol in symbols:
+            qualname = symbol.get("qualname", "")
+            if symbol.get("param_info") and qualname:
+                param_info[qualname] = symbol["param_info"]
+                
+        return param_info
+    except Exception as e:
+        logger.warning(f"Failed to load parameter info from manifest: {e}")
+        return {}
+
+def _add_api_probing_helpers(code: str, package_root: str) -> str:
+    """Add helper functions for safe API calls to the test script."""
+    helpers = f'''
+import inspect
+import logging
+
+# API Probing helpers - auto-generated for compatibility
+def safe_create_object(cls, **kwargs):
+    """Create object with only valid arguments based on signature."""
+    try:
+        if not callable(cls):
+            raise TypeError(f"{{cls}} is not callable")
+        sig = inspect.signature(cls)
+        valid_kwargs = {{k: v for k, v in kwargs.items() 
+                       if k in sig.parameters and k != "self"}}
+        return cls(**valid_kwargs)
+    except Exception as e:
+        logging.warning(f"Failed to create {{cls.__name__ if hasattr(cls, '__name__') else cls}} with args {{list(kwargs.keys())}}: {{e}}")
+        raise
+
+def safe_call_function(func, *args, **kwargs):
+    """Call function with only valid arguments based on signature."""
+    try:
+        if not callable(func):
+            raise TypeError(f"{{func}} is not callable")
+        sig = inspect.signature(func)
+        # Filter kwargs to only valid parameters
+        valid_kwargs = {{k: v for k, v in kwargs.items() 
+                       if k in sig.parameters}}
+        return func(*args, **valid_kwargs)
+    except Exception as e:
+        logging.warning(f"Failed to call {{func.__name__ if hasattr(func, '__name__') else func}} with args {{list(kwargs.keys())}}: {{e}}")
+        raise
+
+# Specific helpers for common {package_root} classes
+def safe_create_engine_output(**kwargs):
+    """Create EngineCoreOutput with compatible arguments."""
+    try:
+        from {package_root}.v1.engine import EngineCoreOutput
+        return safe_create_object(EngineCoreOutput, **kwargs)
+    except ImportError:
+        try:
+            from {package_root}.engine import EngineCoreOutput  
+            return safe_create_object(EngineCoreOutput, **kwargs)
+        except ImportError:
+            raise ImportError("EngineCoreOutput not found in {package_root}")
+
+def safe_create_sampling_params(**kwargs):
+    """Create SamplingParams with compatible arguments."""
+    try:
+        from {package_root} import SamplingParams
+        return safe_create_object(SamplingParams, **kwargs)
+    except ImportError:
+        try:
+            from {package_root}.sampling_params import SamplingParams
+            return safe_create_object(SamplingParams, **kwargs)
+        except ImportError:
+            raise ImportError("SamplingParams not found in {package_root}")
+
+def safe_create_llm(**kwargs):
+    """Create LLM with compatible arguments."""
+    try:
+        from {package_root} import LLM
+        return safe_create_object(LLM, **kwargs)
+    except ImportError:
+        raise ImportError("LLM not found in {package_root}")
+
+'''
+    # Insert helpers after existing imports
+    lines = code.splitlines()
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith(('import ', 'from ')):
+            insert_idx = i + 1
+        else:
+            if insert_idx != 0:
+                break
+    
+    return "\n".join(lines[:insert_idx] + [helpers] + lines[insert_idx:])
+
+def _rewrite_api_calls_in_code(code: str, param_info: Dict[str, Dict[str, Any]]) -> str:
+    """Rewrite direct API calls to use safe creation patterns."""
+    import re
+    
+    # Common patterns to replace with safe versions
+    replacements = [
+        # EngineCoreOutput instantiation
+        (r'EngineCoreOutput\\(([^)]+)\\)', r'safe_create_engine_output(\\1)'),
+        # SamplingParams instantiation  
+        (r'SamplingParams\\(([^)]+)\\)', r'safe_create_sampling_params(\\1)'),
+        # LLM instantiation
+        (r'(?<!safe_create_)LLM\\(([^)]+)\\)', r'safe_create_llm(\\1)'),
+    ]
+    
+    modified_code = code
+    for pattern, replacement in replacements:
+        modified_code = re.sub(pattern, replacement, modified_code)
+    
+    return modified_code
+
+def rewrite_test_script_with_api_probing(test_script: Path, manifest_path: Path) -> Dict[str, Any]:
+    """Enhanced version that combines manifest rewriting with API probing."""
+    # First, do the standard manifest-based rewriting
+    summary = rewrite_test_script_against_manifest(test_script, manifest_path)
+    
+    # Load parameter information
+    param_info = _load_param_info_from_manifest(manifest_path)
+    
+    # Read the current code (after standard rewriting)
+    code = _read_text_safe(test_script)
+    if not code:
+        return summary
+    
+    # Determine package root
+    s = _load_manifest_sets(manifest_path)
+    if s is None:
+        return summary
+    package_root, _, _ = s
+    
+    # Add API probing helpers
+    code_with_helpers = _add_api_probing_helpers(code, package_root)
+    
+    # Rewrite API calls to use safe patterns
+    final_code = _rewrite_api_calls_in_code(code_with_helpers, param_info)
+    
+    # Write back the enhanced code
+    test_script.write_text(final_code)
+    
+    # Add to summary
+    summary["api_probing_added"] = True
+    summary["param_info_loaded"] = len(param_info)
+    
+    return summary
+
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 def rewrite_test_script_against_manifest(test_script: Path, manifest_path: Path) -> Dict[str, Any]:
     summary: Dict[str, Any] = {"rewrites": [], "added_imports": []}
     s = _load_manifest_sets(manifest_path)
@@ -577,6 +798,10 @@ def rewrite_test_script_against_manifest(test_script: Path, manifest_path: Path)
     except Exception as e:
         logger.warning(f"Failed to write rewritten test to {test_script}: {e}")
     return summary
+<<<<<<< HEAD
+=======
+
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 def _extract_hf_repo_id(hf_repo: Optional[str], default_repo_name: str = "omni_commit_dataset") -> Optional[str]:
     """Normalize various HF repo formats to a repo id suitable for push_to_hub.
 
@@ -608,7 +833,6 @@ def _extract_hf_repo_id(hf_repo: Optional[str], default_repo_name: str = "omni_c
         return s
     # Single segment -> treat as org/user and append default repo name
     return f"{s}/{default_repo_name}"
-
 
 
 def clone_or_update_repo(repo_url: str, dest_dir: Path) -> Path:
@@ -882,6 +1106,7 @@ def run_tests_with_commit_hopping(
         else:
             logger.warning(f"API manifest not generated for {commit_hash}")
 
+<<<<<<< HEAD
         # Optionally rewrite the generated test code to align with available API
         if api_rewrite and api_snapshot is not None:
             try:
@@ -890,6 +1115,23 @@ def run_tests_with_commit_hopping(
                 logger.info(f"API rewrite summary: {rewrite_summary}")
             except Exception as e:
                 logger.warning(f"Failed to rewrite test script against manifest: {e}")
+=======
+        # Always rewrite the generated test code with API probing when manifest is available
+        if api_snapshot is not None:
+            try:
+                manifest_path = Path(_API_MANIFESTS[commit_hash]["path"])  # type: ignore[index]
+                rewrite_summary = rewrite_test_script_with_api_probing(test_script, manifest_path)
+                logger.info(f"API rewrite with probing summary: {rewrite_summary}")
+            except Exception as e:
+                logger.warning(f"Failed to rewrite test script with API probing: {e}")
+                # Fallback to standard rewriting if API probing fails
+                if api_rewrite:
+                    try:
+                        rewrite_summary = rewrite_test_script_against_manifest(test_script, manifest_path)
+                        logger.info(f"Fallback API rewrite summary: {rewrite_summary}")
+                    except Exception as e2:
+                        logger.warning(f"Fallback rewrite also failed: {e2}")
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 
         # Copy test script to work_dir (NOT repo) to avoid import conflicts
         test_dest = work_dir / f"test_{commit_hash[:8]}.py"
@@ -897,12 +1139,50 @@ def run_tests_with_commit_hopping(
         shutil.copy2(test_script, test_dest)
 
         # Run the test from work_dir to avoid local vLLM source interference
+<<<<<<< HEAD
         logger.info("Running test...")
         env = os.environ.copy()
         env["PYTHONPATH"] = ""  # Clear PYTHONPATH to avoid local repo interference
         result = subprocess.run([
             str(venv_python), str(test_dest)
         ], capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300)
+=======
+        logger.info(f"Running test: {test_dest}")
+        logger.info(f"Using venv python: {venv_python}")
+        logger.info(f"Working directory: {work_dir}")
+        logger.info(f"Test script exists: {test_dest.exists()}")
+        
+        # Log test script info
+        if test_dest.exists():
+            try:
+                test_size = test_dest.stat().st_size
+                logger.info(f"Test script size: {test_size} bytes")
+            except Exception as e:
+                logger.warning(f"Could not get test script info: {e}")
+        
+        env = os.environ.copy()
+        env["PYTHONPATH"] = ""  # Clear PYTHONPATH to avoid local repo interference
+        
+        # Log environment info
+        logger.info(f"CUDA_VISIBLE_DEVICES: {env.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+        logger.info(f"PYTHONPATH cleared: {env.get('PYTHONPATH', 'not set')}")
+        
+        cmd = [str(venv_python), str(test_dest)]
+        logger.info(f"Executing command: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300)
+
+        # Enhanced logging and error reporting
+        logger.info(f"Test process completed with return code: {result.returncode}")
+        
+        # Always log stdout if available (even for successful runs)
+        if result.stdout:
+            logger.info(f"Test stdout ({len(result.stdout)} chars): {result.stdout[:1000]}{'...' if len(result.stdout) > 1000 else ''}")
+        
+        # Always log stderr if available
+        if result.stderr:
+            logger.warning(f"Test stderr ({len(result.stderr)} chars): {result.stderr[:2000]}{'...' if len(result.stderr) > 2000 else ''}")
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 
         # Parse timing from output
         timing = parse_execution_time(result.stdout)
@@ -910,19 +1190,76 @@ def run_tests_with_commit_hopping(
             logger.info(f"Test completed successfully: {timing:.6f}s")
             return [timing * 1000]  # Convert to milliseconds
 
-        # Check for errors
+        # Check for errors with detailed reporting
         if result.returncode != 0:
-            logger.error(f"Test execution failed: {result.stderr}")
+            error_msg = f"Test execution failed with return code {result.returncode}"
+            
+            # Extract more useful error information
+            if result.stderr:
+                # Look for Python tracebacks
+                stderr_lines = result.stderr.splitlines()
+                traceback_lines = []
+                capturing_traceback = False
+                for line in stderr_lines:
+                    if line.startswith("Traceback") or capturing_traceback:
+                        traceback_lines.append(line)
+                        capturing_traceback = True
+                        if line.strip() and not line.startswith((" ", "\t", "Traceback")):
+                            break
+                
+                if traceback_lines:
+                    error_msg += f"\nPython traceback:\n" + "\n".join(traceback_lines[-10:])  # Last 10 lines
+                else:
+                    error_msg += f"\nStderr: {result.stderr}"
+            
+            if result.stdout:
+                # Look for error patterns in stdout too
+                stdout_lines = result.stdout.splitlines()
+                error_patterns = ["Error", "Exception", "Traceback", "FAILED", "CRITICAL"]
+                error_lines = [line for line in stdout_lines[-20:] if any(pattern in line for pattern in error_patterns)]
+                if error_lines:
+                    error_msg += f"\nError lines from stdout:\n" + "\n".join(error_lines)
+            
+            # Log test command and environment for debugging
+            logger.error(f"Test command: {' '.join([str(venv_python), str(test_dest)])}")
+            logger.error(f"Working directory: {work_dir}")
+            logger.error(f"Test script path: {test_dest}")
+            
+            # Check if test file exists and is readable
+            if test_dest.exists():
+                try:
+                    test_content = test_dest.read_text()
+                    logger.info(f"Test script size: {len(test_content)} characters")
+                    # Show first few lines of test script for context
+                    first_lines = test_content.splitlines()[:10]
+                    logger.info(f"Test script preview:\n" + "\n".join(first_lines))
+                except Exception as e:
+                    logger.error(f"Could not read test script: {e}")
+            else:
+                logger.error(f"Test script file does not exist: {test_dest}")
+            
+            logger.error(error_msg)
             return [float('inf')]
 
-        logger.warning("Could not parse execution time from test output")
+        logger.warning(f"Could not parse execution time from test output. Stdout: {result.stdout[:500] if result.stdout else 'None'}")
         return [float('inf')]
 
-    except subprocess.TimeoutExpired:
-        logger.error("Test execution timed out")
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Test execution timed out after {e.timeout}s")
+        logger.error(f"Test command: {' '.join([str(venv_python), str(test_dest)])}")
+        logger.error(f"Working directory: {work_dir}")
+        # Try to capture any partial output
+        if hasattr(e, 'stdout') and e.stdout:
+            logger.error(f"Partial stdout before timeout: {e.stdout[:1000]}")
+        if hasattr(e, 'stderr') and e.stderr:
+            logger.error(f"Partial stderr before timeout: {e.stderr[:1000]}")
         return [300000.0]  # 5 minutes in milliseconds
     except Exception as e:
-        logger.error(f"Error during commit-hopping test execution: {e}")
+        logger.error(f"Unexpected error during commit-hopping test execution: {e}")
+        logger.error(f"Test command: {' '.join([str(venv_python), str(test_dest)])}")
+        logger.error(f"Working directory: {work_dir}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         return [float('inf')]
     finally:
         # Always restore original commit
@@ -1082,10 +1419,106 @@ def _parse_times(stdout: str) -> List[float]:
     return [float(m.group(1)) for m in pattern.finditer(stdout or "")]
 
 
+def detect_test_failure(timing_results: List[float]) -> bool:
+    """Check if test execution failed based on timing results.
+
+    Returns True if any timing result indicates failure (inf or negative values).
+    """
+    if not timing_results:
+        return True  # Empty results indicate failure
+
+    for result in timing_results:
+        if result == float('inf') or result < 0:
+            return True
+
+    return False
+
+
+def check_test_indicators_in_json(json_path: Path) -> bool:
+    """Check if the extraction JSON indicates presence of tests.
+
+    Returns True if 'is_test_actually_there' contains 'test' (case-insensitive).
+    """
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+
+        csv_metadata = data.get("csv_metadata", {})
+        is_test_actually_there = csv_metadata.get("is_test_actually_there", "")
+
+        if isinstance(is_test_actually_there, str):
+            return "test" in is_test_actually_there.lower()
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to check test indicators in {json_path}: {e}")
+        return False
+
+
+def search_existing_test_files(repo_path: Path, json_path: Path) -> Optional[Path]:
+    """Search for existing test files in the repository based on JSON clues.
+
+    Returns the path to a suitable test file if found, None otherwise.
+    """
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+
+        csv_metadata = data.get("csv_metadata", {})
+        sample_clues = csv_metadata.get("sample_clues", "")
+
+        # Extract potential test file names from clues
+        clues = [clue.strip() for clue in sample_clues.split(",") if clue.strip()]
+
+        # Common test file patterns to search for
+        test_patterns = [
+            "test_*.py",
+            "*_test.py",
+            "tests/**/*.py",
+            "**/test_*.py",
+            "**/*_test.py"
+        ]
+
+        # Search for test files matching the clues
+        for clue in clues:
+            logger.info(f"Searching for test files related to clue: {clue}")
+
+            # Look for files containing the clue in their name
+            for pattern in test_patterns:
+                # Use glob to find matching files
+                try:
+                    matching_files = list(repo_path.glob(f"**/{pattern}"))
+                    for test_file in matching_files:
+                        # Check if the clue appears in the filename
+                        if clue.lower() in test_file.name.lower():
+                            logger.info(f"Found potential test file: {test_file}")
+                            return test_file
+                except Exception as e:
+                    logger.debug(f"Error searching pattern {pattern}: {e}")
+                    continue
+
+            # Also search for files with clue in the path
+            try:
+                all_test_files = list(repo_path.glob("**/test*.py")) + list(repo_path.glob("**/tests/**/*.py"))
+                for test_file in all_test_files:
+                    if clue.lower() in str(test_file).lower():
+                        logger.info(f"Found potential test file via path match: {test_file}")
+                        return test_file
+            except Exception as e:
+                logger.debug(f"Error searching for clue in paths: {e}")
+
+        logger.info("No existing test files found matching the clues")
+        return None
+
+    except Exception as e:
+        logger.warning(f"Failed to search for existing test files: {e}")
+        return None
+
+
 def find_or_generate_test_script(
     commit_hash: str,
     extractions_dir: Path,
     out_dir: Path,
+    repo_path: Optional[str] = None,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
     llm_temperature: Optional[float] = None,
@@ -1153,6 +1586,17 @@ def find_or_generate_test_script(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory created/verified: {out_dir}")
+
+    # 2.5) Check if existing tests are available in the repository
+    logger.info("Checking for existing test files in repository")
+    if repo_path and check_test_indicators_in_json(json_path):
+        logger.info("JSON indicates presence of tests, searching for existing test files")
+        existing_test = search_existing_test_files(Path(repo_path), json_path)
+        if existing_test:
+            logger.info(f"Found existing test file: {existing_test}")
+            return existing_test, json_path
+
+    logger.info("No existing test files found or JSON doesn't indicate tests, proceeding with LLM generation")
 
     # Require API credentials for generation
     logger.info("Checking LLM API credentials")
@@ -1252,6 +1696,10 @@ class CanonicalRecord:
     notes: Optional[str] = None
     api_manifest_paths: Optional[Dict[str, str]] = None
     api_manifest_summaries: Optional[Dict[str, Any]] = None
+<<<<<<< HEAD
+=======
+    test_failed: str = "No"  # Track if tests failed during execution
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 
 
 def build_instance_id(repo_owner: str, repo_name: str, repo_path: Path, head_commit: str) -> str:
@@ -1365,6 +1813,7 @@ def assemble_canonical(
         head_commit,
         extr_dir,
         gen_out_dir,
+        repo_path=repo_path_arg,
         llm_provider=llm_provider,
         llm_model=llm_model,
         llm_temperature=llm_temperature_val,
@@ -1468,6 +1917,15 @@ def assemble_canonical(
 
     instance_id = build_instance_id(repo_owner, repo_name, repo_path, head_commit)
 
+    # Check if any tests failed
+    test_failed = "No"
+    if (detect_test_failure(base_times_arr) or
+        detect_test_failure(head_times_arr) or
+        detect_test_failure(main_times_arr)):
+        test_failed = "Yes"
+        logger.warning(f"Test execution failed for commit {head_commit}")
+
+    logger.info(f"Test failure status: {test_failed}")
     logger.info("Creating CanonicalRecord")
     logger.info(f"efficiency_test field will be set with list containing 1 item of {len(test_code_text)} characters")
 
@@ -1501,6 +1959,10 @@ def assemble_canonical(
         # notes=notes,
         api_manifest_paths=api_manifest_paths or None,
         api_manifest_summaries=api_manifest_summaries or None,
+<<<<<<< HEAD
+=======
+        test_failed=test_failed,
+>>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
     )
 
     # Verify the record was created correctly
@@ -1531,12 +1993,36 @@ def save_and_push(records: List[CanonicalRecord], out_dir: Path, dataset_file_na
     jsonl_path = out_dir / f"{safe_file}.jsonl"
     logger.info(f"Output JSONL path: {jsonl_path}")
 
-    with open(jsonl_path, "w") as f:
+    # Load existing records to avoid duplicates
+    existing_records = set()
+    if jsonl_path.exists():
+        logger.info(f"Loading existing records from {jsonl_path}")
+        try:
+            with open(jsonl_path, "r") as f:
+                for line in f:
+                    if line.strip():
+                        record = json.loads(line.strip())
+                        # Use (repo, head_commit) as unique identifier
+                        key = (record.get("repo", ""), record.get("head_commit", ""))
+                        existing_records.add(key)
+            logger.info(f"Loaded {len(existing_records)} existing records")
+        except Exception as e:
+            logger.warning(f"Failed to load existing records: {e}")
+
+    with open(jsonl_path, "a") as f:
+        appended_count = 0
         for i, r in enumerate(records):
             logger.info(f"Processing record {i+1}/{len(records)}")
             logger.info(f"Record efficiency_test field has {len(r.efficiency_test) if r.efficiency_test else 0} items")
 
             record_dict = asdict(r)
+
+            # Check for duplicates
+            record_key = (record_dict.get("repo", ""), record_dict.get("head_commit", ""))
+            if record_key in existing_records:
+                logger.info(f"Skipping duplicate record: {record_key}")
+                continue
+
             logger.info(f"Serialized record has efficiency_test with {len(record_dict.get('efficiency_test', []))} items")
 
             # Check if efficiency_test is being serialized properly
@@ -1550,9 +2036,12 @@ def save_and_push(records: List[CanonicalRecord], out_dir: Path, dataset_file_na
                 logger.error("efficiency_test key missing from serialized record!")
 
             f.write(json.dumps(record_dict) + "\n")
+            appended_count += 1
 
-    logger.info(f"Wrote {jsonl_path}")
-    print(f"Wrote {jsonl_path}")
+        logger.info(f"Appended {appended_count} new records to {jsonl_path}")
+
+    logger.info(f"Updated {jsonl_path}")
+    print(f"Updated {jsonl_path}")
 
     try:
         from datasets import Dataset, load_dataset, concatenate_datasets  # type: ignore
