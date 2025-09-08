@@ -114,6 +114,75 @@ def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDERR:\n{result.stderr}")
     return result.stdout
+
+def _run_commands_in_venv(commands: Optional[List[str]], cwd: Path, venv_path: Path, base_env: Optional[Dict[str, str]] = None) -> None:
+    """Run a list of shell commands with the venv bin on PATH so pip/python resolve to the venv.
+
+    - Each command is executed in its own bash -lc invocation with set -euo pipefail semantics.
+    - Raises RuntimeError on first failure.
+    """
+    if not commands:
+        return
+    venv_bin = venv_path / "bin"
+    env = dict(base_env or os.environ)
+    # Prepend venv bin so 'python' and 'pip' resolve to the venv without activation
+    env["PATH"] = f"{venv_bin}:{env.get('PATH','')}"
+    env["VIRTUAL_ENV"] = str(venv_path)
+    env.setdefault("PYTHONNOUSERSITE", "1")
+
+    venv_python = venv_bin / "python"
+    for cmd in commands:
+        if not isinstance(cmd, str) or not cmd.strip():
+            continue
+        # If the command uses 'uv pip' without specifying --python, force it to use the venv's interpreter
+        if "uv pip" in cmd and "--python" not in cmd:
+            cmd = f"{cmd} --python {venv_python}"
+        full_cmd = f"set -euo pipefail; {cmd}"
+        r = subprocess.run(full_cmd, cwd=str(cwd), env=env, shell=True, executable="/bin/bash", capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"Install/setup command failed: {cmd}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
+
+def _normalize_install_commands(raw: Optional[Any]) -> Optional[List[str]]:
+    """Normalize YAML install_commands into concrete commands.
+
+    Examples:
+    - "pytest" -> ["uv pip install pytest"]
+    - ["pytest", "-r requirements.txt"] -> ["uv pip install pytest", "uv pip install -r requirements.txt"]
+    - "uv pip install -e ." -> ["uv pip install -e ."]
+    - ["uv pip install -e .", "pytest"] -> ["uv pip install -e .", "uv pip install pytest"]
+    """
+    if raw is None:
+        return None
+    items: List[str]
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = [str(x) for x in raw]
+    else:
+        return None
+
+    normalized: List[str] = []
+    for item in items:
+        s = (item or "").strip()
+        if not s:
+            continue
+        # If already a command (starts with uv/pip/python/bash/sh/echo/apt/sudo/conda/mamba), keep
+        lower = s.lower()
+        is_command = lower.startswith((
+            "uv ", "pip ", "python", "bash", "sh ", "echo ", "apt ", "apt-get ", "sudo ", "conda ", "mamba ",
+        ))
+        if is_command:
+            # If it's a bare 'uv pip install' missing target (unlikely), skip; otherwise keep
+            normalized.append(s)
+            continue
+        # Treat as package spec (possibly includes version pins like pkg==x)
+        # Also allow shorthand '-r requirements.txt' to be interpreted as file install
+        if s.startswith("-r ") or s.startswith("--requirement "):
+            normalized.append(f"uv pip install {s}")
+        else:
+            normalized.append(f"uv pip install {s}")
+
+    return normalized or None
 _API_MANIFESTS: Dict[str, Dict[str, Any]] = {}
 
 def _read_text_safe(path: Path) -> str:
@@ -188,12 +257,6 @@ def _select_import_name_via_venv(venv_python: Path, repo_path: Path, prefer: Opt
     return None
 
 def _write_api_dump_script(script_path: Path) -> None:
-<<<<<<< HEAD
-    """Write a small script that imports a package and emits a JSON manifest of public symbols."""
-    script = """
-import importlib, inspect, json, pkgutil, sys, types, traceback
-
-=======
     """Write a small script that imports a package and emits a JSON manifest of public symbols with signatures."""
     script = """
 import importlib, inspect, json, pkgutil, sys, types, traceback
@@ -226,7 +289,6 @@ def extract_parameter_info(obj):
     except Exception as e:
         return {'error': str(e)}
 
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict:
     manifest = {"package": import_name, "symbols": []}
     summary = {"modules_scanned": 0, "symbols_collected": 0, "errors": []}
@@ -273,29 +335,20 @@ def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict
                 continue
             kind = None
             sig = None
-<<<<<<< HEAD
-=======
             param_info = None
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
             try:
                 if inspect.isclass(obj):
                     kind = "class"
                     try:
                         sig = str(inspect.signature(obj))
-<<<<<<< HEAD
-=======
                         param_info = extract_parameter_info(obj)
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 elif inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isbuiltin(obj):
                     kind = "function"
                     try:
                         sig = str(inspect.signature(obj))
-<<<<<<< HEAD
-=======
                         param_info = extract_parameter_info(obj)
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 elif inspect.ismodule(obj):
@@ -304,30 +357,20 @@ def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict
                     kind = "callable"
                     try:
                         sig = str(inspect.signature(obj))
-<<<<<<< HEAD
-=======
                         param_info = extract_parameter_info(obj)
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                     except Exception:
                         sig = None
                 else:
                     kind = "attribute"
             except Exception:
                 kind = "unknown"
-<<<<<<< HEAD
-            manifest["symbols"].append({
-=======
             
             symbol_entry = {
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
                 "module": mod_name,
                 "name": n,
                 "qualname": f"{mod_name}.{n}",
                 "kind": kind,
                 "signature": sig,
-<<<<<<< HEAD
-            })
-=======
             }
             
             # Add detailed parameter info for callable objects
@@ -335,7 +378,6 @@ def collect_manifest(import_name: str, max_modules: int, walk_all: bool) -> dict
                 symbol_entry["param_info"] = param_info
                 
             manifest["symbols"].append(symbol_entry)
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
             summary["symbols_collected"] += 1
 
     return {"manifest": manifest, "summary": summary}
@@ -506,8 +548,6 @@ def _insert_additional_imports(code: str, new_import_lines: List[str]) -> str:
                 break
     return "\n".join(lines[:insert_idx] + new_import_lines + lines[insert_idx:])
 
-<<<<<<< HEAD
-=======
 def _load_param_info_from_manifest(manifest_path: Path) -> Dict[str, Dict[str, Any]]:
     """Load parameter information for key classes from the manifest."""
     try:
@@ -660,7 +700,6 @@ def rewrite_test_script_with_api_probing(test_script: Path, manifest_path: Path)
     
     return summary
 
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 def rewrite_test_script_against_manifest(test_script: Path, manifest_path: Path) -> Dict[str, Any]:
     summary: Dict[str, Any] = {"rewrites": [], "added_imports": []}
     s = _load_manifest_sets(manifest_path)
@@ -798,10 +837,7 @@ def rewrite_test_script_against_manifest(test_script: Path, manifest_path: Path)
     except Exception as e:
         logger.warning(f"Failed to write rewritten test to {test_script}: {e}")
     return summary
-<<<<<<< HEAD
-=======
-
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
+    
 def _extract_hf_repo_id(hf_repo: Optional[str], default_repo_name: str = "omni_commit_dataset") -> Optional[str]:
     """Normalize various HF repo formats to a repo id suitable for push_to_hub.
 
@@ -919,11 +955,19 @@ def run_tests_locally(repo_path: Path, commit_hash: str, test_entry: Path) -> Li
             end = _time.time()
             execution_time = (end - start) * 1000  # Convert to milliseconds
 
+        # Always echo full outputs for visibility
+        if result.stdout:
+            print("\n===== Test STDOUT =====\n")
+            print(result.stdout)
+            print("\n===== End STDOUT =====\n")
+        if result.stderr:
+            print("\n===== Test STDERR =====\n")
+            print(result.stderr)
+            print("\n===== End STDERR =====\n")
+
         # Check for script errors and print output for debugging
         if result.returncode != 0:
             print(f"Script exited with code {result.returncode}")
-            print(f"STDOUT: {result.stdout}")
-            print(f"STDERR: {result.stderr}")
             return [float('inf')]
 
         return [execution_time]
@@ -1007,7 +1051,9 @@ def run_tests_with_commit_hopping(
     commit_hash: str,
     repo_path: Path,
     work_dir: Path,
-    api_rewrite: bool = False
+    api_rewrite: bool = False,
+    setup_commands: Optional[List[str]] = None,
+    install_commands: Optional[List[str]] = None,
 ) -> List[float]:
     """Run test using simple commit-hopping approach with uv.
 
@@ -1096,6 +1142,14 @@ def run_tests_with_commit_hopping(
             logger.info(f"Successfully installed vLLM wheel for commit {commit_hash}")
             wheel_ok = True
 
+        # Run optional setup and install commands provided via config, inside the venv
+        try:
+            _run_commands_in_venv(setup_commands, cwd=repo_path, venv_path=venv_path)
+            _run_commands_in_venv(install_commands, cwd=repo_path, venv_path=venv_path)
+        except Exception as e:
+            logger.error(f"Failed running setup/install commands in venv: {e}")
+            return [float('inf')]
+
         # Snapshot public API after installation
         prefer_name = "vllm" if wheel_ok else None
         api_snapshot = snapshot_public_api(venv_python=venv_python, repo_path=repo_path, commit_hash=commit_hash, prefer_import_name=prefer_name, work_dir=work_dir)
@@ -1106,16 +1160,6 @@ def run_tests_with_commit_hopping(
         else:
             logger.warning(f"API manifest not generated for {commit_hash}")
 
-<<<<<<< HEAD
-        # Optionally rewrite the generated test code to align with available API
-        if api_rewrite and api_snapshot is not None:
-            try:
-                manifest_path = Path(_API_MANIFESTS[commit_hash]["path"])  # type: ignore[index]
-                rewrite_summary = rewrite_test_script_against_manifest(test_script, manifest_path)
-                logger.info(f"API rewrite summary: {rewrite_summary}")
-            except Exception as e:
-                logger.warning(f"Failed to rewrite test script against manifest: {e}")
-=======
         # Always rewrite the generated test code with API probing when manifest is available
         if api_snapshot is not None:
             try:
@@ -1131,7 +1175,6 @@ def run_tests_with_commit_hopping(
                         logger.info(f"Fallback API rewrite summary: {rewrite_summary}")
                     except Exception as e2:
                         logger.warning(f"Fallback rewrite also failed: {e2}")
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 
         # Copy test script to work_dir (NOT repo) to avoid import conflicts
         test_dest = work_dir / f"test_{commit_hash[:8]}.py"
@@ -1139,14 +1182,6 @@ def run_tests_with_commit_hopping(
         shutil.copy2(test_script, test_dest)
 
         # Run the test from work_dir to avoid local vLLM source interference
-<<<<<<< HEAD
-        logger.info("Running test...")
-        env = os.environ.copy()
-        env["PYTHONPATH"] = ""  # Clear PYTHONPATH to avoid local repo interference
-        result = subprocess.run([
-            str(venv_python), str(test_dest)
-        ], capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300)
-=======
         logger.info(f"Running test: {test_dest}")
         logger.info(f"Using venv python: {venv_python}")
         logger.info(f"Working directory: {work_dir}")
@@ -1172,17 +1207,17 @@ def run_tests_with_commit_hopping(
         
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300)
 
-        # Enhanced logging and error reporting
+        # Enhanced logging and error reporting + echo full outputs for visibility
         logger.info(f"Test process completed with return code: {result.returncode}")
-        
-        # Always log stdout if available (even for successful runs)
+
         if result.stdout:
-            logger.info(f"Test stdout ({len(result.stdout)} chars): {result.stdout[:1000]}{'...' if len(result.stdout) > 1000 else ''}")
-        
-        # Always log stderr if available
+            print("\n===== Test STDOUT =====\n")
+            print(result.stdout)
+            print("\n===== End STDOUT =====\n")
         if result.stderr:
-            logger.warning(f"Test stderr ({len(result.stderr)} chars): {result.stderr[:2000]}{'...' if len(result.stderr) > 2000 else ''}")
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
+            print("\n===== Test STDERR =====\n")
+            print(result.stderr)
+            print("\n===== End STDERR =====\n")
 
         # Parse timing from output
         timing = parse_execution_time(result.stdout)
@@ -1391,11 +1426,19 @@ def run_tests_in_docker(repo_path: Path, commit_hash: str, test_entry: Path, doc
             end = _time.time()
             execution_time = (end - start) * 1000  # Convert to milliseconds
 
+        # Always echo full outputs for visibility
+        if result.stdout:
+            print("\n===== Test STDOUT (docker) =====\n")
+            print(result.stdout)
+            print("\n===== End STDOUT (docker) =====\n")
+        if result.stderr:
+            print("\n===== Test STDERR (docker) =====\n")
+            print(result.stderr)
+            print("\n===== End STDERR (docker) =====\n")
+
         # Check for script errors and print output for debugging
         if result.returncode != 0:
             print(f"Docker script exited with code {result.returncode}")
-            print(f"STDOUT: {result.stdout}")
-            print(f"STDERR: {result.stderr}")
             return [float('inf')]
 
         return [execution_time]
@@ -1696,10 +1739,7 @@ class CanonicalRecord:
     notes: Optional[str] = None
     api_manifest_paths: Optional[Dict[str, str]] = None
     api_manifest_summaries: Optional[Dict[str, Any]] = None
-<<<<<<< HEAD
-=======
     test_failed: str = "No"  # Track if tests failed during execution
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
 
 
 def build_instance_id(repo_owner: str, repo_name: str, repo_path: Path, head_commit: str) -> str:
@@ -1876,7 +1916,9 @@ def assemble_canonical(
         commit_hash=base_commit,
         repo_path=repo_path,
         work_dir=work_dir,
-        api_rewrite=False
+        api_rewrite=False,
+        setup_commands=setup_commands,
+        install_commands=install_commands,
     )
 
     # Test head commit
@@ -1886,7 +1928,9 @@ def assemble_canonical(
         commit_hash=head_commit,
         repo_path=repo_path,
         work_dir=work_dir,
-        api_rewrite=True
+        api_rewrite=True,
+        setup_commands=setup_commands,
+        install_commands=install_commands,
     )
 
     # Test main branch
@@ -1897,7 +1941,9 @@ def assemble_canonical(
         commit_hash=main_head,
         repo_path=repo_path,
         work_dir=work_dir,
-        api_rewrite=False
+        api_rewrite=False,
+        setup_commands=setup_commands,
+        install_commands=install_commands,
     )
 
     duration_changes: List[Dict[str, List[float]]] = []
@@ -1959,10 +2005,7 @@ def assemble_canonical(
         # notes=notes,
         api_manifest_paths=api_manifest_paths or None,
         api_manifest_summaries=api_manifest_summaries or None,
-<<<<<<< HEAD
-=======
         test_failed=test_failed,
->>>>>>> a878864 (Major: Added entry script for test generation (API probing, heirarchical search), along with the updated prompts to use with Opus.)
     )
 
     # Verify the record was created correctly
@@ -2210,7 +2253,7 @@ def main() -> None:
     hf_repo = config.get("hf_repo")
     push_to_hf = bool(config.get("push_to_hf", False))
     setup_commands = config.get("setup_commands")
-    install_commands = config.get("install_commands")
+    install_commands = _normalize_install_commands(config.get("install_commands"))
     api = config.get("api")
     notes = config.get("notes")
 
