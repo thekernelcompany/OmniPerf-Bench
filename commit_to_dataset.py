@@ -18,6 +18,12 @@ Usage example (YAML config):
   docker_image: ayushnangia16/nvidia-vllm-docker:latest
   hf_repo: yourname/omni-commit-dataset  # optional
   push_to_hf: false
+  # LLM configuration (optional)
+  llm_provider: bedrock          # openai, anthropic, openrouter, bedrock
+  llm_model: claude-4.1-opus     # specific model override
+  llm_enable_thinking: true      # enable extended thinking (default: true for bedrock)
+  llm_thinking_budget: 16000     # thinking token budget (default: 10000)
+  # Note: temperature automatically set to 1.0 when thinking is enabled
 
 Run:
   PYTHONPATH=src python src/collect/commit_to_dataset.py commit_to_dataset.yaml
@@ -219,8 +225,14 @@ def _guess_project_name_from_pyproject(repo_path: Path) -> Optional[str]:
 def _candidate_import_names(repo_path: Path) -> List[str]:
     """Generate candidate top-level import names for the installed project."""
     candidates: List[str] = []
+    # Prefer env-provided package/import name when available
+    pkg_from_env = os.getenv("OMNIPERF_PREFER_IMPORT_NAME") or os.getenv("OMNIPERF_PACKAGE_NAME")
+    if pkg_from_env:
+        candidates.append(pkg_from_env)
     # Common case for this repo's target
     candidates.append("vllm")
+    # Also consider sglang when profiling that repo
+    candidates.append("sglang")
     project_name = _guess_project_name_from_pyproject(repo_path)
     if project_name:
         candidates.append(project_name)
@@ -1046,6 +1058,273 @@ def detect_capabilities() -> Dict[str, Any]:
     return capabilities
 
 
+def get_script_cache_dir(work_dir: Path) -> Path:
+    """Get the directory for caching successful test scripts."""
+    cache_dir = work_dir / "script_cache" / "successful"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_permanent_scripts_dir() -> Path:
+    """Get the permanent directory for storing successful test scripts in the repo."""
+    repo_dir = Path.cwd()  # Assuming we're running from repo root
+    permanent_dir = repo_dir / "misc" / "experiments" / "successful_scripts"
+    permanent_dir.mkdir(parents=True, exist_ok=True)
+    return permanent_dir
+
+
+def save_script_permanently(script_path: Path, commit_hash: str, api_fingerprint: str) -> Path:
+    """Save a successful script permanently in the repo for future reference."""
+    permanent_dir = get_permanent_scripts_dir()
+    script_filename = f"{commit_hash[:8]}_{api_fingerprint.replace('/', '_').replace('.', '_')}.py"
+    permanent_script = permanent_dir / script_filename
+
+    try:
+        # Copy the script to permanent location
+        import shutil
+        shutil.copy2(script_path, permanent_script)
+
+        # Save comprehensive metadata
+        metadata = {
+            "commit_hash": commit_hash,
+            "api_fingerprint": api_fingerprint,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "script_size": script_path.stat().st_size,
+            "source_script": str(script_path),
+            "permanent_location": str(permanent_script),
+            "purpose": "Successful test script for performance benchmarking"
+        }
+
+        metadata_file = permanent_script.with_suffix('.json')
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"✅ Saved successful script permanently: {permanent_script}")
+        return permanent_script
+    except Exception as e:
+        logger.warning(f"Failed to save script permanently: {e}")
+        return script_path
+
+
+def save_script_to_cache(script_path: Path, commit_hash: str, api_fingerprint: str, work_dir: Path) -> Path:
+    """Save a successful script to cache for future reuse."""
+    cache_dir = get_script_cache_dir(work_dir)
+    cache_filename = f"{commit_hash[:8]}_{api_fingerprint.replace('/', '_').replace('.', '_')}.py"
+    cached_script = cache_dir / cache_filename
+
+    try:
+        # Copy the script to cache
+        import shutil
+        shutil.copy2(script_path, cached_script)
+
+        # Save metadata
+        metadata = {
+            "original_commit": commit_hash,
+            "api_fingerprint": api_fingerprint,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "script_size": script_path.stat().st_size
+        }
+
+        metadata_file = cached_script.with_suffix('.json')
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"Cached successful script: {cached_script}")
+
+        # Also save permanently in repo
+        permanent_script = save_script_permanently(script_path, commit_hash, api_fingerprint)
+
+        return cached_script
+    except Exception as e:
+        logger.warning(f"Failed to cache script: {e}")
+        return script_path
+
+
+def find_cached_script(commit_hash: str, work_dir: Path) -> Optional[Path]:
+    """Find a cached script that might work for this commit."""
+    cache_dir = get_script_cache_dir(work_dir)
+    if not cache_dir.exists():
+        return None
+
+    # Look for cached scripts
+    for cache_file in cache_dir.glob("*.py"):
+        try:
+            metadata_file = cache_file.with_suffix('.json')
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+
+                # For now, return the most recently cached script
+                # TODO: Implement smarter matching based on API fingerprint
+                return cache_file
+        except Exception as e:
+            logger.debug(f"Error reading cache metadata {metadata_file}: {e}")
+            continue
+
+    return None
+
+
+def should_attempt_regeneration(stderr: str, returncode: int, pass_count: int, max_passes: int = 3) -> bool:
+    """Determine if a failed test execution should trigger LLM regeneration.
+
+    Returns False for:
+    - Max passes reached
+    - Hardware/environment errors (CUDA not available, etc.)
+    - Permission errors
+    - Network errors
+    - Timeout errors
+
+    Returns True for:
+    - Import errors
+    - API compatibility errors
+    - Attribute/method errors
+    - Module not found errors
+    """
+    if pass_count >= max_passes:
+        logger.info(f"Max regeneration passes ({max_passes}) reached, not attempting repair")
+        return False
+
+    if not stderr or not stderr.strip():
+        return False
+
+    # Error patterns that indicate fixable issues (should attempt regeneration)
+    fixable_patterns = [
+        r"ImportError:",
+        r"ModuleNotFoundError:",
+        r"AttributeError:",
+        r"No module named",
+        r"has no attribute",
+        r"name .* is not defined",
+        r"'NoneType' object has no attribute",
+        r"TypeError:",
+        r"ValueError:",
+        r"AssertionError:",
+        r"Failed to parse:",
+        # API compatibility errors
+        r"unexpected keyword argument",
+        r"missing.*required.*argument",
+        r"'dict' object has no attribute",
+        r"object has no attribute",
+    ]
+
+    # Error patterns that indicate unfixable issues (should NOT attempt regeneration)
+    unfixable_patterns = [
+        r"CUDA.*not available",
+        r"cuDNN.*not available",
+        r"No CUDA.*devices",
+        r"GPU.*not available",
+        r"Permission denied",
+        r"Connection refused",
+        r"Network is unreachable",
+        r"timeout",
+        r"Timeout",
+        r"Out of memory",
+        r"MemoryError",
+        r"Disk quota exceeded",
+        r"FileNotFoundError.*python",  # Missing Python interpreter
+    ]
+
+    stderr_lower = stderr.lower()
+
+    # Check for unfixable errors first
+    for pattern in unfixable_patterns:
+        if re.search(pattern, stderr, re.IGNORECASE):
+            logger.info(f"Unfixable error pattern detected: {pattern}")
+            return False
+
+    # Check for fixable errors
+    for pattern in fixable_patterns:
+        if re.search(pattern, stderr, re.IGNORECASE):
+            logger.info(f"Fixable error pattern detected: {pattern}")
+            return True
+
+    # Default: if we can't classify the error, don't attempt regeneration
+    logger.info("Error pattern not recognized, not attempting regeneration")
+    return False
+
+
+def build_runtime_repair_prompt(original_code: str, stderr: str, commit_hash: str, pass_count: int) -> str:
+    """Build a repair prompt for runtime errors in test scripts."""
+    return f"""You previously generated a Python test script that failed during execution.
+
+EXECUTION ERROR (Pass {pass_count + 1}):
+{stderr}
+
+ORIGINAL TEST SCRIPT:
+```python
+{original_code}
+```
+
+TASK: Fix the script to resolve the execution error. Common issues to address:
+
+1. **Import Errors**: Update import statements for API changes
+2. **Attribute Errors**: Use correct attribute names or methods
+3. **API Compatibility**: Update function calls to match current API
+4. **Type Errors**: Fix type mismatches or missing arguments
+5. **Missing Dependencies**: Add proper error handling for optional dependencies
+
+INSTRUCTIONS:
+- Fix ONLY the specific error mentioned above
+- Keep the core test logic and performance measurement intact
+- Use safe fallbacks for API compatibility issues
+- Add try/catch blocks if appropriate for optional functionality
+- Output ONLY the complete fixed Python script
+- Do NOT include markdown code fences
+
+Generate the corrected Python script:"""
+
+
+def attempt_llm_repair(
+    original_script_path: Path,
+    stderr: str,
+    llm_client,
+    commit_hash: str,
+    pass_count: int,
+    work_dir: Path
+) -> Optional[Path]:
+    """Attempt to repair a failed test script using LLM.
+
+    Returns the path to the repaired script, or None if repair failed.
+    """
+    try:
+        # Read the original script
+        original_code = original_script_path.read_text()
+        logger.info(f"Read original script for repair: {len(original_code)} characters")
+
+        # Build repair prompt
+        repair_prompt = build_runtime_repair_prompt(original_code, stderr, commit_hash, pass_count)
+
+        # Generate repair
+        logger.info(f"Generating repair for commit {commit_hash} (pass {pass_count + 1})")
+        repaired_code = llm_client.generate(repair_prompt)
+
+        if not repaired_code or not repaired_code.strip():
+            logger.warning("LLM repair returned empty response")
+            return None
+
+        # Clean the response
+        from test_scripts.generate_test_generators import clean_llm_code_response
+        cleaned_code = clean_llm_code_response(repaired_code)
+
+        # Validate syntax of repaired code
+        from test_scripts.generate_test_generators import validate_python_syntax
+        ok, syntax_error = validate_python_syntax(cleaned_code)
+        if not ok:
+            logger.warning(f"Repaired code has syntax error: {syntax_error}")
+            return None
+
+        # Save repaired script
+        repaired_path = work_dir / f"test_{commit_hash[:8]}_repaired_v{pass_count + 1}.py"
+        repaired_path.write_text(cleaned_code)
+        logger.info(f"Saved repaired script: {repaired_path}")
+
+        return repaired_path
+
+    except Exception as e:
+        logger.error(f"Failed to generate repair: {e}")
+        return None
+
+
 def run_tests_with_commit_hopping(
     test_script: Path,
     commit_hash: str,
@@ -1054,7 +1333,10 @@ def run_tests_with_commit_hopping(
     api_rewrite: bool = False,
     setup_commands: Optional[List[str]] = None,
     install_commands: Optional[List[str]] = None,
-) -> List[float]:
+    llm_client=None,
+    json_path: Optional[Path] = None,
+    max_repair_passes: int = 3,
+) -> Tuple[List[float], Optional[Path]]:
     """Run test using simple commit-hopping approach with uv.
 
     This is the winning approach: checkout commit, install with uv, run test.
@@ -1062,10 +1344,13 @@ def run_tests_with_commit_hopping(
     """
     logger.info(f"Running test with commit-hopping for {commit_hash}")
 
+    # Track the final successful script (original or repaired)
+    final_successful_script = test_script
+
     # Check hardware capabilities first
     if not check_capability_requirements(test_script):
         logger.warning(f"Hardware requirements not met for {test_script}")
-        return [float('inf')]
+        return [float('inf')], None
 
     # Determine Python version for this commit
     python_version = get_python_version_for_commit(commit_hash)
@@ -1093,54 +1378,71 @@ def run_tests_with_commit_hopping(
 
         if result.returncode != 0:
             logger.error(f"Failed to create venv: {result.stderr}")
-            return [float('inf')]
+            return [float('inf')], None
 
         # Install vLLM using pre-built wheels from vLLM wheel index
         venv_python = venv_path / "bin" / "python"
-        logger.info(f"Installing vLLM pre-built wheel for commit {commit_hash}...")
-        
-        # Use vLLM's wheel index for the specific commit
-        wheel_index_url = f"https://wheels.vllm.ai/{commit_hash}"
-        result = subprocess.run([
-            "uv", "pip", "install", "vllm", 
-            "--torch-backend=auto",
-            "--extra-index-url", wheel_index_url,
-            "--python", str(venv_python)
-        ], capture_output=True, text=True, cwd=str(work_dir))
-
-        if result.returncode != 0:
-            logger.warning(f"Failed to install vLLM wheel for commit {commit_hash}: {result.stderr}")
-            logger.info("Falling back to source installation...")
+        pkg_name_lower = (os.getenv("OMNIPERF_PACKAGE_NAME") or "").lower()
+        if pkg_name_lower == "sglang":
+            logger.info(f"Installing SGLang from source for commit {commit_hash}...")
             wheel_ok = False
-            
-            # Fallback: install from source if wheel not available
-            requirements_file = repo_path / "requirements.txt"
-            if requirements_file.exists():
-                logger.info("Installing requirements.txt with uv...")
-                result = subprocess.run([
-                    "uv", "pip", "install", "-r", "requirements.txt", "--python", str(venv_python)
-                ], capture_output=True, text=True, cwd=str(repo_path))
-                
-                if result.returncode != 0:
-                    logger.error(f"Failed to install requirements.txt: {result.stderr}")
-                    return [float('inf')]
-            
-            # Install build tools
+            # Try extras path first
             result = subprocess.run([
-                "uv", "pip", "install", "setuptools", "wheel", "build", "--python", str(venv_python)
-            ], capture_output=True, text=True, cwd=str(work_dir))
-            
-            # Install from source
-            result = subprocess.run([
-                "uv", "pip", "install", "-e", ".", "--python", str(venv_python)
+                "uv", "pip", "install", "-e", "python[all]", "--python", str(venv_python)
             ], capture_output=True, text=True, cwd=str(repo_path))
+            if result.returncode != 0:
+                logger.warning(f"Failed to install SGLang with extras: {result.stderr}")
+                logger.info("Falling back to editable install of repository root (-e .)...")
+                result = subprocess.run([
+                    "uv", "pip", "install", "-e", ".", "--python", str(venv_python)
+                ], capture_output=True, text=True, cwd=str(repo_path))
+                if result.returncode != 0:
+                    logger.error(f"Failed to install SGLang from source: {result.stderr}")
+                    return [float('inf')], None
+        else:
+            logger.info(f"Installing vLLM pre-built wheel for commit {commit_hash}...")
+            # Use vLLM's wheel index for the specific commit
+            wheel_index_url = f"https://wheels.vllm.ai/{commit_hash}"
+            result = subprocess.run([
+                "uv", "pip", "install", "vllm", 
+                "--torch-backend=auto",
+                "--extra-index-url", wheel_index_url,
+                "--python", str(venv_python)
+            ], capture_output=True, text=True, cwd=str(work_dir))
 
             if result.returncode != 0:
-                logger.error(f"Failed to install vLLM from source: {result.stderr}")
-                return [float('inf')]
-        else:
-            logger.info(f"Successfully installed vLLM wheel for commit {commit_hash}")
-            wheel_ok = True
+                logger.warning(f"Failed to install vLLM wheel for commit {commit_hash}: {result.stderr}")
+                logger.info("Falling back to source installation...")
+                wheel_ok = False
+                
+                # Fallback: install from source if wheel not available
+                requirements_file = repo_path / "requirements.txt"
+                if requirements_file.exists():
+                    logger.info("Installing requirements.txt with uv...")
+                    result = subprocess.run([
+                        "uv", "pip", "install", "-r", "requirements.txt", "--python", str(venv_python)
+                    ], capture_output=True, text=True, cwd=str(repo_path))
+                    
+                    if result.returncode != 0:
+                        logger.error(f"Failed to install requirements.txt: {result.stderr}")
+                        return [float('inf')], None
+                
+                # Install build tools
+                _ = subprocess.run([
+                    "uv", "pip", "install", "setuptools", "wheel", "build", "--python", str(venv_python)
+                ], capture_output=True, text=True, cwd=str(work_dir))
+                
+                # Install from source
+                result = subprocess.run([
+                    "uv", "pip", "install", "-e", ".", "--python", str(venv_python)
+                ], capture_output=True, text=True, cwd=str(repo_path))
+
+                if result.returncode != 0:
+                    logger.error(f"Failed to install vLLM from source: {result.stderr}")
+                    return [float('inf')], None
+            else:
+                logger.info(f"Successfully installed vLLM wheel for commit {commit_hash}")
+                wheel_ok = True
 
         # Run optional setup and install commands provided via config, inside the venv
         try:
@@ -1148,10 +1450,10 @@ def run_tests_with_commit_hopping(
             _run_commands_in_venv(install_commands, cwd=repo_path, venv_path=venv_path)
         except Exception as e:
             logger.error(f"Failed running setup/install commands in venv: {e}")
-            return [float('inf')]
+            return [float('inf')], None
 
         # Snapshot public API after installation
-        prefer_name = "vllm" if wheel_ok else None
+        prefer_name = os.getenv("OMNIPERF_PREFER_IMPORT_NAME") or ("vllm" if wheel_ok else None)
         api_snapshot = snapshot_public_api(venv_python=venv_python, repo_path=repo_path, commit_hash=commit_hash, prefer_import_name=prefer_name, work_dir=work_dir)
         if api_snapshot is not None:
             manifest_path, summary = api_snapshot
@@ -1164,17 +1466,15 @@ def run_tests_with_commit_hopping(
         if api_snapshot is not None:
             try:
                 manifest_path = Path(_API_MANIFESTS[commit_hash]["path"])  # type: ignore[index]
-                rewrite_summary = rewrite_test_script_with_api_probing(test_script, manifest_path)
-                logger.info(f"API rewrite with probing summary: {rewrite_summary}")
+                pkg = (os.getenv("OMNIPERF_PACKAGE_NAME") or "").lower()
+                if pkg == "vllm":
+                    rewrite_summary = rewrite_test_script_with_api_probing(test_script, manifest_path)
+                    logger.info(f"API rewrite with probing summary: {rewrite_summary}")
+                else:
+                    rewrite_summary = rewrite_test_script_against_manifest(test_script, manifest_path)
+                    logger.info(f"Generic API rewrite summary: {rewrite_summary}")
             except Exception as e:
-                logger.warning(f"Failed to rewrite test script with API probing: {e}")
-                # Fallback to standard rewriting if API probing fails
-                if api_rewrite:
-                    try:
-                        rewrite_summary = rewrite_test_script_against_manifest(test_script, manifest_path)
-                        logger.info(f"Fallback API rewrite summary: {rewrite_summary}")
-                    except Exception as e2:
-                        logger.warning(f"Fallback rewrite also failed: {e2}")
+                logger.warning(f"Failed to rewrite test script: {e}")
 
         # Copy test script to work_dir (NOT repo) to avoid import conflicts
         test_dest = work_dir / f"test_{commit_hash[:8]}.py"
@@ -1223,12 +1523,94 @@ def run_tests_with_commit_hopping(
         timing = parse_execution_time(result.stdout)
         if timing is not None:
             logger.info(f"Test completed successfully: {timing:.6f}s")
-            return [timing * 1000]  # Convert to milliseconds
+            return [timing * 1000], final_successful_script  # Convert to milliseconds
+
+        # K-PASS REGENERATION LOOP
+        current_script = test_script
+        regeneration_stats = {
+            "total_passes": 1,
+            "regeneration_attempts": 0,
+            "successful_repairs": 0,
+            "final_success": False
+        }
+
+        # Check if we should attempt regeneration
+        if (result.returncode != 0 and
+            llm_client is not None and
+            should_attempt_regeneration(result.stderr, result.returncode, regeneration_stats["regeneration_attempts"], max_repair_passes)):
+
+            logger.info(f"Attempting regeneration for commit {commit_hash} (pass 1 failed)")
+
+            repair_result = None
+            for pass_count in range(max_repair_passes):
+                regeneration_stats["regeneration_attempts"] += 1
+                logger.info(f"Regeneration attempt {pass_count + 1}/{max_repair_passes} for commit {commit_hash}")
+
+                # Attempt to repair the script using the latest stderr
+                current_stderr = result.stderr if (pass_count == 0 or repair_result is None) else repair_result.stderr
+                repaired_script = attempt_llm_repair(
+                    original_script_path=current_script,
+                    stderr=current_stderr,
+                    llm_client=llm_client,
+                    commit_hash=commit_hash,
+                    pass_count=pass_count,
+                    work_dir=work_dir
+                )
+
+                if repaired_script is None:
+                    logger.warning(f"Regeneration attempt {pass_count + 1} failed for commit {commit_hash}")
+                    continue
+
+                # Execute the repaired script
+                logger.info(f"Executing repaired script: {repaired_script}")
+                repair_result = subprocess.run(
+                    [str(venv_python), str(repaired_script)],
+                    capture_output=True, text=True, cwd=str(work_dir), env=env, timeout=300
+                )
+
+                # Log repair execution results
+                logger.info(f"Repaired script execution completed with return code: {repair_result.returncode}")
+                if repair_result.stdout:
+                    print(f"\n===== Repaired Test STDOUT (Pass {pass_count + 1}) =====\n")
+                    print(repair_result.stdout)
+                    print(f"\n===== End Repaired Test STDOUT (Pass {pass_count + 1}) =====\n")
+                if repair_result.stderr:
+                    print(f"\n===== Repaired Test STDERR (Pass {pass_count + 1}) =====\n")
+                    print(repair_result.stderr)
+                    print(f"\n===== End Repaired Test STDERR (Pass {pass_count + 1}) =====\n")
+
+                # Check if repair was successful
+                repair_timing = parse_execution_time(repair_result.stdout)
+                if repair_timing is not None and repair_result.returncode == 0:
+                    logger.info(f"Regeneration successful! Test completed: {repair_timing:.6f}s")
+                    regeneration_stats["successful_repairs"] += 1
+                    regeneration_stats["final_success"] = True
+                    regeneration_stats["total_passes"] = pass_count + 2  # +1 for original, +1 for current
+                    final_successful_script = repaired_script  # Update to use the repaired script
+                    logger.info(f"Regeneration stats: {regeneration_stats}")
+                    return [repair_timing * 1000], final_successful_script  # Convert to milliseconds
+
+                # If repair failed, check if we should try again
+                if not should_attempt_regeneration(repair_result.stderr, repair_result.returncode, regeneration_stats["regeneration_attempts"], max_repair_passes):
+                    logger.info(f"Further regeneration not warranted for commit {commit_hash}")
+                    break
+
+                # Update current script for next iteration
+                current_script = repaired_script
+
+            logger.warning(f"All regeneration attempts failed for commit {commit_hash}")
+            regeneration_stats["final_success"] = False
+            logger.info(f"Final regeneration stats: {regeneration_stats}")
+
+        # If we reach here, either:
+        # 1. No regeneration was attempted (no LLM client or not worth it)
+        # 2. All regeneration attempts failed
+        # Fall back to original error handling
 
         # Check for errors with detailed reporting
         if result.returncode != 0:
             error_msg = f"Test execution failed with return code {result.returncode}"
-            
+
             # Extract more useful error information
             if result.stderr:
                 # Look for Python tracebacks
@@ -1241,12 +1623,12 @@ def run_tests_with_commit_hopping(
                         capturing_traceback = True
                         if line.strip() and not line.startswith((" ", "\t", "Traceback")):
                             break
-                
+
                 if traceback_lines:
                     error_msg += f"\nPython traceback:\n" + "\n".join(traceback_lines[-10:])  # Last 10 lines
                 else:
                     error_msg += f"\nStderr: {result.stderr}"
-            
+
             if result.stdout:
                 # Look for error patterns in stdout too
                 stdout_lines = result.stdout.splitlines()
@@ -1254,12 +1636,12 @@ def run_tests_with_commit_hopping(
                 error_lines = [line for line in stdout_lines[-20:] if any(pattern in line for pattern in error_patterns)]
                 if error_lines:
                     error_msg += f"\nError lines from stdout:\n" + "\n".join(error_lines)
-            
+
             # Log test command and environment for debugging
             logger.error(f"Test command: {' '.join([str(venv_python), str(test_dest)])}")
             logger.error(f"Working directory: {work_dir}")
             logger.error(f"Test script path: {test_dest}")
-            
+
             # Check if test file exists and is readable
             if test_dest.exists():
                 try:
@@ -1272,12 +1654,12 @@ def run_tests_with_commit_hopping(
                     logger.error(f"Could not read test script: {e}")
             else:
                 logger.error(f"Test script file does not exist: {test_dest}")
-            
+
             logger.error(error_msg)
-            return [float('inf')]
+            return [float('inf')], final_successful_script
 
         logger.warning(f"Could not parse execution time from test output. Stdout: {result.stdout[:500] if result.stdout else 'None'}")
-        return [float('inf')]
+        return [float('inf')], final_successful_script
 
     except subprocess.TimeoutExpired as e:
         logger.error(f"Test execution timed out after {e.timeout}s")
@@ -1288,14 +1670,14 @@ def run_tests_with_commit_hopping(
             logger.error(f"Partial stdout before timeout: {e.stdout[:1000]}")
         if hasattr(e, 'stderr') and e.stderr:
             logger.error(f"Partial stderr before timeout: {e.stderr[:1000]}")
-        return [300000.0]  # 5 minutes in milliseconds
+        return [300000.0], final_successful_script  # 5 minutes in milliseconds
     except Exception as e:
         logger.error(f"Unexpected error during commit-hopping test execution: {e}")
         logger.error(f"Test command: {' '.join([str(venv_python), str(test_dest)])}")
         logger.error(f"Working directory: {work_dir}")
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
-        return [float('inf')]
+        return [float('inf')], final_successful_script
     finally:
         # Always restore original commit
         try:
@@ -1566,7 +1948,7 @@ def find_or_generate_test_script(
     llm_model: Optional[str] = None,
     llm_temperature: Optional[float] = None,
     llm_max_tokens: Optional[int] = None,
-) -> Tuple[Optional[Path], Optional[Path]]:
+) -> Tuple[Optional[Path], Optional[Path], Optional[Any]]:
     """Locate a pre-generated test-case-generator for the commit, or generate one via LLM.
 
     Returns path to the generated test module file, or None if unavailable.
@@ -1595,7 +1977,7 @@ def find_or_generate_test_script(
         if c.exists():
             logger.info(f"Using pre-generated test generator: {c}")
             # No JSON needed in this branch; return None for json_path
-            return c, None
+            return c, None, None
     logger.info("No pre-generated test generators found")
 
     # 2) If not found, attempt on-the-fly generation via LLM
@@ -1631,15 +2013,17 @@ def find_or_generate_test_script(
     logger.info(f"Output directory created/verified: {out_dir}")
 
     # 2.5) Check if existing tests are available in the repository
+    """
     logger.info("Checking for existing test files in repository")
     if repo_path and check_test_indicators_in_json(json_path):
         logger.info("JSON indicates presence of tests, searching for existing test files")
         existing_test = search_existing_test_files(Path(repo_path), json_path)
         if existing_test:
             logger.info(f"Found existing test file: {existing_test}")
-            return existing_test, json_path
-
+            return existing_test, json_path, None
+    
     logger.info("No existing test files found or JSON doesn't indicate tests, proceeding with LLM generation")
+    """
 
     # Require API credentials for generation
     logger.info("Checking LLM API credentials")
@@ -1698,7 +2082,7 @@ def find_or_generate_test_script(
                 logger.debug(f"Generated script content preview: {content[:500]}...")
             except Exception as e:
                 logger.error(f"Failed to read generated script content: {e}")
-            return path, json_path
+            return path, json_path, client
         else:
             logger.error(f"Generated script path does not exist: {path}")
     else:
@@ -1808,6 +2192,18 @@ def assemble_canonical(
         repo_owner, repo_name = "local", provisional_name
         logger.info(f"Using fallback repo info: {repo_owner}/{repo_name}")
 
+    # Auto-detect package profile based on repo name for install/runtime choices
+    try:
+        lowered_repo = (repo_name or "").lower()
+        if "sglang" in lowered_repo:
+            os.environ.setdefault("OMNIPERF_PACKAGE_NAME", "sglang")
+            os.environ.setdefault("OMNIPERF_PREFER_IMPORT_NAME", "sglang")
+        elif "vllm" in lowered_repo:
+            os.environ.setdefault("OMNIPERF_PACKAGE_NAME", "vllm")
+            os.environ.setdefault("OMNIPERF_PREFER_IMPORT_NAME", "vllm")
+    except Exception:
+        pass
+
     # Collect commit metadata (must use PerfCommitAnalyzer)
     logger.info("Starting PerfCommitAnalyzer processing")
     if PerfCommitAnalyzer is None:
@@ -1849,7 +2245,7 @@ def assemble_canonical(
     logger.info(f"LLM config - provider: {llm_provider}, model: {llm_model}, temp: {llm_temperature_val}, max_tokens: {llm_max_tokens_val}")
     logger.info(f"About to call find_or_generate_test_script for commit {head_commit}")
 
-    test_script, json_path = find_or_generate_test_script(
+    test_script, json_path, llm_client = find_or_generate_test_script(
         head_commit,
         extr_dir,
         gen_out_dir,
@@ -1859,7 +2255,7 @@ def assemble_canonical(
         llm_temperature=llm_temperature_val,
         llm_max_tokens=llm_max_tokens_val,
     )
-    logger.info(f"find_or_generate_test_script completed, returned test_script: {test_script}")
+    logger.info(f"find_or_generate_test_script completed, returned test_script: {test_script}, llm_client: {llm_client is not None}")
     if test_script is None:
         logger.error("Unable to locate or generate a test script for this commit.")
         raise RuntimeError("Unable to locate or generate a test script for this commit.")
@@ -1904,14 +2300,14 @@ def assemble_canonical(
     logger.info("Setting efficiency_test field in CanonicalRecord")
     logger.info(f"efficiency_test will contain: {len(test_code_text)} characters")
 
-    # Use simple commit-hopping approach for vLLM API compatibility
-    logger.info("Using simple commit-hopping approach for test execution")
+    # Use simple commit-hopping approach with intelligent reuse
+    logger.info("Using commit-hopping approach with intelligent script reuse")
     work_dir = Path.cwd() / ".test_work"
     work_dir.mkdir(exist_ok=True)
 
-    # Test base commit
+    # Test base commit first to validate script
     logger.info(f"Testing base commit: {base_commit}")
-    base_times_arr = run_tests_with_commit_hopping(
+    base_result = run_tests_with_commit_hopping(
         test_script=test_script,
         commit_hash=base_commit,
         repo_path=repo_path,
@@ -1919,32 +2315,98 @@ def assemble_canonical(
         api_rewrite=False,
         setup_commands=setup_commands,
         install_commands=install_commands,
+        llm_client=llm_client,
+        json_path=json_path,
     )
 
-    # Test head commit
-    logger.info(f"Testing head commit: {head_commit}")
-    head_times_arr = run_tests_with_commit_hopping(
-        test_script=test_script,
-        commit_hash=head_commit,
-        repo_path=repo_path,
-        work_dir=work_dir,
-        api_rewrite=True,
-        setup_commands=setup_commands,
-        install_commands=install_commands,
-    )
+    base_times_arr, final_base_script = base_result
 
-    # Test main branch
-    main_head = get_main_branch_head(repo_path)
-    logger.info(f"Testing main branch: {main_head}")
-    main_times_arr = run_tests_with_commit_hopping(
-        test_script=test_script,
-        commit_hash=main_head,
-        repo_path=repo_path,
-        work_dir=work_dir,
-        api_rewrite=False,
-        setup_commands=setup_commands,
-        install_commands=install_commands,
-    )
+    # Check if base test was successful
+    base_success = not detect_test_failure(base_times_arr)
+
+    # If base succeeded, save the final successful script (original or repaired)
+    if base_success and final_base_script:
+        logger.info("✅ Base test successful - saving final script for reuse")
+        # Save to cache and permanent repo location
+        api_fingerprint = "vllm_api"  # TODO: Extract from manifest
+        cached_script_path = save_script_to_cache(final_base_script, base_commit, api_fingerprint, work_dir)
+        logger.info(f"✅ Saved successful script to cache: {cached_script_path}")
+
+        # Also saved permanently in repo at: misc/experiments/successful_scripts/
+        permanent_script_path = get_permanent_scripts_dir() / f"{base_commit[:8]}_{api_fingerprint.replace('/', '_').replace('.', '_')}.py"
+        logger.info(f"✅ Also saved permanently in repo: {permanent_script_path}")
+
+    if base_success:
+        logger.info("✅ Script works on base commit - will reuse for head and main")
+
+        # Use the final successful script (could be original or repaired)
+        successful_script = final_base_script or test_script
+
+        # Reuse script for head commit (no regeneration needed)
+        logger.info(f"Reusing successful script for head commit: {head_commit}")
+        head_result = run_tests_with_commit_hopping(
+            test_script=successful_script,
+            commit_hash=head_commit,
+            repo_path=repo_path,
+            work_dir=work_dir,
+            api_rewrite=False,  # Reuse existing script
+            setup_commands=setup_commands,
+            install_commands=install_commands,
+            llm_client=llm_client,
+            json_path=json_path,
+            max_repair_passes=0,  # Disable regeneration for reuse
+        )
+        head_times_arr, _ = head_result
+
+        # Test main branch
+        main_head = get_main_branch_head(repo_path)
+        logger.info(f"Reusing successful script for main branch: {main_head}")
+        main_result = run_tests_with_commit_hopping(
+            test_script=successful_script,
+            commit_hash=main_head,
+            repo_path=repo_path,
+            work_dir=work_dir,
+            api_rewrite=False,  # Reuse existing script
+            setup_commands=setup_commands,
+            install_commands=install_commands,
+            llm_client=llm_client,
+            json_path=json_path,
+            max_repair_passes=0,  # Disable regeneration for reuse
+        )
+        main_times_arr, _ = main_result
+    else:
+        logger.warning("❌ Script failed on base commit - will test others with full regeneration")
+
+        # Test head commit with full regeneration capability
+        logger.info(f"Testing head commit: {head_commit}")
+        head_result = run_tests_with_commit_hopping(
+            test_script=test_script,
+            commit_hash=head_commit,
+            repo_path=repo_path,
+            work_dir=work_dir,
+            api_rewrite=True,
+            setup_commands=setup_commands,
+            install_commands=install_commands,
+            llm_client=llm_client,
+            json_path=json_path,
+        )
+        head_times_arr, _ = head_result
+
+        # Test main branch with full regeneration capability
+        main_head = get_main_branch_head(repo_path)
+        logger.info(f"Testing main branch: {main_head}")
+        main_result = run_tests_with_commit_hopping(
+            test_script=test_script,
+            commit_hash=main_head,
+            repo_path=repo_path,
+            work_dir=work_dir,
+            api_rewrite=False,
+            setup_commands=setup_commands,
+            install_commands=install_commands,
+            llm_client=llm_client,
+            json_path=json_path,
+        )
+        main_times_arr, _ = main_result
 
     duration_changes: List[Dict[str, List[float]]] = []
     duration_changes.append({"base": base_times_arr, "head": head_times_arr, "main": main_times_arr})
@@ -2262,6 +2724,8 @@ def main() -> None:
     llm_model = config.get("llm_model")
     llm_temperature = config.get("llm_temperature")
     llm_max_tokens = config.get("llm_max_tokens")
+    llm_enable_thinking = config.get("llm_enable_thinking")
+    llm_thinking_budget = config.get("llm_thinking_budget")
     if llm_provider:
         os.environ["OMNIPERF_LLM_PROVIDER"] = str(llm_provider)
     if llm_model:
@@ -2270,6 +2734,10 @@ def main() -> None:
         os.environ["OMNIPERF_LLM_TEMPERATURE"] = str(llm_temperature)
     if llm_max_tokens is not None:
         os.environ["OMNIPERF_LLM_MAX_TOKENS"] = str(llm_max_tokens)
+    if llm_enable_thinking is not None:
+        os.environ["ENABLE_THINKING"] = str(llm_enable_thinking).lower()
+    if llm_thinking_budget is not None:
+        os.environ["THINKING_BUDGET"] = str(llm_thinking_budget)
 
     logger.info(f"Configuration: repo_path={repo_path}")
     logger.info(f"Test generation settings: extractions_dir={extractions_dir}, use_docker={use_docker}")
@@ -2308,6 +2776,9 @@ def main() -> None:
 
     save_and_push(records, out_dir, dataset_name, push_to_hf=bool(push_to_hf and hf_repo), hf_repo_id=hf_repo_id)
     logger.info("save_and_push completed successfully")
+
+    # Note: Individual commit regeneration statistics are logged during test execution
+    # Look for "Regeneration stats:" and "regeneration attempt" messages in the logs
 
 
 if __name__ == "__main__":
