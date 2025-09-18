@@ -55,11 +55,26 @@ class PrepareExecutor:
             for p in candidates:
                 if p.exists():
                     for line in p.read_text().splitlines():
+                        original = line
                         line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
+                        if not line:
                             continue
-                        k, v = line.split("=", 1)
-                        env[k.strip()] = v.strip()
+                        # Allow shell-style export statements
+                        if line.startswith("export "):
+                            line = line[len("export "):].strip()
+                        # Skip comments or invalid lines
+                        if line.startswith("#") or "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # If value is unquoted, strip trailing inline comments
+                        if value and value[0] not in ('"', "'") and "#" in value:
+                            value = value.split("#", 1)[0].strip()
+                        # Strip surrounding single or double quotes if present
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                            value = value[1:-1]
+                        env[key] = value
                     break
             return env
 
@@ -231,6 +246,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             # For local runtime (bench_test.yaml), use the absolute worktree path.
             # Container mode will still work since paths are advisory for the agent.
             agent_workspace_root = str(wt_dir)
+            scratch_rel_dir = ".bench_scratch"
+            scratch_abs_dir = str(Path(agent_workspace_root) / scratch_rel_dir)
 
             # Build the official GSO prompt with the human's diff
             task_lines = [
@@ -251,7 +268,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 "",
                 "Follow these steps to improve performance:",
                 "1. As a first step, explore the repository structure.",
-                f"2. Create a script in the {agent_workspace_root} directory (e.g., {agent_workspace_root}/test_opt.py) to reproduce and time the example, then execute it with python <filename.py> from the repo root.",
+                f"2. Create a script ONLY inside {scratch_abs_dir} (e.g., {scratch_abs_dir}/test_opt.py) to reproduce and time the example, then execute it with python <filename.py> from the repo root.",
                 "3. Edit the source code of the repository to improve performance.",
                 "4. Rebuild and rerun your script to confirm that performance has improved.",
                 "",
@@ -403,7 +420,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             task_lines.append("")
             task_lines.append("## IMMEDIATE ACTION REQUIREMENTS:")
             task_lines.append("1. Start editing files by iteration 3")
-            task_lines.append(f"2. Create and run {agent_workspace_root}/test_opt.py before and after edits")
+            task_lines.append(f"2. Create and run {scratch_abs_dir}/test_opt.py before and after edits (do not create timing scripts outside {scratch_abs_dir})")
             task_lines.append("3. Make at least 3 concrete optimizations")
             task_lines.append("4. Commit changes by iteration 8")
             task_lines.append("5. Use finish command by iteration 10")
@@ -412,8 +429,10 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             task_lines.append("When you have made optimizations:")
             task_lines.append("```bash")
             task_lines.append("git add -A")
+            # ensure scratch artifacts are not staged
+            task_lines.append(f"git reset -q {scratch_rel_dir} || true")
             task_lines.append("git commit -m 'Optimize MoE align sum kernels performance'")
-            task_lines.append(f"git diff $(git merge-base HEAD origin/HEAD || git rev-parse HEAD~1) > {agent_workspace_root}/model_patch.diff || true")
+            task_lines.append(f"git diff $(git merge-base HEAD origin/HEAD || git rev-parse HEAD~1) -- . ':(exclude){scratch_rel_dir}' > {agent_workspace_root}/model_patch.diff || true")
             task_lines.append("finish")
             task_lines.append("```")
             task_lines.append("")
@@ -423,20 +442,37 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             task_file = jw.dir / "task.txt"
             task_file.write_text(task_text)
 
-            # Run OpenHands locally
-            agent_cfg = self.cfg["agents"]["openhands"]
-            cli = agent_cfg["cli"]
-            time_budget = agent_cfg["time_budget_minutes"]
-            container_image = agent_cfg.get("container_image") or None
-            args_cfg = agent_cfg.get("args", {})
-            # Reduce iterations to force faster action
-            iterations = args_cfg.get("iterations", 50)  # Increased to give agent more time
-            max_budget = args_cfg.get("max_budget_per_task", 10.0)
-            use_python_api = bool(args_cfg.get("use_python_api", True))
+            # Select agent
+            default_agent = str(self.cfg["agents"].get("default", "openhands"))
             branch = f"agent/{task_cfg['id']}/{human[:8]}"
+            returncode = -1
+            stdout_content = ""
+            stderr_content = ""
+            dur = 0.0
 
-            # Execute and capture logs (containerized if container_image provided)
-            if container_image:
+            if default_agent == "openhands":
+                # Run OpenHands locally
+                agent_cfg = self.cfg["agents"]["openhands"]
+                cli = agent_cfg["cli"]
+                time_budget = agent_cfg["time_budget_minutes"]
+                container_image = agent_cfg.get("container_image") or None
+                args_cfg = agent_cfg.get("args", {})
+                # Reduce iterations to force faster action
+                iterations = args_cfg.get("iterations", 50)
+                max_budget = args_cfg.get("max_budget_per_task", 10.0)
+                use_python_api = bool(args_cfg.get("use_python_api", True))
+            else:
+                # Trae Agent configuration
+                trae_cfg = self.cfg["agents"].get("trae", {})
+                cli = trae_cfg.get("cli", "python")
+                time_budget = int(self.cfg["agents"].get("time_budget_minutes", 60))
+                args_cfg = trae_cfg.get("args", {})
+                iterations = int(args_cfg.get("max_steps", 50))
+                trae_config_file = trae_cfg.get("config_file") or None
+
+            # Execute and capture logs (OpenHands containerized path)
+            if default_agent == "openhands" and (agent_cfg.get("container_image") or None):
+                container_image = agent_cfg.get("container_image") or None
                 # Use proper OpenHands headless mode with Docker
                 cmd = [
                     "docker", "run", "--rm",
@@ -469,7 +505,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     "-i", str(iterations),
                     "-b", str(max_budget),
                 ]
-            else:
+            elif default_agent == "openhands":
                 # Run with proper headless mode arguments (not uvx)
                 # Assume 'cli' is the path to python with OpenHands installed
                 if cli == "uvx":
@@ -494,11 +530,28 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         "-b", str(max_budget)
                     ]
 
-            logger.info("Initializing OpenHands execution")
+            elif default_agent == "trae":
+                # Run Trae Agent (local). Ensure PYTHONPATH includes third-party/trae-agent
+                cmd = [
+                    cli, "-m", "trae_agent.cli", "run",
+                    "--file", str(task_file),
+                    "--working-dir", str(wt_dir),
+                    "--max-steps", str(iterations),
+                    "--must-patch",
+                    "--patch-path", str((jw.dir / "model_patch.diff").resolve()),
+                    "--trajectory-file", str((jw.dir / "trajectory.json").resolve()),
+                ]
+                if trae_config_file:
+                    cmd.extend(["--config-file", str(trae_config_file)])
+                logger.info(f"Trae agent command: {' '.join(map(str, cmd))}")
+                logger.info(f"Trae config file: {trae_config_file}")
+            else:
+                raise NotImplementedError(f"Unknown agent default: {default_agent}")
+
+            logger.info(f"Initializing {default_agent} execution")
             logger.info(f"Working directory: {wt_dir}")
             logger.info(f"Task file: {task_file}")
             logger.info(f"Max iterations: {iterations}")
-            logger.info(f"Budget limit: ${max_budget}")
             logger.info(f"Agent branch: {branch}")
             logger.debug(f"OpenHands command: {' '.join(map(str, cmd))}")
 
@@ -511,39 +564,60 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 logger.warning(f"Git branch creation failed: {e}")
 
             t0 = time.time()
-            logger.info(f"Starting OpenHands execution at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Starting {default_agent} execution at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             try:
-                returncode = -1
                 # Merge env vars from .env into subprocess environment
                 env = os.environ.copy()
                 env.update(env_vars)
+                
+                # Log environment variables for debugging
+                logger.info(f"Environment variables loaded from .env: {len(env_vars)}")
+                for key in env_vars:
+                    if 'API_KEY' in key:
+                        logger.info(f"  {key}: {env_vars[key][:20]}...{env_vars[key][-4:]}" if env_vars[key] and len(env_vars[key]) > 24 else f"  {key}: {env_vars[key] if env_vars[key] else 'EMPTY'}")
+                    else:
+                        logger.info(f"  {key}: {env_vars[key]}")
+                
+                # Check if OPENAI_API_KEY is properly set
+                api_key = env.get("OPENAI_API_KEY")
+                if api_key:
+                    logger.info(f"OPENAI_API_KEY is set in subprocess environment: {api_key[:20]}...{api_key[-4:]}")
+                else:
+                    logger.warning("OPENAI_API_KEY is NOT set in subprocess environment!")
+                
                 # Add debugging environment variables
                 env["LOG_ALL_EVENTS"] = "true"
                 env["OPENHANDS_DEBUG"] = "true"
                 env["PYTHONUNBUFFERED"] = "1"
                 # Modern sandbox volume mapping (replaces deprecated WORKSPACE_* envs)
                 env["SANDBOX_VOLUMES"] = f"{wt_dir}:/workspace:rw"
+                # Ensure Trae Agent module is discoverable when used
+                trae_repo_path = str(Path(__file__).resolve().parents[2] / "third-party" / "trae-agent")
+                env["PYTHONPATH"] = (trae_repo_path + os.pathsep + env.get("PYTHONPATH", "")).rstrip(os.pathsep)
                 # Prefer non-interactive behavior and disable auto-continue loops (best-effort)
                 env["OPENHANDS_AUTO_CONTINUE"] = "false"
                 env["AUTO_CONTINUE"] = "false"
                 # Set max empty responses to prevent infinite loops
                 env["MAX_EMPTY_RESPONSES"] = "2"
+                # Enable Trae Agent startup diagnostics
+                env["TRAE_LOG_STARTUP"] = "1"
                 # Force agent to take action instead of asking questions
                 env["AGENT_MODE"] = "action_oriented"
                 # Add more logging to see what's happening
                 env["LOG_LEVEL"] = "DEBUG"
                 env["OPENHANDS_LOG_LEVEL"] = "DEBUG"
-                # Provide an explicit headless user message to avoid empty auto-continue loops
-                try:
-                    forced_target = target_files[0] if target_files else ""
-                except Exception:
-                    forced_target = ""
-                headless_msg = (
-                    "Do not ask for user input. Proceed immediately to implement the next step: "
-                    f"1) create {agent_workspace_root}/test_opt.py to time the critical path; 2) edit the performance-critical file "
-                    f"{forced_target if forced_target else 'one of the target files'} now; 3) run the timing script; 4) commit; then finish."
-                )
-                env["OPENHANDS_HEADLESS_USER_MESSAGE"] = headless_msg
+                if default_agent == "openhands":
+                    # Provide an explicit headless user message to avoid empty auto-continue loops
+                    try:
+                        forced_target = target_files[0] if target_files else ""
+                    except Exception:
+                        forced_target = ""
+                    headless_msg = (
+                        "Do not ask for user input. Proceed immediately to implement the next step: "
+                        f"1) create {scratch_abs_dir}/test_opt.py to time the critical path (do not create timing scripts outside {scratch_abs_dir}); 2) edit the performance-critical file "
+                        f"{forced_target if forced_target else 'one of the target files'} now; 3) run the timing script; 4) commit; then finish."
+                    )
+                    env["OPENHANDS_HEADLESS_USER_MESSAGE"] = headless_msg
                 
                 logger.debug("Environment variables configured:")
                 debug_vars = ["LOG_ALL_EVENTS", "OPENHANDS_DEBUG", "PYTHONUNBUFFERED", "OPENAI_API_KEY", "SANDBOX_VOLUMES"]
@@ -554,7 +628,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         else:
                             logger.debug(f"  {var}: {env[var]}")
                 
-                if not use_python_api:
+                if default_agent == "openhands" and not use_python_api:
                     logger.info("Executing OpenHands command with real-time output")
                     # Use Popen for real-time output streaming
                     proc = subprocess.Popen(
@@ -608,7 +682,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     stdout_content = '\n'.join(stdout_lines)
                     stderr_content = '\n'.join(stderr_lines)
                     returncode = proc.returncode
-                else:
+                elif default_agent == "openhands":
                     # Use Python API to pass custom fake_user_response_fn and conversation instructions
                     from openhands.core.config import parse_arguments as _parse_arguments, setup_config_from_args as _setup_cfg
                     import asyncio as _asyncio
@@ -689,7 +763,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     )
                     logger.info("Executing OpenHands via Python API with custom headless directive")
                     task_content = task_file.read_text()
-                    logger.info(f"Task content preview: {task_content[:500]}...")
+                    logger.info(f"Task content: {task_content}")
                     logger.info(f"Using fake_user_response: 'Continue implementing the optimization changes...'")
                     logger.info(f"Conversation instruction: {CONVERSATION_INSTR}")
                     _state = _asyncio.run(_run_controller(
@@ -708,14 +782,177 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     stdout_content = ""
                     stderr_content = ""
                     returncode = 0
+                else:
+                    # Execute Trae Agent with real-time logging
+                    logger.info(f"Executing Trae Agent subprocess with timeout: {time_budget * 60}s")
+                    logger.debug(f"Working directory: {wt_dir}")
+                    logger.debug(f"Environment OPENAI_API_KEY present: {bool(env.get('OPENAI_API_KEY'))}")
+                    logger.debug(f"Environment PYTHONPATH: {env.get('PYTHONPATH', 'NOT_SET')}")
+                    
+                    # Point agent step logs to run directory file
+                    env["TRAE_STEP_LOG_FILE"] = str((jw.dir / "trae_steps.log").resolve())
+                    
+                    # Use Popen for real-time output streaming (same as OpenHands)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                        cwd=wt_dir,
+                        bufsize=1,
+                        universal_newlines=True
+                    )
+                    
+                    stdout_lines = []
+                    stderr_lines = []
+                    
+                    # Stream output in real-time
+                    import select
+                    import sys
+                    timeout_seconds = time_budget * 60
+                    start_time = time.time()
+                    
+                    while proc.poll() is None:
+                        # Check for timeout
+                        if time.time() - start_time > timeout_seconds:
+                            logger.warning(f"TRAE Agent timeout after {timeout_seconds}s, terminating process")
+                            proc.terminate()
+                            proc.wait(timeout=5)
+                            break
+                            
+                        ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.1)
+                        for stream in ready:
+                            if stream == proc.stdout:
+                                line = stream.readline()
+                                if line:
+                                    line = line.rstrip()
+                                    stdout_lines.append(line)
+                                    logger.info(f"TRAE STDOUT: {line}")
+                                    sys.stdout.flush()
+                            elif stream == proc.stderr:
+                                line = stream.readline()
+                                if line:
+                                    line = line.rstrip()
+                                    stderr_lines.append(line)
+                                    logger.warning(f"TRAE STDERR: {line}")
+                                    sys.stderr.flush()
+                    
+                    # Read any remaining output
+                    remaining_stdout, remaining_stderr = proc.communicate()
+                    if remaining_stdout:
+                        for line in remaining_stdout.split('\n'):
+                            if line.strip():
+                                stdout_lines.append(line.strip())
+                                logger.info(f"TRAE STDOUT: {line.strip()}")
+                    if remaining_stderr:
+                        for line in remaining_stderr.split('\n'):
+                            if line.strip():
+                                stderr_lines.append(line.strip())
+                                logger.warning(f"TRAE STDERR: {line.strip()}")
+                    
+                    stdout_content = '\n'.join(stdout_lines)
+                    stderr_content = '\n'.join(stderr_lines)
+                    returncode = proc.returncode
+                    
+                    dur = time.time() - t0
+                    logger.info(f"TRAE Agent execution completed in {dur:.1f} seconds")
+                    logger.info(f"Process return code: {returncode}")
+                    logger.info(f"Total stdout lines: {len(stdout_lines)}")
+                    logger.info(f"Total stderr lines: {len(stderr_lines)}")
+                    
+                    # Save explicit Trae Agent logs for review
+                    try:
+                        jw.write_trae_logs(stdout_content, stderr_content)
+                    except Exception:
+                        logger.warning("Failed to write Trae Agent logs")
+
+                    # Determine success based on task completion, not just return code
+                    # TRAE agent may have internal API errors but still complete the task successfully
+                    task_completed = False
+                    if returncode == 0:
+                        task_completed = True
+                    else:
+                        # Check if agent made commits despite API errors
+                        try:
+                            commits = subprocess.check_output([
+                                "git", "log", "--oneline", f"{pre}..HEAD"
+                            ], cwd=wt_dir, text=True).strip()
+                            if commits:
+                                logger.info(f"TRAE agent made commits despite API errors: {len(commits.splitlines())} commits")
+                                task_completed = True
+                        except Exception:
+                            pass
+                    
+                    if not task_completed:
+                        logger.error(f"Trae Agent failed with return code {returncode}")
+                        logger.error(f"Stdout: {stdout_content}")
+                        logger.error(f"Stderr: {stderr_content}")
                 
                 jw.write_openhands_logs(stdout_content, stderr_content)
-                status = "success" if returncode == 0 else "error"
+                
+                # Determine status based on actual task completion, not just return code
+                if default_agent == "trae":
+                    # For TRAE, check if commits were made or files changed
+                    status = "success" if task_completed else "error"
+                else:
+                    # For OpenHands, use return code
+                    status = "success" if returncode == 0 else "error"
                 logger.info(f"Task status determined as: {status}")
                 
                 # Enforce targets
                 logger.info("Analyzing file changes made by agent")
-                changed = get_changed_files(wt_dir, pre, "HEAD")
+                changed: list[str] = []
+                if default_agent == "openhands":
+                    changed = get_changed_files(wt_dir, pre, "HEAD")
+                else:
+                    # For Trae Agent, get changed files from git commit in worktree
+                    try:
+                        # Get files changed in the latest commit made by agent
+                        changed = subprocess.check_output([
+                            "git", "diff", "--name-only", pre, "HEAD"
+                        ], cwd=wt_dir, text=True).strip().splitlines()
+                        changed = [f for f in changed if f.strip()]  # Filter empty lines
+                        logger.debug(f"Git diff detected {len(changed)} changed files")
+                    except Exception as e:
+                        logger.warning(f"Failed to get changed files from git: {e}")
+                        # Fallback: try to derive from patch file in worktree
+                        patch_path_wt = wt_dir / "model_patch.diff"
+                        patch_path_run = jw.dir / "model_patch.diff"
+                        
+                        # First check worktree patch
+                        if patch_path_wt.exists():
+                            try:
+                                for line in patch_path_wt.read_text().splitlines():
+                                    if line.startswith("diff --git a/"):
+                                        parts = line.split()
+                                        if len(parts) >= 4:
+                                            b_path = parts[3]
+                                            if b_path.startswith("b/"):
+                                                rel = b_path[2:]
+                                                if rel and rel not in changed:
+                                                    changed.append(rel)
+                                logger.debug(f"Worktree patch detected {len(changed)} changed files")
+                            except Exception as e2:
+                                logger.warning(f"Failed to parse worktree patch: {e2}")
+                        
+                        # Then check run directory patch as fallback
+                        if not changed and patch_path_run.exists():
+                            try:
+                                for line in patch_path_run.read_text().splitlines():
+                                    if line.startswith("diff --git a/"):
+                                        parts = line.split()
+                                        if len(parts) >= 4:
+                                            b_path = parts[3]
+                                            if b_path.startswith("b/"):
+                                                rel = b_path[2:]
+                                                if rel and rel not in changed:
+                                                    changed.append(rel)
+                                logger.debug(f"Run directory patch detected {len(changed)} changed files")
+                            except Exception as e3:
+                                logger.warning(f"Failed to parse run directory patch: {e3}")
+                # Exclude hidden scratch directory changes from enforcement
+                changed = [p for p in changed if not (p.startswith(f"{scratch_rel_dir}/") or p == scratch_rel_dir)]
                 targets = set(target_files)
                 disallowed = [p for p in changed if p not in targets]
                 ok = len(disallowed) == 0
@@ -738,8 +975,27 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
                 if len(changed) == 0:
-                    logger.warning("No file changes detected. Marking task as error to avoid analysis loops.")
-                    status = "error"
+                    logger.warning("No file changes detected.")
+                    # For TRAE agent, check if this is due to detection bug vs actual no changes
+                    if default_agent == "trae":
+                        # Check if there are any commits made by agent
+                        try:
+                            commits = subprocess.check_output([
+                                "git", "log", "--oneline", f"{pre}..HEAD"
+                            ], cwd=wt_dir, text=True).strip()
+                            if commits:
+                                logger.warning(f"Agent made {len(commits.splitlines())} commits but file detection failed. This may be a detection bug.")
+                                # Don't mark as error if commits exist - likely a detection issue
+                            else:
+                                logger.warning("No commits found. Agent likely made no changes. Marking as error to avoid analysis loops.")
+                                status = "error"
+                        except Exception:
+                            logger.warning("Could not check git commits. Marking task as error to avoid analysis loops.")
+                            status = "error"
+                    else:
+                        # For OpenHands, mark as error if no changes
+                        logger.warning("Marking task as error to avoid analysis loops.")
+                        status = "error"
                 if task_cfg["optimization_contract"].get("strict_targets", False) and not ok:
                     logger.warning("Status changed to error due to strict target enforcement")
                     status = "error"
@@ -748,11 +1004,33 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     import tomllib as _tomllib  # Python 3.11+
                 except Exception:
                     _tomllib = None
-                try:
-                    # Compute unified diff against base (pre) commit
-                    diff_text = subprocess.check_output(["git", "diff", f"{pre}", "HEAD"], cwd=wt_dir).decode()
-                except Exception:
+                if default_agent == "openhands":
+                    try:
+                        # Compute unified diff against base (pre) commit, excluding scratch artifacts
+                        diff_text = subprocess.check_output([
+                            "git", "diff", f"{pre}", "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"
+                        ], cwd=wt_dir).decode()
+                    except Exception:
+                        diff_text = ""
+                else:
+                    # Use Trae Agent patch from worktree (primary) or run directory (fallback)
+                    patch_path_wt = wt_dir / "model_patch.diff"
+                    patch_path_run = jw.dir / "model_patch.diff"
+                    
                     diff_text = ""
+                    if patch_path_wt.exists():
+                        diff_text = patch_path_wt.read_text()
+                        # Copy patch to run directory for artifact preservation
+                        try:
+                            patch_path_run.write_text(diff_text)
+                            logger.debug("Copied patch file from worktree to run directory")
+                        except Exception as e:
+                            logger.warning(f"Failed to copy patch file: {e}")
+                    elif patch_path_run.exists():
+                        diff_text = patch_path_run.read_text()
+                        logger.debug("Using patch file from run directory")
+                    else:
+                        logger.warning("No patch file found in worktree or run directory")
                 # Derive instance_id from repo URL and base commit
                 repo_url_val = plan.get("repo", repo_url)
                 try:
@@ -794,9 +1072,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     "commits": {"pre": pre, "human": human},
                     "agent_branch": branch,
                     "status": status,
-                    "openhands": {
+                    default_agent: {
                         "cli": cli,
-                        "container_image": container_image,
                         "time_budget_minutes": time_budget,
                         "returncode": returncode,
                         "duration_s": dur,
@@ -826,4 +1103,3 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
 
         with futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(process, items))
-
