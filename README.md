@@ -131,15 +131,30 @@ OmniPerf-Bench/
 - Docker (for containerized evaluation)
 - Git with LFS support
 
+### Cloning the Repository
+
+This repository uses Git submodules for external dependencies. You must clone with the `--recursive` flag to get all required components:
+
+```bash
+# Clone repository with submodules (REQUIRED)
+git clone --recursive git@github.com:thekernelcompany/OmniPerf-Bench.git
+cd OmniPerf-Bench
+```
+
+**Important:** If you already cloned without `--recursive`, initialize submodules with:
+```bash
+git submodule update --init --recursive
+```
+
+**Submodules included:**
+- `vllm/` - Modified vLLM fork with OmniPerf-Bench integration
+- `third-party/trae-agent/` - TRAE agent integration for automated optimization
+
 ### Option 1: Using uv (recommended)
 ```bash
 # Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.local/bin/env
-
-# Clone repository
-git clone https://github.com/your-org/OmniPerf-Bench.git
-cd OmniPerf-Bench
 
 # Create virtual environment and install dependencies
 uv venv
@@ -149,9 +164,6 @@ uv sync
 
 ### Option 2: Using pip
 ```bash
-git clone https://github.com/your-org/OmniPerf-Bench.git
-cd OmniPerf-Bench
-
 # Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
