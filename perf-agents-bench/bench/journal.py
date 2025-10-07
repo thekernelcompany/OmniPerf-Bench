@@ -20,6 +20,10 @@ class JournalWriter:
         (self.dir / "openhands_stdout.txt").write_text(stdout)
         (self.dir / "openhands_stderr.txt").write_text(stderr)
 
+    def write_trae_logs(self, stdout: str, stderr: str):
+        (self.dir / "trae_stdout.txt").write_text(stdout)
+        (self.dir / "trae_stderr.txt").write_text(stderr)
+
     def write_journal(self, payload: Dict[str, Any]):
         payload.setdefault("timestamps", {})
         payload["timestamps"].setdefault("written", time.time())

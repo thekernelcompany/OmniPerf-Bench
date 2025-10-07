@@ -1,0 +1,30 @@
+{
+    "commit_hash": "8aa1485fcff7be3e42300c0615ee0f3f3cbce9a8",
+    "subject": "[Perf] Disable chunked local attention by default with llama4 (#21761)",
+    "message": "[Perf] Disable chunked local attention by default with llama4 (#21761)\n\nSigned-off-by: Lucas Wilkinson <lwilkins@redhat.com>",
+    "date": "2025-07-28T18:49:04-04:00",
+    "files_changed": [
+      "vllm/config.py",
+      "vllm/envs.py"
+    ],
+    "functions_changed": [],
+    "stats": {
+      "num_test_files": 0,
+      "num_non_test_files": 2,
+      "only_test_files": 0,
+      "only_non_test_files": 1,
+      "num_files": 2,
+      "num_hunks": 3,
+      "num_edited_lines": 35,
+      "num_non_test_edited_lines": 35,
+      "commit_year": 2025
+    },
+    "affected_paths": [],
+    "apis": [
+      "vllm.core.scheduler.Scheduler"
+    ],
+    "diff_text": "diff --git a/vllm/config.py b/vllm/config.py\nindex 6bfe94b76..3bcbbe606 100644\n--- a/vllm/config.py\n+++ b/vllm/config.py\n@@ -4769,12 +4769,23 @@ class VllmConfig:\n                 # Hybrid KV cache manager is not compatible with KV events.\n                 self.scheduler_config.disable_hybrid_kv_cache_manager = True\n             if self.model_config is not None and \\\n-                self.model_config.attention_chunk_size is not None and \\\n-                self.speculative_config is not None and \\\n-                self.speculative_config.use_eagle():\n-                # Hybrid KV cache manager is not yet supported with chunked\n-                # local attention + eagle.\n-                self.scheduler_config.disable_hybrid_kv_cache_manager = True\n+                self.model_config.attention_chunk_size is not None:\n+                if self.speculative_config is not None and \\\n+                    self.speculative_config.use_eagle():\n+                    # Hybrid KV cache manager is not yet supported with chunked\n+                    # local attention + eagle.\n+                    self.scheduler_config.disable_hybrid_kv_cache_manager = True\n+                elif \\\n+                    not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:\n+                    logger.warning(\n+                        \"There is a latency regression when using chunked local\"\n+                        \" attention with the hybrid KV cache manager. Disabling\"\n+                        \" it, by default. To enable it, set the environment \"\n+                        \"VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=1.\"\n+                    )\n+                    # Hybrid KV cache manager is not yet supported with chunked\n+                    # local attention.\n+                    self.scheduler_config.disable_hybrid_kv_cache_manager = True\n \n     def update_sizes_for_sequence_parallelism(self,\n                                               possible_sizes: list) -> list:\ndiff --git a/vllm/envs.py b/vllm/envs.py\nindex 0eff74151..fcfad4eec 100755\n--- a/vllm/envs.py\n+++ b/vllm/envs.py\n@@ -143,6 +143,7 @@ if TYPE_CHECKING:\n     VLLM_USE_CUDNN_PREFILL: bool = False\n     VLLM_ENABLE_CUDAGRAPH_GC: bool = False\n     VLLM_LOOPBACK_IP: str = \"\"\n+    VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = False\n \n \n def get_default_cache_root():\n@@ -991,6 +992,17 @@ environment_variables: dict[str, Callable[[], Any]] = {\n     # The default value is \"VLLM\".\n     \"VLLM_PROCESS_NAME_PREFIX\":\n     lambda: os.getenv(\"VLLM_PROCESS_NAME_PREFIX\", \"VLLM\"),\n+\n+    # Allow chunked local attention with hybrid kv cache manager.\n+    # Currently using the Hybrid KV cache manager with chunked local attention\n+    # in the Llama4 models (the only models currently using chunked local attn)\n+    # causes a latency regression. For this reason, we disable it by default.\n+    # This flag is used to allow users to enable it if they want to (to save on\n+    # kv-cache memory usage and enable longer contexts)\n+    # TODO(lucas): Remove this flag once latency regression is resolved.\n+    \"VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE\":\n+    lambda: bool(int(os.getenv(\\\n+            \"VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE\", \"0\"))),\n }\n \n # --8<-- [end:env-vars-definition]",
+    "llm_reason": "The commit modifies non-test, production code (vllm/config.py and vllm/envs.py) and contains non-trivial changes to disable the hybrid KV cache manager when using chunked local attention, in order to mitigate a latency regression. This flag change is directly connected to performance issues (latency regression) in specific model setups (e.g., llama4) while still being testable on CPU and not tied to specific hardware. The focus is on performance optimization and not on a bug fix or a refactoring of comments or documentation.",
+    "llm_api_reason": "This commit modifies how the configuration is set in VllmConfig regarding the hybrid KV cache manager when using chunked local attention. The changes ensure that the scheduler configuration’s flag disable_hybrid_kv_cache_manager is always set to True when chunked local attention is enabled, unless an environment override is provided. Since this flag is read by the scheduler during batching and scheduling, the behavior of vllm.core.scheduler.Scheduler is affected by these changes.",
+    "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm"
+}

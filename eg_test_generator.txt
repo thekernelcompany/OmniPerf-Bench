@@ -1,0 +1,644 @@
+--- system ---
+<research_benchmark_prompt version="1.0">
+
+  <about>
+    You are GPT-5 acting as a meticulous performance engineer in a research benchmark setting (not production). 
+    Your task is to generate a SINGLE Python script (prob_script) that measures the real-world performance impact of a specific commit to an LLM inference engine, while supporting cross-commit (child vs parent vs agent-variant) comparisons and strict functional equivalence.
+    The output MUST be deterministic: given the same inputs, you MUST generate identical code and formatting across runs.
+  </about>
+
+  <inputs>
+    <!-- These values are supplied by my pipeline. Use them deterministically. Do not improvise new fields. -->
+    <commit>
+      <hash>{commit_hash}</hash>
+      <message><![CDATA[{commit_message}]]></message>
+      <diff><![CDATA[{git_diff_patch_or_unified_diff}]]></diff>
+      <!-- Optional structured metadata (if available). Prefer these over guessing; otherwise infer from diff. -->
+      <changed_symbols><![CDATA[{json_changed_symbols_array_or_empty}]]></changed_symbols>
+      <changed_files><![CDATA[{json_changed_files_array_or_empty}]]></changed_files>
+    </commit>
+
+    <env>
+      <!-- Hints; may be empty. If provided, OBEY strictly for imports/targets. -->
+      <module_hint>{optional_python_module_path_or_empty}</module_hint>
+      <symbol_hint>{optional_symbol_or_qualified_attr_or_empty}</symbol_hint>
+      <impl_tag>{parent|child|agent}</impl_tag>
+      <commit_role>{baseline|optimized|agent_variant}</commit_role>
+
+      <!-- Default runtime knobs (can be overridden at execution via env vars). Use to shape defaults deterministically. -->
+      <default_device>{cuda|cpu|mps|auto}</default_device>
+      <default_dtype>{fp32|fp16|bf16|auto}</default_dtype>
+      <eq_level_default>{numeric|exact|behavioral}</eq_level_default>
+      <opt_gates><![CDATA[{json_kv_for_env_flags_or_empty}]]></opt_gates>
+    </env>
+
+    <repo_context>
+      <root_path>{repo_root_or_placeholder}</root_path>
+      <ecosystem>{pytorch|triton|tensorrt-llm|vllm|transformers|mlx|rocm|other}</ecosystem>
+      <target_domain>LLM_inference</target_domain>
+      <!-- If provided: e.g., "CUDA-only", "ROCm supported", "Apple MPS supported". -->
+      <hardware_scope>{optional_text}</hardware_scope>
+    </repo_context>
+  </inputs>
+
+  <determinism>
+    <!-- Make your own generation deterministic: -->
+    <rules>
+      - Use minimal and consistent verbosity in the final output: ONLY emit the required Python file, nothing else.
+      - Never ask clarifying questions or present alternatives; pick the best deterministic choice per tie-break rules.
+      - Resolve ambiguities via the specified deterministic tie-breakers (below) in the exact stated order.
+      - Use canonical code formatting: PEP8-compatible, stable import ordering (stdlib, third-party, local), stable helper order.
+      - Use stable identifier names: do not randomize variable or function names.
+      - Include all the requested functions in the exact order with the exact signatures.
+      - Do not include platform-dependent whitespace or timestamps.
+    </rules>
+    <tie_breakers>
+      <!-- Apply strictly in this order whenever ambiguity arises (e.g., multiple symbol candidates). -->
+      1) Prefer symbols/files explicitly indicated by <module_hint>/<symbol_hint>.
+      2) Otherwise, choose the symbol with the largest hunk of changed LOC in the diff.
+      3) If still tied, prefer the symbol appearing in both commit message and diff.
+      4) If still tied, prefer the path under the repo’s primary package (e.g., shortest module path).
+      5) If still tied, pick alphabetically by fully-qualified symbol name.
+    </tie_breakers>
+  </determinism>
+
+  <agentic_control>
+    <!-- We want rigorous but cost-aware behavior in a research pipeline. -->
+    <reasoning_effort>minimal</reasoning_effort>
+    <verbosity>low</verbosity>
+    <context_gathering>
+      Goal: extract only what is needed from the provided commit message/diff to generate the script.
+      Method:
+        - Parse the diff once; extract changed modules, functions, classes, and call signatures.
+        - Identify gating flags/kwargs/env vars that trigger the optimized path.
+        - Determine data types, shapes, and computational patterns referenced.
+      Early stop:
+        - As soon as the exact performance-critical call(s) and required arguments are known.
+      Tool budget:
+        - No external tools; no web, no extra files. Use only the provided inputs.
+    </context_gathering>
+    <persistence>
+      - Do not hand back partially; produce the final script in one shot.
+      - If uncertain, apply the tie-breakers and proceed. Document assumptions in code comments succinctly.
+    </persistence>
+  </agentic_control>
+
+  <classification>
+    <!-- Infer commit category to set up realistic workloads and equivalence criteria. -->
+    <categories>
+      - kernel: low-level CUDA/ROCm/Triton/TensorCore fused ops (e.g., attention, layernorm, softmax, matmul, rope, kv-cache ops, paged attention, sampling).
+      - model: graph-level / module-level changes (e.g., attention API swaps, SDPA routing, cache layout, quantization, tensor parallel sharding).
+      - misc: runtime/batching/scheduler/IO (e.g., request queuing, contiguous vs paged KV, pinned memory, CUDA graph capture); test the core optimized subroutine only.
+    </categories>
+    <policy>
+      - kernel → benchmark the EXACT kernel entrypoint or the thin wrapper that maps directly to it.
+      - model → isolate the modified module forward path (single-step inference or single attention block), not full text generation.
+      - misc → extract the specific improved routine (e.g., batch pack/unpack) and time that; avoid queue/network/IO overhead.
+    </policy>
+  </classification>
+
+  <script_requirements>
+    <!-- Keep these EXACT function names / signatures and core behavior. -->
+    <functions>
+      setup()
+      experiment(data)
+      store_result(result, filepath)
+      load_result(filepath)
+      check_equivalence(current_result, reference_result)
+      run_test(eqcheck: bool = False, reference: bool = False, prefix: str = '') -> float
+    </functions>
+    <imports_policy>
+      - Import the actual modified/optimized target function/class based on the diff (or hints).
+      - Support dynamic import roots via env vars at runtime: PROB_MODULE, PROB_SYMBOL.
+      - Use importlib and attribute walking for qualified symbols (e.g., Class.method).
+      - Provide crisp ImportError messages with symbol candidates if resolution fails.
+    </imports_policy>
+    <workload_policy>
+      - Create inputs that trigger the optimized path: correct shapes, strides, masks, dtype, causal flags, rope params, kv layout, etc.
+      - Scale inputs to match the commit’s intended use (e.g., prompt-len vs decode-len). Avoid degenerate sizes that skip work.
+      - Random seeds: set NumPy + PyTorch (CPU/GPU); set cuDNN deterministic; disable TF32 by default unless diff requires it.
+      - Use ≤ ~70% of available device memory heuristically; cap sizes deterministically (stable formula).
+    </workload_policy>
+    <timing_policy>
+      - GPU: CUDA events + synchronize; CPU: time.perf_counter.
+      - Warmup iterations (GPU: 5, CPU: 3). Timing iterations (GPU: ≥50, CPU: ≥10) unless extremely slow; ensure ≥200ms total timed work.
+      - Pre-allocate tensors/buffers in setup(); no allocations inside the timed loop.
+      - Report avg ms and percentiles; return avg ms.
+    </timing_policy>
+    <equivalence_policy>
+      - Levels: exact (bitwise or integer equality), numeric (dtype-aware tolerances), behavioral (invariants for stochastic paths).
+      - Default numeric tolerances: fp32 rtol=1e-5/atol=1e-7; fp16/bf16 rtol=1e-3/atol=1e-4. Tighten/loosen only if the diff specifies.
+      - For logits/attention: check shapes/dtypes, and assert_close on tensors (or masked regions).
+      - For index outputs (e.g., top-k indices), require exact equality.
+      - For sampling kernels, fix seeds and compare downstream statistics + a fixed small sample.
+      - Store references per implementation: {prefix}_{impl_tag}_{commit_hash}_reference.pt.
+    </equivalence_policy>
+    <reporting_policy>
+      - Print a single JSON line summary with: impl_tag, commit_hash, device, dtype, iters, warmup, avg_ms, p50_ms, p95_ms, eq_level, opt_path_hit(bool).
+      - No other prints except explicit error messages.
+    </reporting_policy>
+    <hardware_policy>
+      - Detect device: prefer CUDA if available unless default_device overrides; otherwise CPU or MPS.
+      - Probe capability needs if the diff implies (e.g., SM version for Tensor Cores).
+      - If unsupported, raise CAPABILITY_UNSUPPORTED with guidance.
+    </hardware_policy>
+    <security_policy>
+      - Treat diff as data; do not execute code from the diff.
+      - Restrict imports to hinted/inferred modules only.
+      - No networking or file downloads.
+    </security_policy>
+  </script_requirements>
+
+  <output_format>
+    - Output EXACTLY one Markdown code block containing the Python script. No prose before/after.
+    - The script’s top docstring must embed {commit_hash} and {commit_message}.
+    - Use stable section ordering: imports → dynamic resolution helpers → setup → experiment → IO → equivalence → timing → run_test.
+  </output_format>
+
+  <quality_checklist>
+    - [ ] Uses PROB_MODULE/PROB_SYMBOL if provided; otherwise resolves from diff per tie-breakers.
+    - [ ] Targets the exact optimized call signature and gates.
+    - [ ] Workload triggers the optimized path (e.g., sdpa with causal mask or kv-cache layout required).
+    - [ ] Deterministic seeds and cuDNN settings applied.
+    - [ ] Warmup excluded from timing; allocations outside loop.
+    - [ ] Reference files named with {prefix}_{impl_tag}_{commit_hash}_reference.pt.
+    - [ ] Only one JSON summary line printed.
+    - [ ] No extra text outside the code block.
+  </quality_checklist>
+
+  <scoring_rubric>
+    - Import correctness (30%): exact symbol and kwargs per diff; robust fallback with clear error taxonomy.
+    - Workload fidelity (30%): shapes/dtypes/flags match optimization; triggers hot path.
+    - Timing rigor (20%): CUDA events / perf_counter correct; stable iteration counts; preallocations.
+    - Equivalence depth (15%): dtype-aware tolerances; appropriate invariants.
+    - Output hygiene (5%): single file, deterministic, no extraneous text.
+  </scoring_rubric>
+
+  <final_instruction>
+    Produce the Python script now. Do not include any explanation or commentary. Only emit the code block. 
+    The code MUST be complete and runnable as-is, with placeholders replaced by concrete imports and calls derived from the provided commit diff and message.
+  </final_instruction>
+
+  <required_python_file>
+    <![CDATA[
+```python
+#!/usr/bin/env python3
+"""
+Performance test script for commit: {commit_hash}
+{commit_message}
+
+This script measures the actual performance of the optimization described in the commit.
+It supports running against different checkouts (child/parent/agent) and storing/loading
+references for cross-commit equivalence checks in a research benchmark pipeline.
+"""
+
+import os
+import json
+import time
+import importlib
+import types
+from typing import Dict, Any, Tuple, Callable, Optional
+
+import numpy as np
+import torch
+
+# -------------------------------
+# Error taxonomy (deterministic)
+# -------------------------------
+E_IMPORT_MISSING = "IMPORT_MISSING_SYMBOL"
+E_OPT_PATH_NOT_TRIGGERED = "OPT_PATH_NOT_TRIGGERED"
+E_CAPABILITY = "CAPABILITY_UNSUPPORTED"
+E_EQFAIL = "EQUIVALENCE_FAILED"
+
+# -------------------------------
+# Determinism & policy helpers
+# -------------------------------
+def ensure_determinism() -> None:
+    torch.manual_seed(1234)
+    np.random.seed(1234)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(1234)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    # Be strict by default unless commit requires TF32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+def pick_device() -> torch.device:
+    want = os.getenv("PROB_DEVICE", "{default_device}").lower()
+    if want == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if want == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if want == "cpu":
+        return torch.device("cpu")
+    # auto
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def pick_dtype() -> torch.dtype:
+    key = os.getenv("PROB_FORCE_DTYPE", "{default_dtype}").lower()
+    map_ = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16, "auto": torch.float32, "": torch.float32}
+    return map_.get(key, torch.float32)
+
+def parse_opt_gates() -> Dict[str, Any]:
+    raw = os.getenv("PROB_OPT_GATES", '{opt_gates}')
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        gates = {}
+        for kv in raw.split(","):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                gates[k.strip()] = v.strip()
+        return gates
+
+# -------------------------------
+# Diff-aware import resolution
+# -------------------------------
+def _infer_candidates_from_diff() -> Tuple[Optional[str], Optional[str], list]:
+    """
+    Deterministically infer (module, symbol) from the provided diff and commit message.
+    Returns: (module_path or None, symbol_name or None, candidate_list_for_errors)
+    """
+    module_hint = os.getenv("PROB_MODULE", "").strip() or "{optional_python_module_path_or_empty}".strip()
+    symbol_hint = os.getenv("PROB_SYMBOL", "").strip() or "{optional_symbol_or_qualified_attr_or_empty}".strip()
+    candidates = []
+
+    # Highest priority: explicit hints
+    if module_hint and symbol_hint:
+        return module_hint, symbol_hint, [(module_hint, symbol_hint)]
+
+    # Parse inputs (static text replacement already done upstream)
+    diff_text = """{git_diff_patch_or_unified_diff}"""
+    commit_msg = """{commit_message}"""
+    changed_files_json = """{json_changed_files_array_or_empty}"""
+    changed_symbols_json = """{json_changed_symbols_array_or_empty}"""
+
+    # Very lightweight deterministic heuristics (no regex explosion):
+    # 1) Prefer items listed in changed_symbols_json if present.
+    try:
+        import json as _json
+        syms = _json.loads(changed_symbols_json) if changed_symbols_json.strip() else []
+    except Exception:
+        syms = []
+    if syms:
+        # Choose symbol with largest reported 'changed_loc' or first in order
+        syms_sorted = sorted(syms, key=lambda s: (-int(s.get("changed_loc", 0)), s.get("qualified", "")))
+        top = syms_sorted[0]
+        mod = top.get("module", "")
+        sym = top.get("qualified", "") or top.get("name", "")
+        if mod and sym:
+            candidates.append((mod, sym))
+
+    # 2) Fallback: scan diff headers for python modules and defs/classes
+    # (simple, deterministic substr searches)
+    for line in diff_text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            path = line.split("\t")[0].split()[-1]
+            if path.endswith(".py") and "/tests/" not in path:
+                mod = path.replace("/", ".").rstrip(".py").rstrip(".")
+                candidates.append((mod, None))
+        elif line.startswith("+class ") or line.startswith("+def "):
+            token = line.split()[0][1:]  # class|def
+            name = line.split()[1].split("(")[0].strip()
+            if candidates and candidates[-1][1] is None:
+                mod = candidates[-1][0]
+                candidates[-1] = (mod, name)
+            else:
+                candidates.append((None, name))
+
+    # 3) Boost candidates mentioned in commit message
+    boosted = []
+    for mod, sym in candidates:
+        score = 0
+        if mod and mod in commit_msg:
+            score += 1
+        if sym and sym in commit_msg:
+            score += 1
+        boosted.append((score, mod, sym))
+    boosted.sort(key=lambda t: (-t[0], t[1] or "", t[2] or ""))
+    if boosted:
+        _, mod, sym = boosted[0]
+        return mod, sym, [(m, s) for _, m, s in boosted]
+
+    return None, None, candidates
+
+def resolve_target() -> Tuple[Callable, Dict[str, Any], str]:
+    """
+    Returns (callable_or_bound_method, call_kwargs, fq_name_string).
+    Must resolve to the EXACT code path described by the commit diff, honoring env hints first.
+    """
+    mod_hint = os.getenv("PROB_MODULE", "").strip()
+    sym_hint = os.getenv("PROB_SYMBOL", "").strip()
+
+    if mod_hint and sym_hint:
+        mod_path, sym_name = mod_hint, sym_hint
+        candidates = [(mod_path, sym_name)]
+    else:
+        mod_path, sym_name, candidates = _infer_candidates_from_diff()
+
+    # Deterministic resolution with tie-breakers baked in above
+    if not mod_path or not sym_name:
+        raise ImportError(f"{E_IMPORT_MISSING}: Unable to infer target. Candidates={candidates}")
+
+    m = importlib.import_module(mod_path)
+    target = m
+    for part in sym_name.split("."):
+        if not hasattr(target, part):
+            raise ImportError(f"{E_IMPORT_MISSING}: {mod_path}.{sym_name} not found; nearest candidates={candidates}")
+        target = getattr(target, part)
+
+    fq = f"{mod_path}.{sym_name}"
+    # DEFAULT: no extra kwargs; adjust in experiment() if diff requires
+    return target, {}, fq
+
+# -------------------------------
+# Setup: workload reflecting commit
+# -------------------------------
+def _cap_by_memory(nelms: int, bytes_per: int, frac: float = 0.7) -> int:
+    try:
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            cap = int((total * frac) // max(bytes_per, 1))
+            return min(nelms, cap)
+    except Exception:
+        pass
+    return nelms
+
+def setup() -> Dict[str, Any]:
+    """Create realistic workload that exercises the optimization."""
+    ensure_determinism()
+    device = pick_device()
+    dtype = pick_dtype()
+
+    # Heuristic defaults; will be refined per category inferred from diff
+    # LLM inference defaults: matmul/attention-heavy shapes
+    B = 8          # batch
+    H = 32         # heads
+    D = 128        # head_dim
+    T_q = 128      # query length
+    T_kv = 2048    # key/value length (prefill-style)
+    hidden = H * D
+
+    # Memory cap (deterministic function of defaults and device)
+    bytes_per = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    _ = _cap_by_memory(B * T_q * hidden, bytes_per)
+
+    # Create representative tensors; avoid degenerate cases
+    q = torch.randn((B, H, T_q, D), dtype=dtype, device=device)
+    k = torch.randn((B, H, T_kv, D), dtype=dtype, device=device)
+    v = torch.randn((B, H, T_kv, D), dtype=dtype, device=device)
+
+    # Example masks for causal attention; adjusted in experiment if needed
+    causal = True
+    attn_mask = None  # Prefer kernel-native causal paths; set explicit masks only if required by diff
+
+    # Apply opt gates/environment flags
+    opt_gates = parse_opt_gates()
+    for k_env, v_env in opt_gates.items():
+        os.environ[str(k_env)] = str(v_env)
+
+    return {
+        "device": device,
+        "dtype": dtype,
+        "B": B, "H": H, "D": D, "T_q": T_q, "T_kv": T_kv,
+        "q": q, "k": k, "v": v,
+        "causal": causal,
+        "attn_mask": attn_mask,
+        "opt_gates": opt_gates,
+    }
+
+# -------------------------------
+# Experiment: EXACT optimized path
+# -------------------------------
+def experiment(data: Dict[str, Any]) -> Any:
+    """
+    Execute ONLY the performance-critical code path being optimized.
+    Replace the call site and kwargs to match the commit diff EXACTLY.
+    """
+    target, call_kwargs, fqname = resolve_target()
+
+    # Category-sensitive calling convention:
+    # - kernel (e.g., fused attention/layernorm/rope): call target(q, k, v, mask/causal/scale/rope as per diff)
+    # - model  (e.g., module.forward): call target.forward(...) with tensors matching shapes from setup()
+    # - misc   (e.g., pack/unpack kv-cache): call target with appropriate strides/layout flags
+
+    with torch.no_grad():
+        # !!!! REPLACE BELOW WITH THE EXACT CALL PATTERN FROM THE COMMIT DIFF !!!!
+        # Examples (commented to preserve determinism and guidance):
+        # result = target(data["q"], data["k"], data["v"], attn_mask=data["attn_mask"], is_causal=data["causal"], **call_kwargs)
+        # result = target(data["q"], data["k"], data["v"], scale=1.0 / (data["D"] ** 0.5), **call_kwargs)
+        # result = target.forward(data["q"], data["k"], data["v"], **call_kwargs)
+        # result = target(data["q"])  # e.g., layernorm or rope
+        #
+        # Placeholder fallback (non-trivial compute to keep timing meaningful):
+        q = data["q"]
+        k = data["k"]
+        v = data["v"]
+        # scaled dot-product attention reference-ish path to avoid no-op:
+        scores = torch.matmul(q, k.transpose(-1, -2)) / (data["D"] ** 0.5)
+        if data["causal"]:
+            # causal mask: disallow attention to future tokens
+            Tq, Tkv = scores.shape[-2], scores.shape[-1]
+            mask = torch.triu(torch.ones((Tq, Tkv), device=scores.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        result = torch.matmul(probs, v)
+        # !!!! END REPLACE REGION !!!!
+
+    return result
+
+# -------------------------------
+# Result I/O for equivalence
+# -------------------------------
+def store_result(result: Any, filepath: str) -> None:
+    """Store result for future equivalence checking."""
+    if isinstance(result, torch.Tensor):
+        payload = {
+            "type": "torch_tensor",
+            "shape": tuple(result.shape),
+            "dtype": str(result.dtype),
+            "device": "cpu",  # store on CPU for portability
+            "sample": result.flatten()[:4096].detach().cpu(),
+        }
+        torch.save(payload, filepath)
+    else:
+        torch.save({"type": "generic", "value": result}, filepath)
+
+def load_result(filepath: str) -> Any:
+    return torch.load(filepath)
+
+# -------------------------------
+# Equivalence with dtype-aware tolerances
+# -------------------------------
+def _eq_tolerances(dtype: torch.dtype, level: str) -> Tuple[float, float]:
+    if level == "exact":
+        return (0.0, 0.0)
+    if dtype in (torch.float16, torch.bfloat16):
+        return (1e-3, 1e-4)
+    if dtype == torch.float32:
+        return (1e-5, 1e-7)
+    return (1e-5, 1e-7)
+
+def check_equivalence(current_result: Any, reference_payload: Any) -> None:
+    level = os.getenv("PROB_EQ_LEVEL", "{eq_level_default}").lower()
+    if isinstance(current_result, torch.Tensor) and reference_payload.get("type") == "torch_tensor":
+        ref_sample = reference_payload["sample"]
+        assert tuple(current_result.shape) == tuple(reference_payload["shape"]), \
+            f"Shape mismatch: {tuple(current_result.shape)} vs {tuple(reference_payload['shape'])}"
+        assert str(current_result.dtype) == reference_payload["dtype"], \
+            f"Dtype mismatch: {current_result.dtype} vs {reference_payload['dtype']}"
+        rtol, atol = _eq_tolerances(current_result.dtype, level)
+        torch.testing.assert_close(
+            current_result.flatten()[: ref_sample.numel()].cpu(),
+            ref_sample,
+            rtol=rtol,
+            atol=atol,
+            msg=f"{E_EQFAIL}: deviation beyond tolerances (level={level})"
+        )
+    else:
+        assert current_result == reference_payload.get("value"), f"{E_EQFAIL}: non-tensor results not equal"
+
+# -------------------------------
+# Timing utilities
+# -------------------------------
+def _time_gpu(run: Callable, iters: int) -> Tuple[float, float, float]:
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(iters):
+        start.record()
+        _ = run()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))  # ms
+    times.sort()
+    avg = sum(times) / len(times)
+    p50 = times[len(times) // 2]
+    p95 = times[int(len(times) * 0.95) - 1]
+    return avg, p50, p95
+
+def _time_cpu(run: Callable, iters: int) -> Tuple[float, float, float]:
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = run()
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000.0)
+    times.sort()
+    avg = sum(times) / len(times)
+    p50 = times[len(times) // 2]
+    p95 = times[int(len(times) * 0.95) - 1]
+    return avg, p50, p95
+
+# -------------------------------
+# Main entry: run_test
+# -------------------------------
+def run_test(eqcheck: bool = False, reference: bool = False, prefix: str = '') -> float:
+    """
+    Run the performance test and return average execution time in milliseconds.
+
+    Args:
+        eqcheck: Compare current result vs stored reference.
+        reference: Store current result as reference.
+        prefix: Prefix for reference filenames.
+
+    Returns:
+        Average execution time (ms).
+    """
+    data = setup()
+    impl_tag = os.getenv("PROB_IMPL_TAG", "{parent|child|agent}")
+    commit_hash = os.getenv("PROB_COMMIT_HASH", "{commit_hash}")
+
+    # Warmup
+    warmup = 5 if torch.cuda.is_available() else 3
+    for _ in range(warmup):
+        _ = experiment(data)
+
+    # Timing iterations
+    iters = 50 if torch.cuda.is_available() else 10
+    if torch.cuda.is_available():
+        avg_ms, p50_ms, p95_ms = _time_gpu(lambda: experiment(data), iters)
+    else:
+        avg_ms, p50_ms, p95_ms = _time_cpu(lambda: experiment(data), iters)
+
+    # Equivalence/reference I/O
+    result = experiment(data)
+    ref_path = f"{prefix}_{impl_tag}_{commit_hash}_reference.pt"
+    if reference:
+        store_result(result, ref_path)
+    if eqcheck:
+        reference_payload = load_result(ref_path)
+        check_equivalence(result, reference_payload)
+
+    # Summary JSON (single line)
+    summary = {
+        "impl_tag": impl_tag,
+        "commit_hash": commit_hash,
+        "device": str(data["device"]),
+        "dtype": str(data["dtype"]),
+        "iters": iters,
+        "warmup": warmup,
+        "avg_ms": round(avg_ms, 6),
+        "p50_ms": round(p50_ms, 6),
+        "p95_ms": round(p95_ms, 6),
+        "eq_level": os.getenv("PROB_EQ_LEVEL", "{eq_level_default}"),
+        "opt_path_hit": True  # Set to False if you detect fallback in experiment()
+    }
+    print(json.dumps(summary, sort_keys=True))
+    return avg_ms
+
+# End of script
+</required_python_file>
+
+</research_benchmark_prompt>
+
+--- user ---
+<!-- Commit: 8d75fe48ca5f46b7af0f5201d8500b9604eed769 -->
+Here is the commit extraction JSON you must base the tests on:
+
+```json
+{
+  "commit_hash": "8d75fe48ca5f46b7af0f5201d8500b9604eed769",
+  "parent_hash": "388596c91437a51d428a447594e9faec340c29b2",
+  "message": "[Kernel] Switch fp8 layers to use the CUTLASS kernels (#5183)\n\nSwitching from torch._scaled_mm to vLLM's cutlass fp8 kernels when supported as we are seeing 5-15% improvement in e2e performance on neuralmagic/Meta-Llama-3-8B-Instruct-FP8\n\nsee https://docs.google.com/spreadsheets/d/1GiAnmzyGHgZ6zL_LDSTm35Bdrt4A8AaFEurDlISYYA4/ for some quick e2e benchmarks and #5144 for comparisons across different GEMM sizes.",
+  "author": "Tyler Michael Smith <tyler@neuralmagic.com>",
+  "date": "2024-06-07 08:42:35 +0000",
+  "files_changed": [
+    {
+      "file_path": "vllm/_custom_ops.py",
+      "old_content": "from typing import Optional, Tuple, Type\n\nimport torch\n\ntry:\n    from vllm._C import cache_ops as vllm_cache_ops\n    from vllm._C import ops as vllm_ops\nexcept ImportError as e:\n    from vllm.logger import init_logger\n    logger = init_logger(__name__)\n    logger.warning(\"Failed to import from vllm._C with %r\", e)\n\n\n# activation ops\ndef silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:\n    vllm_ops.silu_and_mul(out, x)\n\n\ndef gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:\n    vllm_ops.gelu_and_mul(out, x)\n\n\ndef gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:\n    vllm_ops.gelu_tanh_and_mul(out, x)\n\n\ndef gelu_fast(out: torch.Tensor, x: torch.Tensor) -> None:\n    vllm_ops.gelu_fast(out, x)\n\n\ndef gelu_new(out: torch.Tensor, x: torch.Tensor) -> None:\n    vllm_ops.gelu_new(out, x)\n\n\n# page attention ops\ndef paged_attention_v1(\n    out: torch.Tensor,\n    query: torch.Tensor,\n    key_cache: torch.Tensor,\n    value_cache: torch.Tensor,\n    num_kv_heads: int,\n    scale: float,\n    block_tables: torch.Tensor,\n    seq_lens: torch.Tensor,\n    block_size: int,\n    max_seq_len: int,\n    alibi_slopes: Optional[torch.Tensor],\n    kv_cache_dtype: str,\n    kv_scale: float,\n    tp_rank: int = 0,\n    blocksparse_local_blocks: int = 0,\n    blocksparse_vert_stride: int = 0,\n    blocksparse_block_size: int = 64,\n    blocksparse_head_sliding_step: int = 0,\n) -> None:\n    vllm_ops.paged_attention_v1(\n        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,\n        seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,\n        kv_scale, tp_rank, blocksparse_local_blocks, blocksparse_vert_stride,\n        blocksparse_block_size, blocksparse_head_sliding_step)\n\n\ndef paged_attention_v2(\n    out: torch.Tensor,\n    exp_sum: torch.Tensor,\n    max_logits: torch.Tensor,\n    tmp_out: torch.Tensor,\n    query: torch.Tensor,\n    key_cache: torch.Tensor,\n    value_cache: torch.Tensor,\n    num_kv_heads: int,\n    scale: float,\n    block_tables: torch.Tensor,\n    seq_lens: torch.Tensor,\n    block_size: int,\n    max_seq_len: int,\n    alibi_slopes: Optional[torch.Tensor],\n    kv_cache_dtype: str,\n    kv_scale: float,\n    tp_rank: int = 0,\n    blocksparse_local_blocks: int = 0,\n    blocksparse_vert_stride: int = 0,\n    blocksparse_block_size: int = 64,\n    blocksparse_head_sliding_step: int = 0,\n) -> None:\n    vllm_ops.paged_attention_v2(\n        out, exp_sum, max_logits, tmp_out, query, key_cache, value_cache,\n        num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len,\n        alibi_slopes, kv_cache_dtype, kv_scale, tp_rank,\n        blocksparse_local_blocks, blocksparse_vert_stride,\n        blocksparse_block_size, blocksparse_head_sliding_step)\n\n\n# pos encoding ops\ndef rotary_embedding(\n    positions: torch.Tensor,\n    query: torch.Tensor,\n    key: torch.Tensor,\n    head_size: int,\n    cos_sin_cache: torch.Tensor,\n    is_neox: bool,\n) -> None:\n    vllm_ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache,\n                              is_neox)\n\n\ndef batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,\n                             key: torch.Tensor, head_size: int,\n                             cos_sin_cache: torch.Tensor, is_neox: bool,\n                             rot_dim: int,\n                             cos_sin_cache_offsets: torch.Tensor) -> None:\n    vllm_ops.batched_rotary_embedding(positions, query, key, head_size,\n                                      cos_sin_cache, is_neox, rot_dim,\n                                      cos_sin_cache_offsets)\n\n\n# layer norm ops\ndef rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,\n             epsilon: float) -> None:\n    vllm_ops.rms_norm(out, input, weight, epsilon)\n\n\ndef fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,\n                       weight: torch.Tensor, epsilon: float) -> None:\n    vllm_ops.fused_add_rms_norm(input, residual, weight, epsilon)\n\n\n# quantization ops\n# awq\ndef awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,\n                   zeros: torch.Tensor, split_k_iters: int, thx: int,\n                   thy: int) -> torch.Tensor:\n    return vllm_ops.awq_dequantize(qweight, scales, zeros, split_k_iters, thx,\n                                   thy)\n\n\ndef awq_gemm(input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor,\n             scales: torch.Tensor, split_k_iters: int) -> torch.Tensor:\n    return vllm_ops.awq_gemm(input, qweight, qzeros, scales, split_k_iters)\n\n\n# gptq\ndef gptq_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,\n              b_gptq_qzeros: torch.Tensor, b_gptq_scales: torch.Tensor,\n              b_g_idx: torch.Tensor, use_exllama: bool,\n              bit: int) -> torch.Tensor:\n    return vllm_ops.gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,\n                              b_g_idx, use_exllama, bit)\n\n\ndef gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor,\n                 bit: int) -> None:\n    vllm_ops.gptq_shuffle(q_weight, q_perm, bit)\n\n\n# squeezellm\ndef squeezellm_gemm(vec: torch.Tensor, mat: torch.Tensor, mul: torch.Tensor,\n                    lookup_table: torch.Tensor) -> None:\n    vllm_ops.squeezellm_gemm(vec, mat, mul, lookup_table)\n\n\n# marlin\ndef marlin_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,\n                b_scales: torch.Tensor, workspace: torch.Tensor, size_m: int,\n                size_n: int, size_k: int) -> torch.Tensor:\n    return vllm_ops.marlin_gemm(a, b_q_weight, b_scales, workspace, size_m,\n                                size_n, size_k)\n\n\n# marlin_24\ndef gptq_marlin_24_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,\n                        b_meta: torch.Tensor, b_scales: torch.Tensor,\n                        workspace: torch.Tensor, num_bits: int, size_m: int,\n                        size_n: int, size_k: int) -> torch.Tensor:\n    return vllm_ops.gptq_marlin_24_gemm(a, b_q_weight, b_meta, b_scales,\n                                        workspace, num_bits, size_m, size_n,\n                                        size_k)\n\n\n# cutlass\ndef cutlass_scaled_mm_dq(a: torch.Tensor, b: torch.Tensor,\n                         a_scales: torch.Tensor, b_scales: torch.Tensor,\n                         out_dtype: Type[torch.dtype]) -> torch.Tensor:\n    assert (b.shape[0] % 16 == 0 and b.shape[1] % 16 == 0)\n    assert (out_dtype is torch.bfloat16 or out_dtype is torch.float16)\n\n    m = a.shape[0]\n    n = b.shape[1]\n    out = torch.empty((m, n), dtype=out_dtype, device=a.device)\n\n    vllm_ops.cutlass_scaled_mm_dq(out, a, b, a_scales, b_scales)\n\n    return out\n\n\n# aqlm\ndef aqlm_gemm(input: torch.Tensor, codes: torch.Tensor,\n              codebooks: torch.Tensor, scales: torch.Tensor,\n              codebook_partition_sizes: torch.Tensor,\n              bias: Optional[torch.Tensor]) -> torch.Tensor:\n    return vllm_ops.aqlm_gemm(input, codes, codebooks, scales,\n                              codebook_partition_sizes, bias)\n\n\ndef aqlm_dequant(codes: torch.Tensor, codebooks: torch.Tensor,\n                 codebook_partition_sizes: torch.Tensor) -> torch.Tensor:\n    return vllm_ops.aqlm_dequant(codes, codebooks, codebook_partition_sizes)\n\n\n# gptq_marlin\ndef gptq_marlin_repack(b_q_weight: torch.Tensor, perm: torch.Tensor,\n                       size_k: int, size_n: int,\n                       num_bits: int) -> torch.Tensor:\n    return vllm_ops.gptq_marlin_repack(b_q_weight, perm, size_k, size_n,\n                                       num_bits)\n\n\ndef gptq_marlin_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,\n                     b_scales: torch.Tensor, g_idx: torch.Tensor,\n                     perm: torch.Tensor, workspace: torch.Tensor,\n                     num_bits: int, size_m: int, size_n: int, size_k: int,\n                     is_k_full: bool) -> torch.Tensor:\n    return vllm_ops.gptq_marlin_gemm(a, b_q_weight, b_scales, g_idx, perm,\n                                     workspace, num_bits, size_m, size_n,\n                                     size_k, is_k_full)\n\n\n# fp8\ndef scaled_fp8_quant(\n    input: torch.Tensor,\n    scale: Optional[torch.Tensor] = None,\n    batch_dim_padding: Optional[int] = None,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"\n    Quantize input tensor to FP8 and return quantized tensor and scale.\n\n    This function supports both static and dynamic quantization: If you\n    provide the scale, it will use static scaling and if you omit it,\n    the scale will be determined dynamically. The function also allows\n    optional padding of the output tensor for downstream kernels that\n    will benefit from padding.\n\n    Args:\n        input: The input tensor to be quantized to FP8\n        scale: Optional scaling factor for the FP8 quantization\n        batch_dim_padding: If specified, pad the first dimension\n            of the output to at least this value.\n\n    Returns:\n        Tuple[torch.Tensor, torch.Tensor]: The output tensor in FP8 and\n            scaling factor.\n    \"\"\"\n    if batch_dim_padding:\n        shape = (max(batch_dim_padding, input.shape[0]), *input.shape[1:])\n        output = torch.empty(shape,\n                             device=input.device,\n                             dtype=torch.float8_e4m3fn)\n    else:\n        output = torch.empty_like(input, dtype=torch.float8_e4m3fn)\n    if scale is None:\n        scale = torch.zeros(1, device=input.device, dtype=torch.float32)\n        vllm_ops.dynamic_scaled_fp8_quant(output, input, scale)\n    else:\n        vllm_ops.static_scaled_fp8_quant(output, input, scale)\n    return output, scale\n\n\n# int8\ndef static_scaled_int8_quant(input: torch.Tensor,\n                             scale: torch.Tensor) -> torch.Tensor:\n    \"\"\"\n    Quantize the input tensor to int8 and return the quantized tensor.\n\n    Args:\n        input: The input tensor to be quantized to int8.\n        scale: Scaling factor for the int8 quantization.\n\n    Returns:\n        torch.Tensor: Output tensor in int8.\n    \"\"\"\n    q = torch.empty_like(input, dtype=torch.int8)\n    vllm_ops.static_scaled_int8_quant(q, input, scale)\n    return q\n\n\n# moe\ndef moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,\n                         block_size: int, sorted_token_ids: torch.Tensor,\n                         experts_ids: torch.Tensor,\n                         num_tokens_post_pad: torch.Tensor) -> None:\n    vllm_ops.moe_align_block_size(topk_ids, num_experts, block_size,\n                                  sorted_token_ids, experts_ids,\n                                  num_tokens_post_pad)\n\n\ndef reshape_and_cache(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    key_cache: torch.Tensor,\n    value_cache: torch.Tensor,\n    slot_mapping: torch.Tensor,\n    kv_cache_dtype: str,\n    kv_scale: float,\n) -> None:\n    vllm_cache_ops.reshape_and_cache(key, value, key_cache, value_cache,\n                                     slot_mapping, kv_cache_dtype, kv_scale)\n\n\ndef reshape_and_cache_flash(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    key_cache: torch.Tensor,\n    value_cache: torch.Tensor,\n    slot_mapping: torch.Tensor,\n    kv_cache_dtype: str,\n) -> None:\n    vllm_cache_ops.reshape_and_cache_flash(key, value, key_cache, value_cache,\n                                           slot_mapping, kv_cache_dtype)\n\n\ndef copy_blocks(key_caches: torch.Tensor, value_caches: torch.Tensor,\n                block_mapping: torch.Tensor) -> None:\n    vllm_cache_ops.copy_blocks(key_caches, value_caches, block_mapping)\n\n\ndef swap_blocks(src: torch.Tensor, dst: torch.Tensor,\n                block_mapping: torch.Tensor) -> None:\n    vllm_cache_ops.swap_blocks(src, dst, block_mapping)\n\n\ndef convert_fp8(output: torch.Tensor,\n                input: torch.Tensor,\n                scale: float = 1.0,\n                kv_dtype: str = \"fp8\") -> None:\n    vllm_cache_ops.convert_fp8(output, input, scale, kv_dtype)\n\n\n#TODO: cuda_utils, custom_ar\n",
+      "diff": "diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py\nindex 462ba8a75..cae682216 100644\n--- a/vllm/_custom_ops.py\n+++ b/vllm/_custom_ops.py\n@@ -179,7 +179,7 @@ def gptq_marlin_24_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,\n \n # cutlass\n def cutlass_scaled_mm_dq(a: torch.Tensor, b: torch.Tensor,\n-                         a_scales: torch.Tensor, b_scales: torch.Tensor,\n+                         scale_a: torch.Tensor, scale_b: torch.Tensor,\n                          out_dtype: Type[torch.dtype]) -> torch.Tensor:\n     assert (b.shape[0] % 16 == 0 and b.shape[1] % 16 == 0)\n     assert (out_dtype is torch.bfloat16 or out_dtype is torch.float16)\n@@ -188,7 +188,7 @@ def cutlass_scaled_mm_dq(a: torch.Tensor, b: torch.Tensor,\n     n = b.shape[1]\n     out = torch.empty((m, n), dtype=out_dtype, device=a.device)\n \n-    vllm_ops.cutlass_scaled_mm_dq(out, a, b, a_scales, b_scales)\n+    vllm_ops.cutlass_scaled_mm_dq(out, a, b, scale_a, scale_b)\n \n     return out",
+      "change_type": "modified",
+      "lines_added": 3,
+      "lines_removed": 3
+    },
+    {
+      "file_path": "vllm/model_executor/layers/quantization/fp8.py",
+      "old_content": "from typing import Any, Dict, List, Optional, Tuple, Union\n\nimport torch\nfrom torch.nn import Module\nfrom torch.nn.parameter import Parameter\n\nfrom vllm import _custom_ops as ops\nfrom vllm.logger import init_logger\nfrom vllm.model_executor.layers.linear import LinearBase, LinearMethodBase\nfrom vllm.model_executor.layers.quantization.base_config import (\n    QuantizationConfig, QuantizeMethodBase)\nfrom vllm.model_executor.utils import set_weight_attrs\nfrom vllm.utils import print_warning_once\n\nACTIVATION_SCHEMES = [\"static\", \"dynamic\"]\n\nlogger = init_logger(__name__)\n\n\nclass Fp8Config(QuantizationConfig):\n    \"\"\"Config class for FP8.\"\"\"\n\n    def __init__(\n        self,\n        is_checkpoint_fp8_serialized: bool = False,\n        activation_scheme: str = \"dynamic\",\n    ) -> None:\n        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized\n        if is_checkpoint_fp8_serialized:\n            logger.warning(\"Detected fp8 checkpoint. Please note that the \"\n                           \"format is experimental and subject to change.\")\n        if activation_scheme not in ACTIVATION_SCHEMES:\n            raise ValueError(\n                f\"Unsupported activation scheme {activation_scheme}\")\n        self.activation_scheme = activation_scheme\n\n    @classmethod\n    def get_name(cls) -> str:\n        return \"fp8\"\n\n    @classmethod\n    def get_supported_act_dtypes(cls) -> List[torch.dtype]:\n        return [torch.bfloat16, torch.half]\n\n    @classmethod\n    def get_min_capability(cls) -> int:\n        return 89\n\n    @classmethod\n    def get_config_filenames(cls) -> List[str]:\n        return []\n\n    @classmethod\n    def from_config(cls, config: Dict[str, Any]) -> \"Fp8Config\":\n        quant_method = cls.get_from_keys(config, [\"quant_method\"])\n        is_checkpoint_fp8_serialized = (\"fp8\" in quant_method)\n        activation_scheme = cls.get_from_keys(config, [\"activation_scheme\"])\n        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,\n                   activation_scheme=activation_scheme)\n\n    def get_quant_method(\n            self, layer: torch.nn.Module) -> Optional[\"QuantizeMethodBase\"]:\n        from vllm.attention.layer import Attention  # Avoid circular import\n\n        if isinstance(layer, LinearBase):\n            return Fp8LinearMethod(self)\n        if isinstance(layer, Attention):\n            return Fp8KVCacheMethod(self)\n        return None\n\n    def get_scaled_act_names(self) -> List[str]:\n        return []\n\n\nclass Fp8LinearMethod(LinearMethodBase):\n    \"\"\"Linear method for FP8.\n    Supports loading FP8 checkpoints with static weight scale and\n    dynamic/static activation scale.\n\n    Also supports loading quantized FP16/BF16 model checkpoints with dynamic\n    activation scaling. The weight scaling factor will be initialized after\n    the model weights are loaded.\n\n    Limitations:\n    1. Only support per-tensor quantization due to torch._scaled_mm support.\n    2. Only support float8_e4m3fn data type due to the limitation of\n       torch._scaled_mm (https://github.com/pytorch/pytorch/blob/2e48b39603411a41c5025efbe52f89560b827825/aten/src/ATen/native/cuda/Blas.cpp#L854-L856)\n       \n    Args:\n        quant_config: The quantization config.\n    \"\"\"\n\n    def __init__(self, quant_config: Fp8Config):\n        self.quant_config = quant_config\n\n    def _create_scale_param(\n        self,\n        scale_name: str,\n        layer: torch.nn.Module,\n        output_partition_sizes: List[int],\n        **extra_weight_attrs,\n    ) -> None:\n        scale = Parameter(torch.empty(len(output_partition_sizes),\n                                      dtype=torch.float32),\n                          requires_grad=False)\n        layer.register_parameter(scale_name, scale)\n        set_weight_attrs(\n            scale, {\n                **extra_weight_attrs,\n                \"fp8_scales_shard_indexer\":\n                self.scales_shard_indexer,\n            })\n\n    def create_weights(\n        self,\n        layer: torch.nn.Module,\n        input_size_per_partition: int,\n        output_partition_sizes: List[int],\n        input_size: int,\n        output_size: int,\n        params_dtype: torch.dtype,\n        **extra_weight_attrs,\n    ):\n        del input_size, output_size\n        output_size_per_partition = sum(output_partition_sizes)\n\n        layer.process_after_load = True\n        layer.logical_widths = output_partition_sizes\n\n        # WEIGHT\n        weight_dtype = (torch.float8_e4m3fn\n                        if self.quant_config.is_checkpoint_fp8_serialized else\n                        params_dtype)\n        weight = Parameter(torch.empty(output_size_per_partition,\n                                       input_size_per_partition,\n                                       dtype=weight_dtype),\n                           requires_grad=False)\n        layer.register_parameter(\"weight\", weight)\n        set_weight_attrs(weight, {\n            **extra_weight_attrs,\n            \"input_dim\": 1,\n            \"output_dim\": 0,\n        })\n\n        # If checkpoint is serialized fp8, load them.\n        # Otherwise, wait until process_weights_after_loading.\n        if self.quant_config.is_checkpoint_fp8_serialized:\n            # WEIGHT SCALE\n            self._create_scale_param(\n                scale_name=\"weight_scale\",\n                layer=layer,\n                output_partition_sizes=output_partition_sizes,\n                **extra_weight_attrs)\n\n            # ACTIVATION SCALE\n            if self.quant_config.activation_scheme == \"static\":\n                self._create_scale_param(\n                    scale_name=\"act_scale\",\n                    layer=layer,\n                    output_partition_sizes=output_partition_sizes,\n                    **extra_weight_attrs)\n\n    def scales_shard_indexer(\n            self, param: torch.Tensor, loaded_weight: torch.Tensor,\n            shard_id: Union[str, int]) -> Tuple[torch.Tensor, torch.Tensor]:\n        qkv_idxs = {\"q\": 0, \"k\": 1, \"v\": 2}\n\n        if isinstance(shard_id, int):\n            pass\n        elif isinstance(shard_id, str):\n            if shard_id not in qkv_idxs:\n                raise ValueError(f\"Unknown shard_id: {shard_id}\")\n            shard_id = qkv_idxs[shard_id]\n        else:\n            ValueError(f\"Shard id must be int or str but got {type(shard_id)}\")\n\n        return param[shard_id], loaded_weight\n\n    def process_weights_after_loading(self, layer: Module) -> None:\n        if (not hasattr(layer, \"process_after_load\")\n                or not layer.process_after_load):\n            return\n\n        # If checkpoint is fp/bf16 (not serialized fp8), quantize the weights.\n        if not self.quant_config.is_checkpoint_fp8_serialized:\n            qweight, weight_scale = ops.scaled_fp8_quant(layer.weight,\n                                                         scale=None)\n            layer.weight = Parameter(qweight.t(), requires_grad=False)\n            layer.weight_scale = Parameter(weight_scale, requires_grad=False)\n            layer.logical_widths = None\n            layer.act_scale = None\n            return\n\n        # If checkpoint is fp8, requantize the separately quantized logical\n        # weights into a single fp8 weight with a single weight scale.\n        else:\n            # WEIGHT_SCALE / WEIGHT\n            #   Loop over logical weights, requantizing with single scale.\n            max_w_scale = layer.weight_scale.max()\n            start = 0\n            for idx, logical_width in enumerate(layer.logical_widths):\n                end = start + logical_width\n                weight_dq = per_tensor_dequantize(layer.weight[start:end, :],\n                                                  layer.weight_scale[idx])\n\n                layer.weight[start:end, :] = per_tensor_quantize(\n                    weight_dq, layer.weight_scale.max())\n                start = end\n            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)\n\n            # WEIGHT\n            #   Transpose weight for passing to torch._scaled_mm\n            weight = layer.weight\n            layer.weight = Parameter(weight.t(), requires_grad=False)\n\n            # ACT_SCALE\n            #   Dynamic: set to None (required input to ops.scaled_fp8_quant).\n            #   Static:  set to max of the act_scales (since they are equal).\n            if self.quant_config.activation_scheme == \"dynamic\":\n                layer.act_scale = None\n            elif self.quant_config.activation_scheme == \"static\":\n                if not all_close_1d(layer.act_scale):\n                    raise ValueError(\n                        \"All the act_scales for the logical weights of a layer \"\n                        f\"must be equal. But got {layer.act_scale}\")\n                layer.act_scale = Parameter(layer.act_scale.max(),\n                                            requires_grad=False)\n            else:\n                raise ValueError(\n                    f\"Unknown scheme {self.quant_config.activation_scheme}\")\n\n    def apply(self,\n              layer: torch.nn.Module,\n              x: torch.Tensor,\n              bias: Optional[torch.Tensor] = None) -> torch.Tensor:\n        # ops.scaled_fp8_quant supports both dynamic and static quant.\n        #   If dynamic, layer.act_scale is None and x_scale computed from x.\n        #   If static,  layer.act_scale is scalar and x_scale set to act_scale.\n        qinput, x_scale = ops.scaled_fp8_quant(x,\n                                               layer.act_scale,\n                                               batch_dim_padding=17)\n\n        # Fused GEMM_DQ -- note we padded the input above because\n        # torch._scaled_mm is more performant for matrices with\n        # batch dimension > 16. Note that this could change\n        # in the future.\n        output, _ = torch._scaled_mm(\n            qinput,\n            layer.weight,\n            out_dtype=x.dtype,\n            scale_a=x_scale,\n            scale_b=layer.weight_scale,\n            bias=bias,\n        )\n\n        return torch.narrow(output, 0, 0, x.shape[0])\n\n\nclass Fp8KVCacheMethod(QuantizeMethodBase):\n    \"\"\"Supports loading kv-cache scaling factors from FP8 checkpoints.\n    \"\"\"\n\n    def __init__(self, quant_config: Fp8Config):\n        self.quant_config = quant_config\n\n    def create_weights(self, layer: torch.nn.Module):\n        \"\"\"Create \"weight\" (aka kv_scale) for an attention layer. \n        \n        Args:\n            layer: The layer that is using the QuantizeMethodBase factory.\n        \"\"\"\n        # Initialize the KV cache scale to 1.0 as the default value.\n        # If the kv_scale appears in the checkpoint, it will be\n        # overwritten when loading weights.\n        layer.kv_scale = Parameter(torch.tensor(1.0), requires_grad=False)\n\n    def apply(self, layer: torch.nn.Module) -> torch.Tensor:\n        raise RuntimeError(\"Fp8KVCacheMethod.apply should not be called.\")\n\n    def process_weights_after_loading(self, layer: Module) -> None:\n        # If the kv-cache dtype is auto, we enforce the kv-scale to be 1.0\n        # regardless whether the kv-scale is available in the checkpoint.\n        if layer.kv_cache_dtype != \"auto\":\n            kv_scale = layer.kv_scale.to(\"cpu\").tolist()\n            if not isinstance(kv_scale, float):\n                raise ValueError(\"Only support per-tensor scaling factor \"\n                                 \"for fp8 KV cache\")\n            layer._kv_scale = kv_scale\n            if layer._kv_scale == 1.0 and \"e5m2\" not in layer.kv_cache_dtype:\n                print_warning_once(\n                    \"Using KV cache scaling factor 1.0 for fp8_e4m3. This may \"\n                    \"cause accuracy issues. Please make sure kv-cache scaling \"\n                    \"factor is available in the fp8 checkpoint.\")\n        del layer.kv_scale\n\n\ndef all_close_1d(x: torch.Tensor) -> bool:\n    assert len(x.shape) == 1\n    return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))\n\n\ndef per_tensor_quantize(tensor: torch.Tensor,\n                        inv_scale: Union[float, torch.Tensor]) -> torch.Tensor:\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    qweight = (tensor / inv_scale).clamp(min=finfo.min, max=finfo.max)\n    return qweight.to(torch.float8_e4m3fn)\n\n\ndef per_tensor_dequantize(\n        tensor: torch.Tensor, inv_scale: Union[float,\n                                               torch.Tensor]) -> torch.Tensor:\n    fake_qweight = tensor.to(torch.float16)\n    dq_weight = fake_qweight * inv_scale\n    return dq_weight\n",
+      "diff": "diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py\nindex bf3a59e3d..136a64623 100644\n--- a/vllm/model_executor/layers/quantization/fp8.py\n+++ b/vllm/model_executor/layers/quantization/fp8.py\n@@ -17,6 +17,24 @@ ACTIVATION_SCHEMES = [\"static\", \"dynamic\"]\n logger = init_logger(__name__)\n \n \n+def cutlass_fp8_supported() -> bool:\n+    capability = torch.cuda.get_device_capability()\n+    capability = capability[0] * 10 + capability[1]\n+    version = torch.version.cuda\n+    version = version[0] * 10 + version[1]\n+\n+    # CUTLASS FP8 kernels need at least\n+    #   CUDA 12.0 on SM90 systems (Hopper)\n+    #   CUDA 12.4 on SM89 systems (Lovelace)\n+    gpu_is_supported = False\n+    if capability >= 900:\n+        gpu_is_supported = version > 120\n+    elif capability >= 890:\n+        gpu_is_supported = version > 124\n+\n+    return gpu_is_supported\n+\n+\n class Fp8Config(QuantizationConfig):\n     \"\"\"Config class for FP8.\"\"\"\n \n@@ -92,6 +110,7 @@ class Fp8LinearMethod(LinearMethodBase):\n \n     def __init__(self, quant_config: Fp8Config):\n         self.quant_config = quant_config\n+        self.cutlass_fp8_supported = cutlass_fp8_supported()\n \n     def _create_scale_param(\n         self,\n@@ -233,25 +252,40 @@ class Fp8LinearMethod(LinearMethodBase):\n               layer: torch.nn.Module,\n               x: torch.Tensor,\n               bias: Optional[torch.Tensor] = None) -> torch.Tensor:\n+\n         # ops.scaled_fp8_quant supports both dynamic and static quant.\n         #   If dynamic, layer.act_scale is None and x_scale computed from x.\n         #   If static,  layer.act_scale is scalar and x_scale set to act_scale.\n-        qinput, x_scale = ops.scaled_fp8_quant(x,\n-                                               layer.act_scale,\n-                                               batch_dim_padding=17)\n-\n-        # Fused GEMM_DQ -- note we padded the input above because\n-        # torch._scaled_mm is more performant for matrices with\n-        # batch dimension > 16. Note that this could change\n-        # in the future.\n-        output, _ = torch._scaled_mm(\n-            qinput,\n-            layer.weight,\n-            out_dtype=x.dtype,\n-            scale_a=x_scale,\n-            scale_b=layer.weight_scale,\n-            bias=bias,\n-        )\n+\n+        if bias is None and self.cutlass_fp8_supported:\n+            qinput, x_scale = ops.scaled_fp8_quant(x, layer.act_scale)\n+\n+            # Fused GEMM_DQ\n+            output = ops.cutlass_scaled_mm_dq(\n+                qinput,\n+                layer.weight,\n+                out_dtype=x.dtype,\n+                scale_a=x_scale,\n+                scale_b=layer.weight_scale,\n+            )\n+\n+        else:\n+            qinput, x_scale = ops.scaled_fp8_quant(x,\n+                                                   layer.act_scale,\n+                                                   batch_dim_padding=17)\n+\n+            # Fused GEMM_DQ -- note we padded the input above because\n+            # torch._scaled_mm is more performant for matrices with\n+            # batch dimension > 16. Note that this could change\n+            # in the future.\n+            output, _ = torch._scaled_mm(\n+                qinput,\n+                layer.weight,\n+                out_dtype=x.dtype,\n+                scale_a=x_scale,\n+                scale_b=layer.weight_scale,\n+                bias=bias,\n+            )\n \n         return torch.narrow(output, 0, 0, x.shape[0])",
+      "change_type": "modified",
+      "lines_added": 51,
+      "lines_removed": 17
+    }
+  ],
+  "affected_apis": [],
+  "summary": {
+    "total_files": 2,
+    "files_added": 0,
+    "files_deleted": 0,
+    "files_modified": 2
+  },
+  "csv_metadata": {
+    "category": "kernel-based",
+    "json_has_tests": "FALSE",
+    "json_has_benchmarks": "TRUE",
+    "is_test_actually_there": "Yes (test_fp8_quant, test_fp8)",
+    "is_benchmark_actually_there": "",
+    "sample_clues": "_custom_ops, apply, custom"
+  }
+}
+```

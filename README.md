@@ -31,8 +31,11 @@ OmniPerf-Bench/
 ├── pyproject.toml              # Python project configuration (gso package)
 ├── uv.lock                     # Lock file for uv package manager
 ├── requirements.txt            # Python dependencies
-├── commit_to_dataset.py        # Commit-to-dataset conversion pipeline
+│
+├── 🚀 commit_to_dataset.py     # 🔥 Main entry point: Single-commit dataset pipeline
 ├── experiments.yaml            # Example experiment configuration
+├── 8d75fe48_test_case_generator_v2.py  # Example test generator script
+├── eg_test_generator.txt       # Example prompt template
 │
 ├── src/                        # Main OmniPerf-Bench source code
 │   ├── collect/                # Collection framework for dataset generation
@@ -114,11 +117,23 @@ OmniPerf-Bench/
         └── reviews/           # Manual review files (CSV format)
 ```
 
+**🎯 Repository Organization Philosophy:**
+
+This repository follows a **"no duplicates, clear entry points"** structure:
+
+- **Root level** - Main entry points and configuration files
+- **`commit_to_dataset.py`** - 🔥 **PRIMARY ENTRY POINT** for single-commit dataset creation
+- **`src/`** - Organized source code by functionality (collect, harness, data, utils)  
+- **`misc/`** - Experimental data and working files (preserved as-is for research)
+- **`data/`** - Generated datasets ready for consumption
+- **`docs/`** - Documentation and schemas
+
 **Key Components:**
+- **`commit_to_dataset.py`** - 🚀 **Main script**: Streamlined single-commit to dataset conversion  
 - **`src/collect/`** - Multi-stage dataset generation pipeline (commit extraction → API mapping → test generation → execution)
 - **`src/harness/`** - Docker-based evaluation system with Opt@K metrics and visualization
 - **`src/data/`** - Core data models and schema validation
-- **`commit_to_dataset.py`** - Streamlined single-commit to dataset conversion
+- **`experiments.yaml`** - Example configuration that works out-of-the-box
 - **`data/`** - Generated benchmark datasets ready for use
 - **`docs/dataset_schema.md`** - Canonical schema supporting GSO/SWE-Perf export views
 - **`misc/experiments/`** - Real experimental data including 64 extracted commits and vLLM dataset (282 problems)
@@ -181,6 +196,14 @@ export OPENAI_API_KEY="your_openai_api_key"           # For LLM test generation
 export ANTHROPIC_API_KEY="your_anthropic_api_key"     # Alternative to OpenAI
 export GHAPI_TOKEN="your_github_token"                # For commit extraction
 export HF_TOKEN="your_huggingface_token"              # For dataset uploads
+
+# For AWS Bedrock (alternative to OpenAI/Anthropic)
+export AWS_REGION="us-east-1"                         # AWS region for Bedrock
+# AWS credentials via one of:
+export AWS_ACCESS_KEY_ID="your_aws_access_key"        # Method 1: Environment variables
+export AWS_SECRET_ACCESS_KEY="your_aws_secret_key"
+# OR use AWS SSO: aws sso login --sso-session your-session  # Method 2: SSO
+# OR use ~/.aws/credentials file                            # Method 3: Credential file
 ```
 
 **Optional for Cloud Execution:**
@@ -194,8 +217,47 @@ export AWS_SECRET_ACCESS_KEY="your_aws_secret"
 **Token Setup Links:**
 - [OpenAI API Key](https://platform.openai.com/api-keys)
 - [Anthropic API Key](https://console.anthropic.com/)
+- [AWS Bedrock Setup](https://docs.aws.amazon.com/bedrock/latest/userguide/getting-started.html) (requires model access)
 - [GitHub Token](https://github.com/settings/tokens) (needs repo access)
 - [HuggingFace Token](https://huggingface.co/docs/hub/en/security-tokens)
+
+### AWS Bedrock Setup (Optional)
+
+For using Claude Opus 4.1 via AWS Bedrock (highest quality option):
+
+```bash
+# 1. Install AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
+# 2. Configure credentials (choose one method)
+
+# Method A: SSO (recommended)
+aws configure sso
+aws sso login --sso-session your-session
+
+# Method B: Access keys
+aws configure
+# Enter your AWS Access Key ID and Secret Access Key
+
+# Method C: Environment variables
+export AWS_ACCESS_KEY_ID="your_access_key"
+export AWS_SECRET_ACCESS_KEY="your_secret_key"
+export AWS_REGION="us-east-1"
+
+# 3. Enable Bedrock model access
+# Go to AWS Console > Bedrock > Model Access
+# Request access to Anthropic Claude models
+
+# 4. Verify access
+aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic
+```
+
+**Supported Bedrock Models:**
+- `us.anthropic.claude-opus-4-1-20250805-v1:0` (Claude Opus 4.1) - Highest quality
+- `us.anthropic.claude-sonnet-4-20250514-v1:0` (Claude Sonnet 4)
+- `anthropic.claude-3-5-sonnet-20241022-v2:0` (Claude 3.5 Sonnet)
 
 ### Verify Installation
 ```bash
@@ -207,10 +269,28 @@ docker --version
 
 # Check CUDA availability (for performance testing)
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+
+# Check AWS Bedrock access (if using Bedrock)
+aws sts get-caller-identity
+aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic --query "modelSummaries[?contains(modelId, 'claude-opus-4-1')]"
 ```
 
 
 ## 💽 usage
+
+**🔥 TL;DR - Quick Start:**
+```bash
+# Option 1: Using OpenAI
+export OPENAI_API_KEY="your_key"
+python commit_to_dataset.py experiments.yaml
+
+# Option 2: Using AWS Bedrock (Claude Opus 4.1)
+export AWS_REGION="us-east-1"
+aws sso login --sso-session your-session  # or configure AWS credentials
+python commit_to_dataset.py experiments.yaml
+
+# Your dataset appears in data/vllm_dataset_with_test.jsonl
+```
 
 ### 1. evaluation harness
 
@@ -300,34 +380,56 @@ repo_instr: "Look for CUDA kernel optimizations"
 
 For detailed instructions, see the [collection framework documentation](src/collect/README.md).
 
-### 3. commit-to-dataset pipeline
+### 3. 🚀 commit-to-dataset pipeline (quickest start)
 
-The `commit_to_dataset.py` script provides a streamlined way to create canonical OmniPerf-Bench dataset records from individual performance optimization commits.
+The `commit_to_dataset.py` script is the **main entry point** for creating performance optimization datasets from individual commits. This is the simplest way to get started!
 
-#### quick start
-1. **Create configuration file** (`commit_config.yaml`):
+#### ⚡ super quick start
+```bash
+# 1. Set up API keys (choose one option)
+
+# Option A: OpenAI
+export OPENAI_API_KEY="your_openai_key"
+
+# Option B: Anthropic
+export ANTHROPIC_API_KEY="your_anthropic_key"
+
+# Option C: AWS Bedrock (Claude Opus 4.1 - highest quality)
+export AWS_REGION="us-east-1"
+aws sso login --sso-session your-session
+
+# 2. Run the pipeline on the provided example configuration
+python commit_to_dataset.py experiments.yaml
+
+# 3. Your dataset will be created in data/vllm_dataset_with_test.jsonl
+```
+
+#### 📝 custom configuration
+Create your own configuration file (`my_config.yaml`):
 ```yaml
 repo_path: "/path/to/your/repo"
-head_commit: "abc123def456"  # The optimized commit
-base_commit: null            # Optional: defaults to head_commit^
 extractions_dir: "misc/experiments/commit_extractions_with_apis"
 use_docker: false            # Set true for reproducible environments
 docker_image: "ayushnangia16/nvidia-vllm-docker:latest"
 dataset_name: "my_perf_dataset"
 hf_repo: "your_username/dataset_repo"  # Optional HF upload
 push_to_hf: false
+
+# LLM Configuration
+llm_provider: "openai"       # or "anthropic" or "bedrock"
+llm_model: "gpt-4o-mini"     # or "claude-3-sonnet-20240229" or "us.anthropic.claude-opus-4-1-20250805-v1:0"
+llm_temperature: 0.1
+llm_max_tokens: 4096
 ```
 
-2. **Run pipeline**:
+Then run:
 ```bash
-# Ensure API keys are set
-export OPENAI_API_KEY="your_key" # or ANTHROPIC_API_KEY
-
-# Execute pipeline
-PYTHONPATH=src python commit_to_dataset.py commit_config.yaml
+python commit_to_dataset.py my_config.yaml
 ```
 
-3. **Output**: Creates `data/my_perf_dataset.jsonl` with canonical dataset record
+#### 📤 output
+- **Local file**: `data/{dataset_name}.jsonl` with canonical dataset records
+- **Optional HF upload**: Pushes to HuggingFace if `push_to_hf: true`
 
 #### performance measurement methodology
 
@@ -369,10 +471,71 @@ the script generates:
 
 #### requirements
 
-- **llm api access**: openai or anthropic api key
+- **llm api access**: one of:
+  - OpenAI API key
+  - Anthropic API key 
+  - AWS Bedrock access (requires model permissions)
 - **commit extractions**: pre-extracted commit data in `extractions_dir`
 - **docker (optional)**: for containerized test execution
 - **python dependencies**: `pyyaml`, `datasets`, `pandas` (for hf push)
+
+#### 🔧 troubleshooting
+
+**Common Issues:**
+
+1. **"No such file or directory: commit_to_dataset.py"**
+   ```bash
+   # Make sure you're in the repository root
+   cd /path/to/OmniPerf-Bench
+   ls commit_to_dataset.py  # Should exist
+   ```
+
+2. **"ModuleNotFoundError: No module named 'collect'"**
+   ```bash
+   # Always run from the repository root, script handles PYTHONPATH automatically
+   python commit_to_dataset.py experiments.yaml
+   ```
+
+3. **"Config file not found"**
+   ```bash
+   # Use the provided example configuration
+   python commit_to_dataset.py experiments.yaml
+   # Or specify full path to your config
+   python commit_to_dataset.py /full/path/to/my_config.yaml
+   ```
+
+4. **"Missing LLM credentials"**
+   ```bash
+   # Set at least one API key/credential
+   export OPENAI_API_KEY="sk-your-key-here"
+   # OR
+   export ANTHROPIC_API_KEY="your-anthropic-key"
+   # OR for AWS Bedrock
+   export AWS_REGION="us-east-1"
+   aws sso login --sso-session your-session
+   ```
+
+5. **"No valid extraction files found"**
+   ```bash
+   # Check that the extractions directory exists and has JSON files
+   ls misc/experiments/commit_extractions_with_apis/*.json
+   ```
+
+6. **AWS Bedrock Issues**
+   ```bash
+   # Check AWS credentials
+   aws sts get-caller-identity
+   
+   # Check Bedrock model access
+   aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic
+   
+   # If using SSO, ensure session is active
+   aws sso login --sso-session your-session
+   
+   # For "streaming required" errors - this is automatically handled
+   # For "system role" errors - this is automatically handled
+   # For "inference profile" errors - check model access in AWS Console
+   ```
 
 ### 4. available datasets and experiments
 

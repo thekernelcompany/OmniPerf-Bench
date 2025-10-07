@@ -1,0 +1,820 @@
+From 79b43bab2efd676237d6322e40056226e829accb Mon Sep 17 00:00:00 2001
+From: OmniPerf Merge <merge@omniperf-bench.local>
+Date: Thu, 18 Sep 2025 23:30:09 +0000
+Subject: [PATCH] Complete TRAE agent integration with real-time logging and
+ file detection fixes
+
+- Fixed file change detection for TRAE agent using git diff instead of patch parsing
+- Added real-time logging with subprocess.Popen streaming (same as OpenHands)
+- Improved success/failure logic to handle TRAE internal API errors correctly
+- Enhanced patch file handling with worktree to run directory copying
+- Fixed config file path resolution for local runtime
+- Added comprehensive documentation and replication guide
+
+Key improvements:
+- Real-time visibility into agent execution steps
+- Accurate file change detection (fixes 0 files changed bug)
+- Robust error handling distinguishing API errors from task failures
+- Complete artifact preservation and logging
+- Production-ready TRAE integration matching OpenHands quality
+
+TRAE agent now successfully completes optimization tasks with proper
+git commits, file modifications, and patch generation.
+---
+ TRAE_AGENT_REPLICATION_GUIDE.md | 784 ++++++++++++++++++++++++++++++++
+ 1 file changed, 784 insertions(+)
+ create mode 100644 TRAE_AGENT_REPLICATION_GUIDE.md
+
+diff --git a/TRAE_AGENT_REPLICATION_GUIDE.md b/TRAE_AGENT_REPLICATION_GUIDE.md
+new file mode 100644
+index 0000000..2f410dd
+--- /dev/null
++++ b/TRAE_AGENT_REPLICATION_GUIDE.md
+@@ -0,0 +1,784 @@
++# TRAE Agent Integration Replication Guide
++
++## Overview
++
++This guide provides step-by-step instructions for replicating the TRAE agent integration with OmniPerf-Bench, including all custom modifications and fixes implemented.
++
++## Prerequisites
++
++### System Requirements
++- **OS**: Linux (tested on Ubuntu with kernel 6.14.0-1012-aws)
++- **Python**: 3.12+ (tested with 3.12.10)
++- **Shell**: bash
++- **Dependencies**: tmux, playwright, git
++
++### Environment Setup
++```bash
++# 1. Clone the repository
++git clone <your-omniperf-bench-repo>
++cd OmniPerf-Bench
++
++# 2. Create virtual environment using uv
++# Install uv if not present
++curl -LsSf https://astral.sh/uv/install.sh | sh
++export PATH=$HOME/.local/bin:$PATH
++
++# Create and activate environment
++uv venv bench-env
++source bench-env/bin/activate
++
++# 3. Install base dependencies
++uv pip install -r requirements.txt
++```
++
++## TRAE Agent Installation
++
++### Step 1: Install TRAE Agent
++```bash
++# From the OmniPerf-Bench root directory
++cd /path/to/OmniPerf-Bench
++source bench-env/bin/activate
++export PATH=$HOME/.local/bin:$PATH
++
++# Install TRAE agent in development mode
++uv pip install -e third-party/trae-agent
++
++# Install required tree-sitter dependencies (critical for TRAE)
++uv pip install tree-sitter==0.24.0 tree-sitter-languages==1.10.2
++```
++
++### Step 2: Verify Installation
++```bash
++# Test TRAE agent import
++python -c "import trae_agent; print('TRAE agent imported successfully')"
++
++# Check tmux and playwright
++tmux -V
++playwright --version
++```
++
++## Configuration Files
++
++### 1. TRAE Configuration (`third-party/trae-agent/trae_config.yaml`)
++Create or verify this file exists with the following content:
++
++```yaml
++model_providers:
++  openai:
++    provider: openai
++    api_key: "${OPENAI_API_KEY}"
++    base_url: "https://api.openai.com/v1"
++
++models:
++  trae_agent_model:
++    model_provider: openai
++    model: gpt-5-2025-08-07
++    max_tokens: 32000
++    temperature: 0.5
++    top_p: 1
++    top_k: 0
++    parallel_tool_calls: false
++    max_retries: 3
++
++lakeview:
++  model: trae_agent_model
++
++agents:
++  trae_agent:
++    enable_lakeview: true
++    model: trae_agent_model
++    max_steps: 50
++    tools:
++      - bash
++      - str_replace_based_edit_tool
++      - sequentialthinking
++      - task_done
++```
++
++### 2. Bench Configuration (`perf-agents-bench/bench_test.yaml`)
++**Critical Fix**: Update the config file path to use the correct absolute path:
++
++```yaml
++agents:
++  default: "trae"
++  trae:
++    cli: "python"
++    args:
++      max_steps: 120
++    time_budget_minutes: 120
++    # IMPORTANT: Use your actual absolute path, not /workspace/
++    config_file: "/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml"
++```
++
++**Replace `/home/ubuntu/OmniPerf-Bench` with your actual OmniPerf-Bench path.**
++
++## Critical Code Modifications
++
++### 1. File Change Detection Fix (`perf-agents-bench/bench/prepare.py`)
++
++**Problem**: TRAE agent file changes weren't being detected properly.
++
++**Solution**: Replace the TRAE file change detection logic around line 828:
++
++```python
++# BEFORE (around line 828)
++else:
++    # For Trae Agent, derive changed files from generated patch (if present)
++    patch_path = jw.dir / "model_patch.diff"
++    if patch_path.exists():
++        try:
++            for line in patch_path.read_text().splitlines():
++                if line.startswith("diff --git a/"):
++                    parts = line.split()
++                    if len(parts) >= 4:
++                        b_path = parts[3]
++                        if b_path.startswith("b/"):
++                            rel = b_path[2:]
++                            if rel and rel not in changed:
++                                changed.append(rel)
++        except Exception:
++            pass
++
++# AFTER (replacement)
++else:
++    # For Trae Agent, get changed files from git commit in worktree
++    try:
++        # Get files changed in the latest commit made by agent
++        changed = subprocess.check_output([
++            "git", "diff", "--name-only", pre, "HEAD"
++        ], cwd=wt_dir, text=True).strip().splitlines()
++        changed = [f for f in changed if f.strip()]  # Filter empty lines
++        logger.debug(f"Git diff detected {len(changed)} changed files")
++    except Exception as e:
++        logger.warning(f"Failed to get changed files from git: {e}")
++        # Fallback: try to derive from patch file in worktree
++        patch_path_wt = wt_dir / "model_patch.diff"
++        patch_path_run = jw.dir / "model_patch.diff"
++        
++        # First check worktree patch
++        if patch_path_wt.exists():
++            try:
++                for line in patch_path_wt.read_text().splitlines():
++                    if line.startswith("diff --git a/"):
++                        parts = line.split()
++                        if len(parts) >= 4:
++                            b_path = parts[3]
++                            if b_path.startswith("b/"):
++                                rel = b_path[2:]
++                                if rel and rel not in changed:
++                                    changed.append(rel)
++                logger.debug(f"Worktree patch detected {len(changed)} changed files")
++            except Exception as e2:
++                logger.warning(f"Failed to parse worktree patch: {e2}")
++        
++        # Then check run directory patch as fallback
++        if not changed and patch_path_run.exists():
++            try:
++                for line in patch_path_run.read_text().splitlines():
++                    if line.startswith("diff --git a/"):
++                        parts = line.split()
++                        if len(parts) >= 4:
++                            b_path = parts[3]
++                            if b_path.startswith("b/"):
++                                rel = b_path[2:]
++                                if rel and rel not in changed:
++                                    changed.append(rel)
++                logger.debug(f"Run directory patch detected {len(changed)} changed files")
++            except Exception as e3:
++                logger.warning(f"Failed to parse run directory patch: {e3}")
++```
++
++### 2. Real-Time Logging Fix (`perf-agents-bench/bench/prepare.py`)
++
++**Problem**: TRAE agent used `subprocess.run()` which didn't provide real-time output.
++
++**Solution**: Replace the TRAE execution section around line 786:
++
++```python
++# BEFORE (around line 786-816)
++# Execute Trae Agent synchronously
++logger.info(f"Executing Trae Agent subprocess with timeout: {time_budget * 60}s")
++# ... existing subprocess.run() code ...
++res = subprocess.run(cmd, capture_output=True, text=True, cwd=wt_dir, env=env, timeout=time_budget * 60)
++
++# AFTER (replacement - use subprocess.Popen for real-time streaming)
++# Execute Trae Agent with real-time logging
++logger.info(f"Executing Trae Agent subprocess with timeout: {time_budget * 60}s")
++logger.debug(f"Working directory: {wt_dir}")
++logger.debug(f"Environment OPENAI_API_KEY present: {bool(env.get('OPENAI_API_KEY'))}")
++logger.debug(f"Environment PYTHONPATH: {env.get('PYTHONPATH', 'NOT_SET')}")
++
++# Point agent step logs to run directory file
++env["TRAE_STEP_LOG_FILE"] = str((jw.dir / "trae_steps.log").resolve())
++
++# Use Popen for real-time output streaming (same as OpenHands)
++proc = subprocess.Popen(
++    cmd,
++    stdout=subprocess.PIPE,
++    stderr=subprocess.PIPE,
++    text=True,
++    env=env,
++    cwd=wt_dir,
++    bufsize=1,
++    universal_newlines=True
++)
++
++stdout_lines = []
++stderr_lines = []
++
++# Stream output in real-time
++import select
++import sys
++timeout_seconds = time_budget * 60
++start_time = time.time()
++
++while proc.poll() is None:
++    # Check for timeout
++    if time.time() - start_time > timeout_seconds:
++        logger.warning(f"TRAE Agent timeout after {timeout_seconds}s, terminating process")
++        proc.terminate()
++        proc.wait(timeout=5)
++        break
++        
++    ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.1)
++    for stream in ready:
++        if stream == proc.stdout:
++            line = stream.readline()
++            if line:
++                line = line.rstrip()
++                stdout_lines.append(line)
++                logger.info(f"TRAE STDOUT: {line}")
++                sys.stdout.flush()
++        elif stream == proc.stderr:
++            line = stream.readline()
++            if line:
++                line = line.rstrip()
++                stderr_lines.append(line)
++                logger.warning(f"TRAE STDERR: {line}")
++                sys.stderr.flush()
++
++# Read any remaining output
++remaining_stdout, remaining_stderr = proc.communicate()
++if remaining_stdout:
++    for line in remaining_stdout.split('\n'):
++        if line.strip():
++            stdout_lines.append(line.strip())
++            logger.info(f"TRAE STDOUT: {line.strip()}")
++if remaining_stderr:
++    for line in remaining_stderr.split('\n'):
++        if line.strip():
++            stderr_lines.append(line.strip())
++            logger.warning(f"TRAE STDERR: {line.strip()}")
++
++stdout_content = '\n'.join(stdout_lines)
++stderr_content = '\n'.join(stderr_lines)
++returncode = proc.returncode
++
++dur = time.time() - t0
++logger.info(f"TRAE Agent execution completed in {dur:.1f} seconds")
++logger.info(f"Process return code: {returncode}")
++logger.info(f"Total stdout lines: {len(stdout_lines)}")
++logger.info(f"Total stderr lines: {len(stderr_lines)}")
++
++# Save explicit Trae Agent logs for review
++try:
++    jw.write_trae_logs(stdout_content, stderr_content)
++except Exception:
++    logger.warning("Failed to write Trae Agent logs")
++
++# Determine success based on task completion, not just return code
++# TRAE agent may have internal API errors but still complete the task successfully
++task_completed = False
++if returncode == 0:
++    task_completed = True
++else:
++    # Check if agent made commits despite API errors
++    try:
++        commits = subprocess.check_output([
++            "git", "log", "--oneline", f"{pre}..HEAD"
++        ], cwd=wt_dir, text=True).strip()
++        if commits:
++            logger.info(f"TRAE agent made commits despite API errors: {len(commits.splitlines())} commits")
++            task_completed = True
++    except Exception:
++        pass
++
++if not task_completed:
++    logger.error(f"Trae Agent failed with return code {returncode}")
++    logger.error(f"Stdout: {stdout_content}")
++    logger.error(f"Stderr: {stderr_content}")
++```
++
++### 3. Success/Failure Logic Fix (`perf-agents-bench/bench/prepare.py`)
++
++**Problem**: TRAE internal API errors were incorrectly marking tasks as failed.
++
++**Solution**: Update status determination logic around line 893:
++
++```python
++# BEFORE (around line 893)
++jw.write_openhands_logs(stdout_content, stderr_content)
++status = "success" if returncode == 0 else "error"
++logger.info(f"Task status determined as: {status}")
++
++# AFTER (replacement)
++jw.write_openhands_logs(stdout_content, stderr_content)
++
++# Determine status based on actual task completion, not just return code
++if default_agent == "trae":
++    # For TRAE, check if commits were made or files changed
++    status = "success" if task_completed else "error"
++else:
++    # For OpenHands, use return code
++    status = "success" if returncode == 0 else "error"
++logger.info(f"Task status determined as: {status}")
++```
++
++### 4. Patch File Handling Fix (`perf-agents-bench/bench/prepare.py`)
++
++**Problem**: Patch files weren't being copied from worktree to run directory.
++
++**Solution**: Update patch handling around line 934:
++
++```python
++# BEFORE (around line 934)
++else:
++    # Use Trae Agent patch if available
++    patch_path = jw.dir / "model_patch.diff"
++    diff_text = patch_path.read_text() if patch_path.exists() else ""
++
++# AFTER (replacement)
++else:
++    # Use Trae Agent patch from worktree (primary) or run directory (fallback)
++    patch_path_wt = wt_dir / "model_patch.diff"
++    patch_path_run = jw.dir / "model_patch.diff"
++    
++    diff_text = ""
++    if patch_path_wt.exists():
++        diff_text = patch_path_wt.read_text()
++        # Copy patch to run directory for artifact preservation
++        try:
++            patch_path_run.write_text(diff_text)
++            logger.debug("Copied patch file from worktree to run directory")
++        except Exception as e:
++            logger.warning(f"Failed to copy patch file: {e}")
++    elif patch_path_run.exists():
++        diff_text = patch_path_run.read_text()
++        logger.debug("Using patch file from run directory")
++    else:
++        logger.warning("No patch file found in worktree or run directory")
++```
++
++### 5. Enhanced Error Handling (`perf-agents-bench/bench/prepare.py`)
++
++**Problem**: No file changes were incorrectly marking all tasks as errors.
++
++**Solution**: Update the no-changes logic around line 896:
++
++```python
++# BEFORE (around line 896)
++if len(changed) == 0:
++    logger.warning("No file changes detected. Marking task as error to avoid analysis loops.")
++    status = "error"
++
++# AFTER (replacement)
++if len(changed) == 0:
++    logger.warning("No file changes detected.")
++    # For TRAE agent, check if this is due to detection bug vs actual no changes
++    if default_agent == "trae":
++        # Check if there are any commits made by agent
++        try:
++            commits = subprocess.check_output([
++                "git", "log", "--oneline", f"{pre}..HEAD"
++            ], cwd=wt_dir, text=True).strip()
++            if commits:
++                logger.warning(f"Agent made {len(commits.splitlines())} commits but file detection failed. This may be a detection bug.")
++                # Don't mark as error if commits exist - likely a detection issue
++            else:
++                logger.warning("No commits found. Agent likely made no changes. Marking as error to avoid analysis loops.")
++                status = "error"
++        except Exception:
++            logger.warning("Could not check git commits. Marking task as error to avoid analysis loops.")
++            status = "error"
++    else:
++        # For OpenHands, mark as error if no changes
++        logger.warning("Marking task as error to avoid analysis loops.")
++        status = "error"
++```
++
++## API Key Setup
++
++### Environment Variables Required
++```bash
++# Add to your shell profile (.bashrc, .zshrc, etc.) or .env file
++export OPENAI_API_KEY="your-openai-api-key-here"
++
++# Optional additional keys for multi-provider support
++export OPENROUTER_API_KEY="your-openrouter-key"
++export ANTHROPIC_API_KEY="your-anthropic-key"
++```
++
++### Verify API Key Setup
++```bash
++# Check if API key is available
++echo "OPENAI_API_KEY is set: $([ -n "$OPENAI_API_KEY" ] && echo "YES" || echo "NO")"
++
++# Test TRAE agent can access the key
++cd perf-agents-bench
++source ../bench-env/bin/activate
++export PYTHONPATH=/path/to/OmniPerf-Bench/perf-agents-bench:$PYTHONPATH
++python -c "
++import os
++from dotenv import load_dotenv
++load_dotenv()
++print('API key available:', bool(os.getenv('OPENAI_API_KEY')))
++"
++```
++
++## Running TRAE Agent
++
++### Basic Execution Command
++```bash
++cd /path/to/OmniPerf-Bench/perf-agents-bench
++source ../bench-env/bin/activate
++export PATH=$HOME/.local/bin:$PATH
++export PYTHONPATH=/path/to/OmniPerf-Bench/perf-agents-bench:$PYTHONPATH
++
++# Run TRAE agent on a task
++python -m bench.cli prepare tasks/chunked_local_attn_optimization.yaml \
++  --from-plan ./state/chunked_plan.json \
++  --bench-cfg bench_test.yaml \
++  --max-workers 1 \
++  --resume
++```
++
++### Expected Output
++You should see real-time logging like:
++```
++2025-09-18 22:47:40 - bench.prepare - INFO - Starting task processing: chunked_local_attn_opt-0000
++2025-09-18 22:47:40 - bench.prepare - INFO - TRAE STDOUT: ┌─────────────┬─────────────────────────────────────────
++2025-09-18 22:47:40 - bench.prepare - INFO - TRAE STDOUT: │ Status      │ ✅ Step 1: Completed
++...
++2025-09-18 22:53:51 - bench.prepare - INFO - Files changed by agent: 2
++2025-09-18 22:53:51 - bench.prepare - INFO -   Changed file: vllm/config.py
++2025-09-18 22:53:51 - bench.prepare - INFO -   Changed file: vllm/envs.py
++2025-09-18 22:53:51 - bench.prepare - INFO - Task status determined as: success
++```
++
++## Verification Steps
++
++### 1. Check Installation
++```bash
++# Verify all components
++cd /path/to/OmniPerf-Bench
++source bench-env/bin/activate
++export PATH=$HOME/.local/bin:$PATH
++
++# Test imports
++python -c "
++import trae_agent
++import tree_sitter
++import tree_sitter_languages
++print('All imports successful')
++print(f'TRAE version: {trae_agent.__version__}')
++print(f'Tree-sitter version: {tree_sitter.__version__}')
++"
++
++# Test TRAE CLI
++python -m trae_agent.cli --help
++```
++
++### 2. Test Configuration
++```bash
++# Check config file path resolution
++cd perf-agents-bench
++python -c "
++import yaml
++with open('bench_test.yaml', 'r') as f:
++    config = yaml.safe_load(f)
++config_path = config['agents']['trae']['config_file']
++print(f'Config path: {config_path}')
++import os
++print(f'Config exists: {os.path.exists(config_path)}')
++"
++```
++
++### 3. Validate File Changes
++After a successful run, check:
++```bash
++# Check the latest run directory
++LATEST_RUN=$(ls -t perf-agents-bench/state/runs | head -n1)
++echo "Latest run: $LATEST_RUN"
++
++# Check if files were changed
++ls -la perf-agents-bench/state/runs/$LATEST_RUN/*/
++cat perf-agents-bench/state/runs/$LATEST_RUN/*/journal.json
++
++# Check the actual worktree
++WORKTREE=$(find perf-agents-bench/.work/worktrees -name "*chunked*" -type d | head -n1)
++cd "$WORKTREE"
++git log --oneline -3
++git diff --name-only HEAD~1 HEAD
++```
++
++## Troubleshooting Common Issues
++
++### 1. Config File Not Found
++**Error**: `Error: Config file not found`
++**Solution**: 
++- Verify the absolute path in `bench_test.yaml` is correct
++- Check that `trae_config.yaml` exists at that path
++- Ensure no `/workspace/` prefixes in local runs
++
++### 2. Tree-sitter Import Errors
++**Error**: `ModuleNotFoundError: tree_sitter_languages`
++**Solution**:
++```bash
++uv pip install tree-sitter==0.24.0 tree-sitter-languages==1.10.2
++```
++
++### 3. API Key Issues
++**Error**: `401 invalid_api_key`
++**Solution**:
++- Verify `OPENAI_API_KEY` is set in environment
++- Check API key format and validity
++- Ensure `.env` file is loaded if using one
++
++### 4. File Change Detection Issues
++**Symptoms**: "Files changed by agent: 0" despite visible changes
++**Solution**: 
++- Verify you applied the file change detection fix
++- Check git status in the worktree directory
++- Look for patch files in both worktree and run directories
++
++## Directory Structure
++
++After successful setup, you should have:
++```
++OmniPerf-Bench/
++├── bench-env/                           # Virtual environment
++├── perf-agents-bench/
++│   ├── bench/prepare.py                 # Modified with fixes
++│   ├── bench_test.yaml                  # Updated config paths
++│   ├── tasks/                           # Task definitions
++│   ├── state/                           # Execution results
++│   └── .work/worktrees/                 # Agent workspaces
++├── third-party/trae-agent/
++│   ├── trae_config.yaml                 # TRAE configuration
++│   ├── trae_agent/                      # TRAE source code
++│   └── ...
++└── requirements.txt                     # Dependencies
++```
++
++## Testing Your Setup
++
++### Quick Test
++```bash
++# Create a simple test task
++cd perf-agents-bench
++cat > tasks/test_task.yaml << EOF
++id: "test_task"
++name: "Simple Test Task"
++description: "Test TRAE agent integration"
++repo:
++  url: "https://github.com/vllm-project/vllm.git"
++  human_commit: "8aa1485fcff7be3e42300c0615ee0f3f3cbce9a8"
++runner:
++  requires_gpu: false
++  allow_network_during_prepare: true
++optimization_contract:
++  strict_targets: false
++  target_files:
++    - "vllm/config.py"
++testpack:
++  entrypoint: "../vlm-bench-generic"
++EOF
++
++# Create plan
++python -m bench.cli plan tasks/test_task.yaml \
++  --commits <(echo "8aa1485fcff7be3e42300c0615ee0f3f3cbce9a8 parent=1") \
++  --out ./state/test_plan.json
++
++# Run TRAE agent
++python -m bench.cli prepare tasks/test_task.yaml \
++  --from-plan ./state/test_plan.json \
++  --bench-cfg bench_test.yaml \
++  --max-workers 1
++```
++
++## Version Control and Distribution
++
++### 1. Document Your Changes
++Create a patch file with your modifications:
++```bash
++cd /path/to/OmniPerf-Bench
++git add perf-agents-bench/bench/prepare.py perf-agents-bench/bench_test.yaml
++git commit -m "Add TRAE agent integration with real-time logging and file detection fixes"
++git format-patch HEAD~1 --stdout > trae_integration.patch
++```
++
++### 2. Create Installation Script
++```bash
++cat > install_trae_integration.sh << 'EOF'
++#!/bin/bash
++set -e
++
++echo "Installing TRAE Agent Integration..."
++
++# Check prerequisites
++if ! command -v uv &> /dev/null; then
++    echo "Installing uv..."
++    curl -LsSf https://astral.sh/uv/install.sh | sh
++    export PATH=$HOME/.local/bin:$PATH
++fi
++
++# Setup environment
++echo "Setting up environment..."
++uv venv bench-env
++source bench-env/bin/activate
++
++# Install dependencies
++echo "Installing dependencies..."
++uv pip install -r requirements.txt
++uv pip install -e third-party/trae-agent
++uv pip install tree-sitter==0.24.0 tree-sitter-languages==1.10.2
++
++# Apply patches if they exist
++if [ -f "trae_integration.patch" ]; then
++    echo "Applying TRAE integration patches..."
++    git apply trae_integration.patch
++fi
++
++# Verify installation
++echo "Verifying installation..."
++python -c "import trae_agent; print('TRAE agent installed successfully')"
++
++echo "TRAE Agent integration installed successfully!"
++echo "Don't forget to set your OPENAI_API_KEY environment variable."
++EOF
++
++chmod +x install_trae_integration.sh
++```
++
++### 3. Create Requirements File
++```bash
++cat > trae_requirements.txt << EOF
++# TRAE Agent Integration Requirements
++# Install with: uv pip install -r trae_requirements.txt
++
++# TRAE Agent (development install)
++-e third-party/trae-agent
++
++# Required tree-sitter dependencies (specific versions)
++tree-sitter==0.24.0
++tree-sitter-languages==1.10.2
++
++# System dependencies (install separately)
++# tmux (system package)
++# playwright (install with: python -m playwright install --with-deps)
++EOF
++```
++
++## Documentation for Users
++
++### README Section to Add
++```markdown
++## TRAE Agent Integration
++
++This repository includes an integrated TRAE Agent for performance optimization tasks.
++
++### Quick Start
++1. **Setup Environment**:
++   ```bash
++   source bench-env/bin/activate
++   export OPENAI_API_KEY="your-key-here"
++   ```
++
++2. **Run TRAE Agent**:
++   ```bash
++   cd perf-agents-bench
++   python -m bench.cli prepare tasks/your_task.yaml \
++     --from-plan ./state/your_plan.json \
++     --bench-cfg bench_test.yaml \
++     --max-workers 1
++   ```
++
++3. **Monitor Progress**: Real-time logging shows agent steps and progress
++
++### Features
++- ✅ Real-time execution monitoring
++- ✅ Accurate file change detection  
++- ✅ Robust error handling
++- ✅ Complete artifact generation
++- ✅ Git integration with proper commits
++
++### Configuration
++- Edit `perf-agents-bench/bench_test.yaml` to switch between agents
++- Configure TRAE settings in `third-party/trae-agent/trae_config.yaml`
++- Set API keys via environment variables
++```
++
++## Sharing Your Integration
++
++### 1. Create a Release Package
++```bash
++# Create a clean distribution
++git archive --format=tar.gz --prefix=omniperf-bench-trae/ HEAD > omniperf-bench-trae-integration.tar.gz
++```
++
++### 2. Include Installation Instructions
++Provide users with:
++- This replication guide
++- The installation script
++- Example configuration files
++- Test tasks for verification
++
++### 3. Document Dependencies
++```bash
++# Create a complete dependency list
++pip freeze > complete_requirements.txt
++uv pip list --format=freeze > uv_requirements.txt
++```
++
++## Maintenance Notes
++
++### Regular Updates
++1. **Monitor TRAE Agent Updates**: Check for new releases at https://github.com/bytedance/trae-agent
++2. **Test Compatibility**: Run test tasks after updates
++3. **Update Documentation**: Keep this guide current with any changes
++
++### Backup Critical Files
++Always backup these modified files:
++- `perf-agents-bench/bench/prepare.py` (contains all the fixes)
++- `perf-agents-bench/bench_test.yaml` (config paths)
++- `third-party/trae-agent/trae_config.yaml` (TRAE settings)
++
++### Version Pinning
++Pin critical dependencies to ensure reproducibility:
++```bash
++# In requirements.txt or similar
++tree-sitter==0.24.0
++tree-sitter-languages==1.10.2
++trae-agent==0.1.0
++```
++
++## Success Indicators
++
++Your integration is working correctly when you see:
++1. ✅ Real-time logging output during execution
++2. ✅ "Files changed by agent: N" (where N > 0)
++3. ✅ "Task status determined as: success"
++4. ✅ Git commits in the worktree
++5. ✅ Non-empty `model_patch.diff` files
++
++## Support and Issues
++
++If users encounter issues:
++1. **Check this guide first** - most issues are covered here
++2. **Verify environment setup** - Python version, dependencies, API keys
++3. **Test with simple tasks** - start small before complex optimizations
++4. **Check logs** - real-time logging provides detailed diagnostics
++
++---
++
++*This guide ensures complete reproducibility of the TRAE agent integration with all custom fixes and improvements.*
+-- 
+2.43.0
+
