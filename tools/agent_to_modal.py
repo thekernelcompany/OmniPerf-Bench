@@ -18,15 +18,15 @@ Usage:
 
 from __future__ import annotations
 
-import json
+import json  # noqa: F401 (used in generated app template)
 import os
 import shutil
 import subprocess
-import sys
-import time
+import sys  # noqa: F401 (potential future use / CLI)
+import time  # noqa: F401 (timestamps in logs / future use)
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional
 
 import typer
 
@@ -39,7 +39,7 @@ DEFAULT_REGISTRY_REPO = os.environ.get(
     "OPB_BASE_IMAGE_REPO", "ayushnangia16/nvidia-vllm-docker"
 )
 DEFAULT_GPUS = ["H100", "A100", "L40S"]
-DEFAULT_GENERATORS_REL = "../test-generation-scripts/working_test_generators"
+DEFAULT_GENERATORS_REL = "misc/experiments/generated_test_generators_v4"
 MODAL_RESULTS_VOLUME = os.environ.get("OPB_MODAL_RESULTS_VOLUME", "opb-results")
 MODAL_GENERATORS_VOLUME = os.environ.get("OPB_MODAL_GENERATORS_VOLUME", "opb-generators")
 MODAL_SOURCE_VOLUME = os.environ.get("OPB_MODAL_SOURCE_VOLUME", "opb-source")
@@ -259,73 +259,51 @@ def modal_prepare_volumes(generators_dir: Path) -> None:
         pass
 
 
-def modal_prepare_source_volume(worktree: Path) -> None:
+def modal_prepare_source_volume(worktree: Path, source_dir_name: str) -> None:
     typer.echo("[Stage C] Uploading source worktree to Modal volume (idempotent)...")
     try:
         _run(["modal", "volume", "create", MODAL_SOURCE_VOLUME])
     except Exception:
         pass
     try:
-        _run(["modal", "volume", "put", MODAL_SOURCE_VOLUME, str(worktree)])
+        _run(["modal", "volume", "put", MODAL_SOURCE_VOLUME, str(worktree), f"/{source_dir_name}"])
     except Exception:
         pass
 
 
 def write_modal_app(app_py: Path, base_image: str, source_dir_name: str) -> None:
     # No user echo here; called within Stage C
-    content = f"""
-import modal
+    # First, write the Dockerfile
+    dockerfile_path = app_py.parent / "Dockerfile.modal"
+    dockerfile_path.write_text(f"""FROM {base_image}
 
-BASE = "{base_image}"
-IMG = modal.Image.from_registry(BASE)
-app = modal.App("vllm-agent-tests")
+# Clear ENTRYPOINT and CMD from base image to allow Modal control
+ENTRYPOINT []
+CMD []
 
-GENS = modal.Volume.from_name("{MODAL_GENERATORS_VOLUME}")
-RESULTS = modal.Volume.from_name("{MODAL_RESULTS_VOLUME}")
-SRC = modal.Volume.from_name("{MODAL_SOURCE_VOLUME}")
-
-
-def _run_and_capture(script_rel: str, args: list[str]) -> str:
-    import subprocess
-    import os
-    # Uninstall baked vllm and install agent source uploaded to /opb-source
-    try:
-        subprocess.run(["python3", "-m", "pip", "uninstall", "-y", "vllm"], check=False)
-    except Exception:
-        pass
-    subprocess.run(["python3", "-m", "pip", "install", "--no-deps", "--force-reinstall", f"/opb-source/{source_dir_name}"], check=True)
-    script_path = os.path.join("/opb-generators", script_rel)
-    cmd = ["python", script_path, *args]
-    res = subprocess.run(cmd, check=True, text=True, capture_output=True)
-    return res.stdout
-
-
-@app.function(image=IMG, gpu=modal.gpu.H100(), timeout=3600, volumes={{"/opb-generators": GENS, "/results": RESULTS, "/opb-source": SRC}})
-def test_h100(script_rel: str, args: list[str]) -> str:
-    return _run_and_capture(script_rel, args)
-
-
-@app.function(image=IMG, gpu=modal.gpu.A100(), timeout=3600, volumes={{"/opb-generators": GENS, "/results": RESULTS, "/opb-source": SRC}})
-def test_a100(script_rel: str, args: list[str]) -> str:
-    return _run_and_capture(script_rel, args)
-
-
-@app.function(image=IMG, gpu=modal.gpu.L40S(), timeout=4800, volumes={{"/opb-generators": GENS, "/results": RESULTS, "/opb-source": SRC}})
-def test_l40s(script_rel: str, args: list[str]) -> str:
-    return _run_and_capture(script_rel, args)
-"""
-    app_py.write_text(content, encoding="utf-8")
+# Ensure python3 is accessible as python
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+""", encoding="utf-8")
+    
+    # Preserve existing app.py to avoid f-string templating issues
+    if not app_py.exists():
+        repo_app = Path(__file__).resolve().parent / "modal_runner" / "app.py"
+        if repo_app.exists():
+            app_py.write_text(repo_app.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def write_modal_submit(submit_py: Path, commit_sha: str, script_rel: str) -> None:
     # No user echo here; called within Stage C
-    content = f"""
-from app import test_h100, test_a100, test_l40s
+    content = f"""import modal
 
 SCRIPT = "{script_rel}"
 ARGS_H100 = ["--reference", "--json-out", f"/results/{commit_sha}-H100.json"]
 ARGS_A100 = ["--reference", "--json-out", f"/results/{commit_sha}-A100.json"]
 ARGS_L40S = ["--reference", "--json-out", f"/results/{commit_sha}-L40S.json"]
+
+test_h100 = modal.Function.from_name("vllm-agent-tests-v5", "test_h100")
+test_a100 = modal.Function.from_name("vllm-agent-tests-v5", "test_a100")
+test_l40s = modal.Function.from_name("vllm-agent-tests-v5", "test_l40s")
 
 print(test_h100.remote(SCRIPT, ARGS_H100))
 print(test_a100.remote(SCRIPT, ARGS_A100))
@@ -362,12 +340,12 @@ def run(
     overlay_tag: str = typer.Option("", help="Override overlay tag; default '<sha>-agent-<short>'"),
     gpu: List[str] = typer.Option(DEFAULT_GPUS, "--gpu", help="GPUs to run on (H100, A100, L40S)"),
     generator_script_rel: str = typer.Option(
-        "working_test_generators/0f40557a_test_case_generator.py",
-        help="Path under generators volume to the script to execute",
+        None,
+        help="Path under generators volume to the script to execute; auto-derived from commit SHA if not specified",
     ),
     generators_dir: Optional[Path] = typer.Option(
         None,
-        help="Local path to generator scripts directory; defaults to ../test-generation-scripts/working_test_generators",
+        help="Local path to generator scripts directory; defaults to misc/experiments/generated_test_generators_v4",
     ),
 ) -> None:
     """Execute the full pipeline for a given perf commit SHA."""
@@ -395,14 +373,21 @@ def run(
 
     gen_dir = generators_dir or (paths.repo_root / DEFAULT_GENERATORS_REL).resolve()
     modal_prepare_volumes(gen_dir)
-    modal_prepare_source_volume(worktree)
+    
+    # Compute source directory name before uploading
+    source_dir_name = Path(str(worktree)).name
+    modal_prepare_source_volume(worktree, source_dir_name)
+
+    # Auto-derive generator script from commit SHA if not specified
+    if generator_script_rel is None:
+        short_sha = commit_sha[:8]
+        generator_script_rel = f"generated_test_generators_v4/{short_sha}_test_case_generator.py"
+        typer.echo(f"[Stage C] Auto-derived generator script: {generator_script_rel}")
 
     # Generate Modal app and submitter with this overlay image and script
     typer.echo("[Stage C] Generating Modal app and submitter...")
     modal_dir = paths.repo_root / "tools" / "modal_runner"
     modal_dir.mkdir(parents=True, exist_ok=True)
-    # Worktree volume is uploaded under '/<item_id>' inside the volume root; compute folder name
-    source_dir_name = Path(str(worktree)).name
     write_modal_app(modal_dir / "app.py", overlay_full_tag, source_dir_name)
     write_modal_submit(modal_dir / "submit.py", commit_sha=commit_sha, script_rel=generator_script_rel)
 

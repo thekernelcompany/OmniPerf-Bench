@@ -6,6 +6,7 @@ import subprocess
 import concurrent.futures as futures
 import logging
 import traceback
+import threading
 from pathlib import Path
 from typing import Dict, Any
 
@@ -80,6 +81,19 @@ class PrepareExecutor:
 
         env_vars = _load_env_vars()
 
+        # Experiment config (A/B hints + optional preflight)
+        def _as_bool(x: Any) -> bool:  # type: ignore[name-defined]
+            try:
+                return str(x).strip().lower() in {"1", "true", "yes", "on"}
+            except Exception:
+                return False
+
+        experiment_cfg = self.cfg.get("experiment", {}) if isinstance(self.cfg.get("experiment", {}), dict) else {}
+        hints_enabled = _as_bool(experiment_cfg.get("hints_enabled", False))
+        preflight_enabled = _as_bool(experiment_cfg.get("preflight_enabled", False))
+        metadata_dir = Path(experiment_cfg.get("metadata_json_dir", "")).resolve() if experiment_cfg.get("metadata_json_dir") else None
+        generators_dir = Path(experiment_cfg.get("generators_dir", "")).resolve() if experiment_cfg.get("generators_dir") else None
+
         def process(item: Dict[str, Any]):
             item_id = item["item_id"]
             logger.info(f"Starting task processing: {item_id}")
@@ -142,17 +156,23 @@ class PrepareExecutor:
             except Exception:
                 diff_stat = ""
 
-            # Read the actual commit data to get the diff
-            commit_json_path = f"/workspace/OmniPerf-Bench/tmp_single_commit/{human}.json"
+            # Read the actual commit data (diff/apis/perf_command)
+            commit_data: Dict[str, Any] | None = None
             diff_text = ""
-            
-            if os.path.exists(commit_json_path):
+            # Candidate paths: new configurable dir first, then legacy workspace path (if present)
+            candidate_paths: list[Path] = []
+            if metadata_dir:
+                candidate_paths.append(Path(metadata_dir) / f"{human}.json")
+            candidate_paths.append(Path(f"/workspace/OmniPerf-Bench/tmp_single_commit/{human}.json"))
+            for cand in candidate_paths:
                 try:
-                    with open(commit_json_path, 'r') as f:
-                        commit_data = json.load(f)
-                    diff_text = commit_data.get("diff_text", "")
+                    if cand.exists():
+                        with open(cand, "r") as f:
+                            commit_data = json.load(f)
+                        diff_text = commit_data.get("diff_text", "") or diff_text
+                        break
                 except Exception:
-                    pass
+                    commit_data = None
             
             # If no diff from JSON, get it from git
             if not diff_text:
@@ -326,6 +346,39 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 "",
                 "CRITICAL: You MUST make actual code changes. Look for patterns like:",
             ])
+
+            # Optional: Inject symbolic hints from commit metadata
+            if hints_enabled:
+                task_lines.append("")
+                task_lines.append("## HINTS (symbolic; no gold diffs)")
+                if commit_data:
+                    apis = commit_data.get("apis") or []
+                    if isinstance(apis, list) and apis:
+                        task_lines.append("APIs to target (from metadata):")
+                        for api in apis[:10]:
+                            task_lines.append(f"- {api}")
+                # Suggest likely generator and test command
+                likely_gen: str | None = None
+                try:
+                    if generators_dir and generators_dir.exists():
+                        import glob as _glob
+                        pattern = str(generators_dir / f"*{human[:8]}*test_case_generator.py")
+                        matches = _glob.glob(pattern)
+                        if matches:
+                            likely_gen = matches[0]
+                except Exception:
+                    likely_gen = None
+                perf_cmd = (commit_data or {}).get("perf_command") if commit_data else None
+                if likely_gen:
+                    task_lines.append("")
+                    task_lines.append("Likely local generator:")
+                    task_lines.append(f"- {likely_gen}")
+                if perf_cmd:
+                    task_lines.append("")
+                    task_lines.append("Suggested test command (from metadata):")
+                    task_lines.append("```")
+                    task_lines.append(str(perf_cmd))
+                    task_lines.append("```")
             
             # Analyze the actual commit diff to understand what needs to be optimized
             optimization_hints = []
@@ -441,6 +494,27 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             task_text = "\n".join(task_lines) + "\n"
             task_file = jw.dir / "task.txt"
             task_file.write_text(task_text)
+
+            # Optional preflight logging (lightweight; does not block)
+            preflight_info: Dict[str, Any] = {"attempted": bool(preflight_enabled)}
+            if preflight_enabled:
+                try:
+                    # Check generator presence and perf command availability
+                    gen_found = False
+                    perf_cmd_present = False
+                    if commit_data:
+                        perf_cmd_present = bool(commit_data.get("perf_command"))
+                    if generators_dir and generators_dir.exists():
+                        import glob as _glob2
+                        gen_matches = _glob2.glob(str(generators_dir / f"*{human[:8]}*test_case_generator.py"))
+                        gen_found = bool(gen_matches)
+                    preflight_info.update({
+                        "generator_found": gen_found,
+                        "perf_command_present": perf_cmd_present,
+                        "status": "logged_only",
+                    })
+                except Exception as _e_pf:
+                    preflight_info.update({"error": str(_e_pf)})
 
             # Select agent
             default_agent = str(self.cfg["agents"].get("default", "openhands"))
@@ -564,6 +638,21 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 logger.warning(f"Git branch creation failed: {e}")
 
             t0 = time.time()
+            # Watcher to record time-to-first-edit (first commit beyond pre)
+            first_edit_time_holder: Dict[str, Any] = {"val": None}
+            stop_watch = threading.Event()
+            def _watch_first_edit():
+                while not stop_watch.is_set():
+                    try:
+                        commits = subprocess.check_output(["git", "log", "--oneline", f"{pre}..HEAD"], cwd=wt_dir, text=True).strip()
+                        if commits and first_edit_time_holder.get("val") is None:
+                            first_edit_time_holder["val"] = time.time() - t0
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+            watcher = threading.Thread(target=_watch_first_edit, daemon=True)
+            watcher.start()
             logger.info(f"Starting {default_agent} execution at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             try:
                 # Merge env vars from .env into subprocess environment
@@ -999,6 +1088,13 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 if task_cfg["optimization_contract"].get("strict_targets", False) and not ok:
                     logger.warning("Status changed to error due to strict target enforcement")
                     status = "error"
+                # Stop watcher
+                try:
+                    stop_watch.set()
+                    watcher.join(timeout=1.0)
+                except Exception:
+                    pass
+
                 # Generate unified diff prediction artifact for GSO harness compatibility
                 try:
                     import tomllib as _tomllib  # Python 3.11+
@@ -1067,11 +1163,45 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 except Exception as _e:
                     logger.warning(f"Failed to write prediction artifacts: {_e}")
                 logger.info(f"Writing journal with final status: {status}")
+                # Compute metrics
+                try:
+                    # commit count
+                    _commits_txt = subprocess.check_output(["git", "log", "--oneline", f"{pre}..HEAD"], cwd=wt_dir, text=True).strip()
+                    commit_count = len([ln for ln in _commits_txt.splitlines() if ln.strip()])
+                except Exception:
+                    commit_count = None
+                # patch size (added+removed lines)
+                def _patch_size_loc(txt: str) -> int:
+                    add = sum(1 for l in txt.splitlines() if l.startswith("+") and not l.startswith("+++"))
+                    rem = sum(1 for l in txt.splitlines() if l.startswith("-") and not l.startswith("---"))
+                    return add + rem
+                diff_for_metrics = diff_text
+                if not diff_for_metrics:
+                    try:
+                        diff_for_metrics = subprocess.check_output(["git", "diff", pre, "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"], cwd=wt_dir).decode()
+                    except Exception:
+                        diff_for_metrics = ""
+                patch_size = _patch_size_loc(diff_for_metrics) if diff_for_metrics else None
+
+                metrics_payload = {
+                    "time_to_first_edit_s": first_edit_time_holder.get("val"),
+                    "commit_count": commit_count,
+                    "patch_size_loc": patch_size,
+                    "changed_files_count": len(changed),
+                    "violations_count": len(disallowed),
+                }
+
                 jw.write_journal({
                     "task_id": task_cfg["id"],
                     "commits": {"pre": pre, "human": human},
                     "agent_branch": branch,
                     "status": status,
+                    "experiment": {
+                        "hints_enabled": hints_enabled,
+                        "preflight_enabled": preflight_enabled,
+                    },
+                    "preflight": preflight_info,
+                    "metrics": metrics_payload,
                     default_agent: {
                         "cli": cli,
                         "time_budget_minutes": time_budget,
