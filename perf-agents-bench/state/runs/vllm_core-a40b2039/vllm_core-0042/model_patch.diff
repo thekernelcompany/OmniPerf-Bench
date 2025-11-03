@@ -1,0 +1,277 @@
+diff --git a/docs/design/v1/p2p_nccl_connector.md b/docs/design/v1/p2p_nccl_connector.md
+index b1df93cfc..b548fa30c 100644
+--- a/docs/design/v1/p2p_nccl_connector.md
++++ b/docs/design/v1/p2p_nccl_connector.md
+@@ -8,7 +8,7 @@ As shown in Figure 1, the overall process of this **PD disaggregation** solution
+ 1. The client sends an HTTP request to the Proxy/Router's `/v1/completions` interface.  
+ 2. The Proxy/Router selects a **1P1D (1 Prefill instance + 1 Decode instance)** through either through round-robin or random selection, generates a `request_id` (rules to be introduced later), modifies the `max_tokens` in the HTTP request message to **1**, and then forwards the request to the **P instance**.  
+ 3. Immediately afterward, the Proxy/Router forwards the **original HTTP request** to the **D instance**.  
+-4. The **P instance** performs **Prefill** and then **actively sends the generated KV cache** to the D instance (using **PUT_ASYNC** mode). The D instance's `zmq_addr` can be resolved through the `request_id`.  
++4. The **P instance** performs **Prefill** and then **actively sends the generated KVCache** to the D instance (using **PUT_ASYNC** mode). The D instance's `zmq_addr` can be resolved through the `request_id`.  
+ 5. The **D instance** has a **dedicated thread** for receiving the KV cache (to avoid blocking the main process). The received KV cache is saved into the **GPU memory buffer**, the size of which is determined by the vLLM startup parameter `kv_buffer_size`. When the GPU buffer is full, the KV cache is stored in the **local Tensor memory pool**.  
+ 6. During the **Decode**, the D instance's main process retrieves the KV cache (transmitted by the P instance) from either the **GPU buffer** or the **memory pool**, thereby **skipping Prefill**.  
+ 7. After completing **Decode**, the D instance returns the result to the **Proxy/Router**, which then forwards it to the **client**.
+@@ -17,7 +17,7 @@ As shown in Figure 1, the overall process of this **PD disaggregation** solution
+ 
+ ## Proxy/Router (Demo)
+ 
+-A simple HTTP service acts as the entry point for client requests and starts a background thread to listen for P/D instances reporting their HTTP IP and PORT, as well as ZMQ IP and PORT. It maintains a dictionary of `http_addr -> zmq_addr`. The `http_addr` is the IP:PORT for the vLLM instance's request, while the `zmq_addr` is the address for KV cache handshake and metadata reception.
++A simple HTTP service acts as the entry point for client requests and starts a background thread to listen for P/D instances reporting their HTTP IP and PORT, as well as ZMQ IP and PORT. It maintains a dictionary of `http_addr -> zmq_addr`. The `http_addr` is the IP:PORT for the vLLM instance's request, while the `zmq_addr` is the address for KVCache handshake and metadata reception.
+ 
+ The Proxy/Router is responsible for selecting 1P1D based on the characteristics of the client request, such as the prompt, and generating a corresponding `request_id`, for example:
+ 
+@@ -31,21 +31,21 @@ Each P/D instance periodically sends a heartbeat packet to the Proxy/Router (cur
+ 
+ ## KV Cache Transfer Methods
+ 
+-There are three methods for KVcache transfer: PUT, GET, and PUT_ASYNC. These methods can be specified using the `--kv-transfer-config` and `kv_connector_extra_config` parameters, specifically through the `send_type` field. Both PUT and PUT_ASYNC involve the P instance actively sending KVcache to the D instance. The difference is that PUT is a synchronous transfer method that blocks the main process, while PUT_ASYNC is an asynchronous transfer method. PUT_ASYNC uses a dedicated thread for sending KVcache, which means it does not block the main process. In contrast, the GET method involves the P instance saving the KVcache to the memory buffer after computing the prefill. The D instance then actively retrieves the computed KVcache from the P instance once it has allocated space for the KVcache.
++There are three methods for KVCache transfer: PUT, GET, and PUT_ASYNC. These methods can be specified using the `--kv-transfer-config` and `kv_connector_extra_config` parameters, specifically through the `send_type` field. Both PUT and PUT_ASYNC involve the P instance actively sending KVCache to the D instance. The difference is that PUT is a synchronous transfer method that blocks the main process, while PUT_ASYNC is an asynchronous transfer method. PUT_ASYNC uses a dedicated thread for sending KVCache, which means it does not block the main process. In contrast, the GET method involves the P instance saving the KVCache to the memory buffer after computing the prefill. The D instance then actively retrieves the computed KVCache from the P instance once it has allocated space for the KVCache.
+ 
+ Experimental results have shown that the performance of these methods, from highest to lowest, is as follows: PUT_ASYNC → GET → PUT.
+ 
+ ## P2P Communication via ZMQ & NCCL
+ 
+-As long as the address of the counterpart is known, point-to-point KV cache transfer (using NCCL) can be performed, without being constrained by rank and world size. To support dynamic scaling (expansion and contraction) of instances with PD disaggregation. This means that adding or removing P/D instances does not require a full system restart.
++As long as the address of the counterpart is known, point-to-point KVCache transfer (using NCCL) can be performed, without being constrained by rank and world size. To support dynamic scaling (expansion and contraction) of instances with PD disaggregation. This means that adding or removing P/D instances does not require a full system restart.
+ 
+-Each P/D instance only needs to create a single `P2pNcclEngine` instance. This instance maintains a ZMQ Server, which runs a dedicated thread to listen on the `zmq_addr` address and receive control flow requests from other instances. These requests include requests to establish an NCCL connection and requests to send KVcache metadata (such as tensor shapes and data types). However, it does not actually transmit the KVcache data itself.
++Each P/D instance only needs to create a single `P2pNcclEngine` instance. This instance maintains a ZMQ Server, which runs a dedicated thread to listen on the `zmq_addr` address and receive control flow requests from other instances. These requests include requests to establish an NCCL connection and requests to send KVCache metadata (such as tensor shapes and data types). However, it does not actually transmit the KVCache data itself.
+ 
+-When a P instance and a D instance transmit KVcache for the first time, they need to establish a ZMQ connection and an NCCL group. For subsequent KVcache transmissions, this ZMQ connection and NCCL group are reused. The NCCL group consists of only two ranks, meaning the world size is equal to 2. This design is intended to support dynamic scaling, which means that adding or removing P/D instances does not require a full system restart. As long as the address of the counterpart is known, point-to-point KVcache transmission can be performed, without being restricted by rank or world size.
++When a P instance and a D instance transmit KVCache for the first time, they need to establish a ZMQ connection and an NCCL group. For subsequent KVCache transmissions, this ZMQ connection and NCCL group are reused. The NCCL group consists of only two ranks, meaning the world size is equal to 2. This design is intended to support dynamic scaling, which means that adding or removing P/D instances does not require a full system restart. As long as the address of the counterpart is known, point-to-point KVCache transmission can be performed, without being restricted by rank or world size.
+ 
+ ## NCCL Group Topology
+ 
+-Currently, only symmetric TP (Tensor Parallelism) methods are supported for KVcache transmission. Asymmetric TP and PP (Pipeline Parallelism) methods will be supported in the future. Figure 2 illustrates the 1P2D setup, where each instance has a TP (Tensor Parallelism) degree of 2. There are a total of 7 NCCL groups: three vLLM instances each have one NCCL group with TP=2. Additionally, the 0th GPU card of the P instance establishes an NCCL group with the 0th GPU card of each D instance. Similarly, the 1st GPU card of the P instance establishes an NCCL group with the 1st GPU card of each D instance.
++Currently, only symmetric TP (Tensor Parallelism) methods are supported for KVCache transmission. Asymmetric TP and PP (Pipeline Parallelism) methods will be supported in the future. Figure 2 illustrates the 1P2D setup, where each instance has a TP (Tensor Parallelism) degree of 2. There are a total of 7 NCCL groups: three vLLM instances each have one NCCL group with TP=2. Additionally, the 0th GPU card of the P instance establishes an NCCL group with the 0th GPU card of each D instance. Similarly, the 1st GPU card of the P instance establishes an NCCL group with the 1st GPU card of each D instance.
+ 
+ ![image2](https://github.com/user-attachments/assets/837e61d6-365e-4cbf-8640-6dd7ab295b36)
+ 
+@@ -53,11 +53,11 @@ Each NCCL group occupies a certain amount of GPU memory buffer for communication
+ 
+ ## GPU Memory Buffer and Tensor Memory Pool
+ 
+-The trade-off in the size of the memory buffer is as follows: For P instances, the memory buffer is not required in PUT and PUT_ASYNC modes, but it is necessary in GET mode. For D instances, a memory buffer is needed in all three modes. The memory buffer for D instances should not be too large. Similarly, for P instances in GET mode, the memory buffer should also not be too large. The memory buffer of D instances is used to temporarily store KVcache sent by P instances. If it is too large, it will reduce the KVcache space available for normal inference by D instances, thereby decreasing the inference batch size and ultimately leading to a reduction in output throughput. The size of the memory buffer is configured by the parameter `kv_buffer_size`, measured in bytes, and is typically set to 5%～10% of the memory size.
++The trade-off in the size of the memory buffer is as follows: For P instances, the memory buffer is not required in PUT and PUT_ASYNC modes, but it is necessary in GET mode. For D instances, a memory buffer is needed in all three modes. The memory buffer for D instances should not be too large. Similarly, for P instances in GET mode, the memory buffer should also not be too large. The memory buffer of D instances is used to temporarily store KVCache sent by P instances. If it is too large, it will reduce the KVCache space available for normal inference by D instances, thereby decreasing the inference batch size and ultimately leading to a reduction in output throughput. The size of the memory buffer is configured by the parameter `kv_buffer_size`, measured in bytes, and is typically set to 5%～10% of the memory size.
+ 
+-If the `--max-num-seqs` parameter for P instances is set to a large value, due to the large batch size, P instances will generate a large amount of KVcache simultaneously. This may exceed the capacity of the memory buffer of D instances, resulting in KVcache loss. Once KVcache is lost, D instances need to recompute Prefill, which is equivalent to performing Prefill twice. Consequently, the time-to-first-token (TTFT) will significantly increase, leading to degraded performance.
++If the `--max-num-seqs` parameter for P instances is set to a large value, due to the large batch size, P instances will generate a large amount of KVCache simultaneously. This may exceed the capacity of the memory buffer of D instances, resulting in KVCache loss. Once KVCache is lost, D instances need to recompute Prefill, which is equivalent to performing Prefill twice. Consequently, the time-to-first-token (TTFT) will significantly increase, leading to degraded performance.
+ 
+-To address the above issues, I have designed and developed a local Tensor memory pool for storing KVcache, inspired by the buddy system used in Linux memory modules. Since the memory is sufficiently large, typically in the TB range on servers, there is no need to consider prefix caching or using block-based designs to reuse memory, thereby saving space. When the memory buffer is insufficient, KVcache can be directly stored in the Tensor memory pool, and D instances can subsequently retrieve KVcache from it. The read and write speed is that of PCIe, with PCIe 4.0 having a speed of approximately 21 GB/s, which is usually faster than the Prefill speed. Otherwise, solutions like Mooncake and lmcache would not be necessary. The Tensor memory pool acts as a flood diversion area, typically unused except during sudden traffic surges. In the worst-case scenario, my solution performs no worse than the normal situation with a Cache store.
++To address the above issues, I have designed and developed a local Tensor memory pool for storing KVCache, inspired by the buddy system used in Linux memory modules. Since the memory is sufficiently large, typically in the TB range on servers, there is no need to consider prefix caching or using block-based designs to reuse memory, thereby saving space. When the memory buffer is insufficient, KVCache can be directly stored in the Tensor memory pool, and D instances can subsequently retrieve KVCache from it. The read and write speed is that of PCIe, with PCIe 4.0 having a speed of approximately 21 GB/s, which is usually faster than the Prefill speed. Otherwise, solutions like Mooncake and lmcache would not be necessary. The Tensor memory pool acts as a flood diversion area, typically unused except during sudden traffic surges. In the worst-case scenario, my solution performs no worse than the normal situation with a Cache store.
+ 
+ # Install vLLM
+ 
+@@ -85,8 +85,8 @@ To address the above issues, I have designed and developed a local Tensor memory
+ 
+ ## Instructions
+ - The following examples are run on an A800 (80GB) device, using the Meta-Llama-3.1-8B-Instruct model.
+-- Pay attention to the setting of the `kv_buffer_size` (in bytes). The empirical value is 10% of the GPU memory size. This is related to the kvcache size. If it is too small, the GPU memory buffer for temporarily storing the received kvcache will overflow, causing the kvcache to be stored in the tensor memory pool, which increases latency. If it is too large, the kvcache available for inference will be reduced, leading to a smaller batch size and decreased throughput.
+-- For Prefill instances, when using non-GET mode, the `kv_buffer_size` can be set to 1, as Prefill currently does not need to receive kvcache. However, when using GET mode, a larger `kv_buffer_size` is required because it needs to store the kvcache sent to the D instance.
++- Pay attention to the setting of the `kv_buffer_size` (in bytes). The empirical value is 10% of the GPU memory size. This is related to the KVCache size. If it is too small, the GPU memory buffer for temporarily storing the received KVCache will overflow, causing the KVCache to be stored in the tensor memory pool, which increases latency. If it is too large, the KVCache available for inference will be reduced, leading to a smaller batch size and decreased throughput.
++- For Prefill instances, when using non-GET mode, the `kv_buffer_size` can be set to 1, as Prefill currently does not need to receive KVCache. However, when using GET mode, a larger `kv_buffer_size` is required because it needs to store the KVCache sent to the D instance.
+ - You may need to modify the `kv_buffer_size` and `port` in the following commands (if there is a conflict).
+ - `PUT_ASYNC` offers the best performance and should be prioritized.
+ - The `--port` must be consistent with the `http_port` in the `--kv-transfer-config`.
+diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+index 4e82424d6..206c9e06d 100644
+--- a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+@@ -82,12 +82,8 @@ async def forward_request(url, data, request_id):
+         }
+         async with session.post(url=url, json=data, headers=headers) as response:
+             if response.status == 200:
+-                if True:
+-                    async for chunk_bytes in response.content.iter_chunked(1024):
+-                        yield chunk_bytes
+-                else:
+-                    content = await response.read()
+-                    yield content
++                async for chunk_bytes in response.content.iter_chunked(1024):
++                    yield chunk_bytes
+ 
+ 
+ @app.route("/v1/completions", methods=["POST"])
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+index 52f589a6d..92c7cb9ed 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+@@ -27,6 +27,11 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++# Precompile regex patterns to avoid recompilation overhead on hot paths
++_DECODE_RE = re.compile(r"___decode_addr_(.*):(\d+)")
++_PREFILL_RE = re.compile(r"___prefill_addr_(.*):(\d+)___")
++
++
+ @dataclass
+ class ReqMeta:
+     # Request Id
+@@ -40,13 +45,16 @@ class ReqMeta:
+     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
+                   block_size: int) -> "ReqMeta":
+         valid_num_tokens = len(token_ids)
+-        token_ids_tensor = torch.tensor(token_ids)
+-        block_ids_tensor = torch.tensor(block_ids)
++        # Use as_tensor to avoid unnecessary copies and ensure correct dtype for indexing
++        token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long)
++        block_ids_tensor = torch.as_tensor(block_ids, dtype=torch.long)
+         num_blocks = block_ids_tensor.shape[0]
+-        block_offsets = torch.arange(0, block_size)
+-        slot_mapping = block_offsets.reshape((1, block_size)) + \
+-                block_ids_tensor.reshape((num_blocks, 1)) * block_size
+-        slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
++        # Precompute offsets as contiguous long tensor
++        block_offsets = torch.arange(block_size, dtype=torch.long)
++        # Compute slot mapping with minimal temporary tensors
++        slot_mapping = block_ids_tensor.view(num_blocks, 1) * block_size
++        slot_mapping = slot_mapping + block_offsets.view(1, block_size)
++        slot_mapping = slot_mapping.reshape(-1)[:valid_num_tokens]
+ 
+         return ReqMeta(
+             request_id=request_id,
+@@ -161,7 +169,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
+                         "num_token:%d, request_id:%s", len(slot_mapping),
+                         num_token, request_id)
+ 
+-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
+             else:
+                 num_pages = dst_kv_cache_layer_shape[1]
+                 page_size = dst_kv_cache_layer_shape[2]
+@@ -180,7 +187,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
+                         "num_token:%d, request_id:%s", len(slot_mapping),
+                         num_token, request_id)
+ 
+-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
+ 
+         # Get the metadata
+         metadata: KVConnectorMetadata = \
+@@ -455,19 +461,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
+ 
+     @staticmethod
+     def parse_request_id(request_id: str, is_prefill=True) -> tuple[str, int]:
+-        # Regular expression to match the string hostname and integer port
+-        if is_prefill:
+-            pattern = r"___decode_addr_(.*):(\d+)"
+-        else:
+-            pattern = r"___prefill_addr_(.*):(\d+)___"
+-
+-        # Use re.search to find the pattern in the request_id
+-        match = re.search(pattern, request_id)
++        # Use precompiled regex patterns to reduce overhead
++        pattern = _DECODE_RE if is_prefill else _PREFILL_RE
++        match = pattern.search(request_id)
+         if match:
+-            # Extract the ranks
+             ip = match.group(1)
+             port = int(match.group(2))
+-
+             return ip, port
+         raise ValueError(
+             f"Request id {request_id} does not contain hostname and port")
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+index 6c9ccb2e3..6b971e635 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+@@ -6,7 +6,7 @@ import os
+ import threading
+ import time
+ import typing
+-from collections import deque
++from collections import deque, OrderedDict
+ from contextlib import contextmanager
+ from typing import TYPE_CHECKING, Any, Optional
+ 
+@@ -24,6 +24,28 @@ from vllm.utils import current_stream, get_ip
+ if TYPE_CHECKING:
+     from vllm.forward_context import ForwardContext
+ 
++
++# Cache dtype conversions to minimize string processing and getattr lookups
++_DTYPE_TO_STR: dict[torch.dtype, str] = {}
++_STR_TO_DTYPE: dict[str, torch.dtype] = {}
++
++def _dtype_to_str(dtype: torch.dtype) -> str:
++    s = _DTYPE_TO_STR.get(dtype)
++    if s is None:
++        s = str(dtype)
++        if s.startswith("torch."):
++            s = s[6:]
++        _DTYPE_TO_STR[dtype] = s
++    return s
++
++
++def _str_to_dtype(name: str) -> torch.dtype:
++    dt = _STR_TO_DTYPE.get(name)
++    if dt is None:
++        dt = getattr(torch, name)
++        _STR_TO_DTYPE[name] = dt
++    return dt
++
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_MEM_POOL_SIZE_GB = 32
+@@ -122,7 +144,7 @@ class P2pNcclEngine:
+         self.send_type = self.config.get_from_extra_config("send_type", "PUT")
+         if self.send_type == "GET":
+             # tensor_id: torch.Tensor
+-            self.send_store: dict[str, torch.Tensor] = {}
++            self.send_store: dict[str, torch.Tensor] = OrderedDict()
+         else:
+             # PUT or PUT_ASYNC
+             # tensor_id: torch.Tensor
+@@ -212,8 +234,7 @@ class P2pNcclEngine:
+                     tensor_size = tensor.element_size() * tensor.numel()
+                     while (self.buffer_size + tensor_size
+                            > self.buffer_size_threshold):
+-                        oldest_tenser_id = next(iter(self.send_store))
+-                        oldest_tenser = self.send_store.pop(oldest_tenser_id)
++                        oldest_tenser_id, oldest_tenser = self.send_store.popitem(last=False)
+                         oldest_tenser_size = oldest_tenser.element_size(
+                         ) * oldest_tenser.numel()
+                         self.buffer_size -= oldest_tenser_size
+@@ -283,7 +304,7 @@ class P2pNcclEngine:
+             return None
+ 
+         tensor = torch.empty(data["shape"],
+-                             dtype=getattr(torch, data["dtype"]),
++                             dtype=_str_to_dtype(data["dtype"]),
+                              device=self.device)
+ 
+         self._recv(comm, tensor, rank ^ 1, self.recv_stream)
+@@ -313,8 +334,8 @@ class P2pNcclEngine:
+                     try:
+                         with torch.cuda.stream(self.recv_stream):
+                             tensor = torch.empty(data["shape"],
+-                                                 dtype=getattr(
+-                                                     torch, data["dtype"]),
++                                                 dtype=_str_to_dtype(
++                                                     data["dtype"]),
+                                                  device=self.device)
+                         self.router_socket.send_multipart(
+                             [remote_address, b"0"])
+@@ -350,16 +371,18 @@ class P2pNcclEngine:
+                 elif data["cmd"] == "GET":
+                     tensor_id = data["tensor_id"]
+                     with self.send_store_cv:
+-                        tensor = self.send_store.pop(tensor_id, None)
++                        tensor = self.send_store.get(tensor_id, None)
+                         if tensor is not None:
+                             data = {
+                                 "ret": 0,
+                                 "shape": tensor.shape,
+-                                "dtype":
+-                                str(tensor.dtype).replace("torch.", "")
++                                "dtype": str(tensor.dtype).replace("torch.", "")
+                             }
+-                            # LRU
+-                            self.send_store[tensor_id] = tensor
++                            # LRU: mark as recently used
++                            try:
++                                self.send_store.move_to_end(tensor_id)
++                            except Exception:
++                                pass
+                             self._have_sent_tensor_id(tensor_id)
+                         else:
+                             data = {"ret": 1}

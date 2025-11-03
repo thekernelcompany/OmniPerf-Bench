@@ -1,0 +1,70 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index d07527304..9230654c1 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -65,12 +65,11 @@ class Sampler(nn.Module):
+         if do_min_p:
+             logits = _apply_min_p(logits, sampling_tensors.min_ps)
+ 
+-        # We use float32 for probabilities and log probabilities.
+-        # Compute the probabilities.
+-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+         # Compute the log probabilities.
+         # Use log_softmax to ensure numerical stability.
+         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
++        # Compute the probabilities via exp(logprobs) to avoid an extra softmax pass.
++        probs = torch.exp(logprobs)
+ 
+         # Sample the next tokens.
+         sample_results = _sample(probs, logprobs, sampling_metadata,
+@@ -506,7 +505,7 @@ def _sample(
+     #                                   sampling_tensors)
+ 
+ 
+-def _get_ranks(x: torch.Tensor, indices: List[int]) -> torch.Tensor:
++def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+     """
+     This function calculates the ranks of the chosen tokens in a logprob tensor.
+ 
+@@ -520,8 +519,11 @@ def _get_ranks(x: torch.Tensor, indices: List[int]) -> torch.Tensor:
+                     Each element in the returned tensor represents the rank 
+                     of the chosen token in the input logprob tensor.
+     """
+-    vals = x[range(len(x)), indices]
+-    return (x > vals[:, None]).long().sum(1) + 1
++    # Use tensor-based indexing on the correct device to avoid Python overhead
++    idx_t = torch.as_tensor(indices, device=x.device, dtype=torch.long)
++    ar = torch.arange(0, x.size(0), device=x.device, dtype=idx_t.dtype)
++    vals = x[ar, idx_t]
++    return torch.count_nonzero(x > vals[:, None], dim=1).add_(1)
+ 
+ 
+ def _get_logprobs(
+@@ -562,10 +564,9 @@ def _get_logprobs(
+     assert sample_idx == logprobs.size(0)
+ 
+     # Batched query for logprobs of selected token
+-    batched_logprobs_query_result = logprobs[[
+-        batched_logprobs_query_seq_indices,
+-        batched_logprobs_query_token_indices
+-    ]]
++    seq_idx_tensor = torch.as_tensor(batched_logprobs_query_seq_indices, device=logprobs.device, dtype=torch.long)
++    token_idx_tensor = torch.as_tensor(batched_logprobs_query_token_indices, device=logprobs.device, dtype=torch.long)
++    batched_logprobs_query_result = logprobs[seq_idx_tensor, token_idx_tensor]
+ 
+     # Batched query for logprobs of topk tokens
+     if largest_num_logprobs > 0:
+@@ -580,8 +581,8 @@ def _get_logprobs(
+     batched_logprobs_query_result = batched_logprobs_query_result.cpu()
+ 
+     batched_ranks_query_result = _get_ranks(
+-        logprobs[batched_logprobs_query_seq_indices],
+-        batched_logprobs_query_token_indices)
++        logprobs[seq_idx_tensor],
++        token_idx_tensor).cpu()
+ 
+     # Gather results
+     result_prompt_logprobs: List[Optional[PromptLogprobs]] = []

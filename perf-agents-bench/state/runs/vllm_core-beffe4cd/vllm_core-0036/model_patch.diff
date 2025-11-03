@@ -1,0 +1,88 @@
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index 2ef8d3115..0a120c408 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -29,7 +29,7 @@ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.activation import ReLUSquaredActivation
+ from vllm.model_executor.layers.layernorm import RMSNorm
+-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
++from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                                QKVParallelLinear,
+                                                RowParallelLinear)
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -63,26 +63,29 @@ class NemotronHMLP(nn.Module):
+         config: NemotronHConfig,
+         quant_config: Optional[QuantizationConfig] = None,
+         bias: bool = False,
++        prefix: str = "",
+     ) -> None:
+         super().__init__()
+-        self.up_proj = MergedColumnParallelLinear(
++        self.up_proj = ColumnParallelLinear(
+             input_size=config.hidden_size,
+-            output_sizes=[config.intermediate_size],
++            output_size=config.intermediate_size,
+             bias=bias,
+             quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "up_proj"),
+         )
+         self.down_proj = RowParallelLinear(
+             input_size=config.intermediate_size,
+             output_size=config.hidden_size,
+             bias=bias,
+             quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "down_proj"),
+         )
+         self.act_fn = ReLUSquaredActivation()
+ 
+     def forward(self, x: torch.Tensor):
+-        x, _ = self.up_proj(x)
++        x = self.up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(x)
++        x = self.down_proj(x)
+         return x
+ 
+ 
+@@ -101,7 +104,8 @@ class NemotronHMLPDecoderLayer(nn.Module):
+ 
+         self.mixer = NemotronHMLP(config,
+                                   quant_config=quant_config,
+-                                  bias=config.mlp_bias)
++                                  bias=config.mlp_bias,
++                                  prefix=maybe_prefix(prefix, "mixer"))
+ 
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+@@ -207,12 +211,14 @@ class NemotronHAttention(nn.Module):
+             self.total_num_kv_heads,
+             bias=False,
+             quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "qkv_proj"),
+         )
+         self.o_proj = RowParallelLinear(
+             self.total_num_heads * self.head_dim,
+             config.hidden_size,
+             bias=False,
+             quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "o_proj"),
+         )
+ 
+         self.attn = Attention(
+@@ -302,6 +308,7 @@ class NemotronHModel(nn.Module):
+             self.vocab_size,
+             config.hidden_size,
+             org_num_embeddings=config.vocab_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
+         def get_layer(prefix: str):
+@@ -473,6 +480,7 @@ class NemotronHForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
+             # We need bigger padding if using lora for kernel
+             # compatibility
+             if not lora_config else lora_config.lora_vocab_padding_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
+         )
+         # Used to track and store by the Mamba cache between steps.
+         self.mamba_cache: Optional[MambaCacheManager] = None

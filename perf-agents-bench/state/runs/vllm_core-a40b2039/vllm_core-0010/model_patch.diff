@@ -1,0 +1,124 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/kernels/test_moe.py b/tests/kernels/test_moe.py
+index 046f11d95..bff18f2a2 100644
+--- a/tests/kernels/test_moe.py
++++ b/tests/kernels/test_moe.py
+@@ -15,16 +15,18 @@ from vllm.model_executor.models.mixtral import MixtralMoE
+ def torch_moe(a, w1, w2, score, topk):
+     B, D = a.shape
+     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+-    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
++    out = torch.empty(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+     score = torch.softmax(score, dim=-1, dtype=torch.float32)
+     topk_weight, topk_ids = torch.topk(score, topk)
+     topk_weight = topk_weight.view(-1)
+     topk_ids = topk_ids.view(-1)
++    silu_mul = SiluAndMul()
++    w1T = w1.transpose(1, 2)
++    w2T = w2.transpose(1, 2)
+     for i in range(w1.shape[0]):
+         mask = topk_ids == i
+         if mask.sum():
+-            out[mask] = SiluAndMul()(
+-                a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
++            out[mask] = silu_mul(a[mask] @ w1T[i]) @ w2T[i]
+     return (out.view(B, -1, w2.shape[1]) *
+             topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+ 
+@@ -77,11 +79,11 @@ def test_mixtral_moe(dtype: torch.dtype):
+     for i in range(config.num_local_experts):
+         weights = (hf_moe.experts[i].w1.weight.data,
+                    hf_moe.experts[i].w3.weight.data)
+-        vllm_moe.ws[i][:] = torch.cat(weights, dim=0)
+-        vllm_moe.w2s[i][:] = hf_moe.experts[i].w2.weight.data
++        vllm_moe.w13_weight[i][:] = torch.cat(weights, dim=0)
++        vllm_moe.w2_weight[i][:] = hf_moe.experts[i].w2.weight.data
+ 
+     # Generate input batch of dimensions [batch_size, seq_len, hidden_dim]
+-    hf_inputs = torch.randn((1, 64, config.hidden_size)).to(dtype).to("cuda")
++    hf_inputs = torch.randn((1, 64, config.hidden_size), dtype=dtype, device="cuda")
+     # vLLM uses 1D query [num_tokens, hidden_dim]
+     vllm_inputs = hf_inputs.flatten(0, 1)
+ 
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 9ff9ba298..746314e9c 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -78,6 +78,7 @@ class MixtralMoE(nn.Module):
+         self.top_k = top_k
+         self.hidden_size = hidden_size
+         self.intermediate_size = intermediate_size // self.tp_size
++        self.quant_config = quant_config
+         # FIXME(pcmoritz): Make this more general to support different
+         # quantization schemes
+         self.use_fp8 = isinstance(quant_config, Fp8Config)
+@@ -92,21 +93,21 @@ class MixtralMoE(nn.Module):
+                                      params_dtype=self.params_dtype,
+                                      quant_config=None)
+ 
+-        self.ws = nn.Parameter(
++        self.w13_weight = nn.Parameter(
+             torch.empty(self.num_total_experts,
+                         2 * self.intermediate_size,
+                         self.hidden_size,
+                         dtype=self.params_dtype))
+-        self.w2s = nn.Parameter(
++        self.w2_weight = nn.Parameter(
+             torch.empty(self.num_total_experts,
+                         self.hidden_size,
+                         self.intermediate_size,
+                         dtype=self.params_dtype))
+ 
+-        set_weight_attrs(self.ws, {
++        set_weight_attrs(self.w13_weight, {
+             "weight_loader": self.weight_loader,
+         })
+-        set_weight_attrs(self.w2s, {
++        set_weight_attrs(self.w2_weight, {
+             "weight_loader": self.weight_loader,
+         })
+ 
+@@ -154,15 +155,15 @@ class MixtralMoE(nn.Module):
+ 
+     def process_weights_after_loading(self):
+         if self.use_fp8:
+-            ws = torch.empty_like(self.ws.data, dtype=torch.float8_e4m3fn)
+-            w2s = torch.empty_like(self.w2s.data, dtype=torch.float8_e4m3fn)
++            ws = torch.empty_like(self.w13_weight.data, dtype=torch.float8_e4m3fn)
++            w2s = torch.empty_like(self.w2_weight.data, dtype=torch.float8_e4m3fn)
+             for expert in range(self.num_total_experts):
+                 ws[expert, :, :], self.ws_scale[expert] = ops.scaled_fp8_quant(
+-                    self.ws.data[expert, :, :])
++                    self.w13_weight.data[expert, :, :])
+                 w2s[expert, :, :], self.w2s_scale[
+-                    expert] = ops.scaled_fp8_quant(self.w2s.data[expert, :, :])
+-            self.ws = nn.Parameter(ws, requires_grad=False)
+-            self.w2s = nn.Parameter(w2s, requires_grad=False)
++                    expert] = ops.scaled_fp8_quant(self.w2_weight.data[expert, :, :])
++            self.w13_weight = nn.Parameter(ws, requires_grad=False)
++            self.w2_weight = nn.Parameter(w2s, requires_grad=False)
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_size = hidden_states.shape
+@@ -170,8 +171,8 @@ class MixtralMoE(nn.Module):
+         # router_logits: (num_tokens, n_experts)
+         router_logits, _ = self.gate(hidden_states)
+         final_hidden_states = fused_moe(hidden_states,
+-                                        self.ws,
+-                                        self.w2s,
++                                        self.w13_weight,
++                                        self.w2_weight,
+                                         router_logits,
+                                         self.top_k,
+                                         renormalize=True,
+@@ -463,7 +464,7 @@ class MixtralForCausalLM(nn.Module):
+         expert_params_mapping = [
+             # These are the weights for the experts
+             # (param_name, weight_name, expert_id)
+-            ("ws" if weight_name in ["w1", "w3"] else "w2s",
++            ("w13_weight" if weight_name in ["w1", "w3"] else "w2_weight",
+              f"experts.{expert_id}.{weight_name}.weight", expert_id)
+             for expert_id in range(self.config.num_local_experts)
+             for weight_name in ["w1", "w2", "w3"]

@@ -1,0 +1,230 @@
+diff --git a/Dockerfile.cpu b/Dockerfile.cpu
+index 403a1cd03..1bfd5609e 100644
+--- a/Dockerfile.cpu
++++ b/Dockerfile.cpu
+@@ -3,11 +3,17 @@
+ FROM ubuntu:22.04 AS cpu-test-1
+ 
+ RUN apt-get update  -y \
+-    && apt-get install -y git wget vim numactl gcc-12 g++-12 python3 python3-pip \
++    && apt-get install -y git wget vim numactl gcc-12 g++-12 python3 python3-pip libtcmalloc-minimal4 \
+     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+ 
++# Use tcmalloc for improved CPU memory allocation performance
++RUN echo 'export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:$LD_PRELOAD' >> ~/.bashrc
++
+ RUN pip install --upgrade pip \
+     && pip install wheel packaging ninja "setuptools>=49.4.0" numpy
++# Optional: install Intel Extension for PyTorch for optimized CPU kernels
++RUN pip install https://intel-extension-for-pytorch.s3.amazonaws.com/ipex_dev/cpu/intel_extension_for_pytorch-2.3.100%2Bgit0eb3473-cp310-cp310-linux_x86_64.whl || true
++
+ 
+ FROM cpu-test-1 AS build
+ 
+@@ -21,6 +27,6 @@ RUN VLLM_TARGET_DEVICE=cpu python3 setup.py install
+ 
+ WORKDIR /workspace/
+ 
+-RUN ln -s /workspace/vllm/tests  && ln -s /workspace/vllm/examples && ln -s /workspace/vllm/benchmarks
++RUN ln -s /workspace/vllm/tests && ln -s /workspace/vllm/examples && ln -s /workspace/vllm/benchmarks
+ 
+ CMD ["/bin/bash"]
+diff --git a/README.md b/README.md
+index 57374d279..e7824924e 100644
+--- a/README.md
++++ b/README.md
+@@ -89,6 +89,8 @@ Visit our [documentation](https://vllm.readthedocs.io/en/latest/) to learn more.
+ - [Quickstart](https://vllm.readthedocs.io/en/latest/getting_started/quickstart.html)
+ - [Supported Models](https://vllm.readthedocs.io/en/latest/models/supported_models.html)
+ 
++  - CPU users: see the CPU installation guide and performance tips for best results: https://vllm.readthedocs.io/en/latest/getting_started/cpu-installation.html
++
+ ## Contributing
+ 
+ We welcome and value any contributions and collaborations.
+diff --git a/docs/source/getting_started/cpu-installation.rst b/docs/source/getting_started/cpu-installation.rst
+index 5270253ca..0699be7d2 100644
+--- a/docs/source/getting_started/cpu-installation.rst
++++ b/docs/source/getting_started/cpu-installation.rst
+@@ -85,3 +85,21 @@ Performance tips
+ 
+ 
+ 
++- Use a high-performance memory allocator on CPU. On Ubuntu, install `libtcmalloc-minimal4` and export it via LD_PRELOAD, e.g.::
++
++    export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:$LD_PRELOAD
++
++- Consider installing Intel Extension for PyTorch (IPEX) for optimized CPU kernels. Example (PyTorch 2.3, CPU wheels):
++
++  .. code-block:: console
++
++      $ pip install https://intel-extension-for-pytorch.s3.amazonaws.com/ipex_dev/cpu/intel_extension_for_pytorch-2.3.100%2Bgit0eb3473-cp310-cp310-linux_x86_64.whl
++
++- Tune OpenMP environment variables to match your hardware and workload. For example::
++
++    export OMP_NUM_THREADS=<num-cores>
++    export KMP_AFFINITY=granularity=fine,compact,1,0
++
++- Pin CPU cores and memory locality when running on multi-socket NUMA systems (e.g., using `numactl` or Docker `--cpuset-cpus/--cpuset-mems`).
++
++
+diff --git a/requirements-cpu.txt b/requirements-cpu.txt
+index b739642d8..347b2b30e 100644
+--- a/requirements-cpu.txt
++++ b/requirements-cpu.txt
+@@ -2,5 +2,5 @@
+ -r requirements-common.txt
+ 
+ # Dependencies for x86_64 CPUs
+-torch == 2.3.0+cpu
+-triton >= 2.2.0  # FIXME(woosuk): This is a hack to avoid import error.
+\ No newline at end of file
++torch==2.3.0+cpu
++triton>=2.2.0  # FIXME(woosuk): This is a hack to avoid import error.
+\ No newline at end of file
+diff --git a/vllm/attention/backends/torch_sdpa.py b/vllm/attention/backends/torch_sdpa.py
+index 9b50adec5..9bbf98049 100644
+--- a/vllm/attention/backends/torch_sdpa.py
++++ b/vllm/attention/backends/torch_sdpa.py
+@@ -11,6 +11,12 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+ from vllm.attention.ops.paged_attn import (PagedAttention,
+                                            PagedAttentionMetadata)
+ 
++# Optional optimized SDPA path for CPU (e.g., IPEX or contiguous fastpath)
++try:
++    from vllm.attention.ops.ipex_attn import sdpa_optimized as _sdpa_opt
++except Exception:  # pragma: no cover - optional optimization
++    _sdpa_opt = None
++
+ 
+ class TorchSDPABackend(AttentionBackend):
+ 
+@@ -176,11 +182,11 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
+                     if self.alibi_slopes is not None:
+                         att_masks = _make_alibi_bias(
+                             self.alibi_slopes, query.dtype,
+-                            attn_metadata.seq_lens)  # type: ignore
++                            attn_metadata.seq_lens, query.device)  # type: ignore
+                     elif self.sliding_window is not None:
+                         att_masks = _make_sliding_window_bias(
+                             attn_metadata.seq_lens, self.sliding_window,
+-                            query.dtype)  # type: ignore
++                            query.dtype, query.device)  # type: ignore
+                     else:
+                         att_masks = [None] * len(attn_metadata.seq_lens)
+                     attn_metadata.attn_bias = att_masks
+@@ -192,11 +198,13 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
+                 start = 0
+                 output = torch.empty(
+                     (num_tokens, self.num_heads, self.head_size),
+-                    dtype=query.dtype)
++                    dtype=query.dtype,
++                    device=query.device)
++                sdpa_fn = _sdpa_opt if _sdpa_opt is not None else scaled_dot_product_attention
+                 for seq_len, mask in zip(attn_metadata.seq_lens,
+                                          attn_metadata.attn_bias):
+                     end = start + seq_len
+-                    sub_out = scaled_dot_product_attention(
++                    sub_out = sdpa_fn(
+                         query[:, start:end, :],
+                         key[:, start:end, :],
+                         value[:, start:end, :],
+@@ -235,23 +243,25 @@ def _make_alibi_bias(
+     alibi_slopes: torch.Tensor,
+     dtype: torch.dtype,
+     seq_lens: List[int],
++    device: Optional[torch.device] = None,
+ ) -> List[torch.Tensor]:
++    if device is None:
++        device = alibi_slopes.device
+     attn_biases = []
++    # prevent dtype/device conversion each loop
++    slopes = alibi_slopes.to(dtype=dtype, device=device)
+     for seq_len in seq_lens:
+-        bias = torch.arange(seq_len, dtype=dtype)
+-        # NOTE(zhuohan): HF uses
+-        #     `bias = bias[None, :].repeat(seq_len, 1)`
+-        # here. We find that both biases give the same results, but
+-        # the bias below more accurately follows the original ALiBi
+-        # paper.
+-        bias = bias[None, :] - bias[:, None]
+-
+-        num_heads = alibi_slopes.shape[0]
+-        bias = bias[None, :].repeat((num_heads, 1, 1))
+-        bias.mul_(alibi_slopes[:, None, None])
+-        inf_mask = torch.empty(
++        line = torch.arange(seq_len, dtype=dtype, device=device)
++        # bias[i, j] = j - i
++        bias = line[None, :] - line[:, None]
++        # Broadcast multiply instead of repeat
++        bias = bias.unsqueeze(0) * slopes[:, None, None]
++        inf_mask = torch.full(
+             (1, seq_len, seq_len),
+-            dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1)
++            fill_value=-torch.inf,
++            dtype=dtype,
++            device=device,
++        ).triu_(diagonal=1)
+         attn_biases.append((bias + inf_mask).to(dtype))
+ 
+     return attn_biases
+@@ -264,10 +274,9 @@ def _make_sliding_window_bias(
+ ) -> List[torch.Tensor]:
+     attn_biases = []
+     for seq_len in seq_lens:
+-        tensor = torch.full(
++        tensor = torch.ones(
+             (1, seq_len, seq_len),
+             dtype=dtype,
+-            fill_value=1,
+         )
+         shift = 0
+         mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore
+diff --git a/vllm/attention/ops/ipex_attn.py b/vllm/attention/ops/ipex_attn.py
+new file mode 100644
+index 000000000..60f7532f1
+--- /dev/null
++++ b/vllm/attention/ops/ipex_attn.py
+@@ -0,0 +1,42 @@
++"""
++Optional CPU-optimized attention ops.
++
++This module provides a thin wrapper around torch.nn.functional.scaled_dot_product_attention
++that ensures inputs are contiguous and leverages any available CPU optimizations
++(e.g., IPEX) when installed. If IPEX is not available, this simply falls back to
++PyTorch's implementation with minimal overhead.
++"""
++from typing import Optional
++
++import torch
++from torch.nn.functional import scaled_dot_product_attention as _sdpa
++
++try:  # optional dependency
++    import intel_extension_for_pytorch as ipex  # noqa: F401
++    _HAS_IPEX = True
++except Exception:  # pragma: no cover
++    _HAS_IPEX = False
++
++
++def _maybe_contiguous(x: torch.Tensor) -> torch.Tensor:
++    return x if x.is_contiguous() else x.contiguous()
++
++
++def sdpa_optimized(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    attn_mask: Optional[torch.Tensor] = None,
++    dropout_p: float = 0.0,
++    is_causal: bool = False,
++    scale: Optional[float] = None,
++) -> torch.Tensor:
++    # Ensure layouts are friendly for kernels
++    q = _maybe_contiguous(query)
++    k = _maybe_contiguous(key)
++    v = _maybe_contiguous(value)
++
++    # If IPEX is present and running on CPU, the underlying kernels may be optimized.
++    # We don't need special handling here; enabling IPEX generally patches PyTorch ops.
++    return _sdpa(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
++                 is_causal=is_causal, scale=scale)

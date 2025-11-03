@@ -1,0 +1,50 @@
+diff --git a/vllm/spec_decode/ngram_worker.py b/vllm/spec_decode/ngram_worker.py
+index 36e5e1774..eb305bee2 100644
+--- a/vllm/spec_decode/ngram_worker.py
++++ b/vllm/spec_decode/ngram_worker.py
+@@ -63,14 +63,23 @@ class NGramWorker(NonLLMProposerWorkerBase):
+         has_spec_out = False
+         token_id_list: List[Optional[torch.Tensor]] = []
+         token_prob_list: List[Optional[torch.Tensor]] = []
++        # Precompute arange for index generation on both CPU and target device.
++        arange_gpu = torch.arange(sample_len, device=self.device)
++        arange_cpu = torch.arange(sample_len)
++        vocab_size = self.vocab_size
++
+         for idx, seq_group_metadata in enumerate(
+                 execute_model_req.seq_group_metadata_list):
+             seq_data = next(iter(seq_group_metadata.seq_data.values()))
+ 
++            seq_len = seq_data.get_len()
++            # For short sequences, do n-gram matching on CPU to reduce GPU sync overhead.
++            cur_device = 'cpu' if seq_len < 3072 else self.device
+             input_ids = torch.as_tensor(seq_data.get_token_ids(),
+                                         dtype=torch.long,
+-                                        device=self.device)
+-            input_length = seq_data.get_len()
++                                        device=cur_device)
++            input_length = seq_len
++            arange_idx = arange_cpu if cur_device == 'cpu' else arange_gpu
+ 
+             for ngram_size in range(
+                     min(self.ngram_prompt_lookup_max, input_length - 1),
+@@ -97,16 +106,15 @@ class NGramWorker(NonLLMProposerWorkerBase):
+                 first_match = matches.max(dim=-1)
+                 if first_match.values.item():
+                     proposal_start_idx = first_match.indices.add_(ngram_size)
+-                    spec_indices = (
+-                        proposal_start_idx).repeat(sample_len) + torch.arange(
+-                            sample_len, device=self.device)
++                    # Use broadcasting with a precomputed arange to avoid repeat() allocation.
++                    spec_indices = proposal_start_idx + arange_idx
+                     spec_indices.clamp_(max=input_ids.shape[-1] - 1)
+                     res = input_ids.gather(dim=-1, index=spec_indices)
+                     token_id_list.append(res)
+                     token_prob_list.append(
+                         torch.nn.functional.one_hot(
+                             res,
+-                            num_classes=self.vocab_size).to(torch.float32))
++                            num_classes=vocab_size).to(torch.float32))
+                     has_spec_out = True
+                     break
+             else:

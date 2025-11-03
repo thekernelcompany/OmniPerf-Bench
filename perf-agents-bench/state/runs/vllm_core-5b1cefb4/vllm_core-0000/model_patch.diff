@@ -1,0 +1,444 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/config.py b/vllm/config.py
+index 6bfe94b76..f9901c754 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -2489,6 +2489,10 @@ class SchedulerConfig:
+         if self.max_num_seqs is None:
+             self.max_num_seqs = 128
+ 
++        if self.enable_chunked_prefill is None:
++            # Allow environment-based default to avoid overhead unless explicitly enabled.
++            self.enable_chunked_prefill = envs.VLLM_ENABLE_CHUNKED_PREFILL
++
+         if self.max_num_batched_tokens is None:
+             if self.enable_chunked_prefill:
+                 if self.num_scheduler_steps > 1:
+@@ -2532,15 +2536,16 @@ class SchedulerConfig:
+         self.encoder_cache_size = self.max_num_batched_tokens
+ 
+         if self.enable_chunked_prefill:
+-            logger.info(
++            logger.info_once(
+                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
+                 self.max_num_batched_tokens)
+ 
+         self.chunked_prefill_enabled = self.enable_chunked_prefill
+         if self.max_num_partial_prefills > 1:
+             if self.long_prefill_token_threshold == 0:
+-                self.long_prefill_token_threshold = int(self.max_model_len *
+-                                                        0.04)
++                self.long_prefill_token_threshold = int(
++                    self.max_model_len * envs.VLLM_LONG_PREFILL_THRESHOLD_FRACTION
++                )
+ 
+             logger.info(
+                 "Concurrent partial prefills enabled with "
+@@ -4711,12 +4716,46 @@ class VllmConfig:
+ 
+         if self.compilation_config.full_cuda_graph and \
+             not self.model_config.disable_cascade_attn:
+-            logger.info("full_cuda_graph is not supported with "
++            logger.info_once("full_cuda_graph is not supported with "
+                         "cascade attention. Disabling cascade attention.")
+             self.model_config.disable_cascade_attn = True
+ 
++        # Optional: let users force-disable full CUDA graph to reduce capture overhead.
++        if envs.VLLM_DISABLE_FULL_CUDA_GRAPH and \
++            self.compilation_config.full_cuda_graph:
++            logger.info_once("Disabling full CUDA graph due to VLLM_DISABLE_FULL_CUDA_GRAPH=1.")
++            self.compilation_config.full_cuda_graph = False
++
++
+         disable_chunked_prefill_reasons: list[str] = []
+ 
++        # Allow users to force-disable the hybrid KV cache manager regardless of
++        # detected compatibility, which can improve latency in some scenarios.
++        if envs.VLLM_DISABLE_HYBRID_KV_CACHE_MANAGER:
++            self.scheduler_config.disable_hybrid_kv_cache_manager = True
++
++        # Optional escape hatch to disable chunked prefill entirely via env var.
++        if envs.VLLM_DISABLE_CHUNKED_PREFILL:
++            logger.info_once("Disabling chunked prefill due to VLLM_DISABLE_CHUNKED_PREFILL=1.")
++            self.scheduler_config.chunked_prefill_enabled = False
++
++            # Explicit override to disable prefix caching entirely when set.
++            if envs.VLLM_DISABLE_PREFIX_CACHING and self.cache_config is not None:
++                self.cache_config.enable_prefix_caching = False
++
++            self.scheduler_config.long_prefill_token_threshold = 0
++            self.scheduler_config.max_num_batched_tokens = max(
++                self.scheduler_config.max_model_len,
++                DEFAULT_MAX_NUM_BATCHED_TOKENS)
++            if self.cache_config is not None:
++                self.cache_config.enable_prefix_caching = False
++
++
++        # Optional escape hatch to disable chunked multimodal input scheduling.
++        if envs.VLLM_DISABLE_CHUNKED_MM_INPUT:
++            self.scheduler_config.disable_chunked_mm_input = True
++
++
+         if self.model_config and self.model_config.pooler_config:
+             pooling_type = self.model_config.pooler_config.pooling_type
+             if pooling_type is None or pooling_type.lower() != "last":
+@@ -4724,9 +4763,21 @@ class VllmConfig:
+                     "Only \"last\" pooling supports chunked "
+                     "prefill and prefix caching; disabling both.")
+ 
++
++        # Apply optional overrides for scheduler tuning.
++        if envs.environment_variables.get("VLLM_LONG_PREFILL_TOKEN_THRESHOLD") is not None:
++            ov = envs.environment_variables["VLLM_LONG_PREFILL_TOKEN_THRESHOLD"]()
++            if ov is not None:
++                self.scheduler_config.long_prefill_token_threshold = max(0, ov)
++
++        if envs.environment_variables.get("VLLM_MAX_NUM_BATCHED_TOKENS") is not None:
++            ov2 = envs.environment_variables["VLLM_MAX_NUM_BATCHED_TOKENS"]()
++            if ov2 is not None:
++                self.scheduler_config.max_num_batched_tokens = max(1, ov2)
++
+         if disable_chunked_prefill_reasons:
+             for reason in disable_chunked_prefill_reasons:
+-                logger.info(reason)
++                logger.info_once(reason)
+             self.scheduler_config.chunked_prefill_enabled = False
+             self.scheduler_config.long_prefill_token_threshold = 0
+             self.scheduler_config.max_num_batched_tokens = max(
+@@ -4739,13 +4790,13 @@ class VllmConfig:
+         if (self.kv_events_config is not None
+                 and self.kv_events_config.enable_kv_cache_events
+                 and not self.cache_config.enable_prefix_caching):
+-            logger.warning(
++            logger.warning_once(
+                 "KV cache events are on, but prefix caching is not enabled."
+                 "Use --enable-prefix-caching to enable.")
+         if (self.kv_events_config is not None
+                 and self.kv_events_config.publisher != "null"
+                 and not self.kv_events_config.enable_kv_cache_events):
+-            logger.warning("KV cache events are disabled,"
++            logger.warning_once("KV cache events are disabled,"
+                            "but the scheduler is configured to publish them."
+                            "Modify KVEventsConfig.enable_kv_cache_events"
+                            "to True to enable.")
+@@ -4770,11 +4821,43 @@ class VllmConfig:
+                 self.scheduler_config.disable_hybrid_kv_cache_manager = True
+             if self.model_config is not None and \
+                 self.model_config.attention_chunk_size is not None and \
+-                self.speculative_config is not None and \
+-                self.speculative_config.use_eagle():
+-                # Hybrid KV cache manager is not yet supported with chunked
+-                # local attention + eagle.
+-                self.scheduler_config.disable_hybrid_kv_cache_manager = True
++                envs.VLLM_DISABLE_CHUNKED_LOCAL_ATTN:
++                logger.info_once(
++                    "Disabling chunked local attention due to "
++                    "VLLM_DISABLE_CHUNKED_LOCAL_ATTN=1.")
++                self.model_config.attention_chunk_size = None
++
++
++            # Disable chunked local attention by default for mRoPE-based models (e.g., Llama 4).
++            if self.model_config is not None and \
++                self.model_config.attention_chunk_size is not None and \
++                hasattr(self.model_config, "uses_mrope") and \
++                self.model_config.uses_mrope and \
++                not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_FOR_MROPE:
++                logger.info_once(
++                    "Disabling chunked local attention by default for mRoPE-based models. "
++                    "Set VLLM_ALLOW_CHUNKED_LOCAL_ATTN_FOR_MROPE=1 to enable."
++                )
++                self.model_config.attention_chunk_size = None
++
++            if self.model_config is not None and \
++                self.model_config.attention_chunk_size is not None:
++                if self.speculative_config is not None and \
++                    self.speculative_config.use_eagle():
++                    # Hybrid KV cache manager is not yet supported with chunked
++                    # local attention + eagle.
++                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
++                elif \
++                    not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:
++                    logger.warning_once(
++                        "There is a latency regression when using chunked local"
++                        " attention with the hybrid KV cache manager. Disabling"
++                        " it, by default. To enable it, set the environment "
++                        "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=1."
++                    )
++                    # Hybrid KV cache manager is not yet supported with chunked
++                    # local attention.
++                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
+ 
+     def update_sizes_for_sequence_parallelism(self,
+                                               possible_sizes: list) -> list:
+@@ -4785,7 +4868,7 @@ class VllmConfig:
+             if size % self.parallel_config.tensor_parallel_size != 0
+         ]
+         if removed_sizes:
+-            logger.warning(
++            logger.warning_once(
+                 "Batch sizes %s are removed because they are not "
+                 "multiple of tp_size %d when "
+                 "sequence parallelism is enabled", removed_sizes,
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 0eff74151..714f5d079 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -7,6 +7,10 @@ import sys
+ import tempfile
+ from typing import TYPE_CHECKING, Any, Callable, Optional
+ 
++
++# Cache for compute_hash to avoid repeated re-hashing on hot paths
++_ENV_HASH_CACHE: Optional[str] = None
++
+ if TYPE_CHECKING:
+     VLLM_HOST_IP: str = ""
+     VLLM_PORT: Optional[int] = None
+@@ -165,6 +169,30 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
+     return int(value)
+ 
+ 
++
++def getenv_bool(name: str, default: bool = False) -> bool:
++    """Fast path for boolean env var parsing with common conventions.
++    Accepts "1" or "true" (case-insensitive) as True. Returns default if unset.
++    """
++    val = os.getenv(name)
++    if val is None:
++        return default
++    val = val.strip().lower()
++    return val == "1" or val == "true"
++
++
++
++def getenv_float(name: str, default: float) -> float:
++    """Parse float env var; return default on unset or invalid."""
++    val = os.getenv(name)
++    if val is None:
++        return default
++    try:
++        return float(val)
++    except ValueError:
++        return default
++
++
+ def get_vllm_port() -> Optional[int]:
+     """Get the port from VLLM_PORT environment variable.
+ 
+@@ -285,7 +313,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # If true, will load models from ModelScope instead of Hugging Face Hub.
+     # note that the value is true or false, not numbers
+     "VLLM_USE_MODELSCOPE":
+-    lambda: os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true",
++    lambda: getenv_bool("VLLM_USE_MODELSCOPE", False),
+ 
+     # Interval in seconds to log a warning message when the ring buffer is full
+     "VLLM_RINGBUFFER_WARNING_INTERVAL":
+@@ -308,15 +336,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+ 
+     # flag to control if vllm should use triton flash attention
+     "VLLM_USE_TRITON_FLASH_ATTN":
+-    lambda: (os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in
+-             ("true", "1")),
++    lambda: getenv_bool("VLLM_USE_TRITON_FLASH_ATTN", True),
+ 
+     # Use separate prefill and decode kernels for V1 attention instead of
+     # the unified triton kernel.
+     "VLLM_V1_USE_PREFILL_DECODE_ATTENTION":
+-    lambda:
+-    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "False").lower() in
+-     ("true", "1")),
++    lambda: getenv_bool("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", False),
+ 
+     # Force vllm to use a specific flash-attention version (2 or 3), only valid
+     # when using the flash-attention backend.
+@@ -332,7 +357,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # In torch <= 2.7 we ignore this flag; in torch >= 2.8 this is
+     # enabled by default.
+     "VLLM_USE_STANDALONE_COMPILE":
+-    lambda: os.environ.get("VLLM_USE_STANDALONE_COMPILE", "1") == "1",
++    lambda: getenv_bool("VLLM_USE_STANDALONE_COMPILE", True),
+ 
+     # local rank of the process in the distributed setting, used to determine
+     # the GPU device id
+@@ -353,8 +378,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+ 
+     # Whether to log responses from API Server for debugging
+     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE":
+-    lambda: os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False"
+-                           ).lower() == "true",
++    lambda: getenv_bool("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", False),
+ 
+     # S3 access information, used for tensorizer to load model from S3
+     "S3_ACCESS_KEY_ID":
+@@ -948,6 +972,68 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # implement and support a subset of all possible layouts.
+     "VLLM_KV_CACHE_LAYOUT":
+     lambda: os.getenv("VLLM_KV_CACHE_LAYOUT", None),
++    # If set, allow using hybrid KV cache manager together with chunked local attention.
++    # Default is disabled due to latency regressions; set to 1 to enable.
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE":
++    lambda: getenv_bool("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", False),
++    
++    # Force-disable hybrid KV cache manager (overrides compatibility checks).
++    "VLLM_DISABLE_HYBRID_KV_CACHE_MANAGER":
++    lambda: getenv_bool("VLLM_DISABLE_HYBRID_KV_CACHE_MANAGER", False),
++
++    # For mRoPE-based models (e.g., Llama 4), disable chunked local attention by default.
++    # Set to 1 to allow enabling chunked local attention with mRoPE models.
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_FOR_MROPE":
++    lambda: getenv_bool("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_FOR_MROPE", False),
++
++
++    # Enable chunked prefill by default. When false (default), reduces CPU overhead.
++    "VLLM_ENABLE_CHUNKED_PREFILL":
++    lambda: getenv_bool("VLLM_ENABLE_CHUNKED_PREFILL", False),
++
++    # Fraction of max_model_len used to classify 'long' prompts for partial prefills.
++    "VLLM_LONG_PREFILL_THRESHOLD_FRACTION":
++    lambda: getenv_float("VLLM_LONG_PREFILL_THRESHOLD_FRACTION", 0.04),
++
++    # Disable chunked prefill across the board to reduce latency when needed.
++    "VLLM_DISABLE_CHUNKED_PREFILL":
++    lambda: getenv_bool("VLLM_DISABLE_CHUNKED_PREFILL", False),
++    
++    # Disable chunked local attention entirely. Can reduce latency on some
++    # models with hybrid KV cache or when chunking offers little benefit.
++    "VLLM_DISABLE_CHUNKED_LOCAL_ATTN":
++    lambda: getenv_bool("VLLM_DISABLE_CHUNKED_LOCAL_ATTN", False),
++
++
++    # Allow enabling chunked local attention on CPU/other non-GPU targets.
++    # Default is disabled because the overhead can outweigh benefits on CPU.
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_ON_CPU":
++    lambda: getenv_bool("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_ON_CPU", False),
++
++    # Disable chunked multimodal input scheduling. When set, MM items are scheduled
++    # as a whole to reduce scheduling overhead in some scenarios.
++    "VLLM_DISABLE_CHUNKED_MM_INPUT":
++    lambda: getenv_bool("VLLM_DISABLE_CHUNKED_MM_INPUT", False),
++
++    # Explicit knob to disable prefix caching, independent of other features.
++    "VLLM_DISABLE_PREFIX_CACHING":
++    lambda: getenv_bool("VLLM_DISABLE_PREFIX_CACHING", False),
++
++    # Optional override for scheduler max_num_batched_tokens.
++    "VLLM_MAX_NUM_BATCHED_TOKENS":
++    lambda: maybe_convert_int(os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", None)),
++
++    # Optional override for scheduler long_prefill_token_threshold.
++    "VLLM_LONG_PREFILL_TOKEN_THRESHOLD":
++    lambda: maybe_convert_int(os.environ.get("VLLM_LONG_PREFILL_TOKEN_THRESHOLD", None)),
++
++    # Force-disable full CUDA graph capture to reduce capture overhead when desired.
++    "VLLM_DISABLE_FULL_CUDA_GRAPH":
++    lambda: getenv_bool("VLLM_DISABLE_FULL_CUDA_GRAPH", False),
++
++
++
++
+ 
+     # Enable checking whether the generated logits contain NaNs,
+     # indicating corrupted output. Useful for debugging low level bugs
+@@ -993,13 +1079,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+ }
+ 
++# Subset of env vars that materially affect kernel selection or scheduling
++# and thus should contribute to the computation cache hash. Kept small for
++# performance and stability; add only when it meaningfully changes graphs.
++ENV_HASH_KEYS: tuple[str, ...] = (
++    "VLLM_PP_LAYER_PARTITION",
++    "VLLM_MLA_DISABLE",
++    "VLLM_USE_TRITON_FLASH_ATTN",
++    "VLLM_USE_TRITON_AWQ",
++    "VLLM_DP_RANK",
++    "VLLM_DP_SIZE",
++    "VLLM_USE_STANDALONE_COMPILE",
++    "VLLM_FUSED_MOE_CHUNK_SIZE",
++    # Chunking- and KV-related flags that impact scheduling/graphs
++    "VLLM_DISABLE_CHUNKED_PREFILL",
++    "VLLM_DISABLE_CHUNKED_MM_INPUT",
++    "VLLM_DISABLE_CHUNKED_LOCAL_ATTN",
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_FOR_MROPE",
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE",
++    "VLLM_DISABLE_HYBRID_KV_CACHE_MANAGER",
++    # Additional knobs that can affect static graph or scheduling behavior
++    "VLLM_DISABLE_PREFIX_CACHING",
++    "VLLM_MAX_NUM_BATCHED_TOKENS",
++    "VLLM_LONG_PREFILL_TOKEN_THRESHOLD",
++    "VLLM_DISABLE_FULL_CUDA_GRAPH",
++)
++
++
+ # --8<-- [end:env-vars-definition]
+ 
+ 
+ def __getattr__(name: str):
+-    # lazy evaluation of environment variables
++    # lazy evaluation with simple caching to avoid repeated parsing
+     if name in environment_variables:
+-        return environment_variables[name]()
++        value = environment_variables[name]()
++        # cache the resolved value as a module attribute for fast subsequent access
++        setattr(sys.modules[__name__], name, value)
++        return value
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+@@ -1033,34 +1149,26 @@ def compute_hash() -> str:
+     affect the choice of different kernels or attention backends should
+     also be included in the factors list.
+     """
+-    factors: list[Any] = []
+-
+-    # summarize environment variables
+-    def factorize(name: str):
+-        if __getattr__(name):
+-            factors.append(__getattr__(name))
+-        else:
+-            factors.append("None")
+-
+-    # The values of envs may affects the computation graph.
+-    # TODO(DefTruth): hash all environment variables?
+-    # for key in environment_variables:
+-    #     factorize(key)
+-    environment_variables_to_hash = [
+-        "VLLM_PP_LAYER_PARTITION",
+-        "VLLM_MLA_DISABLE",
+-        "VLLM_USE_TRITON_FLASH_ATTN",
+-        "VLLM_USE_TRITON_AWQ",
+-        "VLLM_DP_RANK",
+-        "VLLM_DP_SIZE",
+-        "VLLM_USE_STANDALONE_COMPILE",
+-        "VLLM_FUSED_MOE_CHUNK_SIZE",
+-    ]
+-    for key in environment_variables_to_hash:
++    # Fast path: return cached value if available.
++    global _ENV_HASH_CACHE
++    if _ENV_HASH_CACHE is not None:
++        return _ENV_HASH_CACHE
++
++    # Build a compact hash using a stable subset of envs. Avoid large
++    # intermediate strings and use streaming updates for speed.
++    factors_iter = []
++    for key in ENV_HASH_KEYS:
+         if key in environment_variables:
+-            factorize(key)
++            val = __getattr__(key)
++        else:
++            val = None
++        # Normalize None to a sentinel
++        factors_iter.append("" if val is None else str(val))
+ 
+-    hash_str = hashlib.md5(str(factors).encode(),
+-                           usedforsecurity=False).hexdigest()
++    md5 = hashlib.md5(usedforsecurity=False)
++    # Use a simple separator to avoid accidental collisions
++    md5.update("|".join(factors_iter).encode())
++    hash_str = md5.hexdigest()
+ 
++    _ENV_HASH_CACHE = hash_str
+     return hash_str

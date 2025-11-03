@@ -1,0 +1,93 @@
+diff --git a/test_opt.py b/test_opt.py
+new file mode 100644
+index 000000000..5192898ec
+--- /dev/null
++++ b/test_opt.py
+@@ -0,0 +1,37 @@
++import os
++import time
++
++# Ensure V1 path to exercise config logic paths if imported
++os.environ.setdefault("VLLM_USE_V1", "1")
++
++
++def time_env_access(n: int = 200000):
++    import vllm.envs as envs  # noqa: F401
++    t0 = time.time()
++    # access a bunch of env-driven properties to simulate runtime polling
++    for _ in range(n):
++        _ = envs.VLLM_USE_V1
++        _ = envs.VLLM_ENABLE_V1_MULTIPROCESSING
++        _ = envs.VLLM_ATTENTION_BACKEND
++    return time.time() - t0
++
++
++def main():
++    # Baseline: environment access
++    t_env = time_env_access()
++    print(f"envs access time: {t_env:.4f}s")
++
++    # Verify the new env flag is wired correctly
++    import vllm.envs as envs
++    os.environ.pop("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", None)
++    print("ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:",
++          envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE)
++    os.environ["VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE"] = "1"
++    print("ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE (set):",
++          envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE)
++
++    print("OK")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm/config.py b/vllm/config.py
+index 6bfe94b76..e6d442faf 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -4769,12 +4769,21 @@ class VllmConfig:
+                 # Hybrid KV cache manager is not compatible with KV events.
+                 self.scheduler_config.disable_hybrid_kv_cache_manager = True
+             if self.model_config is not None and \
+-                self.model_config.attention_chunk_size is not None and \
+-                self.speculative_config is not None and \
+-                self.speculative_config.use_eagle():
+-                # Hybrid KV cache manager is not yet supported with chunked
+-                # local attention + eagle.
+-                self.scheduler_config.disable_hybrid_kv_cache_manager = True
++                self.model_config.attention_chunk_size is not None:
++                if self.speculative_config is not None and \
++                    self.speculative_config.use_eagle():
++                    # Hybrid KV cache manager is not yet supported with chunked
++                    # local attention + eagle.
++                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
++                elif not envs.VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE:
++                    logger.warning_once(
++                        "There is a latency regression when using chunked local"
++                        " attention with the hybrid KV cache manager. Disabling"
++                        " it, by default. To enable it, set the environment "
++                        "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=1.")
++                    # Hybrid KV cache manager is not yet supported with chunked
++                    # local attention.
++                    self.scheduler_config.disable_hybrid_kv_cache_manager = True
+ 
+     def update_sizes_for_sequence_parallelism(self,
+                                               possible_sizes: list) -> list:
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 0eff74151..9e0efc6dd 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -991,6 +991,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # The default value is "VLLM".
+     "VLLM_PROCESS_NAME_PREFIX":
+     lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
++
++    # Allow enabling hybrid KV cache with chunked local attention despite
++    # known latency regressions. Default to disabled for better perf.
++    # Set to 1 to allow the combination.
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE":
++    lambda: os.environ.get(
++        "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "0").lower() in ("1", "true"),
+ }
+ 
+ # --8<-- [end:env-vars-definition]

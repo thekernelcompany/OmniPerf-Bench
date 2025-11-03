@@ -1,0 +1,65 @@
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index 5904ad1f1..8caf9dfc5 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -198,7 +198,7 @@ class Qwen2_5_VisionMLP(nn.Module):
+ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
+     """All-gather the input tensor interleavely across model parallel group."""
+     import torch.distributed as dist
+-    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(tp_size)]
++    gathered_tensors = [torch.empty_like(local_tensor) for _ in range(tp_size)]
+     dist.all_gather(gathered_tensors,
+                     local_tensor,
+                     group=parallel_state.get_tp_group().device_group)
+@@ -478,8 +478,8 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
+         super().__init__()
+         self.dim = dim
+         self.theta = theta
+-        inv_freq = 1.0 / (theta
+-                          **(torch.arange(0, dim, 2, dtype=torch.float) / dim))
++        inv_freq = 1.0 / (theta**(
++            torch.arange(0, dim, 2, dtype=torch.float, device='cpu') / dim))
+         self.register_buffer("inv_freq", inv_freq, persistent=False)
+         self._seq_len_cached = 0
+         self._freqs_cached = None
+@@ -488,9 +488,7 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
+         if seqlen > self._seq_len_cached:
+             seqlen *= 2
+             self._seq_len_cached = seqlen
+-            self.inv_freq = 1.0 / (self.theta**(torch.arange(
+-                0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device)
+-                                                / self.dim))
++
+             seq = torch.arange(seqlen,
+                                device=self.inv_freq.device,
+                                dtype=self.inv_freq.dtype)
+@@ -570,8 +568,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
+     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+         pos_ids = []
+         for t, h, w in grid_thw:
+-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
++            hpos_ids = torch.arange(h, device=self.device).unsqueeze(1).expand(-1, w)
++            wpos_ids = torch.arange(w, device=self.device).unsqueeze(0).expand(h, -1)
+             hpos_ids = hpos_ids.reshape(
+                 h // self.spatial_merge_size,
+                 self.spatial_merge_size,
+@@ -587,7 +585,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
+             pos_ids.append(
+                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+         pos_ids = torch.cat(pos_ids, dim=0)
+-        max_grid_size = grid_thw[:, 1:].max()
++        max_grid_size = int(grid_thw[:, 1:].max().item())
+         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+         return rotary_pos_emb
+@@ -620,8 +618,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
+             index_padded = index_padded.reshape(-1)
+             index_new = index_padded[index_padded != -100]
+             window_index.append(index_new + window_index_id)
+-            cu_seqlens_tmp = seqlens.cumsum(
+-                0) * self.spatial_merge_unit + cu_window_seqlens[-1]
++            cu_seqlens_tmp = seqlens.cumsum(0, dtype=torch.int32) * self.spatial_merge_unit + cu_window_seqlens[-1]
+             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+             window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+         window_index = torch.cat(window_index, dim=0)

@@ -1,0 +1,141 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 13746cef2..3e58ea914 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -39,46 +39,41 @@ PromptLogprobs = List[Optional[Dict[int, Logprob]]]
+ SampleLogprobs = List[Dict[int, Logprob]]
+ 
+ 
+-class SequenceStatus(enum.Enum):
++class SequenceStatus(enum.IntEnum):
+     """Status of a sequence."""
+-    WAITING = enum.auto()
+-    RUNNING = enum.auto()
+-    SWAPPED = enum.auto()
+-    FINISHED_STOPPED = enum.auto()
+-    FINISHED_LENGTH_CAPPED = enum.auto()
+-    FINISHED_ABORTED = enum.auto()
+-    FINISHED_IGNORED = enum.auto()
++    WAITING = 0
++    RUNNING = 1
++    SWAPPED = 2
++    # Note: anything after SWAPPED (2) will be considered
++    # as a finished status.
++    FINISHED_STOPPED = 3
++    FINISHED_LENGTH_CAPPED = 4
++    FINISHED_ABORTED = 5
++    FINISHED_IGNORED = 6
+ 
+     @staticmethod
+     def is_finished(status: "SequenceStatus") -> bool:
+-        return status in [
+-            SequenceStatus.FINISHED_STOPPED,
+-            SequenceStatus.FINISHED_LENGTH_CAPPED,
+-            SequenceStatus.FINISHED_ABORTED,
+-            SequenceStatus.FINISHED_IGNORED,
+-        ]
++        return status > SequenceStatus.SWAPPED
+ 
+     @staticmethod
+     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
+-        if status == SequenceStatus.FINISHED_STOPPED:
+-            finish_reason = "stop"
+-        elif status == SequenceStatus.FINISHED_LENGTH_CAPPED:
+-            finish_reason = "length"
+-        elif status == SequenceStatus.FINISHED_ABORTED:
+-            finish_reason = "abort"
+-        elif status == SequenceStatus.FINISHED_IGNORED:
+-            # The ignored sequences are the sequences whose prompt lengths
+-            # are longer than the model's length cap. Therefore, the stop
+-            # reason should also be "length" as in OpenAI API.
+-            finish_reason = "length"
+-        else:
+-            finish_reason = None
+-        return finish_reason
++        return _FINISH_REASON_MAP.get(status)
++
+ 
++# Map finished statuses to OpenAI-compatible finish reasons.
++_FINISH_REASON_MAP = {
++    SequenceStatus.FINISHED_STOPPED: "stop",
++    SequenceStatus.FINISHED_LENGTH_CAPPED: "length",
++    SequenceStatus.FINISHED_ABORTED: "abort",
++    # The ignored sequences are the sequences whose prompt lengths are
++    # longer than the model's length cap. Therefore, the stop reason should
++    # also be "length" as in OpenAI API.
++    SequenceStatus.FINISHED_IGNORED: "length",
++}
+ 
+-class SequenceStage(enum.Enum):
+-    PREFILL = enum.auto()
+-    DECODE = enum.auto()
++class SequenceStage(enum.IntEnum):
++    PREFILL = 0
++    DECODE = 1
+ 
+ 
+ @dataclass
+@@ -186,9 +181,7 @@ class SequenceData:
+         return self.get_len() - self.get_num_computed_tokens()
+ 
+     def get_last_token_id(self) -> int:
+-        if not self.output_token_ids:
+-            return self.prompt_token_ids[-1]
+-        return self.output_token_ids[-1]
++        return (self.output_token_ids or self.prompt_token_ids)[-1]
+ 
+     def get_prompt_token_ids(self) -> List[int]:
+         return self.prompt_token_ids
+@@ -247,7 +240,7 @@ class Sequence:
+ 
+     @property
+     def n_blocks(self) -> int:
+-        return math.ceil(self.get_len() / self.block_size)
++        return (self.get_len() + self.block_size - 1) // self.block_size
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+@@ -525,11 +518,11 @@ class SequenceGroup:
+                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+     def get_num_uncomputed_tokens(self) -> int:
+-        num_uncomputed_tokens = 0
+-        for seq in self.get_seqs():
+-            if not seq.is_finished():
+-                num_uncomputed_tokens += seq.data.get_num_uncomputed_tokens()
+-        return num_uncomputed_tokens
++        return sum(
++            seq.data.get_num_uncomputed_tokens()
++            for seq in self.seqs_dict.values()
++            if not seq.is_finished()
++        )
+ 
+     def num_seqs(self, status: Optional[SequenceStatus] = None) -> int:
+         # Optimization. We don't need to call get_seqs if we don't need to
+@@ -561,11 +554,11 @@ class SequenceGroup:
+         del self.seqs_dict[seq_id]
+ 
+     def is_finished(self) -> bool:
+-        return all(seq.is_finished() for seq in self.get_seqs())
++        return all(seq.is_finished() for seq in self.seqs_dict.values())
+ 
+     def is_prefill(self) -> bool:
+         # Every sequence should be in the same stage.
+-        return self.get_seqs()[0].is_prefill()
++        return next(iter(self.seqs_dict.values())).is_prefill()
+ 
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
+@@ -857,7 +850,8 @@ class HiddenStates:
+         seq_ids = get_all_seq_ids(seq_group_metadata_list)
+         if seq_ids != self.seq_ids:
+             # Batch contents changed - prune removed sequences.
+-            index = [self.seq_ids.index(seq_id) for seq_id in seq_ids]
++            idx_map = {sid: i for i, sid in enumerate(self.seq_ids)}
++            index = [idx_map[sid] for sid in seq_ids]
+             self.hidden_states = self.hidden_states[index]
+             self.seq_ids = seq_ids
+ 

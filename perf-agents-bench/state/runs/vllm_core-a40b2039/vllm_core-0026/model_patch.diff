@@ -1,0 +1,53 @@
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index b4e0101a0..0913d7a0f 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -155,7 +155,8 @@ def create_and_prepopulate_kv_cache(
+         perm = torch.arange(
+             1, blocks_end)  # Sequential order starting from block 1
+ 
+-    inv_perm = torch.zeros(blocks_end, dtype=torch.long, device=device)
++    inv_perm = torch.empty(blocks_end, dtype=torch.long, device=device)
++    inv_perm[0] = 0
+     inv_perm[1:] = torch.argsort(
+         perm) + 1  # Add 1 to account for starting from block 1
+     kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
+diff --git a/tests/v1/attention/utils.py b/tests/v1/attention/utils.py
+index 30cfbdda5..2d944a6b3 100644
+--- a/tests/v1/attention/utils.py
++++ b/tests/v1/attention/utils.py
+@@ -43,9 +43,10 @@ def create_common_attn_metadata(
+         max_block_idx: int = 1000) -> CommonAttentionMetadata:
+     """Create CommonAttentionMetadata from a BatchSpec and ModelParams."""
+     # Create query start locations
+-    query_start_loc = torch.zeros(batch_spec.batch_size + 1,
++    query_start_loc = torch.empty(batch_spec.batch_size + 1,
+                                   dtype=torch.int32,
+                                   device=device)
++    query_start_loc[0] = 0
+     query_start_loc[1:] = torch.tensor(batch_spec.query_lens,
+                                        dtype=torch.int32,
+                                        device=device).cumsum(0)
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 953ef26c8..4e9360e35 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -422,12 +422,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 < block_table_bounds.unsqueeze(1))
+         paged_kv_indices = block_table_tensor[mask]
+ 
+-        paged_kv_indptr = torch.cat([
+-            torch.zeros(1,
+-                        dtype=block_table_bounds.dtype,
+-                        device=block_table_bounds.device),
+-            block_table_bounds.cumsum(dim=0, dtype=torch.int32)
+-        ])
++        cumsum = block_table_bounds.cumsum(dim=0, dtype=torch.int32)
++        paged_kv_indptr = torch.empty(cumsum.numel() + 1,
++                                      dtype=cumsum.dtype,
++                                      device=cumsum.device)
++        paged_kv_indptr[0] = 0
++        paged_kv_indptr[1:] = cumsum
+ 
+         paged_kv_last_page_len = seq_lens % page_size
+         paged_kv_last_page_len = torch.where(paged_kv_last_page_len == 0,

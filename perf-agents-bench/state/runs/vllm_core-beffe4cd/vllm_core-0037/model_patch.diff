@@ -1,0 +1,110 @@
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 13746cef2..4b56f092b 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -39,42 +39,37 @@ PromptLogprobs = List[Optional[Dict[int, Logprob]]]
+ SampleLogprobs = List[Dict[int, Logprob]]
+ 
+ 
+-class SequenceStatus(enum.Enum):
++class SequenceStatus(enum.IntEnum):
+     """Status of a sequence."""
+-    WAITING = enum.auto()
+-    RUNNING = enum.auto()
+-    SWAPPED = enum.auto()
+-    FINISHED_STOPPED = enum.auto()
+-    FINISHED_LENGTH_CAPPED = enum.auto()
+-    FINISHED_ABORTED = enum.auto()
+-    FINISHED_IGNORED = enum.auto()
++    WAITING = 0
++    RUNNING = 1
++    SWAPPED = 2
++    # Note: anything after SWAPPED (2) will be considered
++    # as a finished status.
++    FINISHED_STOPPED = 3
++    FINISHED_LENGTH_CAPPED = 4
++    FINISHED_ABORTED = 5
++    FINISHED_IGNORED = 6
+ 
+     @staticmethod
+     def is_finished(status: "SequenceStatus") -> bool:
+-        return status in [
+-            SequenceStatus.FINISHED_STOPPED,
+-            SequenceStatus.FINISHED_LENGTH_CAPPED,
+-            SequenceStatus.FINISHED_ABORTED,
+-            SequenceStatus.FINISHED_IGNORED,
+-        ]
++        return status > SequenceStatus.SWAPPED
+ 
+     @staticmethod
+     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
+-        if status == SequenceStatus.FINISHED_STOPPED:
+-            finish_reason = "stop"
+-        elif status == SequenceStatus.FINISHED_LENGTH_CAPPED:
+-            finish_reason = "length"
+-        elif status == SequenceStatus.FINISHED_ABORTED:
+-            finish_reason = "abort"
+-        elif status == SequenceStatus.FINISHED_IGNORED:
+-            # The ignored sequences are the sequences whose prompt lengths
+-            # are longer than the model's length cap. Therefore, the stop
+-            # reason should also be "length" as in OpenAI API.
+-            finish_reason = "length"
+-        else:
+-            finish_reason = None
+-        return finish_reason
++        return _FINISH_REASON_MAP.get(status)
++
+ 
++# Map finished statuses to OpenAI-compatible finish reasons.
++_FINISH_REASON_MAP = {
++    SequenceStatus.FINISHED_STOPPED: "stop",
++    SequenceStatus.FINISHED_LENGTH_CAPPED: "length",
++    SequenceStatus.FINISHED_ABORTED: "abort",
++    # The ignored sequences are the sequences whose prompt lengths are
++    # longer than the model's length cap. Therefore, the stop reason should
++    # also be "length" as in OpenAI API.
++    SequenceStatus.FINISHED_IGNORED: "length",
++}
+ 
+ class SequenceStage(enum.Enum):
+     PREFILL = enum.auto()
+@@ -247,7 +242,7 @@ class Sequence:
+ 
+     @property
+     def n_blocks(self) -> int:
+-        return math.ceil(self.get_len() / self.block_size)
++        return (self.get_len() + self.block_size - 1) // self.block_size
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+@@ -525,11 +520,11 @@ class SequenceGroup:
+                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+     def get_num_uncomputed_tokens(self) -> int:
+-        num_uncomputed_tokens = 0
+-        for seq in self.get_seqs():
+-            if not seq.is_finished():
+-                num_uncomputed_tokens += seq.data.get_num_uncomputed_tokens()
+-        return num_uncomputed_tokens
++        return sum(
++            seq.data.get_num_uncomputed_tokens()
++            for seq in self.seqs_dict.values()
++            if not seq.is_finished()
++        )
+ 
+     def num_seqs(self, status: Optional[SequenceStatus] = None) -> int:
+         # Optimization. We don't need to call get_seqs if we don't need to
+@@ -561,11 +556,11 @@ class SequenceGroup:
+         del self.seqs_dict[seq_id]
+ 
+     def is_finished(self) -> bool:
+-        return all(seq.is_finished() for seq in self.get_seqs())
++        return all(seq.is_finished() for seq in self.seqs_dict.values())
+ 
+     def is_prefill(self) -> bool:
+         # Every sequence should be in the same stage.
+-        return self.get_seqs()[0].is_prefill()
++        return next(iter(self.seqs_dict.values())).is_prefill()
+ 
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
