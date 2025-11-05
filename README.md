@@ -572,6 +572,202 @@ python performance_analyzer.py  # Analyze performance patterns
 python generate_test_generators.py  # Create new test generators
 ```
 
+## 🔄 resuming trae pipeline with filtered commits
+
+### Quick Start: Resume Pipeline
+
+If you have partially completed commits in `state/` and want to process only the remaining ones:
+
+```bash
+# 1. Activate environment and set API key
+cd /home/ubuntu/OmniPerf-Bench
+source bench-env/bin/activate
+export OPENAI_API_KEY="your_openai_api_key"
+
+# 2. Audit what's already done
+cd perf-agents-bench
+python3 << 'EOF'
+import json
+from pathlib import Path
+from collections import defaultdict
+
+runs_dir = Path("state/runs")
+commits_by_status = defaultdict(set)
+
+for journal_path in runs_dir.glob("*/*/journal.json"):
+    try:
+        data = json.loads(journal_path.read_text())
+        status = data.get("status", "unknown")
+        human_commit = data.get("commits", {}).get("human", None)
+        if human_commit:
+            commits_by_status[status].add(human_commit)
+    except:
+        pass
+
+successful = commits_by_status["success"]
+print(f"✅ Completed: {len(successful)} commits")
+
+with open("completed_commits.txt", "w") as f:
+    for commit in sorted(successful):
+        f.write(f"{commit}\n")
+EOF
+
+# 3. Create filtered plan (only unprocessed commits)
+python3 << 'EOF'
+import json
+from pathlib import Path
+
+plan = json.loads(Path("state/plan.json").read_text())
+completed = set(Path("completed_commits.txt").read_text().strip().split("\n"))
+
+missing_items = [item for item in plan["items"] if item["human"] not in completed]
+
+filtered_plan = {
+    "repo": plan["repo"],
+    "task_id": plan["task_id"],
+    "items": missing_items
+}
+
+Path("state/plan_remaining.json").write_text(json.dumps(filtered_plan, indent=2))
+print(f"✅ Created plan_remaining.json with {len(missing_items)} commits")
+EOF
+
+# 4. Set TRAE environment variables
+export TRAE_PYTHON=/home/ubuntu/OmniPerf-Bench/bench-env/bin/python
+export TRAE_CONFIG=/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml
+
+# 5. Run pipeline with filtered plan
+python -m bench.cli prepare \
+    tasks/vllm.yaml \
+    --from-plan state/plan_remaining.json \
+    --bench-cfg bench.yaml \
+    --max-workers 1 \
+    --resume
+```
+
+### Configuration Requirements
+
+**Before running, ensure TRAE is properly configured:**
+
+1. **Initialize TRAE submodule:**
+   ```bash
+   git submodule update --init --recursive third-party/trae-agent
+   ```
+
+2. **Install TRAE agent:**
+   ```bash
+   source bench-env/bin/activate
+   uv pip install -e third-party/trae-agent
+   ```
+
+3. **Configure TRAE for OpenAI:**
+   
+   Edit `third-party/trae-agent/trae_config.yaml`:
+   ```yaml
+   model_providers:
+       openai:
+           api_key: ${OPENAI_API_KEY}
+           provider: openai
+   
+   models:
+       trae_agent_model:
+           model_provider: openai
+           model: gpt-4o
+           max_tokens: 4096
+           temperature: 0.5
+           top_p: 1
+           top_k: 0
+           max_retries: 10
+           parallel_tool_calls: true
+       lakeview_model:
+           model_provider: openai
+           model: gpt-4o
+           max_tokens: 4096
+           temperature: 0.5
+           top_p: 1
+           top_k: 0
+           max_retries: 10
+           parallel_tool_calls: true
+   ```
+
+4. **Update bench.yaml paths:**
+   
+   Edit `perf-agents-bench/bench.yaml`:
+   ```yaml
+   agents:
+     default: "trae"
+     trae:
+       cli: "${TRAE_PYTHON:-/home/ubuntu/OmniPerf-Bench/bench-env/bin/python}"
+       args:
+         max_steps: 120
+       time_budget_minutes: 120
+       config_file: "${TRAE_CONFIG:-/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml}"
+   ```
+
+### Understanding the Resume Logic
+
+**Current Limitation:** The built-in `--resume` flag only works within a single run session. Each time you run `prepare`, it creates a new `run_id` (e.g., `vllm_core-abc12345`), and resume only checks that specific directory.
+
+**Solution:** Pre-filter the plan to exclude already-completed commits. The audit script above:
+1. Scans ALL previous run directories in `state/runs/`
+2. Extracts commit hashes from successful journals
+3. Creates a filtered plan containing only unprocessed commits
+
+This prevents duplicate work and wasted resources.
+
+### Monitoring Progress
+
+**Check current status:**
+```bash
+cd perf-agents-bench
+
+# Count successes and errors
+grep -c "Task status determined as: success" pipeline_run_*.log
+grep -c "Task status determined as: error" pipeline_run_*.log
+
+# View recent activity
+tail -50 pipeline_run_*.log | grep -E "(Starting task|status determined|TRAE STDOUT)"
+
+# Monitor live (if running in tmux)
+tmux attach -t trae_pipeline
+# Detach without stopping: Ctrl+B then D
+```
+
+### Expected Behavior
+
+**For 60 remaining commits:**
+- **Time:** ~15 hours (15 min/commit average)
+- **Tokens:** ~60M tokens total
+- **Cost:** $150-300 (GPT-4o pricing)
+- **Output:** Individual journals in `state/runs/{run_id}/{item_id}/`
+
+**Success indicators:**
+- Real-time TRAE output showing code edits
+- Token usage displayed (e.g., "Input: 332283 Output: 2188")
+- Journal files with `"status": "success"`
+- `model_patch.diff` files generated
+
+**Common issues:**
+- Missing dependencies → Run `uv pip install -e third-party/trae-agent`
+- Config file not found → Check `TRAE_CONFIG` environment variable
+- API key errors → Verify `OPENAI_API_KEY` is set
+- Anthropic import errors → Ensure config uses OpenAI, not Anthropic
+
+### Resume vs. Fresh Run
+
+**Resume (--resume flag):**
+- Skips items already completed in CURRENT run
+- Only helps if restarting interrupted session
+- Does NOT check other run directories
+
+**Filtered Plan (recommended):**
+- Pre-filters plan before running
+- Checks ALL previous runs across all directories
+- Prevents duplicate work across sessions
+- More robust for incremental processing
+
+**Best Practice:** Always create filtered plan before running, then use `--resume` as safety net.
+
 ## ⬇️ artifacts & resources
 
 ### 📊 datasets
