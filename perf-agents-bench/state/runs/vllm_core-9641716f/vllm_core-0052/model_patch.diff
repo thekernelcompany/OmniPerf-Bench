@@ -1,0 +1,92 @@
+diff --git a/vllm/model_executor/layers/rotary_embedding.py b/vllm/model_executor/layers/rotary_embedding.py
+index 9de233896..fbacac226 100644
+--- a/vllm/model_executor/layers/rotary_embedding.py
++++ b/vllm/model_executor/layers/rotary_embedding.py
+@@ -26,6 +26,7 @@
+ import math
+ from typing import Any, Optional, Union
+ 
++import numpy as np
+ import torch
+ import torch.nn as nn
+ from transformers import PretrainedConfig
+@@ -1468,6 +1469,17 @@ class MRotaryEmbedding(RotaryEmbedding):
+             mrope_position_delta + seq_len,
+         ).expand(3, -1)
+ 
++
++    @staticmethod
++    def get_next_input_positions_tensor_out(out: np.ndarray, out_offset: int,
++                                            mrope_position_delta: int,
++                                            context_len: int,
++                                            num_new_tokens: int) -> None:
++        start = mrope_position_delta + context_len
++        end = start + num_new_tokens
++        vals = np.arange(start, end, dtype=out.dtype)
++        out[:, out_offset:out_offset + num_new_tokens] = vals
++
+     @classmethod
+     def omni_get_updates_use_audio_in_video(
+         cls,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 520d8fb18..9214965f2 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -257,7 +257,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
+                                                dtype=torch.int64,
+                                                device=self.device)
+-            self.mrope_positions_cpu = torch.zeros(
++            self.mrope_positions_cpu = torch.empty(
+                 (3, self.max_num_tokens + 1),
+                 dtype=torch.int64,
+                 device="cpu",
+@@ -280,21 +280,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)
+@@ -889,15 +889,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 dst_start = mrope_pos_ptr
+                 dst_end = mrope_pos_ptr + completion_part_len
+ 
+-                self.mrope_positions_cpu[:, dst_start:dst_end] = \
+-                    MRotaryEmbedding.get_next_input_positions_tensor(
+-                        req.mrope_position_delta,
+-                        context_len=num_computed_tokens +
+-                        prompt_part_len,
+-                        seq_len=num_computed_tokens +
+-                        prompt_part_len +
+-                        completion_part_len,
+-                    )
++                MRotaryEmbedding.get_next_input_positions_tensor_out(
++                    self.mrope_positions_cpu.numpy(),
++                    dst_start,
++                    req.mrope_position_delta,
++                    context_len=num_computed_tokens + prompt_part_len,
++                    num_new_tokens=completion_part_len,
++                )
+ 
+                 mrope_pos_ptr += completion_part_len
+ 

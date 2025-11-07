@@ -1,0 +1,110 @@
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 49e63c231..24d00cd3b 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -337,10 +337,19 @@ class BlockTable:
+         This is required for the scheduler to determine whether a sequence can
+         continue generation, or if it must be preempted.
+         """
+-
+-        all_token_ids = token_ids + [-1] * num_lookahead_slots
+-        token_blocks = self._chunk_token_blocks_for_append(all_token_ids)
+-        return len(token_blocks)
++        # Number of slots to account for (new tokens + lookahead slots)
++        total_new_slots = len(token_ids) + num_lookahead_slots
++
++        # The first touched block is always the current (possibly partially
++        # filled) block. Even when total_new_slots is 0, we still count touching
++        # the current block for consistency with previous behavior.
++        first_chunk_capacity = self._block_size - (self._num_full_slots %
++                                                   self._block_size)
++        remaining = total_new_slots - first_chunk_capacity
++        if remaining <= 0:
++            return 1
++        # Additional blocks needed beyond the first touched block.
++        return 1 + cdiv(remaining, self._block_size)
+ 
+     def _chunk_token_blocks_for_append(
+             self, token_ids: List[int]) -> List[List[int]]:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23ee..2987dda4e 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -501,7 +501,24 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark blocks as computed, used in prefix caching.
++
++        This operation is designed to be lightweight and incremental. It only
++        updates internal tracking state for active blocks; blocks that have
++        already been moved to the evictor are considered computed implicitly.
++        """
++        if not block_ids:
++            return
++        for block_id in block_ids:
++            if self._block_tracker[block_id].active:
++                self._block_tracker[block_id].computed = True
++            elif block_id in self.evictor:
++                # Already tracked by evictor as a computed, cached block
++                continue
++            else:
++                # Invalid block_id for this allocator
++                raise ValueError(
++                    "Mark block as computed which is not belonged to GPU")
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+diff --git a/vllm/model_executor/models/__init__.py b/vllm/model_executor/models/__init__.py
+index 87508a116..6be55de19 100644
+--- a/vllm/model_executor/models/__init__.py
++++ b/vllm/model_executor/models/__init__.py
+@@ -7,6 +7,10 @@ from vllm.logger import init_logger
+ from vllm.utils import is_hip
+ 
+ logger = init_logger(__name__)
++# Cache for imported modules and model classes to avoid repeated imports
++_IMPORTED_MODULES: Dict[str, object] = {}
++_MODEL_CLASS_CACHE: Dict[str, Optional[Type[nn.Module]]] = {}
++
+ 
+ # Architecture -> (module, class).
+ _GENERATION_MODELS = {
+@@ -114,10 +118,20 @@ class ModelRegistry:
+                     "Model architecture %s is partially supported by ROCm: %s",
+                     model_arch, _ROCM_PARTIALLY_SUPPORTED_MODELS[model_arch])
+ 
++        # Fast path: return from cache if available
++        if model_arch in _MODEL_CLASS_CACHE:
++            return _MODEL_CLASS_CACHE[model_arch]
++
+         module_name, model_cls_name = _MODELS[model_arch]
+-        module = importlib.import_module(
+-            f"vllm.model_executor.models.{module_name}")
+-        return getattr(module, model_cls_name, None)
++        # Import module with caching
++        module = _IMPORTED_MODULES.get(module_name)
++        if module is None:
++            module = importlib.import_module(
++                f"vllm.model_executor.models.{module_name}")
++            _IMPORTED_MODULES[module_name] = module
++        model_cls = getattr(module, model_cls_name, None)
++        _MODEL_CLASS_CACHE[model_arch] = model_cls
++        return model_cls
+ 
+     @staticmethod
+     def get_supported_archs() -> List[str]:
+diff --git a/vllm/utils.py b/vllm/utils.py
+index f3025a68d..4ecc861ae 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -520,7 +520,7 @@ def create_kv_caches_with_random(
+     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+ 
+     scale = head_size**-0.5
+-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
++    x = 16 // get_dtype_size(torch_dtype)
+     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+     key_caches: List[torch.Tensor] = []
+     for _ in range(num_layers):

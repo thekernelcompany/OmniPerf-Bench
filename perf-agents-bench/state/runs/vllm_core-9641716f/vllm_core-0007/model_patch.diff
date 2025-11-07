@@ -1,0 +1,99 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index abcd4b007..bc03c495b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -118,32 +118,42 @@ class GPUModelRunner:
+             dtype=self.dtype,
+             device=self.device)
+ 
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.seq_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device="cpu",
+                                              pin_memory=self.pin_memory)
+         self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
+ 
++        # OPTIMIZATION: Cache common arange to reduce per-step allocations
++        self.arange_np = np.arange(max(self.max_num_reqs, self.max_model_len),
++                                   dtype=np.int32)
++        # OPTIMIZATION: Preallocate token_indices buffer to avoid from_numpy overhead
++        self.token_indices_cpu = torch.empty(self.max_num_tokens,
++                                             dtype=torch.int64,
++                                             device="cpu",
++                                             pin_memory=self.pin_memory)
++        self.token_indices_np = self.token_indices_cpu.numpy()
++
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+         # Remove stopped requests from the cached states.
+         # Keep the states of the pre-empted requests.
+@@ -269,11 +279,13 @@ class GPUModelRunner:
+ 
+         # Get request indices.
+         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+-        req_indices = np.repeat(np.arange(num_reqs), num_scheduled_tokens)
++        req_indices = np.repeat(self.arange_np[:num_reqs],
++                                num_scheduled_tokens)
+ 
+         # Get batched arange.
+         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+-        arange = np.concatenate([np.arange(n) for n in num_scheduled_tokens])
++        arange = np.concatenate([self.arange_np[:n]
++                                 for n in num_scheduled_tokens])
+ 
+         # Get positions.
+         positions_np = self.positions_np[:total_num_scheduled_tokens]
+@@ -285,14 +297,16 @@ class GPUModelRunner:
+         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+         # where M is the max_model_len.
+-        token_indices = (positions_np +
+-                         req_indices * self.input_batch.token_ids_cpu.shape[1])
++        token_indices_np = self.token_indices_np[:total_num_scheduled_tokens]
++        stride = self.input_batch.token_ids_cpu.shape[1]
++        np.multiply(req_indices, stride, out=token_indices_np)
++        np.add(positions_np, token_indices_np, out=token_indices_np)
+         # NOTE(woosuk): We use torch.index_select instead of np.take here
+         # because torch.index_select is much faster than np.take for large
+         # tensors.
+         torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
+                            0,
+-                           torch.from_numpy(token_indices),
++                           self.token_indices_cpu[:total_num_scheduled_tokens],
+                            out=self.input_ids_cpu[:total_num_scheduled_tokens])
+ 
+         # Calculate the slot mapping.
+@@ -648,6 +662,6 @@ class GPUModelRunner:
+             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+         for _ in range(self.num_attn_layers):
+             self.kv_caches.append(
+-                torch.zeros(kv_cache_shape,
++                torch.empty(kv_cache_shape,
+                             dtype=self.kv_cache_dtype,
+                             device=self.device))

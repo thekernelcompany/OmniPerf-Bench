@@ -1,0 +1,155 @@
+diff --git a/Dockerfile b/Dockerfile
+index f41753aeb..0549c0ee3 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -41,13 +41,6 @@ ENV NVCC_THREADS=$nvcc_threads
+ 
+ RUN python3 setup.py build_ext --inplace
+ 
+-# Build the megablocks library as wheel because it doesn't publish pre-built wheels.
+-# https://github.com/stanford-futuredata/megablocks/commit/5897cd6f254b7b3edf7a708a3a3314ecb54b6f78
+-RUN apt-get install -y git && \
+-    git clone https://github.com/stanford-futuredata/megablocks.git && \
+-    cd megablocks && \
+-    git checkout 5897cd6f254b7b3edf7a708a3a3314ecb54b6f78 && \
+-    MAX_JOBS=8 NVCC_THREADS=8 python3 setup.py bdist_wheel
+ 
+ # image to run unit testing suite
+ FROM dev AS test
+@@ -87,10 +80,5 @@ RUN --mount=type=cache,target=/root/.cache/pip \
+ 
+ COPY vllm vllm
+ COPY --from=build /workspace/vllm/*.so /workspace/vllm/
+-COPY --from=build /workspace/megablocks/dist/*.whl /tmp/
+-RUN --mount=type=cache,target=/root/.cache/pip \
+-    pip install /tmp/megablocks-0.5.0-cp310-cp310-linux_x86_64.whl && \
+-    rm /tmp/megablocks-0.5.0-cp310-cp310-linux_x86_64.whl
+-
+ ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+ 
+diff --git a/README.md b/README.md
+index 84cadee48..e4b3b5026 100644
+--- a/README.md
++++ b/README.md
+@@ -72,10 +72,6 @@ Install vLLM with pip or [from source](https://vllm.readthedocs.io/en/latest/get
+ ```bash
+ pip install vllm
+ ```
+-**NOTE:** The Mixtral model additionally requires `megablocks` which can be installed with pip or [from source](https://github.com/stanford-futuredata/megablocks):
+-```bash
+-pip install megablocks
+-```
+ 
+ ## Getting Started
+ 
+diff --git a/docs/source/models/supported_models.rst b/docs/source/models/supported_models.rst
+index e21cdd65d..f9663fa07 100644
+--- a/docs/source/models/supported_models.rst
++++ b/docs/source/models/supported_models.rst
+@@ -76,7 +76,7 @@ Alternatively, you can raise an issue on our `GitHub <https://github.com/vllm-pr
+ .. note::
+     Currently, the ROCm version of vLLM does not support Mixtral.
+     Additionally, it only supports Mistral for context lengths up to 4096.
+-
++    Mixtral models require additional optional dependencies (megablocks and stanford-stk) to be installed; see the README for details.
+ .. tip::
+     The easiest way to check if your model is supported is to run the program below:
+ 
+diff --git a/vllm/config.py b/vllm/config.py
+index 6bafa73c7..9e88f0d19 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -12,6 +12,9 @@ logger = init_logger(__name__)
+ 
+ _GB = 1 << 30
+ 
++_SUPPORTED_LOAD_FORMATS = ("auto", "pt", "safetensors", "npcache", "dummy")
++_ROCM_NOT_SUPPORTED_LOAD_FORMATS = ("safetensors",)
++
+ 
+ class ModelConfig:
+     """Configuration for the model.
+@@ -98,22 +101,20 @@ class ModelConfig:
+ 
+     def _verify_load_format(self) -> None:
+         load_format = self.load_format.lower()
+-        supported_load_format = [
+-            "auto", "pt", "safetensors", "npcache", "dummy"
+-        ]
+-        rocm_not_supported_load_format = ["safetensors"]
++        supported_load_format = _SUPPORTED_LOAD_FORMATS
++        rocm_not_supported_load_format = _ROCM_NOT_SUPPORTED_LOAD_FORMATS
+         if load_format not in supported_load_format:
+             raise ValueError(
+                 f"Unknown load format: {self.load_format}. Must be one of "
+                 "'auto', 'pt', 'safetensors', 'npcache', or 'dummy'.")
+         if is_hip():
+-            if load_format in ["safetensors"]:
++            if load_format in rocm_not_supported_load_format:
+                 rocm_supported_load_format = [
+                     f for f in supported_load_format
+                     if (f not in rocm_not_supported_load_format)
+                 ]
+                 raise ValueError(
+-                    f"load format \'{load_format}\' is not supported in ROCm. "
++                    f"load format '{load_format}' is not supported in ROCm. "
+                     f"Supported load format are "
+                     f"{rocm_supported_load_format}")
+             # Force ROCm to load from pt weights if nothing specific is set
+diff --git a/vllm/model_executor/models/__init__.py b/vllm/model_executor/models/__init__.py
+index 5596884f3..9e0e4adfa 100644
+--- a/vllm/model_executor/models/__init__.py
++++ b/vllm/model_executor/models/__init__.py
+@@ -1,4 +1,5 @@
+ import importlib
++
+ from typing import List, Optional, Type
+ 
+ import torch.nn as nn
+@@ -39,6 +40,8 @@ _MODELS = {
+ }
+ 
+ # Models not supported by ROCm.
++_SUPPORTED_ARCHS = list(_MODELS.keys())
++
+ _ROCM_UNSUPPORTED_MODELS = ["MixtralForCausalLM"]
+ 
+ # Models partially supported by ROCm.
+@@ -72,7 +75,7 @@ class ModelRegistry:
+ 
+     @staticmethod
+     def get_supported_archs() -> List[str]:
+-        return list(_MODELS.keys())
++        return _SUPPORTED_ARCHS
+ 
+ 
+ __all__ = [
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 8e0a094c7..2879c77f0 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -340,9 +340,10 @@ class BlockSparseMoE(nn.Module):
+         all_probs = F.softmax(gate_logits, dim=1, dtype=torch.float)
+         # weights, selected_experts: (sequence_length, top-k)
+         weights, selected_experts = torch.topk(all_probs, self.top_k, dim=-1)
+-        weights /= weights.sum(dim=-1, keepdim=True)
+-        weights = weights.flatten().to(x.dtype)
+-        selected_experts = selected_experts.flatten()
++        denom = weights.sum(dim=-1, keepdim=True)
++        weights.mul_(denom.reciprocal())
++        weights = weights.to(x.dtype).reshape(-1)
++        selected_experts = selected_experts.reshape(-1)
+ 
+         (indices, bin_ids, bins, padded_bins,
+          _) = self.indices_and_padded_bins(selected_experts)
+@@ -477,9 +478,8 @@ class MixtralForCausalLM(nn.Module):
+         hidden_states = self.tok_embeddings(input_ids)
+ 
+         # forward
+-        for i in range(len(self.layers)):
++        for i, layer in enumerate(self.layers):
+             cache_event = None if cache_events is None else cache_events[i]
+-            layer = self.layers[i]
+             hidden_states = layer(
+                 positions,
+                 hidden_states,

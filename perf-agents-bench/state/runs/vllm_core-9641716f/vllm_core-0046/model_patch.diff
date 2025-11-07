@@ -1,0 +1,77 @@
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 462ba8a75..c931b6933 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -258,7 +258,7 @@ def scaled_fp8_quant(
+     else:
+         output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+     if scale is None:
+-        scale = torch.zeros(1, device=input.device, dtype=torch.float32)
++        scale = torch.empty(1, device=input.device, dtype=torch.float32)
+         vllm_ops.dynamic_scaled_fp8_quant(output, input, scale)
+     else:
+         vllm_ops.static_scaled_fp8_quant(output, input, scale)
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index bf3a59e3d..96a09e349 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -204,7 +204,7 @@ class Fp8LinearMethod(LinearMethodBase):
+                                                   layer.weight_scale[idx])
+ 
+                 layer.weight[start:end, :] = per_tensor_quantize(
+-                    weight_dq, layer.weight_scale.max())
++                    weight_dq, max_w_scale)
+                 start = end
+             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+ 
+@@ -240,18 +240,39 @@ class Fp8LinearMethod(LinearMethodBase):
+                                                layer.act_scale,
+                                                batch_dim_padding=17)
+ 
+-        # Fused GEMM_DQ -- note we padded the input above because
+-        # torch._scaled_mm is more performant for matrices with
+-        # batch dimension > 16. Note that this could change
+-        # in the future.
+-        output, _ = torch._scaled_mm(
+-            qinput,
+-            layer.weight,
+-            out_dtype=x.dtype,
+-            scale_a=x_scale,
+-            scale_b=layer.weight_scale,
+-            bias=bias,
++        # Try optimized CUTLASS kernel when supported; fallback to torch._scaled_mm
++        use_cutlass = (
++            hasattr(ops, 'cutlass_scaled_mm_dq') and
++            isinstance(layer.weight, torch.Tensor) and
++            layer.weight.is_cuda and
++            layer.weight.shape[0] % 16 == 0 and layer.weight.shape[1] % 16 == 0 and
++            (x.dtype is torch.bfloat16 or x.dtype is torch.float16)
+         )
++        output = None
++        if use_cutlass:
++            try:
++                output = ops.cutlass_scaled_mm_dq(
++                    qinput,
++                    layer.weight,
++                    x_scale,
++                    layer.weight_scale,
++                    out_dtype=x.dtype,
++                )
++                if bias is not None:
++                    output = output + bias
++            except Exception:
++                output = None
++
++        if output is None:
++            # Fused GEMM_DQ via PyTorch fallback
++            output, _ = torch._scaled_mm(
++                qinput,
++                layer.weight,
++                out_dtype=x.dtype,
++                scale_a=x_scale,
++                scale_b=layer.weight_scale,
++                bias=bias,
++            )
+ 
+         return torch.narrow(output, 0, 0, x.shape[0])
+ 

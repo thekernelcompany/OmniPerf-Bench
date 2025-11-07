@@ -1,0 +1,143 @@
+diff --git a/tests/kernels/mamba/test_mamba_ssm_ssd.py b/tests/kernels/mamba/test_mamba_ssm_ssd.py
+index 00c1a2911..a7fffe34e 100644
+--- a/tests/kernels/mamba/test_mamba_ssm_ssd.py
++++ b/tests/kernels/mamba/test_mamba_ssm_ssd.py
+@@ -163,7 +163,7 @@ def generate_continuous_batched_examples(example_lens_by_batch,
+ 
+         # get the metadata
+         cu_seqlens = torch.tensor((0, ) + spec, device=device).cumsum(dim=0)
+-        seq_idx = torch.zeros(cu_seqlens[-1],
++        seq_idx = torch.empty(cu_seqlens[-1],
+                               dtype=torch.int32,
+                               device=cu_seqlens.device)
+         for i, (srt, end) in enumerate(zip(
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index 36edac237..e1fa2ccb7 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -583,7 +583,11 @@ class MambaMixer2(MambaBase, CustomOp):
+                                                                1]
+                                  if has_prefill else None)
+ 
+-        ssd_output_list = []
++        feature_dim = (self.num_heads // self.tp_size) * self.head_dim
++        ssd_output_combined = torch.empty(num_actual_tokens,
++                                          feature_dim,
++                                          device=hidden_states_B_C.device,
++                                          dtype=hidden_states_B_C.dtype)
+ 
+         # Process prefill requests
+         if has_prefill:
+@@ -653,7 +657,13 @@ class MambaMixer2(MambaBase, CustomOp):
+             ssm_state[state_indices_tensor_p] = varlen_state
+ 
+             # - reshape
+-            ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))
++            prefill_flat = scan_output.view(num_prefill_tokens, -1)
++            if envs.VLLM_USE_V1:
++                start = num_decodes
++            else:
++                start = 0
++            ssd_output_combined[start:start + num_prefill_tokens].copy_(
++                prefill_flat)
+ 
+         # Process decode requests
+         if has_decode:
+@@ -699,18 +709,16 @@ class MambaMixer2(MambaBase, CustomOp):
+                 state_batch_indices=state_indices_tensor_d,
+             )
+ 
++            decode_flat = hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
++                                         self.head_dim)
+             if envs.VLLM_USE_V1:
+-                ssd_output_list.insert(
+-                    0,
+-                    hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
+-                                         self.head_dim))
++                ssd_output_combined[:num_decodes].copy_(decode_flat)
+             else:
+-                ssd_output_list.append(
+-                    hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
+-                                         self.head_dim))
++                ssd_output_combined[num_prefill_tokens:num_prefill_tokens +
++                                    num_decodes].copy_(decode_flat)
+ 
+         # Merge prefill and decode outputs before passing to gated MLP
+-        hidden_states = torch.vstack(ssd_output_list)
++        hidden_states = ssd_output_combined
+ 
+         # 4. gated MLP
+         # GatedRMSNorm internally applying SiLU to the gate
+diff --git a/vllm/model_executor/models/phi4flash.py b/vllm/model_executor/models/phi4flash.py
+index a4ded2b7a..27dcb4c11 100644
+--- a/vllm/model_executor/models/phi4flash.py
++++ b/vllm/model_executor/models/phi4flash.py
+@@ -129,16 +129,16 @@ class SambaYAttention(nn.Module):
+ 
+         self.lambda_init = self.lambda_init_fn(layer_idx)
+         self.lambda_q1 = nn.Parameter(
+-            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,
++            torch.empty(self.head_dim, dtype=torch.float32).normal_(mean=0,
+                                                                     std=0.1))
+         self.lambda_k1 = nn.Parameter(
+-            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,
++            torch.empty(self.head_dim, dtype=torch.float32).normal_(mean=0,
+                                                                     std=0.1))
+         self.lambda_q2 = nn.Parameter(
+-            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,
++            torch.empty(self.head_dim, dtype=torch.float32).normal_(mean=0,
+                                                                     std=0.1))
+         self.lambda_k2 = nn.Parameter(
+-            torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,
++            torch.empty(self.head_dim, dtype=torch.float32).normal_(mean=0,
+                                                                     std=0.1))
+         self.subln = nn.RMSNorm(2 * self.head_dim,
+                                 eps=1e-5,
+diff --git a/vllm/model_executor/models/plamo2.py b/vllm/model_executor/models/plamo2.py
+index 9bc577cfe..787ae1668 100644
+--- a/vllm/model_executor/models/plamo2.py
++++ b/vllm/model_executor/models/plamo2.py
+@@ -257,7 +257,12 @@ class Plamo2MambaMixer(nn.Module):
+         query_start_loc_p = (attn_metadata.query_start_loc[:num_prefills + 1]
+                              if has_prefill else None)
+ 
+-        ssd_output_list = []
++        feature_dim = (self.num_heads // self.tp_size) * self.head_dim
++        num_actual_tokens = num_prefill_tokens + num_decodes
++        ssd_output_combined = torch.empty(num_actual_tokens,
++                                          feature_dim,
++                                          device=hidden_states.device,
++                                          dtype=hidden_states.dtype)
+ 
+         # Process prefill requests
+         if has_prefill:
+@@ -319,7 +324,8 @@ class Plamo2MambaMixer(nn.Module):
+             mamba_cache_params.ssm_state[state_indices_tensor_p] = varlen_state
+ 
+             # - reshape
+-            ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))
++            prefill_flat = scan_output.view(num_prefill_tokens, -1)
++            ssd_output_combined[:num_prefill_tokens].copy_(prefill_flat)
+ 
+         # Process decode requests
+         if has_decode:
+@@ -363,13 +369,14 @@ class Plamo2MambaMixer(nn.Module):
+                 dt_softplus=True,
+                 state_batch_indices=state_indices_tensor_d,
+             )
+-            assert self.num_heads % self.tp_size == 0
+-            ssd_output_list.append(
+-                hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
+-                                     self.head_dim))
++            ssd_output_combined[num_prefill_tokens:num_prefill_tokens +
++                                num_decodes].copy_(
++                                    hidden_states_d.view(-1, (self.num_heads //
++                                                             self.tp_size) *
++                                                         self.head_dim))
+ 
+         # Merge prefill and decode outputs before passing to MLP
+-        hidden_states = torch.vstack(ssd_output_list)
++        hidden_states = ssd_output_combined
+ 
+         # 4. Final linear projection
+         out = self.out_proj(hidden_states)

@@ -1,0 +1,58 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 00260313e..1d83fb7f0 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -537,7 +537,7 @@ def moe_align_block_size_triton(
+     tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    cumsum = torch.zeros((num_experts + 1,),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
+     tokens_per_thread = ceil_div(numel, num_experts)
+@@ -628,7 +628,7 @@ def moe_align_block_size(
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.
+-    expert_ids = torch.zeros((max_num_m_blocks, ),
++    expert_ids = torch.zeros((max_num_m_blocks,),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+     num_tokens_post_pad = torch.empty((1),
+@@ -994,7 +994,8 @@ def grouped_topk(hidden_states: torch.Tensor,
+                                    -1).max(dim=-1).values  # [n, n_group]
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
+                            sorted=False)[1]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
++    group_mask = torch.empty_like(group_scores)
++
+     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+     score_mask = group_mask.unsqueeze(-1).expand(
+         num_token, num_expert_group,
+@@ -1240,15 +1241,19 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+ 
+     config = get_config_func(M)
+ 
+-    intermediate_cache1 = torch.empty((M, top_k_num, N),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
++    # We can reuse the memory between these because by the time we need
++    # cache3, we're done with cache1
++    cache13 = torch.empty(M * top_k_num * max(N, w2.shape[1]),
++                          device=hidden_states.device,
++                          dtype=hidden_states.dtype)
++    intermediate_cache1 = cache13[:M * top_k_num * N].view(
++        (M, topk_ids.shape[1], N))
++    # This needs separate memory since it's used concurrently with cache1
+     intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                       device=hidden_states.device,
+                                       dtype=hidden_states.dtype)
+-    intermediate_cache3 = torch.empty((M, top_k_num, w2.shape[1]),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
++    intermediate_cache3 = cache13[:M * top_k_num * w2.shape[1]].view(
++        (M, topk_ids.shape[1], w2.shape[1]))
+ 
+     if hidden_states.dtype == torch.bfloat16:
+         compute_type = tl.bfloat16

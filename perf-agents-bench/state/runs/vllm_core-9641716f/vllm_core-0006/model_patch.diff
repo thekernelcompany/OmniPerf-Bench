@@ -1,0 +1,97 @@
+diff --git a/vllm/attention/ops/triton_unified_attention.py b/vllm/attention/ops/triton_unified_attention.py
+index c65f09523..e89f3f4f2 100644
+--- a/vllm/attention/ops/triton_unified_attention.py
++++ b/vllm/attention/ops/triton_unified_attention.py
+@@ -108,6 +108,7 @@ def kernel_unified_attention_2d(
+ 
+     offs_m = tl.arange(0, BLOCK_M)
+     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    offs_n = tl.arange(0, BLOCK_SIZE)
+     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+ 
+     query_offset_0 = cur_batch_in_all_start_index + query_pos
+@@ -146,13 +147,25 @@ def kernel_unified_attention_2d(
+                               other=0.0)
+ 
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
++    # compute the length of the longest sequence prefix spanned by any
++    # query token in the current q_block (q_block_local_idx)
++    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
++        BLOCK_M - 1) // num_queries_per_kv + 1
++
++    # adjust for potential padding in the last q_block by considering the
++    # actual sequence length
++    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
++
++    # calculate the number of tiles (blocks) that need to be processed to
++    # cover the longest sequence prefix (due to causal masking, blocks beyond
++    # this prefix can be skipped)
++    num_blocks = cdiv_fn(max_seq_prefix_len, BLOCK_SIZE)
+ 
+     # iterate through tiles
+     for j in range(0, num_blocks):
+ 
+         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+ 
+-        offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+         v_offset = (physical_block_idx * stride_v_cache_0 +
+                     kv_head_idx * stride_v_cache_2 +
+@@ -195,9 +208,7 @@ def kernel_unified_attention_2d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -316,6 +327,7 @@ def kernel_unified_attention_3d(
+ 
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
++    offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+     # number of segments for this particular sequence
+     num_segments = NUM_SEGMENTS_PER_SEQ
+@@ -363,6 +375,19 @@ def kernel_unified_attention_3d(
+                               other=0.0)
+ 
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
++    # compute the length of the longest sequence prefix spanned by any
++    # query token in the current q_block (q_block_local_idx)
++    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
++        BLOCK_M - 1) // num_queries_per_kv + 1
++
++    # adjust for potential padding in the last q_block by considering the
++    # actual sequence length
++    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
++
++    # calculate the number of tiles (blocks) that need to be processed to
++    # cover the longest sequence prefix (due to causal masking, blocks beyond
++    # this prefix can be skipped)
++    num_blocks = cdiv_fn(max_seq_prefix_len, BLOCK_SIZE)
+ 
+     # iterate through tiles within current segment
+     for j in range(
+@@ -371,7 +396,6 @@ def kernel_unified_attention_3d(
+     ):
+         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+ 
+-        offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+         v_offset = (physical_block_idx * stride_v_cache_0 +
+                     kv_head_idx * stride_v_cache_2 +
+@@ -414,9 +438,7 @@ def kernel_unified_attention_3d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)

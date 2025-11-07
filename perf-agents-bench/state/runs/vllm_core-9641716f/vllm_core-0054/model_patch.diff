@@ -1,0 +1,170 @@
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index e0169f1a4..792f9231a 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -275,9 +275,13 @@ class AsyncLLM(EngineClient):
+                 out = q.get_nowait() if not q.empty() else await q.get()
+ 
+                 # Coalesce any additional queued outputs
+-                while not q.empty():
+-                    next_out = q.get_nowait()
+-                    if sampling_params.output_kind == RequestOutputKind.DELTA:
++                is_delta = sampling_params.output_kind == RequestOutputKind.DELTA
++                while True:
++                    try:
++                        next_out = q.get_nowait()
++                    except asyncio.QueueEmpty:
++                        break
++                    if is_delta:
+                         out.add(next_out)
+                     else:
+                         out = next_out
+@@ -315,6 +319,7 @@ class AsyncLLM(EngineClient):
+                     slices = np.array_split(
+                         outputs.outputs,
+                         cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE))
++                num_slices = len(slices)
+ 
+                 for i, outputs_slice in enumerate(slices):
+                     # 2) Process EngineCoreOutputs.
+@@ -324,7 +329,7 @@ class AsyncLLM(EngineClient):
+                     assert not processed_outputs.request_outputs
+ 
+                     # Allow other asyncio tasks to run between chunks
+-                    if i + 1 < len(slices):
++                    if i + 1 < num_slices:
+                         await asyncio.sleep(0)
+ 
+                     # 3) Abort any reqs that finished due to stop strings.
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 12df34177..e2c57dfcd 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -24,6 +24,35 @@ class OutputProcessorOutput:
+     reqs_to_abort: list[str]
+ 
+ 
++
++
++class RequestOutputCollector:
++
++    def __init__(self) -> None:
++        # Map a queue to a per-request aggregation map
++        self._queues: dict[asyncio.Queue, dict[str, RequestOutput]] = {}
++
++    def add(self, queue: asyncio.Queue, ro: RequestOutput,
++            output_kind: RequestOutputKind) -> None:
++        qmap = self._queues.setdefault(queue, {})
++        prev = qmap.get(ro.request_id)
++        if prev is None:
++            qmap[ro.request_id] = ro
++            return
++        # Merge behavior depends on output kind
++        if output_kind == RequestOutputKind.DELTA:
++            prev.add(ro)
++        else:
++            # Replace with the most recent output for non-delta kinds
++            qmap[ro.request_id] = ro
++
++    def flush(self) -> None:
++        # Push aggregated outputs to their respective queues
++        for queue, qmap in self._queues.items():
++            for ro in qmap.values():
++                queue.put_nowait(ro)
++        self._queues.clear()
++
+ class RequestState:
+ 
+     def __init__(
+@@ -56,6 +85,10 @@ class RequestState:
+         self.is_prefilling = True
+         self.queue = queue
+ 
++        # Cached flags to avoid repeated enum comparisons in hot paths
++        self._final_only = (output_kind == RequestOutputKind.FINAL_ONLY)
++        self._delta = (output_kind == RequestOutputKind.DELTA)
++
+         self.stats = RequestStateStats(
+             arrival_time=arrival_time) if log_stats else None
+ 
+@@ -103,7 +136,7 @@ class RequestState:
+     ) -> Optional[RequestOutput]:
+ 
+         finished = finish_reason is not None
+-        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
++        final_only = self._final_only
+ 
+         if not finished and final_only:
+             # Only the final output is required in FINAL_ONLY mode.
+@@ -153,10 +186,13 @@ class RequestState:
+     ) -> CompletionOutput:
+ 
+         finished = finish_reason is not None
+-        delta = self.output_kind == RequestOutputKind.DELTA
++        delta = self._delta
+ 
+         # Prepare text and token_ids, based on delta mode
+-        text = self.detokenizer.get_next_output_text(finished, delta)
++        if self.detokenizer.tokenizer is None:
++            text = ""
++        else:
++            text = self.detokenizer.get_next_output_text(finished, delta)
+         if not delta:
+             token_ids = self.detokenizer.output_token_ids
+ 
+@@ -267,6 +303,7 @@ class OutputProcessor:
+ 
+         request_outputs: list[RequestOutput] = []
+         reqs_to_abort: list[str] = []
++        collector = RequestOutputCollector()
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+             req_state = self.request_states.get(req_id)
+@@ -286,21 +323,32 @@ class OutputProcessor:
+             req_state.is_prefilling = False
+ 
+             # 2) Detokenize the token ids into text and perform stop checks.
+-            stop_string = req_state.detokenizer.update(
+-                new_token_ids, finish_reason == FinishReason.STOP)
++            detok = req_state.detokenizer
++            if detok.tokenizer is None:
++                # Fast path: skip detokenization when disabled
++                detok.token_ids.extend(new_token_ids)
++                stop_string = None
++            else:
++                stop_string = detok.update(new_token_ids,
++                                           finish_reason == FinishReason.STOP)
+             if stop_string and finish_reason != FinishReason.STOP:
+                 finish_reason = FinishReason.STOP
+                 stop_reason = stop_string
+ 
+             # 3) Compute sample and prompt logprobs for request, if required.
+-            req_state.logprobs_processor.update_from_output(engine_core_output)
++            if (engine_core_output.new_logprobs is not None
++                    or engine_core_output.new_prompt_logprobs_tensors
++                    is not None):
++                req_state.logprobs_processor.update_from_output(
++                    engine_core_output)
+ 
+             # 4) Create and handle RequestOutput objects.
+             if request_output := req_state.make_request_output(
+                     new_token_ids, finish_reason, stop_reason):
+                 if req_state.queue is not None:
+-                    # AsyncLLM: put into queue for handling by generate().
+-                    req_state.queue.put_nowait(request_output)
++                    # AsyncLLM: aggregate per-request outputs for this iteration
++                    collector.add(req_state.queue, request_output,
++                                   req_state.output_kind)
+                 else:
+                     # LLMEngine: return list of RequestOutputs.
+                     request_outputs.append(request_output)
+@@ -322,6 +370,9 @@ class OutputProcessor:
+                                                  iteration_stats)
+ 
+         self.lora_states.update_iteration_stats(iteration_stats)
++        # Flush aggregated outputs to queues (AsyncLLM)
++        collector.flush()
++
+ 
+         return OutputProcessorOutput(
+             request_outputs=request_outputs,

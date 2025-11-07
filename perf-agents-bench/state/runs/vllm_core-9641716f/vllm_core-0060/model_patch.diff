@@ -1,0 +1,245 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 9bb11907f..288b72381 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import atexit
++import gc
+ import importlib
+ import inspect
+ import multiprocessing
+@@ -104,6 +105,10 @@ async def lifespan(app: FastAPI):
+             task.add_done_callback(_running_tasks.remove)
+         else:
+             task = None
++
++        # Mark the startup heap as static so that it's ignored by GC to reduce pause times.
++        gc.collect()
++        gc.freeze()
+         try:
+             yield
+         finally:
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 14e41346d..693314e03 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -19,6 +19,13 @@ from vllm.utils import random_uuid, resolve_obj_by_qualname
+ 
+ logger = init_logger(__name__)
+ 
++
++# Fast path for integer epoch time used in default_factory
++_time = time.time
++
++def _now_int() -> int:
++    return int(_time())
++
+ # torch is mocked during docs generation,
+ # so we have to provide the values as literals
+ _MOCK_LONG_INFO = Namespace(min=-9223372036854775808, max=9223372036854775807)
+@@ -73,7 +80,7 @@ class ErrorResponse(OpenAIBaseModel):
+ class ModelPermission(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"modelperm-{random_uuid()}")
+     object: str = "model_permission"
+-    created: int = Field(default_factory=lambda: int(time.time()))
++    created: int = Field(default_factory=_now_int)
+     allow_create_engine: bool = False
+     allow_sampling: bool = True
+     allow_logprobs: bool = True
+@@ -88,7 +95,7 @@ class ModelPermission(OpenAIBaseModel):
+ class ModelCard(OpenAIBaseModel):
+     id: str
+     object: str = "model"
+-    created: int = Field(default_factory=lambda: int(time.time()))
++    created: int = Field(default_factory=_now_int)
+     owned_by: str = "vllm"
+     root: Optional[str] = None
+     parent: Optional[str] = None
+@@ -170,10 +177,12 @@ def get_logits_processors(processors: Optional[LogitsProcessors],
+                           pattern: Optional[str]) -> Optional[List[Any]]:
+     if processors and pattern:
+         logits_processors = []
++        compiled = re.compile(pattern)
++        match = compiled.match
+         for processor in processors:
+             qualname = processor if isinstance(processor,
+                                                str) else processor.qualname
+-            if not re.match(pattern, qualname):
++            if not match(qualname):
+                 raise ValueError(
+                     f"Logits processor '{qualname}' is not allowed by this "
+                     "server. See --logits-processor-pattern engine argument "
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index b4d3e4411..e50a1da7d 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -205,10 +205,13 @@ class AsyncLLM(EngineClient):
+ 
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
++            get_nowait = q.get_nowait
++            get = q.get
++            qsize = q.qsize
+             while True:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() if q.qsize() > 0 else await q.get()
++                out = get_nowait() if qsize() > 0 else await get()
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+@@ -229,24 +232,26 @@ class AsyncLLM(EngineClient):
+         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
+ 
+         try:
++            get_output_async = self.engine_core.get_output_async
++            process_outputs = self.output_processor.process_outputs
++            abort_requests_async = self.engine_core.abort_requests_async
++            log_stats = self._log_stats
+             while True:
+                 # 1) Pull EngineCoreOutputs from the EngineCore.
+-                outputs = await self.engine_core.get_output_async()
++                outputs = await get_output_async()
+ 
+                 # 2) Process EngineCoreOutputs.
+-                processed_outputs = self.output_processor.process_outputs(
+-                    outputs.outputs)
++                processed_outputs = process_outputs(outputs.outputs)
+                 # NOTE: RequestOutputs are pushed to their queues.
+                 assert len(processed_outputs.request_outputs) == 0
+ 
+                 # 3) Abort any reqs that finished due to stop strings.
+-                await self.engine_core.abort_requests_async(
+-                    processed_outputs.reqs_to_abort)
++                await abort_requests_async(processed_outputs.reqs_to_abort)
+ 
+                 # 4) Logging.
+                 # TODO(rob): make into a coroutine and launch it in
+                 # background thread once we add Prometheus.
+-                self._log_stats(
++                log_stats(
+                     scheduler_stats=outputs.scheduler_stats,
+                     iteration_stats=processed_outputs.iteration_stats,
+                 )
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 19b89003c..12d546ebe 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -111,7 +111,7 @@ class InprocClient(EngineCoreClient):
+         self.engine_core.add_request(request)
+ 
+     def abort_requests(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             self.engine_core.abort_requests(request_ids)
+ 
+     def shutdown(self) -> None:
+@@ -231,7 +231,7 @@ class SyncMPClient(MPClient):
+         self._send_input(EngineCoreRequestType.ADD, request)
+ 
+     def abort_requests(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             self._send_input(EngineCoreRequestType.ABORT, request_ids)
+ 
+     def profile(self, is_start: bool = True) -> None:
+@@ -273,7 +273,7 @@ class AsyncMPClient(MPClient):
+         await self._send_input(EngineCoreRequestType.ADD, request)
+ 
+     async def abort_requests_async(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+ 
+     async def profile_async(self, is_start: bool = True) -> None:
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 749f4f504..b1f35de96 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -21,6 +21,17 @@ class OutputProcessorOutput:
+ 
+ class RequestState:
+ 
++    __slots__ = (
++        "request_id",
++        "prompt",
++        "prompt_token_ids",
++        "prompt_len",
++        "detokenizer",
++        "is_prefilling",
++        "queue",
++    )
++
++
+     def __init__(
+         self,
+         request_id: str,
+@@ -134,17 +145,19 @@ class OutputProcessor:
+         request_outputs: List[RequestOutput] = []
+         reqs_to_abort: List[str] = []
+         iteration_stats = IterationStats(self.log_stats)
++        request_states = self.request_states
++        iteration_stats_update = iteration_stats.update_from_output
++        make_request_output = self._make_request_output
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+-            req_state = self.request_states.get(req_id)
++            req_state = request_states.get(req_id)
+             if req_state is None:
+                 # Ignore output for already-aborted request.
+                 continue
+ 
+             # 1) Compute stats for this iteration.
+-            iteration_stats.update_from_output(engine_core_output,
+-                                               req_state.is_prefilling,
+-                                               req_state.prompt_len)
++            iteration_stats_update(engine_core_output, req_state.is_prefilling,
++                                   req_state.prompt_len)
+             req_state.is_prefilling = False
+ 
+             # 2) Detokenize the token ids into text.
+@@ -152,8 +165,8 @@ class OutputProcessor:
+                 engine_core_output)
+ 
+             # 3) Create and handle RequestOutput objects.
+-            if request_output := self._make_request_output(
+-                    req_state, detokenizer_output):
++            if request_output := make_request_output(req_state,
++                                                     detokenizer_output):
+                 if req_state.queue is not None:
+                     # AsyncLLM: put into queue for handling by generate().
+                     req_state.queue.put_nowait(request_output)
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 45450165e..436bd04cf 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -15,6 +15,28 @@ if TYPE_CHECKING:
+ 
+ class Request:
+ 
++    __slots__ = (
++        "request_id",
++        "sampling_params",
++        "eos_token_id",
++        "metrics",
++        "lora_request",
++        "status",
++        "stop_reason",
++        "max_tokens",
++        "prompt",
++        "prompt_token_ids",
++        "num_prompt_tokens",
++        "_output_token_ids",
++        "_all_token_ids",
++        "num_computed_tokens",
++        "mm_positions",
++        "mm_inputs",
++        "mm_hashes",
++        "_kv_block_hashes",
++    )
++
++
+     def __init__(
+         self,
+         request_id: str,

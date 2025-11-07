@@ -1,0 +1,54 @@
+diff --git a/vllm/model_executor/models/llama4.py b/vllm/model_executor/models/llama4.py
+index 8785e9dcf..51efbfe20 100644
+--- a/vllm/model_executor/models/llama4.py
++++ b/vllm/model_executor/models/llama4.py
+@@ -37,7 +37,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ 
+ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+-from .utils import (AutoWeightsLoader, extract_layer_index,
++from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
+                     is_pp_missing_parameter)
+ 
+ 
+@@ -50,7 +50,7 @@ class Llama4MoE(nn.Module):
+         topk: int,
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
++        router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
+         router_scores = torch.sigmoid(router_scores.float()).to(
+             hidden_states.dtype)
+         return (router_scores, router_indices.to(torch.int32))
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index f197434f3..8893f00db 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -654,7 +654,7 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
+     ) -> IntermediateTensors:
+         return IntermediateTensors({
+             key:
+-            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
++            torch.empty((batch_size, hidden_size), dtype=dtype, device=device)
+             for key in keys
+         })
+ 
+@@ -695,6 +695,18 @@ def extract_layer_index(layer_name: str) -> int:
+     return int_vals[0]
+ 
+ 
++
++def fast_topk(x: torch.Tensor, k: int, dim: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Optimized top-k for the common k==1 case used by some MoE routers.
++    Falls back to torch.topk for k>1.
++    """
++    if k == 1:
++        values, indices = torch.max(x, dim=dim, keepdim=True)
++        return values, indices
++    return torch.topk(x, k, dim=dim)
++
++
+ def cast_overflow_tensors(
+     tensors: torch.Tensor,
+     offset: float = 1000,

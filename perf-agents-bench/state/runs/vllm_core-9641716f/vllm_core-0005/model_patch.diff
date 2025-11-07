@@ -1,0 +1,98 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 79787303a..8ae17fd1a 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -327,15 +327,13 @@ class PyObjectCache:
+         self._obj_builder = obj_builder
+         self._index = 0
+ 
+-        self._obj_cache = []
+-        for _ in range(128):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache = [self._obj_builder() for _ in range(128)]
+ 
+     def _grow_cache(self):
+         # Double the size of the cache
+         num_objs = len(self._obj_cache)
+-        for _ in range(num_objs):
+-            self._obj_cache.append(self._obj_builder())
++        # Use list comprehension for efficiency
++        self._obj_cache.extend(self._obj_builder() for _ in range(num_objs))
+ 
+     def get_object(self):
+         """Returns a pre-allocated cached object. If there is not enough
+@@ -412,6 +410,15 @@ async def merge_async_iterators(
+     iterator that yields the item.
+     """
+ 
++    if not iterators:
++        return
++
++    if len(iterators) == 1:
++        # Fast-path single iterator case.
++        async for item in iterators[0]:
++            yield 0, item
++        return
++
+     loop = asyncio.get_running_loop()
+ 
+     awaits = {_next_task(pair[1], loop): pair for pair in enumerate(iterators)}
+@@ -440,8 +447,9 @@ async def collect_from_async_generator(
+         iterator: AsyncGenerator[T, None]) -> list[T]:
+     """Collect all items from an async generator into a list."""
+     items = []
++    append = items.append
+     async for item in iterator:
+-        items.append(item)
++        append(item)
+     return items
+ 
+ 
+@@ -778,6 +786,10 @@ def make_ndarray_with_pad(
+         # Unlike for most functions, map is faster than a genexpr over `len`
+         max_len = max(map(len, x), default=0)
+ 
++    # Fast-path: if inputs are already rectangular, avoid padding loop
++    if all(len(blocktb) == max_len for blocktb in x):
++        return np.asarray(x, dtype=dtype)
++
+     padded_x = np.full((len(x), max_len), pad, dtype=dtype)
+     for ind, blocktb in enumerate(x):
+         assert len(blocktb) <= max_len
+@@ -804,9 +816,12 @@ def make_tensor_with_pad(
+     np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+     padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+ 
+-    tensor = torch.from_numpy(padded_x).to(device)
++    tensor = torch.from_numpy(padded_x)
+     if pin_memory:
+         tensor = tensor.pin_memory()
++    if device is not None:
++        dev = device if isinstance(device, torch.device) else torch.device(device)
++        tensor = tensor.to(device=dev, non_blocking=(pin_memory and dev.type == "cuda"))
+ 
+     return tensor
+ 
+@@ -819,9 +834,10 @@ def async_tensor_h2d(
+ ) -> torch.Tensor:
+     """Asynchronously create a tensor and copy it from host to device."""
+     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+-    return t.to(device=target_device, non_blocking=True)
++    return t.to(device=target_device, non_blocking=pin_memory)
+ 
+ 
++@lru_cache(maxsize=None)
+ def get_dtype_size(dtype: torch.dtype) -> int:
+     """Get the size of the data type in bytes."""
+     return torch.tensor([], dtype=dtype).element_size()
+@@ -1948,8 +1964,8 @@ class MemorySnapshot:
+         self.torch_peak = torch.cuda.memory_stats().get(
+             "allocated_bytes.all.peak", 0)
+ 
+-        self.cuda_memory = torch.cuda.mem_get_info(
+-        )[1] - torch.cuda.mem_get_info()[0]
++        free, total = torch.cuda.mem_get_info()
++        self.cuda_memory = total - free
+ 
+         # torch.cuda.memory_reserved() is how many bytes
+         # PyTorch gets from cuda (by calling cudaMalloc, etc.)

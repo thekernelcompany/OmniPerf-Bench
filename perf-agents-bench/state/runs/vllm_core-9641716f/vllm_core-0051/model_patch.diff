@@ -1,0 +1,115 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/v1/sample/test_rejection_sampler.py b/tests/v1/sample/test_rejection_sampler.py
+index 84139a40b..0f56f708a 100644
+--- a/tests/v1/sample/test_rejection_sampler.py
++++ b/tests/v1/sample/test_rejection_sampler.py
+@@ -345,8 +345,8 @@ def estimate_rejection_sampling_pdf(
+                                             num_samples, k)
+ 
+     # Bonus tokens not used but required.
+-    bonus_token_ids = torch.zeros((1, 1), dtype=torch.int64,
+-                                  device=DEVICE).repeat(num_samples, 1)
++    bonus_token_ids = torch.zeros((num_samples, 1), dtype=torch.int64,
++                                  device=DEVICE)
+ 
+     sampling_metadata = create_sampling_metadata(all_greedy=False)
+     output_token_ids = sampler(draft_token_ids.tolist(), draft_probs,
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 5601c62e9..6b7910c46 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -248,13 +248,12 @@ class RejectionSampler(nn.Module):
+         if sampling_metadata.all_greedy:
+             return logits
+         assert sampling_metadata.temperature is not None
+-        # We should optimize the following code as
+-        # it will cause CPU -> GPU synchronization.
+-        temperature = torch.repeat_interleave(
+-            sampling_metadata.temperature,
+-            torch.tensor(sample_lens,
+-                         device=sampling_metadata.temperature.device))
+-        temperature = temperature.unsqueeze(dim=1)
++        temps = sampling_metadata.temperature
++        # Move temps to logits device if needed
++        if temps.device != logits.device:
++            temps = temps.to(logits.device)
++        counts = torch.as_tensor(sample_lens, device=temps.device)
++        temperature = torch.repeat_interleave(temps, counts).unsqueeze(1)
+         logits = logits / temperature
+         return logits.softmax(dim=-1, dtype=torch.float32)
+ 
+@@ -292,9 +291,7 @@ def _convert_2d_probs(
+         [num_total_tokens, vocab_size] -> 
+             [batch_size, max_spec_len + 1, vocab_size]
+     """
+-    cumulative_lens = torch.cumsum(torch.tensor(sample_lens,
+-                                                device=probs.device),
+-                                   dim=0)
++    cumulative_lens = torch.as_tensor(sample_lens, device=probs.device).cumsum(0)
+     split_indices = cumulative_lens[:-1].tolist()  # Exclude last index
+ 
+     # Split into chunks without loops
+diff --git a/vllm/v1/spec_decode/utils.py b/vllm/v1/spec_decode/utils.py
+index 584140136..045a6cc84 100644
+--- a/vllm/v1/spec_decode/utils.py
++++ b/vllm/v1/spec_decode/utils.py
+@@ -1,9 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ from vllm.v1.sample.ops.topk_topp_sampler import random_sample  # noqa
+-from vllm.v1.worker.gpu_input_batch import InputBatch
++from typing import Any
+ 
+ 
+-def is_spec_decode_supported(req_id: str, input_batch: InputBatch) -> bool:
++def is_spec_decode_supported(req_id: str, input_batch: Any) -> bool:
+     if req_id in input_batch.top_k_reqs or req_id in input_batch.top_p_reqs:
+         # Spec decode doesn't support top_p/top_k sampling.
+         return False
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 66015382b..927c60780 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -221,7 +221,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 device="cpu",
+                 pin_memory=self.pin_memory)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -234,27 +234,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)

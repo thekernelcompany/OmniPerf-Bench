@@ -1,0 +1,91 @@
+diff --git a/.buildkite/test-pipeline.yaml b/.buildkite/test-pipeline.yaml
+index 4feea786f..d2259ecac 100644
+--- a/.buildkite/test-pipeline.yaml
++++ b/.buildkite/test-pipeline.yaml
+@@ -60,11 +60,12 @@ steps:
+   mirror_hardwares: [amd]
+   commands:
+     # install aws cli for llava_example.py
+-    - pip install awscli
++    - pip install awscli tensorizer
+     - python3 offline_inference.py
+     - python3 offline_inference_with_prefix.py
+     - python3 llm_engine_example.py
+     - python3 llava_example.py
++    - python3 tensorize_vllm_model.py --model facebook/opt-125m serialize --serialized-directory /tmp/ --suffix v1 && python3 tensorize_vllm_model.py --model facebook/opt-125m deserialize --path-to-tensors /tmp/vllm/facebook/opt-125m/v1/model.tensors
+ 
+ - label: Kernels Test %N
+   command: pytest -v -s kernels --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+diff --git a/examples/tensorize_vllm_model.py b/examples/tensorize_vllm_model.py
+index e2456168d..aa9cff677 100644
+--- a/examples/tensorize_vllm_model.py
++++ b/examples/tensorize_vllm_model.py
+@@ -1,6 +1,7 @@
+ import argparse
+ import dataclasses
+ import os
++import json
+ import time
+ import uuid
+ from functools import partial
+@@ -188,6 +189,7 @@ def serialize():
+     model = (engine.model_executor.driver_worker.
+              model_runner.model)
+ 
++    make_model_contiguous(model)
+     encryption_params = EncryptionParams.random() if keyfile else None
+     if keyfile:
+         with _write_stream(keyfile) as stream:
+@@ -211,7 +213,7 @@ def deserialize():
+         model = model_class(config)
+ 
+     before_mem = get_mem_usage()
+-    start = time.time()
++    start = time.perf_counter()
+ 
+     if keyfile:
+         with _read_stream(keyfile) as stream:
+@@ -223,7 +225,7 @@ def deserialize():
+     with (_read_stream(model_path)) as stream, TensorDeserializer(
+             stream, **tensorizer_args.deserializer_params) as deserializer:
+         deserializer.load_into_module(model)
+-        end = time.time()
++        end = time.perf_counter()
+ 
+     # Brag about how fast we are.
+     total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 91cc8f3be..68d8a074d 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -145,7 +145,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+ 
+     # S3 access information, used for tensorizer to load model from S3
+     "S3_ACCESS_KEY_ID":
+-    lambda: os.environ.get("S3_ACCESS_KEY", None),
++    lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
+     "S3_SECRET_ACCESS_KEY":
+     lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
+     "S3_ENDPOINT_URL":
+diff --git a/vllm/model_executor/model_loader/tensorizer.py b/vllm/model_executor/model_loader/tensorizer.py
+index 219a2a392..a7701e869 100644
+--- a/vllm/model_executor/model_loader/tensorizer.py
++++ b/vllm/model_executor/model_loader/tensorizer.py
+@@ -293,7 +293,7 @@ class TensorizerAgent:
+                                          dtype=child.weight.dtype,
+                                          device=child.weight.device)
+                 new_weight[:child.weight.shape[0]].copy_(child.weight.data)
+-                new_weight[child.weight.shape[0]:].fill_(0)
++                new_weight[child.weight.shape[0]:].zero_()
+                 child.weight.data = new_weight
+ 
+     def _check_tensors_on_meta_device(self):
+@@ -337,7 +337,7 @@ class TensorizerAgent:
+         duration = end - start
+         per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
+         after_mem = get_mem_usage()
+-        deserializer.close()
++
+         logger.info("Deserialized %s in %0.2fs, %s/s", total_bytes_str,
+                     end - start, per_second)
+         logger.info("Memory usage before: %s", before_mem)

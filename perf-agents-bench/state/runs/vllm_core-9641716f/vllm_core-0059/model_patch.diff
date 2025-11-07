@@ -1,0 +1,128 @@
+diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py
+index 9588a1bea..a25112385 100644
+--- a/tests/core/test_scheduler.py
++++ b/tests/core/test_scheduler.py
+@@ -540,7 +540,7 @@ def test_decode_schedule_preempted():
+     curr_loras = None
+     for i in range(3):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         running.append(seq_group)
+     scheduler.block_manager.can_append_slots = MagicMock()
+@@ -581,7 +581,7 @@ def test_decode_swap_beam_search():
+     budget = create_token_budget()
+     for i in range(3):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         running.append(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         budget.add_num_seqs(seq_group.request_id,
+@@ -629,7 +629,7 @@ def test_schedule_decode_blocks_to_copy_update():
+     running = deque()
+     policy = PolicyFactory.get_policy(policy_name="fcfs")
+     curr_loras = None
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     running.append(seq_group)
+ 
+@@ -659,7 +659,7 @@ def test_schedule_swapped_simple():
+     curr_loras = None
+     blocks_to_swap_out = {}
+     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     scheduler._swap_out(seq_group, blocks_to_swap_out)
+     swapped.append(seq_group)
+@@ -687,7 +687,7 @@ def test_schedule_swapped_max_token_budget():
+     blocks_to_swap_out = {}
+     for _ in range(2):
+         _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -721,7 +721,7 @@ def test_schedule_swapped_max_seqs():
+     blocks_to_swap_out = {}
+     for i in range(4):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -759,7 +759,7 @@ def test_schedule_swapped_max_loras():
+                                                lora_name=str(i),
+                                                lora_int_id=i + 1,
+                                                lora_local_path="abc"))
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -783,7 +783,7 @@ def test_schedule_swapped_cannot_swap_in():
+     blocks_to_swap_out = {}
+     for _ in range(2):
+         _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -808,7 +808,7 @@ def test_schedule_swapped_blocks_to_copy():
+     policy = PolicyFactory.get_policy(policy_name="fcfs")
+     curr_loras = None
+     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     blocks_to_swap_out = {}
+     scheduler._swap_out(seq_group, blocks_to_swap_out)
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 419855062..cbafa9a14 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -594,7 +594,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = deque(waiting_queue)
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -659,7 +659,7 @@ class Scheduler:
+             if curr_loras is not None and lora_int_id > 0:
+                 curr_loras.add(lora_int_id)
+             waiting_queue.popleft()
+-            self._allocate_and_set_running(seq_group, num_new_tokens)
++            self._allocate_and_set_running(seq_group)
+             seq_groups.append(
+                 ScheduledSequenceGroup(seq_group=seq_group,
+                                        token_chunk_size=num_new_tokens))
+@@ -694,9 +694,7 @@ class Scheduler:
+         for seq_group in self.running:
+             budget.add_num_seqs(seq_group.request_id,
+                                 seq_group.get_max_num_running_seqs())
+-        curr_loras = set(
+-            seq_group.lora_int_id
+-            for seq_group in self.running) if self.lora_enabled else None
++        curr_loras = {seq_group.lora_int_id for seq_group in self.running} if self.lora_enabled else None
+ 
+         remaining_waiting, prefills = (self.waiting,
+                                        SchedulerPrefillOutputs.create_empty())
+@@ -952,8 +950,7 @@ class Scheduler:
+         self.running = deque(seq_group for seq_group in self.running
+                              if not seq_group.is_finished())
+ 
+-    def _allocate_and_set_running(self, seq_group: SequenceGroup,
+-                                  num_new_tokens: int) -> None:
++    def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+         self.block_manager.allocate(seq_group)
+         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+             seq.status = SequenceStatus.RUNNING
