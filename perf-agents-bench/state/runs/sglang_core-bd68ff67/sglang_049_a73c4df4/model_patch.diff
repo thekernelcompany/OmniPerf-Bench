@@ -1,0 +1,264 @@
+diff --git a/sgl-kernel/csrc/cpu/activation.cpp b/sgl-kernel/csrc/cpu/activation.cpp
+new file mode 100644
+index 000000000..d5c2b7c25
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/activation.cpp
+@@ -0,0 +1,103 @@
++#include "common.h"
++#include "vec.h"
++
++namespace {
++
++template <typename scalar_t, typename func_t, typename vec_func_t>
++void act_and_mul_kernel_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    int64_t num_tokens,
++    int64_t dim,
++    const func_t& f,
++    const vec_func_t& vf) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++
++  constexpr int64_t kVecSize = Vec::size();
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* input_ptr = input + i * 2 * dim;
++      const scalar_t* input_other_ptr = input_ptr + dim;
++      scalar_t* output_ptr = output + i * dim;
++
++      int64_t d = 0;
++      for (; d + kVecSize <= dim; d += kVecSize) {
++        Vec x = Vec::loadu(input_ptr + d);
++        Vec y = Vec::loadu(input_other_ptr + d);
++        Vec act = vf(x);
++        (act * y).store(output_ptr + d);
++      }
++      for (; d < dim; ++d) {
++        output_ptr[d] = f(input_ptr[d]) * input_other_ptr[d];
++      }
++    }
++  });
++}
++
++// Example activation functions
++struct SiluFn {
++  inline float operator()(float x) const {
++    return x / (1.0f + std::exp(-x));
++  }
++};
++
++struct GeluTanhFn {
++  inline float operator()(float x) const {
++    const float k0 = 0.79788456f;  // sqrt(2/pi)
++    const float k1 = 0.044715f;
++    float u = k0 * (x + k1 * x * x * x);
++    return 0.5f * x * (1.0f + std::tanh(u));
++  }
++};
++
++}  // namespace
++
++// Public entry points (not registered). Prefer uninitialized output to avoid
++// touching memory unnecessarily.
++
++void silu_and_mul_cpu_out(
++    at::Tensor& out,
++    const at::Tensor& input) {
++  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, 2, dim]");
++  int64_t num_tokens = input.size(0);
++  int64_t dim = input.size(2);
++  out.resize_({num_tokens, dim});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "silu_and_mul_cpu_out", [&] {
++    act_and_mul_kernel_impl<scalar_t>(
++        out.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        num_tokens,
++        dim,
++        SiluFn{},
++        [](const at::vec::Vectorized<scalar_t>& x) {
++          // sigmoid(x) = 1 / (1 + exp(-x)), so x * sigmoid(x) = x / (1 + exp(-x))
++          return x / (1 + (-x).exp());
++        });
++  });
++}
++
++void gelu_tanh_and_mul_cpu_out(
++    at::Tensor& out,
++    const at::Tensor& input) {
++  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, 2, dim]");
++  int64_t num_tokens = input.size(0);
++  int64_t dim = input.size(2);
++  out.resize_({num_tokens, dim});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul_cpu_out", [&] {
++    act_and_mul_kernel_impl<scalar_t>(
++        out.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        num_tokens,
++        dim,
++        GeluTanhFn{},
++        [](const at::vec::Vectorized<scalar_t>& x) {
++          using Vec = at::vec::Vectorized<scalar_t>;
++          const Vec k0 = Vec((scalar_t)0.79788456f);
++          const Vec k1 = Vec((scalar_t)0.044715f);
++          Vec u = k0 * (x + k1 * x * x * x);
++          return (Vec((scalar_t)0.5f) * x) * (Vec((scalar_t)1.0f) + u.tanh());
++        });
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/bmm.cpp b/sgl-kernel/csrc/cpu/bmm.cpp
+new file mode 100644
+index 000000000..b9a5547ac
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/bmm.cpp
+@@ -0,0 +1,54 @@
++#include "common.h"
++
++// Simple CPU BMM kernel using naive loops with cache-friendly blocking.
++// Uses uninitialized output and accumulates into registers to reduce memory traffic.
++void bmm_cpu_naive(
++    const at::Tensor& A, // [B, M, K]
++    const at::Tensor& B, // [B, K, N]
++    at::Tensor& C       // [B, M, N]
++) {
++  TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A and B must be 3D");
++  int64_t Bz = A.size(0);
++  int64_t M = A.size(1);
++  int64_t K = A.size(2);
++  TORCH_CHECK(B.size(0) == Bz && B.size(1) == K, "Shape mismatch");
++  int64_t N = B.size(2);
++
++  C.resize_({Bz, M, N});
++
++  AT_DISPATCH_FLOATING_TYPES(A.scalar_type(), "bmm_cpu_naive", [&] {
++    const scalar_t* a_ptr = A.data_ptr<scalar_t>();
++    const scalar_t* b_ptr = B.data_ptr<scalar_t>();
++    scalar_t* c_ptr = C.data_ptr<scalar_t>();
++
++    constexpr int64_t BM = 64;
++    constexpr int64_t BN = 64;
++    constexpr int64_t BK = 64;
++
++    for (int64_t b = 0; b < Bz; ++b) {
++      const scalar_t* Ab = a_ptr + b * M * K;
++      const scalar_t* Bb = b_ptr + b * K * N;
++      scalar_t* Cb = c_ptr + b * M * N;
++
++      for (int64_t mm = 0; mm < M; mm += BM) {
++        int64_t mmax = std::min(mm + BM, M);
++        for (int64_t nn = 0; nn < N; nn += BN) {
++          int64_t nmax = std::min(nn + BN, N);
++          // Local tile initialized lazily in registers
++          for (int64_t kk = 0; kk < K; kk += BK) {
++            int64_t kmax = std::min(kk + BK, K);
++            for (int64_t m = mm; m < mmax; ++m) {
++              for (int64_t n = nn; n < nmax; ++n) {
++                scalar_t acc = (kk == 0) ? (scalar_t)0 : Cb[m * N + n];
++                for (int64_t k = kk; k < kmax; ++k) {
++                  acc += Ab[m * K + k] * Bb[k * N + n];
++                }
++                Cb[m * N + n] = acc;
++              }
++            }
++          }
++        }
++      }
++    }
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/common.h b/sgl-kernel/csrc/cpu/common.h
+new file mode 100644
+index 000000000..77c41420d
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/common.h
+@@ -0,0 +1,48 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/Parallel.h>
++#include <ATen/cpu/vec/vec.h>
++#include <c10/util/irange.h>
++
++// Common helpers for CPU kernels. Keep lightweight to avoid build-time impact.
++
++#ifndef SGLANG_RESTRICT
++#  if defined(__CUDACC__) || defined(__HIPCC__)
++#    define SGLANG_RESTRICT __restrict__
++#  elif defined(_MSC_VER)
++#    define SGLANG_RESTRICT __restrict
++#  else
++#    define SGLANG_RESTRICT __restrict__
++#  endif
++#endif
++
++#ifndef CEILDIV
++#  define CEILDIV(x, y) (((x) + (y) - 1) / (y))
++#endif
++
++// Round up to a multiple of n (n power-of-two not required)
++static inline int64_t round_up(int64_t x, int64_t n) {
++  return CEILDIV(x, n) * n;
++}
++
++// Fast zero for POD types when needed, otherwise prefer uninitialized alloc
++// to avoid touching memory.
++template <typename T>
++inline void maybe_memset_zero(T* ptr, int64_t num) {
++  std::memset(ptr, 0, sizeof(T) * static_cast<size_t>(num));
++}
+diff --git a/sgl-kernel/csrc/cpu/vec.h b/sgl-kernel/csrc/cpu/vec.h
+new file mode 100644
+index 000000000..36a530ee0
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/vec.h
+@@ -0,0 +1,35 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/cpu/vec/vec.h>
++
++namespace sglang_cpu_vec {
++
++// Minimal helpers mirroring ATen vec interfaces we actually use here.
++using at::vec::Vectorized;
++
++template <typename T>
++inline Vectorized<T> loadu(const T* ptr) {
++  return Vectorized<T>::loadu(ptr);
++}
++
++template <typename T>
++inline void store(T* ptr, const Vectorized<T>& v) {
++  v.store(ptr);
++}
++
++}  // namespace sglang_cpu_vec

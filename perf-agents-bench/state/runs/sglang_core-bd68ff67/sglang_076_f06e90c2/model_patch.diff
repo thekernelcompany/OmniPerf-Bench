@@ -1,0 +1,154 @@
+diff --git a/examples/usage/json_logprobs.py b/examples/usage/json_logprobs.py
+new file mode 100644
+index 000000000..4400f3fe5
+--- /dev/null
++++ b/examples/usage/json_logprobs.py
+@@ -0,0 +1,47 @@
++# Example usage for requesting JSON logprobs via HTTP-compatible interface
++# Note: This is an example; adjust base_url/model to your deployment.
++import json
++from concurrent.futures import ThreadPoolExecutor
++
++from examples.usage.json_decode import character_regex
++from sglang.utils import http_request
++
++character_names = ["Hermione Granger", "Ron Weasley", "Harry Potter"]
++base_url = "http://localhost:30000"
++prompt = "is a character in Harry Potter. Please fill in the following information about this character.\n"
++
++
++def openai_api_request(name):
++    data = {
++        "model": "",
++        "prompt": name + prompt,
++        "temperature": 0,
++        "max_tokens": 128,
++        "regex": character_regex,
++        "logprobs": 3,
++    }
++    r = http_request(
++        base_url + "/v1/completions",
++        json.dumps(data).encode("utf-8"),
++        headers={"Content-Type": "application/json"},
++    )
++    return json.loads(r.decode("utf-8"))
++
++
++def parse_result(result):
++    # Extract the JSON object from the response
++    text = result["choices"][0]["text"].strip()
++    try:
++        obj = json.loads(text)
++    except Exception:
++        obj = {"raw": text}
++    return obj
++
++
++if __name__ == "__main__":
++    with ThreadPoolExecutor(max_workers=3) as ex:
++        futures = [ex.submit(openai_api_request, n) for n in character_names]
++    results = [f.result() for f in futures]
++    # Print parsed results
++    for r in results:
++        print(parse_result(r))
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 53d6620e9..3106d7cec 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -38,13 +38,23 @@ class LogitsProcessor(nn.Module):
+ 
+     def _get_top_logprobs(self, all_logprobs, input_metadata: InputMetadata):
+         if input_metadata.forward_mode == ForwardMode.DECODE:
+-            decode_top_logprobs = []
+-            for i in range(all_logprobs.shape[0]):
+-                k = input_metadata.top_logprobs_nums[i]
+-                t = all_logprobs[i].topk(k)
+-                v_cpu = t.values.tolist()
+-                p_cpu = t.indices.tolist()
+-                decode_top_logprobs.append(list(zip(v_cpu, p_cpu)))
++            decode_top_logprobs = [[] for _ in range(all_logprobs.shape[0])]
++            # Group by identical k to reduce number of topk kernel launches
++            topk_nums = input_metadata.top_logprobs_nums
++            ks_cpu = topk_nums.tolist() if hasattr(topk_nums, "tolist") else list(topk_nums)
++            from collections import defaultdict
++            groups = defaultdict(list)
++            for i, k in enumerate(ks_cpu):
++                if k > 0:
++                    groups[int(k)].append(i)
++                else:
++                    decode_top_logprobs[i] = []
++            for k, idxs in groups.items():
++                t = all_logprobs[idxs].topk(k)
++                vs_cpu = t.values.tolist()
++                ps_cpu = t.indices.tolist()
++                for j, i in enumerate(idxs):
++                    decode_top_logprobs[i] = list(zip(vs_cpu[j], ps_cpu[j]))
+             return None, decode_top_logprobs
+         else:
+             prefill_top_logprobs, decode_top_logprobs = [], []
+@@ -82,7 +92,7 @@ class LogitsProcessor(nn.Module):
+         else:
+             last_hidden = hidden_states[last_index]
+ 
+-        last_logits = torch.matmul(last_hidden, weight.T)
++        last_logits = torch.nn.functional.linear(last_hidden, weight)
+         if self.tp_size > 1:
+             last_logits = tensor_model_parallel_all_gather(last_logits)
+         last_logits = last_logits[:, : self.config.vocab_size]
+@@ -96,14 +106,13 @@ class LogitsProcessor(nn.Module):
+             if input_metadata.forward_mode == ForwardMode.DECODE:
+                 all_logits = last_logits
+             else:
+-                all_logits = torch.matmul(hidden_states, weight.T)
++                all_logits = torch.nn.functional.linear(hidden_states, weight)
+                 if self.tp_size > 1:
+                     all_logits = tensor_model_parallel_all_gather(all_logits)
+                 all_logits = all_logits[:, : self.config.vocab_size]
+ 
+-            all_logprobs = all_logits.float()
++            all_logprobs = torch.nn.functional.log_softmax(all_logits, dim=-1, dtype=torch.float32)
+             del all_logits
+-            all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
+ 
+             return_top_logprob = any(x > 0 for x in input_metadata.top_logprobs_nums)
+             if return_top_logprob:
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index dbe94371b..e7bf9ec81 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -274,13 +274,14 @@ class Batch:
+ 
+         # Handle logit bias but only allocate when needed
+         logit_bias = None
+-        for i in range(bs):
+-            if reqs[i].sampling_params.dtype == "int":
+-                if logit_bias is None:
+-                    logit_bias = torch.zeros(
+-                        (bs, vocab_size), dtype=torch.float32, device=device
+-                    )
+-                logit_bias[i] = int_token_logit_bias
++        int_indices = [i for i in range(bs) if reqs[i].sampling_params.dtype == "int"]
++        if int_indices:
++            logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
++            ib = int_token_logit_bias
++            if getattr(ib, "device", None) is None or str(ib.device) != device:
++                ib = ib.to(device)
++            # Vectorized row assignment for all integer dtype requests
++            logit_bias[int_indices] = ib
+ 
+         # Set fields
+         self.input_ids = torch.tensor(
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 6abb20b25..ee9394111 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -101,7 +101,8 @@ class ModelRpcServer:
+             ),
+         )
+         self.int_token_logit_bias = torch.tensor(
+-            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
++            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size),
++            device="cuda",
+         )
+         set_random_seed(server_args.random_seed)
+ 

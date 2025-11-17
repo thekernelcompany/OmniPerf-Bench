@@ -1,0 +1,82 @@
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index ad7f0a1f3..97af8e5b6 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -34,16 +34,16 @@ class Sampler(nn.Module):
+         logits = logits.contiguous()
+         logits.div_(sampling_info.temperatures)
+         probs = torch.softmax(logits, dim=-1)
+-        logits = None
+         del logits
+ 
+-        if torch.any(torch.isnan(probs)):
++        if torch.isnan(probs).any():
+             logger.warning("Detected errors during sampling! NaN in the probability.")
+-            probs = torch.where(
+-                torch.isnan(probs), torch.full_like(probs, 1e-10), probs
+-            )
++            probs.nan_to_num_(nan=1e-10)
+ 
+-        if global_server_args_dict["sampling_backend"] == "flashinfer":
++        if sampling_info.top_ks.max().item() <= 1:
++            # Use fast greedy path when all requests are greedy
++            batch_next_token_ids = torch.argmax(probs, -1)
++        elif global_server_args_dict["sampling_backend"] == "flashinfer":
+             max_top_k_round, batch_size = 32, probs.shape[0]
+             uniform_samples = torch.rand(
+                 (max_top_k_round, batch_size), device=probs.device
+@@ -85,6 +85,10 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
+     top_ps: torch.Tensor,
+     min_ps: torch.Tensor,
+ ):
++    # Fast path for greedy sampling when applicable
++    if top_ks.max().item() <= 1 and torch.all(top_ps >= 1.0) and torch.all(min_ps <= 0):
++        return torch.argmax(probs, dim=-1)
++
+     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
+     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+     probs_sum = torch.cumsum(probs_sort, dim=-1)
+diff --git a/test/srt/test_bench_serving.py b/test/srt/test_bench_serving.py
+index 056483487..6955d4917 100644
+--- a/test/srt/test_bench_serving.py
++++ b/test/srt/test_bench_serving.py
+@@ -27,11 +27,11 @@ class TestBenchServing(unittest.TestCase):
+             model=DEFAULT_MODEL_NAME_FOR_TEST,
+             num_prompts=200,
+             request_rate=float("inf"),
++            other_server_args=["--max-running-requests", "10"],
+             dataset_name="sharegpt",
+             random_input_len=None,
+             random_output_len=None,
+             disable_stream=True,
+-            other_server_args=["--max-running-requests", "10"],
+         )
+ 
+         if is_in_ci():
+diff --git a/test/srt/test_pytorch_sampling_backend.py b/test/srt/test_pytorch_sampling_backend.py
+index ddd744149..57544e63f 100644
+--- a/test/srt/test_pytorch_sampling_backend.py
++++ b/test/srt/test_pytorch_sampling_backend.py
+@@ -27,6 +27,22 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
+     def tearDownClass(cls):
+         kill_child_process(cls.process.pid)
+ 
++    def test_greedy_shortcut_torch(self):
++        import torch
++        from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
++
++        torch.manual_seed(0)
++        bs, vocab = 8, 1024
++        logits = torch.randn((bs, vocab), dtype=torch.float32)
++        probs = torch.softmax(logits, dim=-1)
++        top_ks = torch.ones((bs,), dtype=torch.int)
++        top_ps = torch.ones((bs,), dtype=torch.float32)
++        min_ps = torch.zeros((bs,), dtype=torch.float32)
++
++        out = top_k_top_p_min_p_sampling_from_probs_torch(probs, top_ks, top_ps, min_ps)
++        argmax = torch.argmax(probs, dim=-1)
++        assert torch.equal(out, argmax)
++
+     def test_mmlu(self):
+         args = SimpleNamespace(
+             base_url=self.base_url,

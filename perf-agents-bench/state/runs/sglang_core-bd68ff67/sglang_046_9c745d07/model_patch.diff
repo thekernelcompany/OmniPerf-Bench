@@ -1,0 +1,122 @@
+diff --git a/python/sglang/srt/constrained/outlines_backend.py b/python/sglang/srt/constrained/outlines_backend.py
+index cc68b97f8..8b5eae898 100644
+--- a/python/sglang/srt/constrained/outlines_backend.py
++++ b/python/sglang/srt/constrained/outlines_backend.py
+@@ -81,10 +81,21 @@ class OutlinesGrammar(BaseGrammarObject):
+     ):
+         self.state = next_state
+ 
+-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
++    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int = None) -> None:
++        if idx is not None:
++            vocab_mask = vocab_mask[idx]
+         vocab_mask.fill_(1)
+         vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+ 
++    def allocate_vocab_mask(
++        self, vocab_size: int, batch_size: int, device
++    ) -> torch.Tensor:
++        return torch.empty(batch_size, vocab_size, dtype=torch.bool, device=device)
++
++    @staticmethod
++    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
++        logits.masked_fill_(vocab_mask, float("-inf"))
++
+     def copy(self):
+         return OutlinesGrammar(self.guide, self.jump_forward_map)
+ 
+diff --git a/python/sglang/srt/constrained/xgrammar_backend.py b/python/sglang/srt/constrained/xgrammar_backend.py
+index ab4df5c98..19f12bfca 100644
+--- a/python/sglang/srt/constrained/xgrammar_backend.py
++++ b/python/sglang/srt/constrained/xgrammar_backend.py
+@@ -80,14 +80,26 @@ class XGrammarGrammar(BaseGrammarObject):
+         for i in range(k, len(new_output_ids)):
+             assert self.matcher.accept_token(new_output_ids[i])
+ 
+-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
++    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int = None) -> None:
+         # Note that this bitmask is a bitset, not bool
++        if idx is not None:
++            vocab_mask = vocab_mask[idx]
++        vocab_mask.fill_(0)
+         bitmask = self.matcher.get_next_token_bitmask()
+         # Mask the tokens that are not allowed
+         vocab_mask[
+             self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
+         ] = 1
+ 
++    def allocate_vocab_mask(
++        self, vocab_size: int, batch_size: int, device
++    ) -> torch.Tensor:
++        return torch.empty(batch_size, vocab_size, dtype=torch.bool, device=device)
++
++    @staticmethod
++    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
++        logits.masked_fill_(vocab_mask, float("-inf"))
++
+     def copy(self):
+         matcher = GrammarMatcher(
+             self.ctx,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 02750d5df..25181fc28 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -645,7 +645,7 @@ class ModelRunner:
+ 
+         # Apply regex vocab_mask
+         if sampling_info.vocab_mask is not None:
+-            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
++            logits.masked_fill_(sampling_info.vocab_mask, float("-inf"))
+ 
+         return logits
+ 
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index a341c2b17..eb7db3daa 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -137,15 +137,26 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
+-        self.vocab_mask = torch.zeros(
+-            len(self.temperatures),
+-            self.vocab_size,
+-            dtype=torch.bool,
+-            device=self.device,
+-        )
++        # Allocate vocab_mask via grammar to allow backend-specific optimizations
++        bs = len(self.temperatures)
++        # Find the first non-None grammar to allocate the shared mask buffer
++        first_grammar = next((g for g in self.grammars if g is not None), None)
++        if first_grammar is not None and hasattr(first_grammar, "allocate_vocab_mask"):
++            self.vocab_mask = first_grammar.allocate_vocab_mask(
++                self.vocab_size, bs, self.device
++            )
++        else:
++            # Fallback: allocate uninitialized buffer; grammars must fully initialize rows
++            self.vocab_mask = torch.empty(
++                bs, self.vocab_size, dtype=torch.bool, device=self.device
++            )
+         for i, grammar in enumerate(self.grammars):
+             if grammar is not None:
+-                grammar.fill_vocab_mask(self.vocab_mask[i])
++                # Support both new (mask, idx) and legacy (mask_row) signatures
++                try:
++                    grammar.fill_vocab_mask(self.vocab_mask, i)
++                except TypeError:
++                    grammar.fill_vocab_mask(self.vocab_mask[i])
+ 
+     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
+         if self.penalizer_orchestrator:
+@@ -180,9 +191,9 @@ class SamplingBatchInfo:
+                 shape, dtype = rhs.shape[1:], rhs.dtype
+             with torch.dtype(dtype):
+                 if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
++                    lhs = torch.full((bs1, *shape), default, device=device, dtype=dtype)
+                 if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++                    rhs = torch.full((bs2, *shape), default, device=device, dtype=dtype)
+             return torch.cat([lhs, rhs])
+ 
+         return None

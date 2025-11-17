@@ -1,0 +1,49 @@
+{
+  "commit_hash": "a191a0e47c2f0b0c8aed28080b9cb78624365e92",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/6593",
+  "pr_date": "2025-05-26",
+  "timeline_text": "Copy link Collaborator fzyzcjy commented May 25, 2025 Motivation Modifications Checklist Format your code according to the Code Formatting with Pre-Commit . Add unit tests as outlined in the Running Unit Tests . Update documentation / docstrings / example tutorials as needed, according to Writing Documentation . Provide throughput / latency benchmark results and accuracy evaluation results as needed, according to Benchmark and Profiling and Accuracy Results . For reviewers: If you haven't made any contributions to this PR and are only assisting with merging the main branch, please remove yourself as a co-author when merging the PR. Please feel free to join our Slack channel at https://slack.sglang.ai to discuss your PR. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions fzyzcjy added 13 commits May 25, 2025 21:37 more 7a0c2ff more ca81d44 more 29084e7 more e11ca61 more 0272773 more e88892d more 2daec6a more 8e79895 more 39e5ca5 more e531405 more 43c8339 more 8c32758 fmt 94d23b0 fzyzcjy requested review from merrymercy , Ying1123 , zhyncs , hnyls2002 , ispobock and ByronHsu as code owners May 25, 2025 13:52 yizhang2077 approved these changes May 25, 2025 View reviewed changes Copy link Collaborator yizhang2077 commented May 25, 2025 \u2022 edited Loading Uh oh! There was an error while loading. Please reload this page . Can we use indices (or mask) to indicate which one belongs to tbo_a and which one belongs to tbo_b instead of one split_index? I think it is more helpful for reducing imbalanced cases. (I am not sure if it is easy to do.) All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Merge branch 'main' into feat/tbo_balance 0ae7661 Copy link Collaborator Author fzyzcjy commented May 25, 2025 @yizhang2077 that may be a bit nontrivial since we need to modify filter_batch etc. I deliberately keep it as simple as possible now, and if future features need more expressive filtering I can surely change it. All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Hide details View details zhyncs merged commit a191a0e into sgl-project : main May 26, 2025 70 of 82 checks passed Uh oh! There was an error while loading. Please reload this page . Layssy pushed a commit\n        to Layssy/sglang-iaas\n      that referenced\n      this pull request Jun 9, 2025 Improve performance of two batch overlap in some imbalanced cases ( sg\u2026 \u2026 1f32b53 \u2026l-project#6593 ) xwu-intel pushed a commit\n        to xwu-intel/sglang\n      that referenced\n      this pull request Jun 17, 2025 Improve performance of two batch overlap in some imbalanced cases ( sg\u2026 \u2026 4457b2c \u2026l-project#6593 ) Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 18:57:26",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": true,
+  "test_details": "PERF | TEST",
+  "analysis_extracted_at": null,
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "Improve performance of two batch overlap in some imbalanced cases (#6593)",
+  "commit_message": "Improve performance of two batch overlap in some imbalanced cases (#6593)",
+  "commit_date": "2025-05-25T22:36:18-07:00",
+  "files_changed": [
+    "python/sglang/srt/two_batch_overlap.py",
+    "test/srt/test_two_batch_overlap.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2025,
+    "num_edited_lines": 56,
+    "num_files": 2,
+    "num_hunks": 3,
+    "num_non_test_edited_lines": 56,
+    "num_non_test_files": 2,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py\nindex 0fbc3c8e7..79ba76d49 100644\n--- a/python/sglang/srt/two_batch_overlap.py\n+++ b/python/sglang/srt/two_batch_overlap.py\n@@ -40,13 +40,21 @@ def compute_split_seq_index(\n \n def _split_array_by_half_sum(arr: Sequence[int]) -> int:\n     overall_sum = sum(arr)\n-    accumulator, split_index = 0, 0\n-    for value in arr[:-1]:\n-        accumulator += value\n-        split_index += 1\n-        if accumulator >= overall_sum // 2:\n+    left_sum = 0\n+    min_diff = float(\"inf\")\n+    best_index = 0\n+\n+    for i in range(1, len(arr)):\n+        left_sum += arr[i - 1]\n+        right_sum = overall_sum - left_sum\n+        diff = abs(left_sum - right_sum)\n+        if diff <= min_diff:\n+            min_diff = diff\n+            best_index = i\n+        else:\n             break\n-    return split_index\n+\n+    return best_index\n \n \n def compute_split_token_index(\ndiff --git a/test/srt/test_two_batch_overlap.py b/test/srt/test_two_batch_overlap.py\nindex 89e793ca6..765679fc3 100644\n--- a/test/srt/test_two_batch_overlap.py\n+++ b/test/srt/test_two_batch_overlap.py\n@@ -4,6 +4,8 @@ from types import SimpleNamespace\n \n import requests\n \n+from sglang.srt.model_executor.forward_batch_info import ForwardMode\n+from sglang.srt.two_batch_overlap import compute_split_seq_index\n from sglang.srt.utils import kill_process_tree\n from sglang.test.run_eval import run_eval\n from sglang.test.test_utils import (\n@@ -68,5 +70,39 @@ class TestTwoBatchOverlap(unittest.TestCase):\n         self.assertGreater(metrics[\"score\"], 0.5)\n \n \n+class TestTwoBatchOverlapUnitTest(unittest.TestCase):\n+    # TODO change tests when having 6328\n+    def test_compute_split_seq_index(self):\n+        for num_tokens, expect in [\n+            (0, 0),\n+            (100, 50),\n+            (99, 49),\n+        ]:\n+            actual = compute_split_seq_index(\n+                forward_mode=ForwardMode.DECODE, num_tokens=num_tokens, extend_lens=None\n+            )\n+            self.assertEqual(actual, expect)\n+\n+        for extend_lens, expect in [\n+            ([], 0),\n+            ([42], 0),\n+            ([42, 999], 1),\n+            ([999, 42], 1),\n+            ([4096, 4096, 4096, 4096], 2),\n+            ([4095, 4096, 4096, 4096, 1], 2),\n+            ([1, 4095, 4096, 4096, 4096], 3),\n+            ([4097, 4096, 4096, 4095, 1], 2),\n+            ([1, 1, 1, 1, 99999], 4),\n+            ([99999, 1, 1, 1, 1], 1),\n+        ]:\n+            actual = compute_split_seq_index(\n+                forward_mode=ForwardMode.EXTEND,\n+                num_tokens=None,\n+                extend_lens=extend_lens,\n+            )\n+            print(f\"{extend_lens=} {expect=} {actual=}\")\n+            self.assertEqual(actual, expect)\n+\n+\n if __name__ == \"__main__\":\n     unittest.main()",
+  "apis": [
+    "sglang.srt.two_batch_overlap.compute_split_seq_index"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/two_batch_overlap.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/api.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/model_executor/forward_batch_info.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit modifies a non-test Python source file (two_batch_overlap.py) by changing the algorithm used in _split_array_by_half_sum to compute a more accurate \"best index\" for splitting an array. The commit message explicitly targets performance improvements in \u201cimbalanced cases,\u201d and the changes aim to optimize a computational routine that is part of a core feature (two batch overlap) of the system. Although tests were modified or added, the primary source code modification affects the behavior of a top-level API related to performance. The changes are not merely cosmetic refactoring, documentation, or bug fixes, but rather a non-trivial reimplementation aimed at improving performance on CPU workloads. Therefore, the commit meets the conditions related to performance and optimization improvements.",
+  "llm_api_reason": "The commit refactors the helper function _split_array_by_half_sum used by compute_split_seq_index in the two_batch_overlap module to more accurately find the best index that splits an array near its half-sum. In addition, new tests were added in test_two_batch_overlap.py to verify the behavior of compute_split_seq_index with various cases. This change improves performance handling in imbalanced cases for the two-batch overlap feature that is used in the scheduling/execution pipeline."
+}

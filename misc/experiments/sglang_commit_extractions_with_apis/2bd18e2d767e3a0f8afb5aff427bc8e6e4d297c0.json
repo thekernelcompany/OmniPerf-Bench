@@ -1,0 +1,53 @@
+{
+  "commit_hash": "2bd18e2d767e3a0f8afb5aff427bc8e6e4d297c0",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/2901",
+  "pr_date": "2025-01-19",
+  "timeline_text": "Copy link Contributor zhengy001 commented Jan 15, 2025 \u2022 edited Loading Uh oh! There was an error while loading. Please reload this page . Motivation use int64 for index tensor to avoid indexing implicit to 2.  Move free_slots to device to avoid H2D and use free_slot_idx to keep track of available slot and enable inplace update Result: overlapping scheduling makes no difference python3 -m sglang.bench_one_batch_server --model-path /data/Llama-2-7b-hf --mem-fraction-static 0.3 --batch-size 48 --disable-overlap-schedule Before: batch size: 48 latency: 26.046028 s output throughput: 29.49 token/s (input + output) throughput: 1916.61 token/s After: batch size: 48 latency: 25.995068 s output throughput: 29.54 token/s (input + output) throughput: 1920.36 token/s Checklist Format your code according to the Contributor Guide . Add unit tests as outlined in the Contributor Guide . Update documentation as needed, including docstrings or example tutorials. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions Memory pool: Minor optimize to avoid to 9358132 zhengy001 requested review from merrymercy , Ying1123 , zhyncs and hnyls2002 as code owners January 15, 2025 09:48 Copy link Contributor Author zhengy001 commented Jan 15, 2025 \u2022 edited Loading Uh oh! There was an error while loading. Please reload this page . Before: After: All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Fix clear 46e436c Copy link Contributor merrymercy commented Jan 15, 2025 please fix CI errors All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . zhengy001 added 3 commits January 16, 2025 05:49 Revert slot to be int32 for accuracy issue 1af1080 Revert slots bfca94e Update dd2dc9c Copy link Contributor Author zhengy001 commented Jan 16, 2025 Revert free_slots change and cannot avoid its to because it needs explicit clone when calling alloc , otherwise, sharing the same tensor storage will cause accuracy issue. All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Copy link Contributor merrymercy commented Jan 16, 2025 Is this PR still useful? Can you tell me which to is avoided after this change? Could you give me the pointer to that line? All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Copy link Contributor Author zhengy001 commented Jan 17, 2025 Is this PR still useful? Can you tell me which to is avoided after this change? Could you give me the pointer to that line? https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/memory_pool.py#L102 There will be int32 to int64 if indices dtype is int32 when doing indexing. All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Copy link Contributor merrymercy commented Jan 17, 2025 Why do you also change seq_lens ? All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Copy link Contributor Author zhengy001 commented Jan 17, 2025 Why do you also change seq_lens ? https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_batch.py#L1037 indices is composed of req_pool_indices and locs which is seq_lens or encoder_lens + seq_lens All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Hide details View details merrymercy merged commit 2bd18e2 into sgl-project : main Jan 19, 2025 16 checks passed Uh oh! There was an error while loading. Please reload this page . timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 Memory pool: Minor optimize to avoid to ( sgl-project#2901 ) 9b13dec Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 18:59:42",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": true,
+  "test_details": "PERF | TEST",
+  "analysis_extracted_at": null,
+  "models": [
+    "meta-llama/Llama-2-7b-hf"
+  ],
+  "lm_eval_commands": [
+    "lm_eval --model sglang --model_args pretrained=meta-llama/Llama-2-7b-hf --tasks hellaswag --batch_size 32"
+  ],
+  "perf_command": "python3 -m sglang.bench_one_batch_server --model-path /data/Llama-2-7b-hf --mem-fraction-static 0.3 --batch-size 48 --disable-overlap-schedule",
+  "commit_subject": "Memory pool: Minor optimize to avoid to (#2901)",
+  "commit_message": "Memory pool: Minor optimize to avoid to (#2901)",
+  "commit_date": "2025-01-18T19:35:12-08:00",
+  "files_changed": [
+    "python/sglang/srt/managers/schedule_batch.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2025,
+    "num_edited_lines": 14,
+    "num_files": 1,
+    "num_hunks": 5,
+    "num_non_test_edited_lines": 14,
+    "num_non_test_files": 1,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py\nindex faf05a7ff..77e5faca4 100644\n--- a/python/sglang/srt/managers/schedule_batch.py\n+++ b/python/sglang/srt/managers/schedule_batch.py\n@@ -668,7 +668,7 @@ class ScheduleBatch:\n                     or len(req.prefix_indices) >= im.num_image_tokens\n                 )\n \n-        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(\n+        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int64).to(\n             self.device, non_blocking=True\n         )\n \n@@ -702,7 +702,7 @@ class ScheduleBatch:\n         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(\n             self.device, non_blocking=True\n         )\n-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(\n+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(\n             self.device, non_blocking=True\n         )\n \n@@ -778,10 +778,10 @@ class ScheduleBatch:\n         self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(\n             self.device, non_blocking=True\n         )\n-        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(\n+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64).to(\n             self.device, non_blocking=True\n         )\n-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(\n+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(\n             self.device, non_blocking=True\n         )\n         self.input_embeds = (\n@@ -1014,9 +1014,9 @@ class ScheduleBatch:\n     def prepare_for_idle(self):\n         self.forward_mode = ForwardMode.IDLE\n         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)\n-        self.seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)\n+        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)\n         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)\n-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)\n+        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)\n         self.seq_lens_sum = 0\n         self.extend_num_tokens = 0\n         self.sampling_info = SamplingBatchInfo.from_schedule_batch(\n@@ -1084,7 +1084,7 @@ class ScheduleBatch:\n             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]\n \n         self.reqs = [self.reqs[i] for i in keep_indices]\n-        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(\n+        new_indices = torch.tensor(keep_indices, dtype=torch.int64).to(\n             self.device, non_blocking=True\n         )\n         self.req_pool_indices = self.req_pool_indices[new_indices]",
+  "apis": [
+    "sglang.srt.managers.schedule_batch.ScheduleBatch",
+    "sglang.srt.managers.schedule_batch.ModelWorkerBatch"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/managers/schedule_batch.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/api.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/benchmark/lora/launch_server.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/launch_server.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/sgl-router/py_src/sglang_router/launch_server.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit modifies a core source file (schedule_batch.py) and changes tensor dtypes from int32 to int64 for several tensors. The commit message hints at a memory pool optimization. Although the change might seem small, it is targeting a lower-level operation that can have performance implications (by ensuring that the correct dtype is used and possibly eliminating implicit conversions). It is not merely a refactoring or documentation change and does not target a specific bug fix or new feature, but rather an internal adjustment aimed at optimizing performance. The change affects CPU operations and is testable without GPU setups.",
+  "llm_api_reason": "The commit changes several tensor datatype conversions within the ScheduleBatch class (and related operations in ModelWorkerBatch) from int32 to int64. These modifications directly affect the internal logic for handling request indices, sequence lengths, and other batch-related variables, thus impacting the runtime batching API used by SGLang for inference scheduling."
+}

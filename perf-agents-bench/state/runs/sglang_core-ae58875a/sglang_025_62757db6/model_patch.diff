@@ -1,0 +1,121 @@
+diff --git a/python/sglang/srt/managers/policy_scheduler.py b/python/sglang/srt/managers/policy_scheduler.py
+index 30a009c2e..944f35679 100644
+--- a/python/sglang/srt/managers/policy_scheduler.py
++++ b/python/sglang/srt/managers/policy_scheduler.py
+@@ -31,8 +31,8 @@ class PolicyScheduler:
+         max_total_num_tokens,
+         tree_cache,
+     ):
+-        if tree_cache.disable and policy == "lpm":
+-            # LMP is meaningless when the tree cache is disabled.
++        if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
++            # LPM and DFS-weight are meaningless when the tree cache is disabled.
+             policy = "fcfs"
+ 
+         self.policy = policy
+@@ -157,6 +157,9 @@ class PrefillAdder:
+ 
+     @contextmanager
+     def _lock_node(self, last_node):
++        if self.tree_cache.disable:
++            yield None
++            return
+         try:
+             delta = self.tree_cache.inc_lock_ref(last_node)
+             self.rem_total_tokens += delta
+@@ -187,7 +190,8 @@ class PrefillAdder:
+             ):
+                 # Non-chunked prefill
+                 self.can_run_list.append(req)
+-                self.tree_cache.inc_lock_ref(req.last_node)
++                if not self.tree_cache.disable:
++                    self.tree_cache.inc_lock_ref(req.last_node)
+                 self._prefill_one_req(
+                     prefix_len, input_tokens, req.sampling_params.max_new_tokens
+                 )
+@@ -201,7 +205,8 @@ class PrefillAdder:
+                 req.input_ids = req.input_ids[: len(req.prefix_indices) + trunc_len]
+                 self.can_run_list.append(req)
+                 self.new_inflight_req = req
+-                self.tree_cache.inc_lock_ref(req.last_node)
++                if not self.tree_cache.disable:
++                    self.tree_cache.inc_lock_ref(req.last_node)
+                 self._prefill_one_req(prefix_len, trunc_len, 0)
+ 
+         return True
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2489abd5d..2e693febd 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -363,13 +363,13 @@ class ScheduleBatch:
+         out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+ 
+         if out_cache_loc is None:
+-            if self.tree_cache is not None:
++            if self.tree_cache is not None and not getattr(self.tree_cache, "disable", False):
+                 self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
+                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+ 
+             if out_cache_loc is None:
+                 logger.error("Prefill out of memory. Try to lower your batch size.")
+-                if self.tree_cache is not None:
++                if self.tree_cache is not None and not getattr(self.tree_cache, "disable", False):
+                     self.tree_cache.pretty_print()
+                 exit(1)
+ 
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 0228073c7..26494c01b 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -271,7 +271,8 @@ class ModelTpServer:
+ 
+     def print_stats(self):
+         num_used = self.max_total_num_tokens - (
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
++            self.token_to_kv_pool.available_size()
++            + (0 if getattr(self.tree_cache, "disable", False) else self.tree_cache.evictable_size())
+         )
+         throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+         self.num_generated_tokens = 0
+@@ -288,7 +289,8 @@ class ModelTpServer:
+     def check_memory(self):
+         crash = os.getenv("CI", "false") == "true"
+         available_size = (
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
++            self.token_to_kv_pool.available_size()
++            + (0 if getattr(self.tree_cache, "disable", False) else self.tree_cache.evictable_size())
+         )
+         if available_size != self.max_total_num_tokens:
+             warnings.warn(
+@@ -387,7 +389,8 @@ class ModelTpServer:
+ 
+         adder = PrefillAdder(
+             self.tree_cache,
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
++            self.token_to_kv_pool.available_size()
++            + (0 if getattr(self.tree_cache, "disable", False) else self.tree_cache.evictable_size()),
+             self.max_prefill_tokens,
+             self.chunked_prefill_size,
+         )
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index c23812049..1b7edefb8 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -169,6 +169,8 @@ class RadixCache(BasePrefixCache):
+                 heapq.heappush(leaves, x.parent)
+ 
+     def inc_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 0:
+@@ -179,6 +181,8 @@ class RadixCache(BasePrefixCache):
+         return delta
+ 
+     def dec_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 1:

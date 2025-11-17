@@ -1,0 +1,51 @@
+{
+  "commit_hash": "c98e84c21e4313d7d307425ca43e61753a53a9f7",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/1589",
+  "pr_date": "2024-10-06",
+  "timeline_text": "Copy link Member Ying1123 commented Oct 6, 2024 No description provided. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions ByronHsu approved these changes Oct 6, 2024 View reviewed changes ByronHsu reviewed Oct 6, 2024 View reviewed changes python/sglang/srt/layers/sampler.py Outdated Show resolved Hide resolved Uh oh! There was an error while loading. Please reload this page . Ying1123 force-pushed the sampling-opt branch\n      2 times, most recently\n    from b0751bf to 0c765be Compare October 6, 2024 19:01 Ying1123 enabled auto-merge (squash) October 6, 2024 19:16 Ying1123 disabled auto-merge October 6, 2024 19:26 use argmax for greedy sampling d7798dc Ying1123 force-pushed the sampling-opt branch\n    from 0c765be to d7798dc Compare October 6, 2024 19:34 Ying1123 enabled auto-merge (squash) October 6, 2024 19:34 Ying1123 commented Oct 6, 2024 View reviewed changes python/sglang/srt/layers/sampler.py Outdated Show resolved Hide resolved Uh oh! There was an error while loading. Please reload this page . Update python/sglang/srt/layers/sampler.py 5d58325 merrymercy disabled auto-merge October 6, 2024 20:14 Hide details View details merrymercy merged commit c98e84c into main Oct 6, 2024 8 of 11 checks passed Uh oh! There was an error while loading. Please reload this page . merrymercy deleted the sampling-opt branch October 6, 2024 20:15 ByronHsu mentioned this pull request Oct 6, 2024 Test consistency for single and batch seperately #1590 Merged 3 tasks merrymercy mentioned this pull request Oct 6, 2024 [Bug] Unable to fix model output #1316 Closed 5 tasks timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 [Minor, Performance] Use torch.argmax for greedy sampling ( sgl-projec\u2026 \u2026 4531a0d \u2026t#1589 ) Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 19:00:26",
+  "has_lm_eval": false,
+  "has_performance": false,
+  "has_serving": false,
+  "has_general_test": true,
+  "test_details": "TEST",
+  "analysis_extracted_at": null,
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "[Minor, Performance] Use torch.argmax for greedy sampling (#1589)",
+  "commit_message": "[Minor, Performance] Use torch.argmax for greedy sampling (#1589)",
+  "commit_date": "2024-10-06T13:15:05-07:00",
+  "files_changed": [
+    "python/sglang/srt/layers/sampler.py",
+    "test/srt/test_bench_serving.py",
+    "test/srt/test_pytorch_sampling_backend.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2024,
+    "num_edited_lines": 36,
+    "num_files": 3,
+    "num_hunks": 4,
+    "num_non_test_edited_lines": 36,
+    "num_non_test_files": 3,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py\nindex ad7f0a1f3..b45ec080b 100644\n--- a/python/sglang/srt/layers/sampler.py\n+++ b/python/sglang/srt/layers/sampler.py\n@@ -43,7 +43,10 @@ class Sampler(nn.Module):\n                 torch.isnan(probs), torch.full_like(probs, 1e-10), probs\n             )\n \n-        if global_server_args_dict[\"sampling_backend\"] == \"flashinfer\":\n+        if sampling_info.top_ks.max().item() <= 1:\n+            # Use torch.argmax if all requests use greedy sampling\n+            batch_next_token_ids = torch.argmax(probs, -1)\n+        elif global_server_args_dict[\"sampling_backend\"] == \"flashinfer\":\n             max_top_k_round, batch_size = 32, probs.shape[0]\n             uniform_samples = torch.rand(\n                 (max_top_k_round, batch_size), device=probs.device\ndiff --git a/test/srt/test_bench_serving.py b/test/srt/test_bench_serving.py\nindex 056483487..6955d4917 100644\n--- a/test/srt/test_bench_serving.py\n+++ b/test/srt/test_bench_serving.py\n@@ -27,11 +27,11 @@ class TestBenchServing(unittest.TestCase):\n             model=DEFAULT_MODEL_NAME_FOR_TEST,\n             num_prompts=200,\n             request_rate=float(\"inf\"),\n+            other_server_args=[\"--max-running-requests\", \"10\"],\n             dataset_name=\"sharegpt\",\n             random_input_len=None,\n             random_output_len=None,\n             disable_stream=True,\n-            other_server_args=[\"--max-running-requests\", \"10\"],\n         )\n \n         if is_in_ci():\ndiff --git a/test/srt/test_pytorch_sampling_backend.py b/test/srt/test_pytorch_sampling_backend.py\nindex ddd744149..5cd121235 100644\n--- a/test/srt/test_pytorch_sampling_backend.py\n+++ b/test/srt/test_pytorch_sampling_backend.py\n@@ -1,6 +1,9 @@\n+import json\n import unittest\n from types import SimpleNamespace\n \n+import requests\n+\n from sglang.srt.utils import kill_child_process\n from sglang.test.run_eval import run_eval\n from sglang.test.test_utils import (\n@@ -39,6 +42,32 @@ class TestPyTorchSamplingBackend(unittest.TestCase):\n         metrics = run_eval(args)\n         assert metrics[\"score\"] >= 0.65\n \n+    def test_greedy(self):\n+        response_single = requests.post(\n+            self.base_url + \"/generate\",\n+            json={\n+                \"text\": \"The capital of France is\",\n+                \"sampling_params\": {\n+                    \"temperature\": 0,\n+                    \"max_new_tokens\": 32,\n+                },\n+            },\n+        ).json()\n+        response_batch = requests.post(\n+            self.base_url + \"/generate\",\n+            json={\n+                \"text\": [\"The capital of France is\"] * 10,\n+                \"sampling_params\": {\n+                    \"temperature\": 0,\n+                    \"max_new_tokens\": 32,\n+                },\n+            },\n+        ).json()\n+        text = response_single[\"text\"]\n+        print(text)\n+        for i in range(10):\n+            assert response_batch[i][\"text\"] == text\n+\n \n if __name__ == \"__main__\":\n     unittest.main()",
+  "apis": [
+    "sglang.api.gen",
+    "TokenizerManager.generate_request"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/api.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/entrypoints/http_server.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/entrypoints/openai/serving_completions.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit introduces a new branch in the sampler that uses torch.argmax when greedy sampling is detected (i.e., when sampling_info.top_ks.max().item() <= 1). This change bypasses the flashinfer backend, which likely optimizes performance for a common case. The modification is made in a non-test source file (python/sglang/srt/layers/sampler.py) and is accompanied by additional test changes to validate the new behavior. The change is neither a mere documentation or refactoring tweak, nor a bug fix\u2014it is an optimization to improve runtime performance on CPU for a key API.",
+  "llm_api_reason": "This commit introduces a performance optimization in the sampler layer by using torch.argmax when all requests require greedy sampling. Although the change is applied inside the implementation of the Sampler\u2019s forward pass (in the sglang/srt/layers/sampler.py file), it affects the behavior of text generation requests. In particular, this improvement will be encountered by users invoking the high\u2010level generation API (sglang.api.gen) as well as by backends (via TokenizerManager.generate_request) that drive the /generate endpoint."
+}

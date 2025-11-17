@@ -1,0 +1,68 @@
+diff --git a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+index f1ee5d40e..e5e999747 100644
+--- a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
++++ b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+@@ -183,7 +183,9 @@ __inline__ __device__ void block_barrier(
+     }
+   }
+ 
+-  __syncthreads();
++  if constexpr (start || need_fence) {
++    __syncthreads();
++  }
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>
+@@ -224,13 +226,14 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+ 
+   // The source pointers. Distributed round-robin for the different warps.
+   auto peer_comm_buffer_ptrs = params.peer_comm_buffer_ptrs->ptrs;
+-  T* local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
++  T* __restrict__ local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
+   // Start and end offsets of the thread
+   size_t chunk_start = bidx * params.elts_per_block + tidx * NUM_ELTS;
+-  size_t chunk_end = std::min((bidx + 1) * params.elts_per_block, params.elts_per_rank);
++  size_t chunk_end = min((bidx + 1) * params.elts_per_block, params.elts_per_rank);
++  T* __restrict__ local_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+ 
+   if constexpr (COPY_INPUT) {
+-    T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
++    T const* __restrict__ local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+     // Copy from local buffer to shareable buffer
+     for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+       *reinterpret_cast<int4*>(&local_shared_buffer[iter_offset]) =
+@@ -243,25 +246,23 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+ 
+   // Each block accumulates the values from the different GPUs on the same node.
+   for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+-    // Iterate over the different ranks/devices on the node to load the values.
+-    PackedStruct vals[RANKS_PER_NODE];
+-#pragma unroll
+-    for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+-      vals[ii].packed = *reinterpret_cast<int4 const*>(&((T*)peer_comm_buffer_ptrs[ii])[iter_offset]);
+-    }
+-
+-    // Sum the values from the different ranks.
++    // Sum the values from the different ranks in a fixed order to ensure determinism.
+     PackedStruct sums;
+-    sums.packed = {0, 0, 0, 0};
++    sums.packed = make_int4(0, 0, 0, 0);
+ #pragma unroll
+     for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+-      sums.packed = add128b(sums, vals[rank]);
++      PackedStruct val;
++      val.packed = *reinterpret_cast<int4 const*>(&((T*)peer_comm_buffer_ptrs[rank])[iter_offset]);
++      sums.packed = add128b(sums, val);
+     }
+ 
+     // Store to the destination buffer.
+-    *reinterpret_cast<int4*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[iter_offset]) = sums.packed;
++    *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
+   }
++  // Signal completion for corresponding blocks on other GPUs. No fence needed here.
++  block_barrier<false>(
++      params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>

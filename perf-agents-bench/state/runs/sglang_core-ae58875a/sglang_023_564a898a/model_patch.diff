@@ -1,0 +1,77 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/managers/controller/infer_batch.py b/python/sglang/srt/managers/controller/infer_batch.py
+index d89e9786e..84fe39353 100644
+--- a/python/sglang/srt/managers/controller/infer_batch.py
++++ b/python/sglang/srt/managers/controller/infer_batch.py
+@@ -781,7 +781,8 @@ class InputMetadata:
+                 device="cuda",
+             )
+             extend_seq_lens = seq_lens - prefix_lens
+-            extend_start_loc = torch.zeros_like(seq_lens)
++            extend_start_loc = torch.empty_like(seq_lens)
++            extend_start_loc[0] = 0
+             extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+             extend_no_prefix = torch.all(prefix_lens == 0)
+             total_num_tokens = int(torch.sum(seq_lens))
+@@ -827,9 +828,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+     else:
+         paged_kernel_lens = prefix_lens
+ 
+-    kv_indptr = torch.zeros(
++    kv_indptr = torch.empty(
+         (batch_size + 1,), dtype=torch.int32, device="cuda"
+     )
++    kv_indptr[0] = 0
+     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+     req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+     paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+@@ -859,9 +861,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+         )
+     else:
+         # extend part
+-        qo_indptr = torch.zeros(
++        qo_indptr = torch.empty(
+             (batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        qo_indptr[0] = 0
+         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+ 
+         model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
+@@ -890,7 +893,8 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+ def init_triton_args(forward_mode, seq_lens, prefix_lens):
+     batch_size = len(seq_lens)
+     max_seq_len = int(torch.max(seq_lens))
+-    start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc[0] = 0
+     start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+ 
+     if forward_mode == ForwardMode.DECODE:
+diff --git a/python/sglang/srt/memory_pool.py b/python/sglang/srt/memory_pool.py
+index 245e6ef08..9b78636f2 100644
+--- a/python/sglang/srt/memory_pool.py
++++ b/python/sglang/srt/memory_pool.py
+@@ -41,7 +41,7 @@ class TokenToKVPool:
+         self.size = size
+         # mem_state is the reference counter.
+         # We also add one slot. This slot is used for writing dummy output from padded tokens.
+-        self.mem_state = torch.zeros((self.size + 1,), dtype=torch.int16, device="cuda")
++        self.mem_state = torch.empty((self.size + 1,), dtype=torch.int16, device="cuda")
+         self.total_ref_ct = 0
+ 
+         # [size, key/value, head_num, head_dim] for each layer
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 03a2d60ab..d31650c47 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -610,7 +610,7 @@ def receive_addrs(model_port_args, server_args):
+     )
+ 
+     for src_rank in range(1, server_args.nnodes):
+-        tensor = torch.zeros(4 + num_tp_ports, dtype=torch.int)
++        tensor = torch.empty(4 + num_tp_ports, dtype=torch.int)
+         dist.recv(tensor, src=src_rank)
+         ip = ".".join([str(x) for x in tensor[:4].tolist()])
+         ports = tensor[4:].tolist()

@@ -1,0 +1,43 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 5a97072de..f784acf68 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -730,9 +730,15 @@ def _wait_and_warmup(
+         },
+     }
+     if server_args.skip_tokenizer_init:
+-        json_data["input_ids"] = [10, 11, 12]
++        if server_args.dp_size > 1:
++            json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
++        else:
++            json_data["input_ids"] = [10, 11, 12]
+     else:
+-        json_data["text"] = "The capital city of France is"
++        if server_args.dp_size > 1:
++            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
++        else:
++            json_data["text"] = "The capital city of France is"
+ 
+     # Debug dumping
+     if server_args.debug_tensor_dump_input_file:
+@@ -743,7 +749,19 @@ def _wait_and_warmup(
+         json_data["sampling_params"]["max_new_tokens"] = 0
+ 
+     try:
+-        for i in range(server_args.dp_size):
++        # Use a single batched warmup request to cover all DP replicas.
++        if server_args.dp_size > 1:
++            payload = orjson.dumps(json_data)
++            batched_headers = dict(headers)
++            batched_headers["Content-Type"] = "application/json"
++            res = requests.post(
++                url + request_name,
++                data=payload,
++                headers=batched_headers,
++                timeout=600,
++            )
++            assert res.status_code == 200, f"{res}"
++        else:
+             res = requests.post(
+                 url + request_name,
+                 json=json_data,

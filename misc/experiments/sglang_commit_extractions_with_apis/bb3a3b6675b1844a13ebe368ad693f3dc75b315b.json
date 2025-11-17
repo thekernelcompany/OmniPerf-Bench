@@ -1,0 +1,50 @@
+{
+  "commit_hash": "bb3a3b6675b1844a13ebe368ad693f3dc75b315b",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/137",
+  "pr_date": "2024-02-03",
+  "timeline_text": "Copy link Collaborator hnyls2002 commented Feb 3, 2024 No description provided. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions support regex fast forward for llava cf40f14 hnyls2002 merged commit bb3a3b6 into main Feb 3, 2024 hnyls2002 deleted the llava-fst-fwd branch February 3, 2024 15:32 CSEEduanyu mentioned this pull request Jan 26, 2025 [Bug] NCCL Crash with SIGSEGV Frequently when deploying deepseek v3 #2803 Closed 5 tasks timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 Support Faster JSON decoding for llava ( sgl-project#137 ) \u2026 abbdca0 When sending fast-forwarded reqs to model_rpc, re-calculate `pad_input_ids` NorthmanPKU pushed a commit\n        to NorthmanPKU/sglang\n      that referenced\n      this pull request May 16, 2025 Add support for Hopper GPU ( sgl-project#137 ) \u2026 dc5e74f * init\n\n* new logic\n\n* del\n\n* fix\n\n* layout\n\n* major issue\n\n* evaluation\n\n* add missing parts\n\n* merge gap\n\n* del\n\n* merge conflict\n\n* del\n\n* clean Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 19:01:15",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": false,
+  "test_details": "PERF",
+  "analysis_extracted_at": null,
+  "models": [
+    "llava-hf/llava-1.5-7b-hf",
+    "llava-hf/llava-1.5-13b-hf"
+  ],
+  "lm_eval_commands": [
+    "lm_eval --model sglang --model_args pretrained=llava-hf/llava-1.5-7b-hf --tasks gsm8k --num_fewshot 5"
+  ],
+  "perf_command": "python benchmarks/benchmark_serving.py --model llava-hf/llava-1.5-7b-hf --num-prompts 100",
+  "commit_subject": "Support Faster JSON decoding for llava (#137)",
+  "commit_message": "Support Faster JSON decoding for llava (#137)\n\nWhen sending fast-forwarded reqs to model_rpc, re-calculate `pad_input_ids`",
+  "commit_date": "2024-02-03T23:32:05+08:00",
+  "files_changed": [
+    "python/sglang/srt/managers/router/infer_batch.py",
+    "python/sglang/srt/managers/router/model_rpc.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2024,
+    "num_edited_lines": 38,
+    "num_files": 2,
+    "num_hunks": 8,
+    "num_non_test_edited_lines": 38,
+    "num_non_test_files": 2,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py\nindex 88f6031f7..5a3cc0897 100644\n--- a/python/sglang/srt/managers/router/infer_batch.py\n+++ b/python/sglang/srt/managers/router/infer_batch.py\n@@ -31,6 +31,7 @@ class Req:\n         self.pixel_values = None\n         self.image_size = None\n         self.image_offset = 0\n+        self.pad_value = None\n \n         self.sampling_params = None\n         self.return_logprob = False\n@@ -58,7 +59,7 @@ class Req:\n     def max_new_tokens(self):\n         return self.sampling_params.max_new_tokens\n \n-    def tokenize_fast_forward(self, fast_forward_str, next_state):\n+    def fast_forward_and_retokenize(self, fast_forward_str, next_state):\n         old_output_str = self.tokenizer.decode(self.output_ids)\n         # FIXME: This logic does not really solve the problem of determining whether\n         # there should be a leading space.\n@@ -75,9 +76,14 @@ class Req:\n             + fast_forward_str\n         )\n         new_input_ids = self.tokenizer.encode(new_input_string)\n-        fast_forward_tokens_len = (\n-            len(new_input_ids) - len(self.input_ids) - len(self.output_ids)\n-        )\n+        if self.pixel_values is not None:\n+            # NOTE: This is a hack because the old input_ids contains the image padding\n+            fast_forward_tokens_len = len(self.tokenizer.encode(fast_forward_str))\n+        else:\n+            fast_forward_tokens_len = (\n+                len(new_input_ids) - len(self.input_ids) - len(self.output_ids)\n+            )\n+\n         # print(\"=\" * 100)\n         # print(f\"Catch fast forward:\\n{fast_forward_str}\")\n         # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))\n@@ -351,7 +357,7 @@ class Batch:\n                     self.tree_cache.dec_ref_counter(req.last_node)\n \n                     # fast forward\n-                    req.tokenize_fast_forward(fast_forward_str, next_state)\n+                    req.fast_forward_and_retokenize(fast_forward_str, next_state)\n \n                     fast_forward_reqs.append(req)\n                     filter_indices.remove(i)\ndiff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py\nindex 8b7adf944..49da99d96 100644\n--- a/python/sglang/srt/managers/router/model_rpc.py\n+++ b/python/sglang/srt/managers/router/model_rpc.py\n@@ -83,7 +83,9 @@ class ModelRpcServer(rpyc.Service):\n         self.max_num_running_seq = self.max_total_num_token // 2\n         self.max_prefill_num_token = max(\n             self.model_config.context_len,\n-            self.max_total_num_token // 6 if server_args.max_prefill_num_token is None else server_args.max_prefill_num_token,\n+            self.max_total_num_token // 6\n+            if server_args.max_prefill_num_token is None\n+            else server_args.max_prefill_num_token,\n         )\n         self.int_token_logit_bias = torch.tensor(\n             get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)\n@@ -233,7 +235,7 @@ class ModelRpcServer(rpyc.Service):\n         req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)\n         req.pixel_values = recv_req.pixel_values\n         if req.pixel_values is not None:\n-            pad_value = [\n+            req.pad_value = [\n                 (recv_req.image_hash) % self.model_config.vocab_size,\n                 (recv_req.image_hash >> 16) % self.model_config.vocab_size,\n                 (recv_req.image_hash >> 32) % self.model_config.vocab_size,\n@@ -241,7 +243,7 @@ class ModelRpcServer(rpyc.Service):\n             ]\n             req.image_size = recv_req.image_size\n             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(\n-                req.input_ids, pad_value, req.pixel_values.shape, req.image_size\n+                req.input_ids, req.pad_value, req.pixel_values.shape, req.image_size\n             )\n         req.sampling_params = recv_req.sampling_params\n         req.return_logprob = recv_req.return_logprob\n@@ -438,6 +440,20 @@ class ModelRpcServer(rpyc.Service):\n         if not self.no_regex_fast_forward:\n             # check for fast forward\n             fast_forward_reqs = batch.check_for_fast_forward()\n+\n+            # check for image fast forward\n+            for req in fast_forward_reqs:\n+                if req.pixel_values is not None:\n+                    (\n+                        req.input_ids,\n+                        req.image_offset,\n+                    ) = self.model_runner.model.pad_input_ids(\n+                        req.input_ids,\n+                        req.pad_value,\n+                        req.pixel_values.shape,\n+                        req.image_size,\n+                    )\n+\n             self.forward_queue.extend(fast_forward_reqs)\n             if batch.is_empty():\n                 return",
+  "apis": [
+    "sglang.srt.managers.router.Router"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/api.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit modifies non-test source code in two modules and changes behavior in processing fast-forwarded requests. Although the commit message mentions \"Faster JSON decoding\", the code changes affect the tokenization and image padding logic for fast-forwarding requests, which is a performance-critical path. The modifications include additional condition branches to calculate token lengths differently and re-computing pad values for image processing. These are not trivial refactorings or bug fixes; they adjust internal APIs that can have a notable impact on the performance of high-level request processing. Thus, the commit meets the criteria for being performance or optimization related. [ANSWER] YES [/ANSWER]",
+  "llm_api_reason": "This commit modifies the router\u2010layer\u2019s handling of \u201cfast forward\u201d in request processing. In particular, an internal method on the request object is renamed from tokenize_fast_forward to fast_forward_and_retokenize and a new property (pad_value) is introduced; additionally, the ModelRpcServer now passes pad_value into the pad_input_ids call. Although these changes occur in internal request\u2010processing code, they directly impact the behavior of the router manager, which is exposed through the public Router API.\n[APIS]\nsglang.srt.managers.router.Router\n[APIS]"
+}

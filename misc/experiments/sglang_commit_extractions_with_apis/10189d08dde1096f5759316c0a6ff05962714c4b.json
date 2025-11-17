@@ -1,0 +1,45 @@
+{
+  "commit_hash": "10189d08dde1096f5759316c0a6ff05962714c4b",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/2171",
+  "pr_date": "2024-11-25",
+  "timeline_text": "Copy link Collaborator HaiShaw commented Nov 25, 2024 Motivation Setting process affinity to designated cpu ids, to avoid unwanted process migrations (cost high in case of multiple sockets) Modifications Assign specific process to designated cores, handle multiple sockets, and HT (hyper threading: 1 Physical core runs as 2 logical cores) Online benchmarking shows notable improvement (request rate: 4/8/16) on MI300X system with dual socket CPUs. Checklist [+] Format your code according to the Contributor Guide . [+] Add unit tests as outlined in the Contributor Guide . [+] Update documentation as needed, including docstrings or example tutorials. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions HaiShaw requested review from merrymercy , Ying1123 and hnyls2002 as code owners November 25, 2024 06:17 HaiShaw force-pushed the affinity branch\n    from 0dfd354 to f6b76d5 Compare November 25, 2024 07:59 merrymercy requested changes Nov 25, 2024 View reviewed changes Copy link Contributor merrymercy left a comment There was a problem hiding this comment. Choose a reason for hiding this comment The reason will be displayed to describe this comment to others. Learn more . Choose a reason Spam Abuse Off Topic Outdated Duplicate Resolved Hide comment We have multiple threads, not sure whether we need to call them all. also call it here sglang/python/sglang/srt/managers/tp_worker_overlap_thread.py Line 90\n      in 55842eb with torch . cuda . stream ( self . forward_stream ): Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions python/sglang/srt/managers/scheduler.py Outdated Show resolved Hide resolved Uh oh! There was an error while loading. Please reload this page . Copy link Collaborator Author HaiShaw commented Nov 25, 2024 We have multiple threads, not sure whether we need to call them all. also call it here sglang/python/sglang/srt/managers/tp_worker_overlap_thread.py Line 90\n      in 55842eb with torch . cuda . stream ( self . forward_stream ): We don't need to call this per thread, currently we look forward to binding at process level. :) All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . HaiShaw requested review from zhyncs , ispobock and ByronHsu as code owners November 25, 2024 20:04 merrymercy requested changes Nov 25, 2024 View reviewed changes python/sglang/srt/managers/scheduler.py Outdated Show resolved Hide resolved Uh oh! There was an error while loading. Please reload this page . HaiShaw added 5 commits November 25, 2024 13:41 Process affinity to CPU cores with multiple sockets support 66095db add support to multiple DPs per node cd0535c Fix Lint 79e03b2 Code refactor 79ac4c0 Function prototype simplification 9cba77f HaiShaw force-pushed the affinity branch\n    from f6441d6 to 9cba77f Compare November 25, 2024 21:41 Hide details View details merrymercy merged commit 10189d0 into sgl-project : main Nov 25, 2024 12 of 14 checks passed Uh oh! There was an error while loading. Please reload this page . HaiShaw deleted the affinity branch November 26, 2024 00:22 timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 [Performance]: Process affinity to CPU cores with multiple sockets su\u2026 \u2026 1c3cc53 \u2026pport ( sgl-project#2171 ) Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 18:59:57",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": false,
+  "test_details": "PERF",
+  "analysis_extracted_at": null,
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "[Performance]: Process affinity to CPU cores with multiple sockets support (#2171)",
+  "commit_message": "[Performance]: Process affinity to CPU cores with multiple sockets support (#2171)",
+  "commit_date": "2024-11-25T14:57:32-08:00",
+  "files_changed": [
+    "python/sglang/srt/managers/scheduler.py",
+    "python/sglang/srt/utils.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2024,
+    "num_edited_lines": 39,
+    "num_files": 2,
+    "num_hunks": 4,
+    "num_non_test_edited_lines": 39,
+    "num_non_test_files": 2,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py\nindex 1d1cf3688..2ae705422 100644\n--- a/python/sglang/srt/managers/scheduler.py\n+++ b/python/sglang/srt/managers/scheduler.py\n@@ -72,6 +72,7 @@ from sglang.srt.utils import (\n     configure_logger,\n     crash_on_warnings,\n     get_zmq_socket,\n+    gpu_proc_affinity,\n     kill_parent_process,\n     set_random_seed,\n     suppress_other_loggers,\n@@ -1393,6 +1394,9 @@ def run_scheduler_process(\n     dp_rank: Optional[int],\n     pipe_writer,\n ):\n+    # set cpu affinity to this gpu process\n+    gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)\n+\n     # [For Router] if env var \"DP_RANK\" exist, set dp_rank to the value of the env var\n     if dp_rank is None and \"DP_RANK\" in os.environ:\n         dp_rank = int(os.environ[\"DP_RANK\"])\ndiff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py\nindex e947d1a92..0222824e6 100644\n--- a/python/sglang/srt/utils.py\n+++ b/python/sglang/srt/utils.py\n@@ -15,6 +15,7 @@\n \n import base64\n import ipaddress\n+import itertools\n import json\n import logging\n import os\n@@ -987,3 +988,37 @@ def direct_register_custom_op(\n     my_lib.impl(op_name, op_func, \"CUDA\")\n     if fake_impl is not None:\n         my_lib._register_fake(op_name, fake_impl)\n+\n+\n+def gpu_proc_affinity(\n+    tp_size: int,\n+    nnodes: int,\n+    gpu_id: int,\n+):\n+    # current process\n+    pid = os.getpid()\n+    p = psutil.Process(pid)\n+\n+    tp_size_per_node = tp_size // nnodes\n+\n+    # total physical cores\n+    total_pcores = psutil.cpu_count(logical=False)\n+    # physical cores per TP (N.B. more Cores than GPUs on node)\n+    num_cores_bind = total_pcores // tp_size_per_node\n+\n+    # able to handle multiple DP per node\n+    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores\n+    end_cpu_id = start_cpu_id + num_cores_bind\n+\n+    if psutil.cpu_count() != psutil.cpu_count(logical=False):\n+        # HT on\n+        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]\n+        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]\n+        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))\n+    else:\n+        # HT off\n+        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]\n+\n+    # set cpu_affinity to current process\n+    p.cpu_affinity(bind_cpu_ids)\n+    logger.info(f\"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}\")",
+  "apis": [
+    "sglang.srt.managers.scheduler.Scheduler"
+  ],
+  "affected_paths": [],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit modifies non-test source files by adding a new function (gpu_proc_affinity) and integrating it into an existing process scheduler. It configures CPU affinity for a GPU process, which is a performance optimization aimed at controlling process placement and improving scheduling efficiency on multi-socket machines. The change directly impacts the performance of a high-level API (the scheduler) and is testable on CPU without relying on GPU/TPU specific computations. The change is non-trivial and is not merely a bug fix, refactoring, or adding incidental features.",
+  "llm_api_reason": "The commit adds a new function (gpu_proc_affinity) to set CPU affinity for GPU processes and integrates it into the scheduler process run routine. Since the scheduler process (defined in sglang.srt.managers.scheduler) is a high-level API for request scheduling and batching, the changes directly affect the Scheduler API. The new gpu_proc_affinity function is internal and used by the scheduler; hence, the affected high-level API is Scheduler."
+}

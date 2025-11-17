@@ -1,0 +1,87 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 32a11c15c..c46ac075d 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -259,6 +259,36 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+             return _create_error_response(e)
+ 
+ 
++
++@app.api_route("/generate_from_file", methods=["POST"])
++async def generate_from_file_request(file: UploadFile, request: Request):
++    """Handle a generate request via file upload for input_embeds only.
++    This avoids large JSON body parsing overhead by directly loading bytes.
++    """
++    content = await file.read()
++    try:
++        # orjson.loads accepts bytes directly
++        input_embeds = orjson.loads(content)
++    except Exception as e:
++        return _create_error_response(e)
++
++    # Provide minimal sampling params to match common defaults in tests
++    obj = GenerateReqInput(
++        input_embeds=input_embeds,
++        sampling_params={
++            "temperature": 0,
++            "max_new_tokens": 50,
++        },
++    )
++
++    try:
++        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
++        return ret
++    except ValueError as e:
++        logger.error(f"Error: {e}")
++        return _create_error_response(e)
++
++
+ @app.api_route("/encode", methods=["POST", "PUT"])
+ async def encode_request(obj: EmbeddingReqInput, request: Request):
+     """Handle an embedding request."""
+diff --git a/test/srt/test_input_embeddings.py b/test/srt/test_input_embeddings.py
+index 015aabe78..72b56dd5d 100644
+--- a/test/srt/test_input_embeddings.py
++++ b/test/srt/test_input_embeddings.py
+@@ -50,6 +50,25 @@ class TestInputEmbeds(unittest.TestCase):
+             "error": f"Request failed with status {response.status_code}: {response.text}"
+         }
+ 
++    def send_request_via_file(self, embeddings):
++        """Send a POST request with input_embeds uploaded as a file to reduce JSON overhead."""
++        import io
++        # Encode embeddings as JSON bytes
++        embeds_bytes = json.dumps(embeddings).encode("utf-8")
++        files = {
++            "file": ("embeds.json", io.BytesIO(embeds_bytes), "application/json"),
++        }
++        response = requests.post(
++            self.base_url + "/generate_from_file",
++            files=files,
++            timeout=30,
++        )
++        if response.status_code == 200:
++            return response.json()
++        return {
++            "error": f"Request failed with status {response.status_code}: {response.text}"
++        }
++
+     def test_text_based_response(self):
+         """Print API response using text-based input."""
+         for text in self.texts:
+@@ -77,6 +96,15 @@ class TestInputEmbeds(unittest.TestCase):
+                 f"Embeddings Input (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
+             )
+ 
++    def test_embedding_based_response_via_file(self):
++        """Print API response using input embeddings uploaded as a file."""
++        for text in self.texts:
++            embeddings = self.generate_input_embeddings(text)
++            response = self.send_request_via_file(embeddings)
++            print(
++                f"Embeddings File Upload (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
++            )
++
+     def test_compare_text_vs_embedding(self):
+         """Print responses for both text-based and embedding-based inputs."""
+         for text in self.texts:

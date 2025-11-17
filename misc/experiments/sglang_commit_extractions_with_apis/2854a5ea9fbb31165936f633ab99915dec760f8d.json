@@ -1,0 +1,56 @@
+{
+  "commit_hash": "2854a5ea9fbb31165936f633ab99915dec760f8d",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/1496",
+  "pr_date": "2024-09-23",
+  "timeline_text": "Copy link Contributor merrymercy commented Sep 23, 2024 There is a wrong line in schedule_batch.py that will trigger cpu-gpu copy. It introduces unnecessary overhead in bench_latency.py. This wrong line is only used in bench_latency.py Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions merrymercy added 4 commits September 23, 2024 06:36 Fix bench_latency 0c5d609 update 82c2fd0 fix output len 4c32e17 simplify c7b1020 Hide details View details merrymercy merged commit 2854a5e into main Sep 23, 2024 10 of 12 checks passed Uh oh! There was an error while loading. Please reload this page . merrymercy deleted the schedule branch September 23, 2024 14:38 timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 Fix the overhead due to penalizer in bench_latency ( sgl-project#1496 ) 953c1ad Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 19:00:33",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": false,
+  "test_details": "PERF",
+  "analysis_extracted_at": null,
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "Fix the overhead due to penalizer in bench_latency (#1496)",
+  "commit_message": "Fix the overhead due to penalizer in bench_latency (#1496)",
+  "commit_date": "2024-09-23T07:38:14-07:00",
+  "files_changed": [
+    "python/sglang/bench_latency.py",
+    "python/sglang/srt/managers/schedule_batch.py",
+    "python/sglang/srt/managers/tp_worker.py",
+    "python/sglang/srt/model_executor/forward_batch_info.py",
+    "python/sglang/srt/model_executor/model_runner.py",
+    "scripts/playground/reference_hf.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2024,
+    "num_edited_lines": 25,
+    "num_files": 6,
+    "num_hunks": 13,
+    "num_non_test_edited_lines": 25,
+    "num_non_test_files": 6,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/bench_latency.py b/python/sglang/bench_latency.py\nindex 7a03e162f..ac6b1fb6f 100644\n--- a/python/sglang/bench_latency.py\n+++ b/python/sglang/bench_latency.py\n@@ -260,7 +260,7 @@ def correctness_test(\n \n     # Decode\n     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]\n-    for _ in range(bench_args.output_len[0]):\n+    for _ in range(bench_args.output_len[0] - 1):\n         next_token_ids, _ = decode(next_token_ids, batch, model_runner)\n         for i in range(len(reqs)):\n             output_ids[i].append(next_token_ids[i])\n@@ -311,7 +311,7 @@ def latency_test_run_once(\n \n     # Decode\n     decode_latencies = []\n-    for i in range(output_len):\n+    for i in range(output_len - 1):\n         torch.cuda.synchronize()\n         tic = time.time()\n         next_token_ids, _ = decode(next_token_ids, batch, model_runner)\ndiff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py\nindex 2ab041726..c4c91c711 100644\n--- a/python/sglang/srt/managers/schedule_batch.py\n+++ b/python/sglang/srt/managers/schedule_batch.py\n@@ -429,7 +429,7 @@ class ScheduleBatch:\n     def prepare_for_extend(self, vocab_size: int):\n         self.forward_mode = ForwardMode.EXTEND\n \n-        bs = self.batch_size()\n+        bs = len(self.reqs)\n         reqs = self.reqs\n         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]\n         extend_num_tokens = sum(len(ids) for ids in input_ids)\n@@ -509,7 +509,7 @@ class ScheduleBatch:\n         self.extend_logprob_start_lens_cpu.extend([0] * running_bs)\n \n     def check_decode_mem(self):\n-        bs = self.batch_size()\n+        bs = len(self.reqs)\n         if self.token_to_kv_pool.available_size() >= bs:\n             return True\n \n@@ -680,14 +680,12 @@ class ScheduleBatch:\n                 r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]\n                 for r in self.reqs\n             ]\n-        else:\n-            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)\n \n         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device=\"cuda\")\n         self.seq_lens.add_(1)\n \n         # Alloc mem\n-        bs = self.batch_size()\n+        bs = len(self.reqs)\n         self.out_cache_loc = self.alloc_token_slots(bs)\n \n         self.req_to_token_pool.req_to_token[\ndiff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py\nindex fe9afc9f3..414424e5b 100644\n--- a/python/sglang/srt/managers/tp_worker.py\n+++ b/python/sglang/srt/managers/tp_worker.py\n@@ -215,6 +215,7 @@ class ModelTpServer:\n         self.new_token_ratio_decay = global_config.new_token_ratio_decay\n         self.do_not_get_new_batch = False\n \n+    @torch.inference_mode()\n     def exposed_step(self, recv_reqs: List):\n         try:\n             # Recv requests\n@@ -246,7 +247,6 @@ class ModelTpServer:\n         self.out_pyobjs = []\n         return ret\n \n-    @torch.inference_mode()\n     def forward_step(self):\n         if self.do_not_get_new_batch and self.current_inflight_req is None:\n             new_batch = None\ndiff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py\nindex 4815fbc56..4e81abec1 100644\n--- a/python/sglang/srt/model_executor/forward_batch_info.py\n+++ b/python/sglang/srt/model_executor/forward_batch_info.py\n@@ -97,14 +97,12 @@ class InputMetadata:\n         self.modalities = [r.modalities for r in reqs]\n \n     def compute_positions(self, batch: ScheduleBatch):\n-        position_ids_offsets = batch.position_ids_offsets\n-\n         if self.forward_mode.is_decode():\n             if True:\n                 self.positions = self.seq_lens - 1\n             else:\n                 # Deprecated\n-                self.positions = (self.seq_lens - 1) + position_ids_offsets\n+                self.positions = (self.seq_lens - 1) + batch.position_ids_offsets\n         else:\n             if True:\n                 self.positions = torch.tensor(\n@@ -119,7 +117,7 @@ class InputMetadata:\n                 )\n             else:\n                 # Deprecated\n-                position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()\n+                position_ids_offsets_cpu = batch.position_ids_offsets.cpu().numpy()\n                 self.positions = torch.tensor(\n                     np.concatenate(\n                         [\ndiff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py\nindex 049a43840..5096257be 100644\n--- a/python/sglang/srt/model_executor/model_runner.py\n+++ b/python/sglang/srt/model_executor/model_runner.py\n@@ -467,7 +467,6 @@ class ModelRunner:\n         logger.info(\"Capture cuda graph begin. This can take up to several minutes.\")\n         self.cuda_graph_runner = CudaGraphRunner(self)\n \n-    @torch.inference_mode()\n     def forward_decode(self, batch: ScheduleBatch):\n         if self.server_args.lora_paths is not None:\n             self.lora_manager.prepare_lora_batch(batch)\n@@ -481,7 +480,6 @@ class ModelRunner:\n             batch.input_ids, input_metadata.positions, input_metadata\n         )\n \n-    @torch.inference_mode()\n     def forward_extend(self, batch: ScheduleBatch):\n         input_metadata = InputMetadata.from_schedule_batch(self, batch)\n         if self.server_args.lora_paths is not None:\n@@ -500,7 +498,6 @@ class ModelRunner:\n                 get_embedding=True,\n             )\n \n-    @torch.inference_mode()\n     def forward_extend_multi_modal(self, batch: ScheduleBatch):\n         input_metadata = InputMetadata.from_schedule_batch(self, batch)\n         return self.model.forward(\ndiff --git a/scripts/playground/reference_hf.py b/scripts/playground/reference_hf.py\nindex 1eb7b0dd2..56c06a174 100644\n--- a/scripts/playground/reference_hf.py\n+++ b/scripts/playground/reference_hf.py\n@@ -45,7 +45,7 @@ def normal_text(args):\n         \"The capital of the United Kindom is\",\n         \"Today is a sunny day and I like\",\n     ]\n-    max_new_tokens = 17\n+    max_new_tokens = 16\n \n     torch.cuda.set_device(0)",
+  "apis": [
+    "ModelTpServer.exposed_step",
+    "ModelTpServer.forward_step",
+    "ScheduleBatch.prepare_for_extend",
+    "ModelRunner.forward_decode",
+    "ModelRunner.forward_extend"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/managers/tp_worker.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/model_executor/model_runner.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit makes non-trivial modifications in multiple source code files (not just tests or comments), adjusting loop iteration counts, refactoring how batch sizes are computed, and notably removing a call to cumulatively update penalizer tokens. Although the commit message mentions \"penalizer\", the changes address overhead issues from unnecessary computation, directly aiming to reduce performance overhead in the bench_latency and schedule_batch parts of the system. The modifications affect core APIs used for model decoding and scheduling in a general CPU environment, making it a performance optimization. Overall, based on the changes and intent, the commit meets the criteria for performance/optimization related modifications.",
+  "llm_api_reason": "This commit reduces unnecessary iterations in the decode loops of the bench_latency script and replaces use of the batch_size() helper with the length of the request list (len(self.reqs)) in ScheduleBatch. In addition, it adjusts the inference decorators on methods in the tensor parallel worker (ModelTpServer) and removes the torch.inference_mode decorator from several forward_* methods in ModelRunner and related metadata computation in InputMetadata. These changes affect the public runtime paths for decoding and scheduling work in the system."
+}

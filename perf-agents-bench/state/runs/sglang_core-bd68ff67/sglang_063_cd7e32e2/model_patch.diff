@@ -1,0 +1,52 @@
+diff --git a/python/sglang/srt/models/llama4.py b/python/sglang/srt/models/llama4.py
+index d933f27ae..26a99ec89 100644
+--- a/python/sglang/srt/models/llama4.py
++++ b/python/sglang/srt/models/llama4.py
+@@ -243,6 +243,11 @@ class Llama4Attention(nn.Module):
+ 
+         return attn_scale.unsqueeze(-1)
+ 
++    @torch.compile(dynamic=True, backend=get_compiler_backend())
++    def _mul_attn_scale(self, positions: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
++        attn_scale = self._get_attn_scale(positions)
++        return (q * attn_scale).to(q.dtype)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -250,17 +255,19 @@ class Llama4Attention(nn.Module):
+         forward_batch: ForwardBatch,
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
+-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        # Reduce the number of split ops: split qk and v first, then split q and k when needed
++        qk, v = qkv.split([self.q_size + self.kv_size, self.kv_size], dim=-1)
+ 
+         if self.rotary_emb is not None:
+-            q, k = self.rotary_emb(positions, q, k)
++            q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
++            q, k = self.rotary_emb(positions, q_view, k_view)
++        else:
++            q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+ 
+         if self.qk_norm is not None:
+             # TODO: support float
+-            q = q.reshape(-1, self.head_dim).contiguous().bfloat16()
+-            k = k.reshape(-1, self.head_dim).contiguous().bfloat16()
+-            q = self.qk_norm(q).to(q.dtype)
+-            k = self.qk_norm(k).to(k.dtype)
++            q = self.qk_norm(q.reshape(-1, self.head_dim).to(torch.bfloat16)).to(q.dtype)
++            k = self.qk_norm(k.reshape(-1, self.head_dim).to(torch.bfloat16)).to(k.dtype)
+             q = q.reshape(-1, self.q_size)
+             k = k.reshape(-1, self.kv_size)
+ 
+@@ -269,8 +276,7 @@ class Llama4Attention(nn.Module):
+         # while working at very long context
+         # https://arxiv.org/abs/2501.19399
+         if self.attn_temperature_tuning and not self.use_rope:
+-            attn_scale = self._get_attn_scale(positions)
+-            q = (q * attn_scale).to(q.dtype)
++            q = self._mul_attn_scale(positions, q)
+ 
+         attn_output = self.attn(q, k, v, forward_batch)
+         output, _ = self.o_proj(attn_output)

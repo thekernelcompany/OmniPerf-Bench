@@ -1,0 +1,50 @@
+{
+  "commit_hash": "e5db40dcbce67157e005f524bf6a5bea7dcb7f34",
+  "pr_url": "https://github.com/sgl-project/sglang/pull/1694",
+  "pr_date": "2024-10-17",
+  "timeline_text": "Copy link Contributor michaelfeil commented Oct 17, 2024 \u2022 edited Loading Uh oh! There was an error while loading. Please reload this page . Motivation Remove overhead in python from encoding the responses. Follow up to: #1688 Modifications Uses ORJson more wideley /v1/embedding from JsonRepsponse to ORJsonResponse Replaces UTF-8 encoding and f-string generation in streaming with simple byte concatenation. import orjson import json sample = { \"some\" : \"data\" , \"number\" : 123 , \"boolean\" : True , \"null\" : None , \"array\" : [ 1 , 2 , 3 ], \"object\" : { \"key\" : \"value\" }, \"non_unicode_key\" : \"\u4e2d\u6587\" , 1 : \"int key\" ,\n} # orjson returns utf-8 bytes ex1 = b\"data: \" + orjson . dumps ( sample , option = orjson . OPT_NON_STR_KEYS ) + b\" \\n \\n \" ex2 = f\"data: { json . dumps ( sample , ensure_ascii = False ) } \\n \\n \" . encode ( \"utf-8\" ) assert json . loads ( ex1 . decode ( \"utf-8\" )[ 6 : - 2 ]) == json . loads ( ex2 . decode ( \"utf-8\" )[ 6 : - 2 ]) > >> ex1 b'data: {\"some\":\"data\",\"number\":123,\"boolean\":true,\"null\":null,\"array\":[1,2,3],\"object\":{\"key\":\"value\"},\"non_unicode_key\":\" \\xe4 \\xb8 \\xad \\xe6 \\x96 \\x87 \",\"1\":\"int key\"} \\n \\n ' > >> ex2 b'data: {\"some\": \"data\", \"number\": 123, \"boolean\": true, \"null\": null, \"array\": [1, 2, 3], \"object\": {\"key\": \"value\"}, \"non_unicode_key\": \" \\xe4 \\xb8 \\xad \\xe6 \\x96 \\x87 \", \"1\": \"int key\"} \\n \\n ' Returning bytes (utf-8) in the generator is the same as the default StreamingResponse. https://github.com/encode/starlette/blob/46131a1af875a5be2190d91713a43ee80c8311c6/starlette/responses.py#L246 Checklist Format your code according to the Contributor Guide . Add unit tests as outlined in the Contributor Guide . [ x] Update documentation as needed, including docstrings or example tutorials. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions michaelfeil added 2 commits October 16, 2024 21:57 commit: server using orjson in streaming response df88abd revert: pre-commit ec97552 zhyncs reviewed Oct 17, 2024 View reviewed changes python/sglang/srt/server.py Outdated Show resolved Hide resolved Uh oh! There was an error while loading. Please reload this page . revert logging_config f664455 michaelfeil marked this pull request as ready for review October 17, 2024 06:35 revert array serialization in json (default behaviour) 4602b23 Hide details View details merrymercy merged commit e5db40d into sgl-project : main Oct 17, 2024 9 of 11 checks passed Uh oh! There was an error while loading. Please reload this page . Copy link Member zhyncs commented Oct 17, 2024 Hi @michaelfeil Welcome to join our slack channel https://join.slack.com/t/sgl-fru7574/shared_invite/zt-2ngly9muu-t37XiH87qvD~6rVBTkTEHw \ud83d\udc4d 1 michaelfeil reacted with thumbs up emoji All reactions \ud83d\udc4d 1 reaction Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . timethink pushed a commit\n        to timethink/sglang\n      that referenced\n      this pull request Mar 9, 2025 ORJson. Faster Json serialization ( sgl-project#1694 ) 210cd93 Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-11 19:00:19",
+  "has_lm_eval": false,
+  "has_performance": true,
+  "has_serving": false,
+  "has_general_test": false,
+  "test_details": "PERF",
+  "analysis_extracted_at": null,
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "ORJson. Faster Json serialization (#1694)",
+  "commit_message": "ORJson. Faster Json serialization (#1694)",
+  "commit_date": "2024-10-17T08:03:08-07:00",
+  "files_changed": [
+    "python/sglang/srt/server.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "commit_year": 2024,
+    "num_edited_lines": 20,
+    "num_files": 1,
+    "num_hunks": 3,
+    "num_non_test_edited_lines": 20,
+    "num_non_test_files": 1,
+    "num_test_files": 0,
+    "only_non_test_files": 1,
+    "only_test_files": 0
+  },
+  "diff_text": "diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py\nindex dea4a7d04..644cb2b8a 100644\n--- a/python/sglang/srt/server.py\n+++ b/python/sglang/srt/server.py\n@@ -28,7 +28,9 @@ import os\n import threading\n import time\n from http import HTTPStatus\n-from typing import Dict, List, Optional, Union\n+from typing import AsyncIterator, Dict, List, Optional, Union\n+\n+import orjson\n \n # Fix a bug of Python threading\n setattr(threading, \"_register_atexit\", lambda *args, **kwargs: None)\n@@ -192,14 +194,18 @@ async def generate_request(obj: GenerateReqInput, request: Request):\n     \"\"\"Handle a generate request.\"\"\"\n     if obj.stream:\n \n-        async def stream_results():\n+        async def stream_results() -> AsyncIterator[bytes]:\n             try:\n                 async for out in tokenizer_manager.generate_request(obj, request):\n-                    yield f\"data: {json.dumps(out, ensure_ascii=False)}\\n\\n\"\n+                    yield b\"data: \" + orjson.dumps(\n+                        out, option=orjson.OPT_NON_STR_KEYS\n+                    ) + b\"\\n\\n\"\n             except ValueError as e:\n                 out = {\"error\": {\"message\": str(e)}}\n-                yield f\"data: {json.dumps(out, ensure_ascii=False)}\\n\\n\"\n-            yield \"data: [DONE]\\n\\n\"\n+                yield b\"data: \" + orjson.dumps(\n+                    out, option=orjson.OPT_NON_STR_KEYS\n+                ) + b\"\\n\\n\"\n+            yield b\"data: [DONE]\\n\\n\"\n \n         return StreamingResponse(\n             stream_results(),\n@@ -260,13 +266,13 @@ async def openai_v1_chat_completions(raw_request: Request):\n     return await v1_chat_completions(tokenizer_manager, raw_request)\n \n \n-@app.post(\"/v1/embeddings\")\n+@app.post(\"/v1/embeddings\", response_class=ORJSONResponse)\n async def openai_v1_embeddings(raw_request: Request):\n     response = await v1_embeddings(tokenizer_manager, raw_request)\n     return response\n \n \n-@app.get(\"/v1/models\")\n+@app.get(\"/v1/models\", response_class=ORJSONResponse)\n def available_models():\n     \"\"\"Show available models.\"\"\"\n     served_model_names = [tokenizer_manager.served_model_name]",
+  "apis": [
+    "sglang.srt.server.generate_request",
+    "sglang.srt.server.openai_v1_embeddings",
+    "sglang.srt.server.available_models"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/api.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/sgl-router/py_src/sglang_router/router.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang/python/sglang/srt/layers/moe/router.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/sglang",
+  "llm_reason": "The commit modifies a source file (server.py) and replaces the built-in JSON serialization (using json.dumps) with orjson.dumps for faster serialization, which is a performance-oriented change. It affects high-level APIs that serve HTTP responses, enhancing the performance of data serialization on the CPU. This is not a mere refactoring or bug fix but a clear performance optimization of a core functionality (JSON handling). The changes are testable without GPU dependency and are general-purpose.",
+  "llm_api_reason": "This commit updates the server implementation to leverage ORJSON for faster JSON serialization. In the generate_request handler, the inner async generator function now returns bytes using orjson.dumps instead of json.dumps. Additionally, the HTTP endpoints for embeddings and available models now specify ORJSONResponse to ensure responses are serialized using ORJSON. These changes affect the public Python APIs exposed in the server module, specifically the generate_request, openai_v1_embeddings, and available_models endpoints."
+}
