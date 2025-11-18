@@ -58,7 +58,9 @@ def load_extraction(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", "/root/OmniPerf-Bench/third-party/effibench/prompts/claude_4_prompt_v2.md")
+# Default prompt template path - now located in src/test_scripts/prompts/
+_DEFAULT_PROMPT = os.path.join(os.path.dirname(__file__), "prompts", "claude_4_prompt_v2.md")
+PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", _DEFAULT_PROMPT)
 
 
 def read_prompt_template(path: str = PROMPT_TEMPLATE_PATH) -> str:

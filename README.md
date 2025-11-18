@@ -28,115 +28,106 @@ vllm_data = load_dataset('Inferencebench/vllm_dataset_with_test', split='test')
 OmniPerf-Bench/
 ├── README.md                    # Main project documentation
 ├── LICENSE                      # Project license
-├── pyproject.toml              # Python project configuration (gso package)
+├── CLAUDE.md                   # Claude Code integration guide
+├── pyproject.toml              # Python project configuration
 ├── uv.lock                     # Lock file for uv package manager
 ├── requirements.txt            # Python dependencies
 │
 ├── 🚀 commit_to_dataset.py     # 🔥 Main entry point: Single-commit dataset pipeline
-├── experiments.yaml            # Example experiment configuration
-├── 8d75fe48_test_case_generator_v2.py  # Example test generator script
-├── eg_test_generator.txt       # Example prompt template
+├── batch_commit_optimization.py # Batch processing for multiple commits
+├── run_commit_optimization.py  # Single commit optimization runner
+├── test_commit_optimization.sh # Test script for optimization pipeline
+│
+├── configs/                    # Configuration files
+│   ├── experiments.yaml        # Batch experiment configuration
+│   ├── single_commit_config.yaml # Single commit configuration
+│   └── bedrock_test.yaml      # AWS Bedrock test configuration
 │
 ├── src/                        # Main OmniPerf-Bench source code
 │   ├── collect/                # Collection framework for dataset generation
 │   │   ├── analysis/           # Commit and API analysis modules
 │   │   │   ├── commits.py      # Performance commit extraction
 │   │   │   ├── apis.py         # API identification and mapping
-│   │   │   ├── parser.py       # Code parsing utilities
 │   │   │   └── retriever.py    # RAG-based code retrieval
-│   │   ├── execute/            # Test execution and evaluation
-│   │   │   ├── execute.py      # SkyPilot-based distributed execution
-│   │   │   ├── evaluate.py     # Performance evaluation and metrics
-│   │   │   └── skymgr.py       # Sky cluster management
-│   │   ├── generate/           # Performance test generation
-│   │   │   ├── generate.py     # Main test generation pipeline
-│   │   │   ├── context.py      # Context extraction for tests
-│   │   │   └── prompt.py       # LLM prompts for test generation
-│   │   ├── scripts/            # Collection utility scripts
-│   │   └── build_dataset.py    # Main dataset building script
-│   ├── data/                   # Data models and parsing utilities
-│   │   ├── commit.py           # Commit data structures
-│   │   ├── dataset.py          # Dataset handling and validation
-│   │   ├── problem.py          # Problem instance definitions
-│   │   └── perf.py             # Performance measurement utilities
+│   │   └── execute/            # Test execution and evaluation
+│   │       └── skymgr.py       # Sky cluster management
 │   ├── harness/                # Evaluation harness for performance testing
-│   │   ├── environment/        # Docker environment management
-│   │   │   ├── docker_build.py # Docker image building
-│   │   │   └── patches.py      # Environment patches
 │   │   ├── grading/            # Grading and metrics evaluation
-│   │   │   ├── grade.py        # Performance grading logic
-│   │   │   └── metrics.py      # Evaluation metrics
 │   │   ├── plot/               # Visualization and plotting tools
-│   │   │   ├── plot_opt_k.py   # Opt@K performance plots
-│   │   │   └── plot_speedups.py # Speedup visualization
 │   │   ├── opt_at_k.py         # Main evaluation runner (Opt@K)
 │   │   ├── prepare_images.py   # Docker image preparation
 │   │   └── run_evaluation.py   # Evaluation orchestration
-│   ├── test_scripts/           # Test generation and analysis scripts
-│   │   ├── generate_test_generators.py # LLM test generator creation
-│   │   ├── performance_analyzer.py     # Performance analysis tools
-│   │   └── commit_analyzer.py          # Commit analysis utilities
-│   ├── utils/                  # General utility functions
-│   │   ├── io.py               # I/O utilities
-│   │   ├── multiprocess.py     # Multiprocessing helpers
-│   │   └── patch_parser.py     # Patch parsing utilities
-│   ├── constants.py            # Project constants
-│   └── logger.py              # Logging configuration
+│   └── test_scripts/           # Test generation utilities
+│       ├── prompts/            # LLM prompt templates
+│       │   ├── claude_4_prompt_v2.md
+│       │   └── focused_test_case_generator_prompt.md
+│       ├── generate_test_generators.py # LLM test generator creation
+│       ├── performance_analyzer.py     # Performance analysis tools
+│       └── commit_analyzer.py          # Commit analysis utilities
 │
 ├── data/                       # Generated datasets
 │   ├── Inferencebench.jsonl    # Inference benchmark dataset
-│   └── vllm_dataset_with_test.jsonl # vLLM performance dataset (282 problems)
+│   └── vllm_dataset_with_test.jsonl # vLLM dataset (282 problems)
 │
 ├── docs/                       # Documentation
-│   └── dataset_schema.md       # Canonical dataset schema specification
+│   ├── dataset_schema.md       # Canonical dataset schema specification
+│   ├── omni_commit_architecture.md # Detailed architecture documentation
+│   ├── TRAE_AGENT_REPLICATION_GUIDE.md # TRAE agent setup guide
+│   ├── COMMIT_OPTIMIZATION_README.md # Optimization workflow
+│   ├── QUICK_START_TRAE.md    # Quick start guide
+│   ├── AGENTS.md              # Agent overview
+│   ├── OPENHANDS_LLM_BENCHMARKING_INTEGRATION.md # OpenHands integration
+│   └── diagrams/              # Architecture diagrams
+│
+├── perf-agents-bench/         # Agent benchmarking framework
+│   ├── bench/                 # Core CLI and orchestration
+│   ├── tasks/                 # Task definitions (vllm.yaml, sglang.yaml)
+│   ├── config/                # Configuration files
+│   ├── state/                 # Execution state (empty - for new runs)
+│   ├── bench.yaml             # Benchmark configuration
+│   ├── requirements.txt       # Python dependencies
+│   ├── README.md              # Agent framework documentation
+│   └── ARCHITECTURE.md        # Agent system architecture
 │
 ├── third-party/               # External dependencies
-│   └── effibench/             # Original EffiBench repository integration
-│       ├── src/               # EffiBench source code
-│       ├── data/              # EffiBench datasets
-│       ├── prompts/           # LLM prompts for EffiBench
-│       └── requirements.txt   # EffiBench dependencies
+│   └── trae-agent/            # TRAE agent submodule
 │
-├── tools/                     # Utility scripts and patches
+├── tools/                     # Utility scripts
+│   ├── modal_runner/          # Modal.com execution integration
+│   ├── agent_to_modal.py      # Agent to Modal conversion
+│   ├── modal_sandbox.py       # Modal sandbox utilities
+│   ├── run_agent_pipeline.sh  # Agent pipeline runner
 │   ├── manual_review.py       # Manual dataset review utilities
-│   └── openrouter_patch.py    # OpenRouter API patches
+│   └── setup_opb.sh           # Environment setup script
 │
-└── misc/                      # Experimental data and results
-    ├── experiments/           # Experimental data and configurations
-    │   ├── commit_extractions/ # Extracted commit data (64 JSON files)
-    │   ├── commit_extractions_with_apis/ # Commit data with API mappings
-    │   ├── generated_test_generators_v4/ # Latest LLM test generators
-    │   ├── vllm/              # vLLM experiment data and results
-    │   │   ├── data/          # vLLM training data (parquet files)
-    │   │   ├── divided/       # Split result files for parallel processing
-    │   │   └── *.json         # vLLM experiment configurations and results
-    │   ├── sglang.yaml        # SGLang experiment configuration
-    │   └── vllm.yaml          # vLLM experiment configuration
-    └── results/               # Analysis results, logs, and reviews
-        ├── logs/              # Execution and system logs
-        └── reviews/           # Manual review files (CSV format)
+└── misc/experiments/          # Input data for benchmark generation
+    ├── commit_extractions_with_apis/ # vLLM commits (64 JSON files)
+    ├── sglang_commit_extractions_with_apis/ # SGLang commits (80 JSON files)
+    ├── generated_test_generators_v4/ # Pre-generated test scripts
+    └── eg_test_generator.txt  # Example prompt (47KB)
 ```
 
 **🎯 Repository Organization Philosophy:**
 
-This repository follows a **"no duplicates, clear entry points"** structure:
+This repository follows a **production-ready benchmark framework** structure:
 
 - **Root level** - Main entry points and configuration files
-- **`commit_to_dataset.py`** - 🔥 **PRIMARY ENTRY POINT** for single-commit dataset creation
-- **`src/`** - Organized source code by functionality (collect, harness, data, utils)  
-- **`misc/`** - Experimental data and working files (preserved as-is for research)
-- **`data/`** - Generated datasets ready for consumption
-- **`docs/`** - Documentation and schemas
+- **`commit_to_dataset.py`** - 🔥 **PRIMARY ENTRY POINT** for dataset generation
+- **`src/`** - Core framework code (collect, harness, test_scripts)
+- **`data/`** - Generated benchmark datasets (vLLM, SGLang)
+- **`docs/`** - Comprehensive documentation and architecture guides
+- **`perf-agents-bench/`** - Agent evaluation framework
+- **`misc/experiments/`** - Input data (commit extractions, pre-generated tests)
 
 **Key Components:**
-- **`commit_to_dataset.py`** - 🚀 **Main script**: Streamlined single-commit to dataset conversion  
-- **`src/collect/`** - Multi-stage dataset generation pipeline (commit extraction → API mapping → test generation → execution)
-- **`src/harness/`** - Docker-based evaluation system with Opt@K metrics and visualization
-- **`src/data/`** - Core data models and schema validation
-- **`experiments.yaml`** - Example configuration that works out-of-the-box
-- **`data/`** - Generated benchmark datasets ready for use
-- **`docs/dataset_schema.md`** - Canonical schema supporting GSO/SWE-Perf export views
-- **`misc/experiments/`** - Real experimental data including 64 extracted commits and vLLM dataset (282 problems)
+- **`commit_to_dataset.py`** - 🚀 **Main script**: Convert commits to benchmark datasets
+- **`src/test_scripts/`** - LLM-powered test generation with prompt templates
+- **`src/harness/`** - Docker-based evaluation system with Opt@K metrics
+- **`perf-agents-bench/`** - Framework for running and evaluating AI agents
+- **`configs/`** - Configuration templates that work out-of-the-box
+- **`data/`** - Production datasets: 282 vLLM problems, 80 SGLang problems
+- **`docs/`** - Architecture docs, integration guides, and schema specifications
+- **`misc/experiments/`** - Input data: 64 vLLM commits + 80 SGLang commits with API mappings
 
 ## 🚀 setup
 
