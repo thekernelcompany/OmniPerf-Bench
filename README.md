@@ -704,6 +704,134 @@ python -m bench.cli prepare \
        config_file: "${TRAE_CONFIG:-/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml}"
    ```
 
+### Codex Agent Integration (no web/doc search)
+
+Codex mirrors the TRAE wiring but enforces a strict offline policy—no MCP servers,
+web-search, or document lookup tools are allowed.
+
+1. **Install the Codex CLI dependencies (same venv as TRAE):**
+   ```bash
+   source bench-env/bin/activate
+   uv pip install -e third-party/trae-agent  # reused runtime
+   ```
+
+2. **Configure Codex:**
+
+   Edit `codex_agent/codex_config.yaml` (or create your own and set `CODEX_CONFIG`):
+   ```yaml
+   model_providers:
+     openai:
+       provider: openai
+       api_key: ${OPENAI_API_KEY}
+   models:
+     codex_agent_model:
+       model_provider: openai
+       model: gpt-4o
+       max_tokens: 8192
+       temperature: 0.4
+       parallel_tool_calls: true
+   allow_mcp_servers: []
+   mcp_servers: {}
+   agents:
+     trae_agent:
+       enable_lakeview: false
+       model: codex_agent_model
+       max_steps: 120
+       tools:
+         - bash
+         - str_replace_based_edit_tool
+         - sequentialthinking
+         - task_done
+   ```
+   > The CLI validates that no tool names include `search`, `lookup`, or `doc`
+   > keywords and that `allow_mcp_servers` remains empty, guaranteeing Codex will
+   > not attempt any web/document lookups.
+
+3. **Update bench.yaml paths:**
+   ```yaml
+   agents:
+     codex:
+       cli: "${CODEX_PYTHON:-/home/ubuntu/OmniPerf-Bench/bench-env/bin/python}"
+       args:
+         max_steps: 120
+       time_budget_minutes: 120
+       config_file: "${CODEX_CONFIG:-/home/ubuntu/OmniPerf-Bench/codex_agent/codex_config.yaml}"
+   ```
+
+4. **Run prepare with Codex (set `agents.default: "codex"` in `bench.yaml` first):**
+   ```bash
+   CODEX_PYTHON=bench-env/bin/python \
+   CODEX_CONFIG=$PWD/codex_agent/codex_config.yaml \
+   python -m bench.cli prepare \
+       tasks/vllm.yaml \
+       --from-plan state/plan_remaining.json \
+       --bench-cfg bench.yaml \
+       --max-workers 1 \
+       --resume
+   ```
+
+### Running the Codex CLI (local, no web/doc search)
+
+We also support the official Codex CLI as a drop-in agent. This route is useful when you already have Codex installed locally, a valid profile with billing enabled, and you want the bench harness to invoke it for every commit without any TRAE plumbing.
+
+1. **Install & authenticate Codex CLI**
+   ```bash
+   codex login  # configure your account/profile (e.g., kernel-bot)
+   ```
+   The bench run uses a dedicated home directory at `perf-agents-bench/.codex_home`.
+   Copy your Codex state there so non-interactive runs inherit your profile:
+   ```bash
+   mkdir -p perf-agents-bench/.codex_home
+   rsync -a ~/.codex/ perf-agents-bench/.codex_home/.codex/
+   ```
+
+2. **Build the plan from the 99 vLLM commit JSONs** (only needed once):
+   ```bash
+   cd /home/raven/coding-mess/kernel-corp/OmniPerf-Bench
+   python - <<'PY'
+   import json
+   from pathlib import Path
+
+   commit_dir = Path("hf_cache/alpha-vllm-99-commits/vllm_commits_separated")
+   items = []
+   for idx, path in enumerate(sorted(commit_dir.glob("*.json")), 1):
+       commit_hash = json.loads(path.read_text()).get("commit_hash") or path.stem
+       items.append({
+           "item_id": f"vllm_core-{idx:04d}",
+           "human": commit_hash,
+           "pre": "",
+           "pre_parent_index": 1,
+       })
+   plan = {
+       "repo": str((Path("vllm")).resolve()),
+       "task_id": "vllm_core",
+       "items": items,
+   }
+   out = Path("perf-agents-bench/state/plan_codex_full.json")
+   out.write_text(json.dumps(plan, indent=2))
+   print(f"Wrote {out} with {len(items)} commits")
+   PY
+   ```
+
+3. **Run the bench harness with Codex CLI** (one commit at a time to keep logs readable):
+   ```bash
+   cd perf-agents-bench
+   source ../bench-env/bin/activate
+   export CODEX_CLI=${CODEX_CLI:-codex}          # path to codex binary
+   export CODEX_PROFILE=${CODEX_PROFILE:-kernel-bot}  # Codex profile to use
+   python -m bench.cli prepare \
+       tasks/vllm.yaml \
+       --from-plan state/plan_codex_full.json \
+       --bench-cfg bench_codex.yaml \
+       --max-workers 1 \
+       --resume
+   ```
+
+   > `bench_codex.yaml` already sets `agents.default: "codex_cli"`. The harness
+   > launches `codex exec --cd <worktree> --sandbox danger-full-access -p $CODEX_PROFILE`
+   > for each commit, enforces our `.bench_scratch` policy, and writes all logs
+   > under `perf-agents-bench/state/runs/<run_id>/<item_id>/`.
+
 ### Understanding the Resume Logic
 
 **Current Limitation:** The built-in `--resume` flag only works within a single run session. Each time you run `prepare`, it creates a new `run_id` (e.g., `vllm_core-abc12345`), and resume only checks that specific directory.

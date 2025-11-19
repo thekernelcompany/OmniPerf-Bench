@@ -24,6 +24,10 @@ class JournalWriter:
         (self.dir / "trae_stdout.txt").write_text(stdout)
         (self.dir / "trae_stderr.txt").write_text(stderr)
 
+    def write_codex_logs(self, stdout: str, stderr: str):
+        (self.dir / "codex_stdout.txt").write_text(stdout)
+        (self.dir / "codex_stderr.txt").write_text(stderr)
+
     def write_journal(self, payload: Dict[str, Any]):
         payload.setdefault("timestamps", {})
         payload["timestamps"].setdefault("written", time.time())
@@ -38,4 +42,3 @@ class JournalWriter:
             return data.get("status") == "success"
         except Exception:
             return False
-

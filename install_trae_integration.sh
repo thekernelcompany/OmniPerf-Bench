@@ -170,19 +170,40 @@ EOF
     print_success "Created default TRAE config"
 fi
 
+# Check Codex config
+CODEX_CONFIG="codex_agent/codex_config.yaml"
+if [ -f "$CODEX_CONFIG" ]; then
+    if grep -qi "search" "$CODEX_CONFIG" || grep -qi "lookup" "$CODEX_CONFIG"; then
+        print_warning "Codex config references search/doc lookup tools. Remove them to enforce offline policy."
+    else
+        print_success "Codex config found (offline mode enforced): $CODEX_CONFIG"
+    fi
+else
+    print_warning "Codex config not found at $CODEX_CONFIG"
+fi
+
 # Check bench config
 BENCH_CONFIG="perf-agents-bench/bench_test.yaml"
 if [ -f "$BENCH_CONFIG" ]; then
     # Check if config file path is correct
     CURRENT_PATH=$(pwd)
     EXPECTED_CONFIG_PATH="$CURRENT_PATH/third-party/trae-agent/trae_config.yaml"
+    EXPECTED_CODEX_CONFIG_PATH="$CURRENT_PATH/codex_agent/codex_config.yaml"
     
     if grep -q "$EXPECTED_CONFIG_PATH" "$BENCH_CONFIG"; then
         print_success "Bench config has correct TRAE config path"
     else
         print_warning "Bench config may have incorrect TRAE config path"
         print_status "Expected path: $EXPECTED_CONFIG_PATH"
-        print_status "Please verify the config_file path in $BENCH_CONFIG"
+        print_status "Please verify the TRAE config_file path in $BENCH_CONFIG"
+    fi
+
+    if grep -q "$EXPECTED_CODEX_CONFIG_PATH" "$BENCH_CONFIG"; then
+        print_success "Bench config has correct Codex config path"
+    else
+        print_warning "Bench config may have incorrect Codex config path"
+        print_status "Expected path: $EXPECTED_CODEX_CONFIG_PATH"
+        print_status "Please verify the Codex config_file path in $BENCH_CONFIG"
     fi
 else
     print_error "Bench config not found: $BENCH_CONFIG"

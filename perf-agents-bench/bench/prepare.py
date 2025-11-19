@@ -518,6 +518,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
 
             # Select agent
             default_agent = str(self.cfg["agents"].get("default", "openhands"))
+            agent_label = default_agent.upper()
             branch = f"agent/{task_cfg['id']}/{human[:8]}"
             returncode = -1
             stdout_content = ""
@@ -535,14 +536,15 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 iterations = args_cfg.get("iterations", 50)
                 max_budget = args_cfg.get("max_budget_per_task", 10.0)
                 use_python_api = bool(args_cfg.get("use_python_api", True))
-            else:
-                # Trae Agent configuration
-                trae_cfg = self.cfg["agents"].get("trae", {})
-                cli = trae_cfg.get("cli", "python")
-                time_budget = int(self.cfg["agents"].get("time_budget_minutes", 60))
-                args_cfg = trae_cfg.get("args", {})
+            elif default_agent in {"trae", "codex", "codex_cli"}:
+                agent_cfg = self.cfg["agents"].get(default_agent, {})
+                cli = agent_cfg.get("cli", "python")
+                time_budget = int(agent_cfg.get("time_budget_minutes", 60))
+                args_cfg = agent_cfg.get("args", {})
                 iterations = int(args_cfg.get("max_steps", 50))
-                trae_config_file = trae_cfg.get("config_file") or None
+                trae_config_file = agent_cfg.get("config_file") or None
+            else:
+                raise NotImplementedError(f"Unknown agent default: {default_agent}")
 
             # Execute and capture logs (OpenHands containerized path)
             if default_agent == "openhands" and (agent_cfg.get("container_image") or None):
@@ -604,23 +606,50 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         "-b", str(max_budget)
                     ]
 
-            elif default_agent == "trae":
-                # Run Trae Agent (local). Ensure PYTHONPATH includes third-party/trae-agent
-                cmd = [
-                    cli, "-m", "trae_agent.cli", "run",
-                    "--file", str(task_file),
-                    "--working-dir", str(wt_dir),
-                    "--max-steps", str(iterations),
-                    "--must-patch",
-                    "--patch-path", str((jw.dir / "model_patch.diff").resolve()),
-                    "--trajectory-file", str((jw.dir / "trajectory.json").resolve()),
-                ]
-                if trae_config_file:
-                    cmd.extend(["--config-file", str(trae_config_file)])
-                logger.info(f"Trae agent command: {' '.join(map(str, cmd))}")
-                logger.info(f"Trae config file: {trae_config_file}")
-            else:
-                raise NotImplementedError(f"Unknown agent default: {default_agent}")
+            elif default_agent in {"trae", "codex", "codex_cli"}:
+                # Run Trae/Codex (module) or Codex CLI
+                if default_agent == "trae":
+                    cmd = [
+                        cli, "-m", "trae_agent.cli", "run",
+                        "--file", str(task_file),
+                        "--working-dir", str(wt_dir),
+                        "--max-steps", str(iterations),
+                        "--must-patch",
+                        "--patch-path", str((jw.dir / "model_patch.diff").resolve()),
+                        "--trajectory-file", str((jw.dir / "trajectory.json").resolve()),
+                    ]
+                    if trae_config_file:
+                        cmd.extend(["--config-file", str(trae_config_file)])
+                elif default_agent == "codex":
+                    cmd = [
+                        cli, "-m", "codex_agent.cli", "run",
+                        "--file", str(task_file),
+                        "--working-dir", str(wt_dir),
+                        "--max-steps", str(iterations),
+                        "--must-patch",
+                        "--patch-path", str((jw.dir / "model_patch.diff").resolve()),
+                        "--trajectory-file", str((jw.dir / "trajectory.json").resolve()),
+                    ]
+                    if trae_config_file:
+                        cmd.extend(["--config-file", str(trae_config_file)])
+                else:  # codex_cli
+                    # Invoke the locally installed Codex CLI directly using non-interactive exec
+                    # Read task prompt content to pass as a single PROMPT argument
+                    try:
+                        prompt_text = Path(task_file).read_text()
+                    except Exception:
+                        prompt_text = ""
+                    profile = args_cfg.get("profile") or os.environ.get("CODEX_PROFILE")
+                    cmd = [
+                        cli, "exec",
+                        "--cd", str(wt_dir),
+                        "--sandbox", "danger-full-access",
+                    ]
+                    if profile:
+                        cmd += ["-p", str(profile)]
+                    cmd += [prompt_text]
+                logger.info(f"{default_agent} agent command: {' '.join(map(str, cmd))}")
+                logger.info(f"{default_agent} config file: {trae_config_file}")
 
             logger.info(f"Initializing {default_agent} execution")
             logger.info(f"Working directory: {wt_dir}")
@@ -658,6 +687,17 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 # Merge env vars from .env into subprocess environment
                 env = os.environ.copy()
                 env.update(env_vars)
+                # Strictly disallow web/doc search envs reaching the agent
+                for k in [
+                    "GOOGLE_API_KEY",
+                    "SERPAPI_API_KEY",
+                    "BING_API_KEY",
+                    "TAVILY_API_KEY",
+                    "BRAVE_API_KEY",
+                    "PERPLEXITY_API_KEY",
+                ]:
+                    if k in env:
+                        env.pop(k, None)
                 
                 # Log environment variables for debugging
                 logger.info(f"Environment variables loaded from .env: {len(env_vars)}")
@@ -680,21 +720,31 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 env["PYTHONUNBUFFERED"] = "1"
                 # Modern sandbox volume mapping (replaces deprecated WORKSPACE_* envs)
                 env["SANDBOX_VOLUMES"] = f"{wt_dir}:/workspace:rw"
-                # Ensure Trae Agent module is discoverable when used
-                trae_repo_path = str(Path(__file__).resolve().parents[2] / "third-party" / "trae-agent")
-                env["PYTHONPATH"] = (trae_repo_path + os.pathsep + env.get("PYTHONPATH", "")).rstrip(os.pathsep)
+                # Ensure Trae/Codex agent modules are discoverable when used
+                project_root = Path(__file__).resolve().parents[2]
+                trae_repo_path = str(project_root / "third-party" / "trae-agent")
+                codex_repo_path = str(project_root)
+                py_paths = [trae_repo_path, codex_repo_path, env.get("PYTHONPATH", "")]
+                env["PYTHONPATH"] = os.pathsep.join([p for p in py_paths if p]).rstrip(os.pathsep)
                 # Prefer non-interactive behavior and disable auto-continue loops (best-effort)
                 env["OPENHANDS_AUTO_CONTINUE"] = "false"
                 env["AUTO_CONTINUE"] = "false"
                 # Set max empty responses to prevent infinite loops
                 env["MAX_EMPTY_RESPONSES"] = "2"
-                # Enable Trae Agent startup diagnostics
+                # Enable agent startup diagnostics
                 env["TRAE_LOG_STARTUP"] = "1"
                 # Force agent to take action instead of asking questions
                 env["AGENT_MODE"] = "action_oriented"
                 # Add more logging to see what's happening
                 env["LOG_LEVEL"] = "DEBUG"
                 env["OPENHANDS_LOG_LEVEL"] = "DEBUG"
+                # Ensure Codex CLI can write state under the workspace (avoids HOME permissions issues)
+                if default_agent == "codex_cli":
+                    codex_home = Path(__file__).resolve().parents[1] / ".codex_home"
+                    codex_home.mkdir(parents=True, exist_ok=True)
+                    env["HOME"] = str(codex_home)
+                    env["XDG_STATE_HOME"] = str(codex_home / ".xdg" / "state")
+                    env["XDG_CACHE_HOME"] = str(codex_home / ".xdg" / "cache")
                 if default_agent == "openhands":
                     # Provide an explicit headless user message to avoid empty auto-continue loops
                     try:
@@ -872,14 +922,17 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     stderr_content = ""
                     returncode = 0
                 else:
-                    # Execute Trae Agent with real-time logging
-                    logger.info(f"Executing Trae Agent subprocess with timeout: {time_budget * 60}s")
+                    # Execute Trae/Codex Agent with real-time logging
+                    logger.info(f"Executing {agent_label} subprocess with timeout: {time_budget * 60}s")
                     logger.debug(f"Working directory: {wt_dir}")
                     logger.debug(f"Environment OPENAI_API_KEY present: {bool(env.get('OPENAI_API_KEY'))}")
                     logger.debug(f"Environment PYTHONPATH: {env.get('PYTHONPATH', 'NOT_SET')}")
                     
                     # Point agent step logs to run directory file
-                    env["TRAE_STEP_LOG_FILE"] = str((jw.dir / "trae_steps.log").resolve())
+                    step_log_path = str((jw.dir / "trae_steps.log").resolve())
+                    env["TRAE_STEP_LOG_FILE"] = step_log_path
+                    if default_agent == "codex":
+                        env["CODEX_STEP_LOG_FILE"] = step_log_path
                     
                     # Use Popen for real-time output streaming (same as OpenHands)
                     proc = subprocess.Popen(
@@ -905,7 +958,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     while proc.poll() is None:
                         # Check for timeout
                         if time.time() - start_time > timeout_seconds:
-                            logger.warning(f"TRAE Agent timeout after {timeout_seconds}s, terminating process")
+                            logger.warning(f"{agent_label} agent timeout after {timeout_seconds}s, terminating process")
                             proc.terminate()
                             proc.wait(timeout=5)
                             break
@@ -917,14 +970,14 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                                 if line:
                                     line = line.rstrip()
                                     stdout_lines.append(line)
-                                    logger.info(f"TRAE STDOUT: {line}")
+                                    logger.info(f"{agent_label} STDOUT: {line}")
                                     sys.stdout.flush()
                             elif stream == proc.stderr:
                                 line = stream.readline()
                                 if line:
                                     line = line.rstrip()
                                     stderr_lines.append(line)
-                                    logger.warning(f"TRAE STDERR: {line}")
+                                    logger.warning(f"{agent_label} STDERR: {line}")
                                     sys.stderr.flush()
                     
                     # Read any remaining output
@@ -933,31 +986,36 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         for line in remaining_stdout.split('\n'):
                             if line.strip():
                                 stdout_lines.append(line.strip())
-                                logger.info(f"TRAE STDOUT: {line.strip()}")
+                                logger.info(f"{agent_label} STDOUT: {line.strip()}")
                     if remaining_stderr:
                         for line in remaining_stderr.split('\n'):
                             if line.strip():
                                 stderr_lines.append(line.strip())
-                                logger.warning(f"TRAE STDERR: {line.strip()}")
+                                logger.warning(f"{agent_label} STDERR: {line.strip()}")
                     
                     stdout_content = '\n'.join(stdout_lines)
                     stderr_content = '\n'.join(stderr_lines)
                     returncode = proc.returncode
                     
                     dur = time.time() - t0
-                    logger.info(f"TRAE Agent execution completed in {dur:.1f} seconds")
+                    logger.info(f"{agent_label} agent execution completed in {dur:.1f} seconds")
                     logger.info(f"Process return code: {returncode}")
                     logger.info(f"Total stdout lines: {len(stdout_lines)}")
                     logger.info(f"Total stderr lines: {len(stderr_lines)}")
                     
-                    # Save explicit Trae Agent logs for review
+                    # Save explicit agent logs for review
                     try:
-                        jw.write_trae_logs(stdout_content, stderr_content)
+                        if default_agent == "trae":
+                            jw.write_trae_logs(stdout_content, stderr_content)
+                        elif default_agent == "codex":
+                            jw.write_codex_logs(stdout_content, stderr_content)
+                        else:
+                            jw.write_openhands_logs(stdout_content, stderr_content)
                     except Exception:
-                        logger.warning("Failed to write Trae Agent logs")
+                        logger.warning("Failed to write agent logs")
 
                     # Determine success based on task completion, not just return code
-                    # TRAE agent may have internal API errors but still complete the task successfully
+                    # Agents may have internal API errors but still complete the task successfully
                     task_completed = False
                     if returncode == 0:
                         task_completed = True
@@ -968,21 +1026,19 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                                 "git", "log", "--oneline", f"{pre}..HEAD"
                             ], cwd=wt_dir, text=True).strip()
                             if commits:
-                                logger.info(f"TRAE agent made commits despite API errors: {len(commits.splitlines())} commits")
+                                logger.info(f"{agent_label} agent made commits despite API errors: {len(commits.splitlines())} commits")
                                 task_completed = True
                         except Exception:
                             pass
                     
                     if not task_completed:
-                        logger.error(f"Trae Agent failed with return code {returncode}")
+                        logger.error(f"{agent_label} agent failed with return code {returncode}")
                         logger.error(f"Stdout: {stdout_content}")
                         logger.error(f"Stderr: {stderr_content}")
                 
-                jw.write_openhands_logs(stdout_content, stderr_content)
-                
                 # Determine status based on actual task completion, not just return code
-                if default_agent == "trae":
-                    # For TRAE, check if commits were made or files changed
+                if default_agent in {"trae", "codex"}:
+                    # For Trae/Codex, check if commits were made or files changed
                     status = "success" if task_completed else "error"
                 else:
                     # For OpenHands, use return code
@@ -995,7 +1051,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 if default_agent == "openhands":
                     changed = get_changed_files(wt_dir, pre, "HEAD")
                 else:
-                    # For Trae Agent, get changed files from git commit in worktree
+                    # For Trae/Codex, get changed files from git commit in worktree
                     try:
                         # Get files changed in the latest commit made by agent
                         changed = subprocess.check_output([
@@ -1065,8 +1121,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
                 if len(changed) == 0:
                     logger.warning("No file changes detected.")
-                    # For TRAE agent, check if this is due to detection bug vs actual no changes
-                    if default_agent == "trae":
+                    # For Trae/Codex agent, check if this is due to detection bug vs actual no changes
+                    if default_agent in {"trae", "codex"}:
                         # Check if there are any commits made by agent
                         try:
                             commits = subprocess.check_output([
@@ -1109,7 +1165,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     except Exception:
                         diff_text = ""
                 else:
-                    # Use Trae Agent patch from worktree (primary) or run directory (fallback)
+                    # Use Trae/Codex patch from worktree (primary) or run directory (fallback)
                     patch_path_wt = wt_dir / "model_patch.diff"
                     patch_path_run = jw.dir / "model_patch.diff"
                     
