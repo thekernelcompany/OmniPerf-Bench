@@ -1,0 +1,51 @@
+{
+  "commit_hash": "25ebed2f8ca6d747d63f2be9ede023c561851ac8",
+  "pr_url": "https://github.com/vllm-project/vllm/pull/11214",
+  "pr_date": "2024-12-15",
+  "timeline_text": "Copy link Collaborator WoosukKwon commented Dec 15, 2024 No description provided. Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . All reactions [V1][Minor] Cache np arange to reduce input preparation overhead … 0e1d13d Signed-off-by: Woosuk Kwon <woosuk.kwon@berkeley.edu> WoosukKwon added\n  the ready ONLY add when PR is ready to merge/full CI is needed label Dec 15, 2024 WoosukKwon requested review from robertgshaw2-redhat , njhill , ywang96 , comaniac and alexm-redhat as code owners December 15, 2024 18:57 Copy link github-actions bot commented Dec 15, 2024 👋 Hi! Thank you for contributing to the vLLM project. Just a reminder: PRs would not trigger full CI run by default. Instead, it would only run fastcheck CI which starts running only a small and essential subset of CI tests to quickly catch errors. You can run other CI tests on top of those by going to your fastcheck build on Buildkite UI (linked in the PR checks section) and unblock them. If you do not have permission to unblock, ping simon-mo or khluu to add you in our Buildkite org. Once the PR is approved and ready to go, your PR reviewer(s) can run CI to test the changes comprehensively before merging. To run CI, PR reviewers can do one of these: Add ready label to the PR Enable auto-merge. 🚀 All reactions Sorry, something went wrong. Uh oh! There was an error while loading. Please reload this page . Hide details View details WoosukKwon merged commit 25ebed2 into main Dec 15, 2024 66 checks passed Uh oh! There was an error while loading. Please reload this page . WoosukKwon deleted the v1-arange branch December 15, 2024 21:33 Sign up for free to join this conversation on GitHub .\n    Already have an account? Sign in to comment",
+  "timeline_extracted_at": "2025-09-07 17:47:24",
+  "has_lm_eval": false,
+  "has_performance": false,
+  "has_serving": false,
+  "has_general_test": true,
+  "test_details": "TEST: test, CI, CI",
+  "analysis_extracted_at": "2025-09-07 17:47:24",
+  "models": [
+    "N/A"
+  ],
+  "lm_eval_commands": null,
+  "perf_command": null,
+  "commit_subject": "[V1][Minor] Cache np arange to reduce input preparation overhead (#11214)",
+  "commit_message": "[V1][Minor] Cache np arange to reduce input preparation overhead (#11214)\n\nSigned-off-by: Woosuk Kwon <woosuk.kwon@berkeley.edu>",
+  "commit_date": "2024-12-15T13:33:00-08:00",
+  "files_changed": [
+    "vllm/v1/worker/gpu_model_runner.py"
+  ],
+  "functions_changed": [],
+  "stats": {
+    "num_test_files": 0,
+    "num_non_test_files": 1,
+    "only_test_files": 0,
+    "only_non_test_files": 1,
+    "num_files": 1,
+    "num_hunks": 2,
+    "num_edited_lines": 12,
+    "num_non_test_edited_lines": 12,
+    "commit_year": 2024
+  },
+  "diff_text": "diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py\nindex abcd4b007..67166fb05 100644\n--- a/vllm/v1/worker/gpu_model_runner.py\n+++ b/vllm/v1/worker/gpu_model_runner.py\n@@ -118,6 +118,12 @@ class GPUModelRunner:\n             dtype=self.dtype,\n             device=self.device)\n \n+        # OPTIMIZATION: Cache the tensors rather than creating them every step.\n+        self.arange_np = np.arange(max(self.max_num_reqs, self.max_model_len),\n+                                   dtype=np.int32)\n+        # NOTE(woosuk): These tensors are \"stateless\", i.e., they are literally\n+        # a faster version of creating a new tensor every time. Thus, we should\n+        # not make any assumptions about the values in these tensors.\n         self.input_ids_cpu = torch.zeros(self.max_num_tokens,\n                                          dtype=torch.int32,\n                                          device=\"cpu\",\n@@ -269,11 +275,13 @@ class GPUModelRunner:\n \n         # Get request indices.\n         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]\n-        req_indices = np.repeat(np.arange(num_reqs), num_scheduled_tokens)\n+        req_indices = np.repeat(self.arange_np[:num_reqs],\n+                                num_scheduled_tokens)\n \n         # Get batched arange.\n         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]\n-        arange = np.concatenate([np.arange(n) for n in num_scheduled_tokens])\n+        arange = np.concatenate(\n+            [self.arange_np[:n] for n in num_scheduled_tokens])\n \n         # Get positions.\n         positions_np = self.positions_np[:total_num_scheduled_tokens]",
+  "apis": [
+    "GPUModelRunner.__init__",
+    "GPUModelRunner._prepare_inputs"
+  ],
+  "affected_paths": [
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm/vllm/v1/worker/gpu_model_runner.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm/vllm/engine/llm_engine.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm/vllm/v1/engine/llm_engine.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm/vllm/entrypoints/api_server.py",
+    "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm/vllm/entrypoints/openai/api_server.py"
+  ],
+  "repo_path": "/Users/fortuna/buckets/gso_bucket/analysis/repos/vllm",
+  "llm_reason": "The commit modifies a non-test file (gpu_model_runner.py) with non-trivial source code changes. The changes cache the creation of np.arange arrays instead of recreating them every step, which reduces overhead during input preparation. Although the commit message mentions caching, the intention is to optimize performance by reducing repetitive computation on the CPU. The optimizations are applied to high-level API routines (the API handling model runner) and are testable without a GPU dependency. Overall, the commit meets the conditions for a performance/optimization related commit.",
+  "llm_api_reason": "This commit introduces a micro-optimization in the GPUModelRunner class by pre-computing and caching a fixed np.arange array (stored in the instance variable “self.arange_np”) during initialization. It then reuses slices of this cached array instead of repeatedly computing new np.arange arrays in the _prepare_inputs method when calculating request indices and per‐request arange values. This change improves the input preparation performance without modifying the external API of GPUModelRunner."
+}
