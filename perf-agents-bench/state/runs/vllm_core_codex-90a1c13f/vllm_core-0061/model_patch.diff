@@ -1,0 +1,216 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 07d51acf9..ea7aefc8d 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+-from typing import Optional, Tuple
++from typing import Optional, Tuple, Dict, Tuple as Tup
+ 
+ import torch
+ import triton
+@@ -14,6 +14,41 @@ def ceil_div(a, b):
+     return (a + b - 1) // b
+ 
+ 
++# Lightweight buffer cache to reduce frequent GPU allocations for
++# per-expert temporary buffers used by the Triton path.
++# Keyed by (device, num_experts) since shapes depend only on num_experts.
++_BUFFER_CACHE: Dict[Tup[torch.device, int], Tup[torch.Tensor, torch.Tensor]] = {}
++
++
++def _get_moe_temp_buffers(topk_ids: torch.Tensor,
++                          num_experts: int) -> Tup[torch.Tensor, torch.Tensor]:
++    device = topk_ids.device
++    key = (device, num_experts)
++    tokens_cnts: Optional[torch.Tensor]
++    cumsum: Optional[torch.Tensor]
++    pair = _BUFFER_CACHE.get(key)
++    if pair is None:
++        tokens_cnts = topk_ids.new_empty((num_experts + 1, num_experts),
++                                         dtype=torch.int32)
++        cumsum = topk_ids.new_empty((num_experts + 1, ), dtype=torch.int32)
++        _BUFFER_CACHE[key] = (tokens_cnts, cumsum)
++    else:
++        tokens_cnts, cumsum = pair
++        # In case buffers were moved/freed externally, re-create.
++        if tokens_cnts.device != device or not tokens_cnts.is_contiguous():
++            tokens_cnts = topk_ids.new_empty((num_experts + 1, num_experts),
++                                             dtype=torch.int32)
++            _BUFFER_CACHE[key] = (tokens_cnts, cumsum)
++        if cumsum.device != device or not cumsum.is_contiguous():
++            cumsum = topk_ids.new_empty((num_experts + 1, ),
++                                        dtype=torch.int32)
++            _BUFFER_CACHE[key] = (tokens_cnts, cumsum)
++    # Reset contents for this invocation.
++    tokens_cnts.zero_()
++    cumsum.zero_()
++    return tokens_cnts, cumsum
++
++
+ @triton.jit
+ def moe_align_block_size_stage1(
+     topk_ids_ptr,
+@@ -109,12 +144,8 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts, )
+-    tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+-                              dtype=torch.int32,
+-                              device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
+-                         dtype=torch.int32,
+-                         device=topk_ids.device)
++    # Reuse zeroed buffers to reduce allocation overhead.
++    tokens_cnts, cumsum = _get_moe_temp_buffers(topk_ids, num_experts)
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -201,19 +232,16 @@ def moe_align_block_size(
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+     if pad_sorted_ids:
+         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+-    sorted_ids = torch.empty((max_num_tokens_padded, ),
+-                             dtype=torch.int32,
+-                             device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
++    # Initialize to a sentinel in a single op.
++    sorted_ids = torch.full((max_num_tokens_padded, ),
++                            int(topk_ids.numel()),
++                            dtype=torch.int32,
++                            device=topk_ids.device)
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.
+-    expert_ids = torch.zeros((max_num_m_blocks, ),
+-                             dtype=torch.int32,
+-                             device=topk_ids.device)
+-    num_tokens_post_pad = torch.empty((1),
+-                                      dtype=torch.int32,
+-                                      device=topk_ids.device)
++    expert_ids = topk_ids.new_zeros((max_num_m_blocks, ), dtype=torch.int32)
++    num_tokens_post_pad = topk_ids.new_empty((1, ), dtype=torch.int32)
+     if num_experts >= 224:
+         if envs.VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON or num_experts != 256:
+             moe_align_block_size_triton(
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 43f30f710..f2beb091d 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -67,11 +67,11 @@ class BlockPool:
+         Returns:
+             The cached block if it exists, or None.
+         """
+-        if block_hash in self.cached_block_hash_to_block:
+-            first_block_id = list(
+-                self.cached_block_hash_to_block[block_hash].keys())[0]
+-            return self.cached_block_hash_to_block[block_hash][first_block_id]
+-        return None
++        cached_blocks = self.cached_block_hash_to_block.get(block_hash)
++        if not cached_blocks:
++            return None
++        first_block_id = next(iter(cached_blocks))
++        return cached_blocks[first_block_id]
+ 
+     def cache_full_blocks(
+         self,
+@@ -102,11 +102,11 @@ class BlockPool:
+             block_size: Number of tokens in each block.
+             hash_fn: The hash function to use for block hashes.
+         """
+-        if num_cached_blocks == num_full_blocks:
+-            return
++        cdict = self.cached_block_hash_to_block
+         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
+         assert len(block_hashes) >= num_cached_blocks
+         new_block_hashes = block_hashes[num_cached_blocks:]
++        new_block_hashes_len = len(new_block_hashes)
+ 
+         # Update the new blocks with the block hashes through the chain.
+         if num_cached_blocks == 0:
+@@ -116,10 +116,11 @@ class BlockPool:
+             assert prev_block.block_hash is not None
+             prev_block_hash_value = prev_block.block_hash.hash_value
+ 
++        all_token_ids = request.all_token_ids
+         for i, blk in enumerate(new_full_blocks):
+             assert blk.block_hash is None
+ 
+-            if i < len(new_block_hashes):
++            if i < new_block_hashes_len:
+                 # The block hash may already be computed in
+                 # "get_computed_blocks" if the tokens are not generated by
+                 # this request (either the prompt tokens or the previously
+@@ -132,8 +133,7 @@ class BlockPool:
+                 blk_idx = num_cached_blocks + i
+                 start_token_idx = blk_idx * block_size
+                 end_token_idx = (blk_idx + 1) * block_size
+-                block_tokens = request.all_token_ids[
+-                    start_token_idx:end_token_idx]
++                block_tokens = all_token_ids[start_token_idx:end_token_idx]
+                 assert len(block_tokens) == block_size, (
+                     f"Expected {block_size} tokens, got "
+                     f"{len(block_tokens)} at {blk_idx}th block for request "
+@@ -152,7 +152,7 @@ class BlockPool:
+ 
+             # Update and added the full block to the cache.
+             blk.block_hash = block_hash
+-            self.cached_block_hash_to_block[block_hash][blk.block_id] = blk
++            cdict[block_hash][blk.block_id] = blk
+             prev_block_hash_value = block_hash.hash_value
+ 
+     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+@@ -171,19 +171,19 @@ class BlockPool:
+                 f"Cannot get {num_blocks} free blocks from the pool")
+ 
+         ret: list[KVCacheBlock] = []
+-        idx = 0
+-        while idx < num_blocks:
++        free_q = self.free_block_queue
++        maybe_evict = self._maybe_evict_cached_block
++        for _ in range(num_blocks):
+             # First allocate blocks.
+-            curr_block = self.free_block_queue.popleft()
++            curr_block = free_q.popleft()
+             assert curr_block.ref_cnt == 0
+ 
+             # If the block is cached, evict it.
+             if self.enable_caching:
+-                self._maybe_evict_cached_block(curr_block)
++                maybe_evict(curr_block)
+ 
+             curr_block.incr_ref()
+             ret.append(curr_block)
+-            idx += 1
+ 
+         return ret
+ 
+@@ -199,15 +199,18 @@ class BlockPool:
+             True if the block is evicted, False otherwise.
+         """
+         block_hash = block.block_hash
+-        if block_hash and block_hash in self.cached_block_hash_to_block:
+-            block.reset_hash()
+-            del self.cached_block_hash_to_block[block_hash][block.block_id]
++        if not block_hash:
++            return False
++        cached_blocks = self.cached_block_hash_to_block.get(block_hash)
++        if not cached_blocks:
++            return False
++        block.reset_hash()
++        cached_blocks.pop(block.block_id, None)
+ 
+-            if len(self.cached_block_hash_to_block[block_hash]) == 0:
+-                del self.cached_block_hash_to_block[block_hash]
++        if not cached_blocks:
++            self.cached_block_hash_to_block.pop(block_hash, None)
+ 
+-            return True
+-        return False
++        return True
+ 
+     def touch(self, blocks: list[KVCacheBlock]) -> None:
+         """Touch a block increases its reference count by 1, and may remove

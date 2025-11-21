@@ -1,0 +1,63 @@
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 24ddd35ab..076eb9be9 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -50,11 +50,14 @@ def decode_tokens(
+     `skip_special_tokens=None` means to use the backend's default
+     settings.
+     """
++    # Prefer fast/private decode path when available to avoid extra
++    # list conversions or Python-side overhead in some tokenizers.
++    decode_method = getattr(tokenizer, "_decode", tokenizer.decode)
+     if skip_special_tokens is not None:
+-        return tokenizer.decode(token_ids,
+-                                skip_special_tokens=skip_special_tokens)
++        return decode_method(token_ids,
++                             skip_special_tokens=skip_special_tokens)
+ 
+-    return tokenizer.decode(token_ids)
++    return decode_method(token_ids)
+ 
+ 
+ def encode_tokens(
+@@ -73,6 +76,14 @@ def encode_tokens(
+     settings.
+     """
+ 
++    # Prefer fast/private encode path when available.
++    encode_method = getattr(tokenizer, "_encode", tokenizer.encode)
++
++    # Fast path: no optional args provided.
++    if truncation is None and max_length is None \
++            and add_special_tokens is None:
++        return encode_method(text)
++
+     kw_args: dict[str, Any] = {}
+     if max_length is not None:
+         kw_args["max_length"] = max_length
+@@ -83,7 +94,7 @@ def encode_tokens(
+     if add_special_tokens is not None:
+         kw_args["add_special_tokens"] = add_special_tokens
+ 
+-    return tokenizer.encode(text, **kw_args)
++    return encode_method(text, **kw_args)
+ 
+ 
+ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+@@ -137,6 +148,16 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+         def __reduce__(self):
+             return get_cached_tokenizer, (tokenizer, )
+ 
++        # Override encode/decode to prefer faster private methods if present
++        # while preserving the original tokenizer's behavior.
++        def decode(self, token_ids, *args, **kwargs):  # type: ignore[override]
++            _decode = getattr(tokenizer, "_decode", tokenizer.decode)
++            return _decode(token_ids, *args, **kwargs)
++
++        def encode(self, text, *args, **kwargs):  # type: ignore[override]
++            _encode = getattr(tokenizer, "_encode", tokenizer.encode)
++            return _encode(text, *args, **kwargs)
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     cached_tokenizer.__class__ = CachedTokenizer

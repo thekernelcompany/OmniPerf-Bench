@@ -1,0 +1,91 @@
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index 2ef8d3115..405ee9022 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -29,7 +29,7 @@ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.activation import ReLUSquaredActivation
+ from vllm.model_executor.layers.layernorm import RMSNorm
+-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
++from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                                QKVParallelLinear,
+                                                RowParallelLinear)
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -63,26 +63,33 @@ class NemotronHMLP(nn.Module):
+         config: NemotronHConfig,
+         quant_config: Optional[QuantizationConfig] = None,
+         bias: bool = False,
++        prefix: str = "",
+     ) -> None:
+         super().__init__()
+-        self.up_proj = MergedColumnParallelLinear(
++        # Use non-merged column-parallel linear for a single output matrix
++        # and avoid returning bias to reduce Python overhead.
++        self.up_proj = ColumnParallelLinear(
+             input_size=config.hidden_size,
+-            output_sizes=[config.intermediate_size],
++            output_size=config.intermediate_size,
+             bias=bias,
+             quant_config=quant_config,
++            prefix=f"{prefix}.up_proj",
++            return_bias=False,
+         )
+         self.down_proj = RowParallelLinear(
+             input_size=config.intermediate_size,
+             output_size=config.hidden_size,
+             bias=bias,
+             quant_config=quant_config,
++            prefix=f"{prefix}.down_proj",
++            return_bias=False,
+         )
+         self.act_fn = ReLUSquaredActivation()
+ 
+     def forward(self, x: torch.Tensor):
+-        x, _ = self.up_proj(x)
++        x = self.up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(x)
++        x = self.down_proj(x)
+         return x
+ 
+ 
+@@ -101,7 +108,8 @@ class NemotronHMLPDecoderLayer(nn.Module):
+ 
+         self.mixer = NemotronHMLP(config,
+                                   quant_config=quant_config,
+-                                  bias=config.mlp_bias)
++                                  bias=config.mlp_bias,
++                                  prefix=f"{prefix}.mlp")
+ 
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+@@ -207,12 +215,16 @@ class NemotronHAttention(nn.Module):
+             self.total_num_kv_heads,
+             bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.qkv_proj",
++            return_bias=False,
+         )
+         self.o_proj = RowParallelLinear(
+             self.total_num_heads * self.head_dim,
+             config.hidden_size,
+             bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.o_proj",
++            return_bias=False,
+         )
+ 
+         self.attn = Attention(
+@@ -229,10 +241,10 @@ class NemotronHAttention(nn.Module):
+         hidden_states: torch.Tensor,
+         **kwargs,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
++        qkv = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         attn_output = self.attn(q, k, v)
+-        output, _ = self.o_proj(attn_output)
++        output = self.o_proj(attn_output)
+         return output
+ 
+ 

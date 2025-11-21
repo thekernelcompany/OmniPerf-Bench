@@ -1,0 +1,57 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 622aca66a..a6733c38e 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -169,15 +169,15 @@ class UncachedBlockAllocator(BlockAllocatorBase):
+         self.block_size = block_size
+         self.num_blocks = num_blocks
+ 
+-        # Initialize the free blocks.
+-        self.free_blocks: List[PhysicalTokenBlock] = []
+-        for i in range(num_blocks):
+-            block = PhysicalTokenBlock(device=device,
+-                                       block_number=i,
+-                                       block_size=block_size,
+-                                       block_hash=-1,
+-                                       num_hashed_tokens=0)
+-            self.free_blocks.append(block)
++        # Initialize the free blocks using a list comprehension to
++        # avoid repeated append overhead in a loop.
++        self.free_blocks: List[PhysicalTokenBlock] = [
++            PhysicalTokenBlock(device=device,
++                               block_number=i,
++                               block_size=block_size,
++                               block_hash=-1,
++                               num_hashed_tokens=0) for i in range(num_blocks)
++        ]
+ 
+     def allocate(self,
+                  block_hash: Optional[int] = None,
+@@ -336,9 +336,11 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+ 
+         # Assign the self-attention block tables for each sequence.
+         if len(wait_seqs) == 1:
+-            self.block_tables[wait_seqs[0].seq_id] = block_table
++            # Fast path: avoid extra indexing/copy for single sequence.
++            self.block_tables[seq.seq_id] = block_table
+         else:
+-            for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
++            # Reuse the precomputed wait_seqs list to avoid repeated calls.
++            for seq in wait_seqs:
+                 self.block_tables[seq.seq_id] = block_table.copy()
+ 
+         # Allocate encoder sequence
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477efc5..fd2dc9656 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -655,6 +655,9 @@ class SequenceGroup:
+         return [seq for seq in self.seqs if not seq.is_finished()]
+ 
+     def get_finished_seqs(self) -> List[Sequence]:
++        if self.is_single_seq:
++            return self.seqs if self.seqs[0].is_finished() else []
++
+         return [seq for seq in self.seqs if seq.is_finished()]
+ 
+     def update_num_computed_tokens(self, num_new_computed_tokens: int):

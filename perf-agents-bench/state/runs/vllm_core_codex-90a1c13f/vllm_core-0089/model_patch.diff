@@ -1,0 +1,104 @@
+diff --git a/benchmarks/kernels/benchmark_marlin.py b/benchmarks/kernels/benchmark_marlin.py
+index 8fb44e3a3..ef79d7f1a 100644
+--- a/benchmarks/kernels/benchmark_marlin.py
++++ b/benchmarks/kernels/benchmark_marlin.py
+@@ -58,7 +58,6 @@ def bench_run(results: List[benchmark.Measurement], model: str,
+     (marlin_24_w_ref, marlin_24_q_w_comp, marlin_24_meta,
+      marlin_24_s) = marlin_24_quantize(b, quant_type, group_size)
+ 
+-    marlin_zp = torch.empty(0, dtype=torch.int, device=b.device)
+ 
+     # GPTQ quant
+     (w_ref, q_w, s, g_idx,
+@@ -77,6 +76,8 @@ def bench_run(results: List[benchmark.Measurement], model: str,
+ 
+     marlin_24_workspace = MarlinWorkspace(size_n, GPTQ_MARLIN_24_MIN_THREAD_N,
+                                           GPTQ_MARLIN_24_MAX_PARALLEL)
++    # Allocate directly to the required shape and dtype to avoid a redundant
++    # temporary buffer.
+     marlin_zp = torch.zeros_like(marlin_s, dtype=torch.int)
+ 
+     globals = {
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index e6f9f01ef..39484d2ba 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -217,10 +217,12 @@ def moe_align_block_size(
+         by block_size for proper block matrix operations.
+     """
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+-    sorted_ids = torch.empty((max_num_tokens_padded, ),
+-                             dtype=torch.int32,
+-                             device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
++    # Pre-initialize with padding sentinel in a single allocation to avoid
++    # an extra device-wide fill after allocation.
++    sorted_ids = torch.full((max_num_tokens_padded, ),
++                            fill_value=topk_ids.numel(),
++                            dtype=torch.int32,
++                            device=topk_ids.device)
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty((max_num_m_blocks, ),
+                              dtype=torch.int32,
+@@ -438,12 +440,13 @@ def grouped_topk(hidden_states: torch.Tensor,
+                                -1).max(dim=-1).values  # [n, n_group]
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
+                            sorted=False)[1]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    # Build a boolean mask directly to avoid dtype conversions.
++    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = group_mask.unsqueeze(-1).expand(
+         num_token, num_expert_group,
+         scores.shape[-1] // num_expert_group).reshape(num_token, -1)  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
++    tmp_scores = scores.masked_fill(~score_mask, 0.0)  # [n, e]
+     topk_weights, topk_ids = torch.topk(tmp_scores,
+                                         k=topk,
+                                         dim=-1,
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 25d95ac6e..f6c6d7651 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -53,15 +53,20 @@ class InputBatch:
+         self.req_ids: List[Optional[str]] = [None] * max_num_reqs
+         self.req_id_to_index: Dict[str, int] = {}
+ 
+-        self.token_ids_cpu = np.empty((max_num_reqs, max_model_len),
+-                                      dtype=np.int32)
++        self.token_ids_cpu_tensor = torch.empty(
++            (max_num_reqs, max_model_len),
++            device="cpu",
++            dtype=torch.int32,
++            pin_memory=pin_memory,
++        )
++        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+         self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+-        self.block_table = torch.zeros((max_num_reqs, max_num_blocks_per_req),
++        self.block_table = torch.empty((max_num_reqs, max_num_blocks_per_req),
+                                        device=self.device,
+                                        dtype=torch.int32)
+-        self.block_table_cpu_tensor = torch.zeros(
++        self.block_table_cpu_tensor = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device="cpu",
+             dtype=torch.int32,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e75be21ef..3d5e9f979 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -627,7 +627,7 @@ class GPUModelRunner:
+             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+         for _ in range(self.num_attn_layers):
+             self.kv_caches.append(
+-                torch.zeros(kv_cache_shape,
++                torch.empty(kv_cache_shape,
+                             dtype=self.kv_cache_dtype,
+                             device=self.device))
+ 

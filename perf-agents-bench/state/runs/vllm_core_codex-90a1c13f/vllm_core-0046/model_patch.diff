@@ -1,0 +1,169 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 462ba8a75..c931b6933 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -258,7 +258,7 @@ def scaled_fp8_quant(
+     else:
+         output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+     if scale is None:
+-        scale = torch.zeros(1, device=input.device, dtype=torch.float32)
++        scale = torch.empty(1, device=input.device, dtype=torch.float32)
+         vllm_ops.dynamic_scaled_fp8_quant(output, input, scale)
+     else:
+         vllm_ops.static_scaled_fp8_quant(output, input, scale)
+diff --git a/vllm/config.py b/vllm/config.py
+index 4efdb6cab..0b0225831 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -173,8 +173,9 @@ class ModelConfig:
+         return quant_cfg
+ 
+     def _verify_quantization(self) -> None:
+-        supported_quantization = [*QUANTIZATION_METHODS]
+-        rocm_supported_quantization = ["gptq", "squeezellm"]
++        # Use sets for faster membership checks on hot paths
++        supported_quantization = set(QUANTIZATION_METHODS)
++        rocm_supported_quantization = {"gptq", "squeezellm"}
+         if self.quantization is not None:
+             self.quantization = self.quantization.lower()
+ 
+@@ -185,7 +186,8 @@ class ModelConfig:
+             quant_method = quant_cfg.get("quant_method", "").lower()
+ 
+             # Detect which checkpoint is it
+-            for _, method in QUANTIZATION_METHODS.items():
++            # Iterate directly over values to avoid tuple unpacking overhead
++            for method in QUANTIZATION_METHODS.values():
+                 quantization_override = method.override_quantization_method(
+                     quant_cfg, self.quantization)
+                 if quantization_override:
+@@ -214,7 +216,7 @@ class ModelConfig:
+                     f"{self.quantization} quantization is currently not "
+                     f"supported in ROCm.")
+             if (self.quantization
+-                    not in ["marlin", "gptq_marlin_24", "gptq_marlin"]):
++                    not in {"marlin", "gptq_marlin_24", "gptq_marlin"}):
+                 logger.warning(
+                     "%s quantization is not fully "
+                     "optimized yet. The speed can be slower than "
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7d5c7371b..355656420 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1,4 +1,5 @@
+ import os
++import sys
+ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+ 
+ if TYPE_CHECKING:
+@@ -216,15 +217,41 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+     # Both spawn and fork work
+     "VLLM_WORKER_MULTIPROC_METHOD":
+     lambda: os.getenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn"),
++
++    # Performance guardrail for experimental features that may regress latency
++    # Default off; set to 1 to allow enabling via config when available.
++    # Kept here for forward compatibility with newer configs.
++    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE":
++    lambda: bool(int(os.getenv(
++        "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "0"))),
++
++    # Controls whether vllm.envs caches resolved env values after first access.
++    # Caching avoids repeated os.getenv parsing overhead on hot paths that
++    # frequently read env-backed flags. Set to 0 to disable caching.
++    "VLLM_ENV_CACHE":
++    lambda: int(os.getenv("VLLM_ENV_CACHE", "1")),
+ }
+ 
+ # end-env-vars-definition
+ 
+ 
++_env_cache: Dict[str, Any] = {}
++_cache_enabled_default = os.getenv("VLLM_ENV_CACHE", "1")
++_CACHE_ENABLED = _cache_enabled_default not in ("0", "false", "False")
++
++
+ def __getattr__(name):
+-    # lazy evaluation of environment variables
++    # lazy evaluation of environment variables with lightweight caching
+     if name in environment_variables:
+-        return environment_variables[name]()
++        if _CACHE_ENABLED and name in _env_cache:
++            return _env_cache[name]
++        value = environment_variables[name]()
++        if _CACHE_ENABLED:
++            # Cache as both a fast attribute and in local dict to avoid
++            # re-running lambdas and repeated os.getenv parsing.
++            _env_cache[name] = value
++            setattr(sys.modules[__name__], name, value)
++        return value
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index bf3a59e3d..96a09e349 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -204,7 +204,7 @@ class Fp8LinearMethod(LinearMethodBase):
+                                                   layer.weight_scale[idx])
+ 
+                 layer.weight[start:end, :] = per_tensor_quantize(
+-                    weight_dq, layer.weight_scale.max())
++                    weight_dq, max_w_scale)
+                 start = end
+             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+ 
+@@ -240,18 +240,39 @@ class Fp8LinearMethod(LinearMethodBase):
+                                                layer.act_scale,
+                                                batch_dim_padding=17)
+ 
+-        # Fused GEMM_DQ -- note we padded the input above because
+-        # torch._scaled_mm is more performant for matrices with
+-        # batch dimension > 16. Note that this could change
+-        # in the future.
+-        output, _ = torch._scaled_mm(
+-            qinput,
+-            layer.weight,
+-            out_dtype=x.dtype,
+-            scale_a=x_scale,
+-            scale_b=layer.weight_scale,
+-            bias=bias,
++        # Try optimized CUTLASS kernel when supported; fallback to torch._scaled_mm
++        use_cutlass = (
++            hasattr(ops, 'cutlass_scaled_mm_dq') and
++            isinstance(layer.weight, torch.Tensor) and
++            layer.weight.is_cuda and
++            layer.weight.shape[0] % 16 == 0 and layer.weight.shape[1] % 16 == 0 and
++            (x.dtype is torch.bfloat16 or x.dtype is torch.float16)
+         )
++        output = None
++        if use_cutlass:
++            try:
++                output = ops.cutlass_scaled_mm_dq(
++                    qinput,
++                    layer.weight,
++                    x_scale,
++                    layer.weight_scale,
++                    out_dtype=x.dtype,
++                )
++                if bias is not None:
++                    output = output + bias
++            except Exception:
++                output = None
++
++        if output is None:
++            # Fused GEMM_DQ via PyTorch fallback
++            output, _ = torch._scaled_mm(
++                qinput,
++                layer.weight,
++                out_dtype=x.dtype,
++                scale_a=x_scale,
++                scale_b=layer.weight_scale,
++                bias=bias,
++            )
+ 
+         return torch.narrow(output, 0, 0, x.shape[0])
+ 

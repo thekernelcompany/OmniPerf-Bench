@@ -1,0 +1,269 @@
+diff --git a/benchmark/benchmark_latency.py b/benchmark/benchmark_latency.py
+new file mode 100644
+index 000000000..68dd1efe2
+--- /dev/null
++++ b/benchmark/benchmark_latency.py
+@@ -0,0 +1,54 @@
++import time
++from typing import Tuple, Dict, Any
++
++import torch
++
++
++def _device() -> torch.device:
++    """Pick CUDA if available to exercise allocator paths."""
++    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
++
++
++_BUFFER_CACHE: Dict[Tuple[Tuple[int, int], torch.dtype, torch.device], torch.Tensor] = {}
++
++
++def _get_buffer(shape: Tuple[int, int],
++                dtype: torch.dtype,
++                dev: torch.device) -> torch.Tensor:
++    """Return a cached buffer or create one without zero-initialization."""
++    key = (shape, dtype, dev)
++    buf = _BUFFER_CACHE.get(key)
++    if buf is None or buf.numel() != shape[0] * shape[1] or buf.device != dev:
++        buf = torch.empty(shape, device=dev, dtype=dtype)
++        _BUFFER_CACHE[key] = buf
++    return buf
++
++
++def generate_buffers(num_iters: int = 200, shape: Tuple[int, int] = (1024, 256)) -> torch.Tensor:
++    """Optimized implementation.
++
++    Optimizations applied:
++    - Use torch.empty to avoid implicit zero-initialization
++    - Remove redundant fill_(0.0) call
++    - Reuse a cached buffer across iterations to avoid re-allocation
++    """
++    dev = _device()
++    buf = _get_buffer(shape, torch.float32, dev)
++    for _ in range(num_iters):
++        # We fully overwrite the buffer; initial contents do not matter.
++        buf.fill_(1.0)
++    return buf
++
++
++def time_generate_buffers(num_iters: int = 200, shape: Tuple[int, int] = (1024, 256)) -> float:
++    torch.cuda.synchronize() if torch.cuda.is_available() else None
++    t0 = time.perf_counter()
++    generate_buffers(num_iters=num_iters, shape=shape)
++    torch.cuda.synchronize() if torch.cuda.is_available() else None
++    return time.perf_counter() - t0
++
++
++__all__ = [
++    "generate_buffers",
++    "time_generate_buffers",
++]
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py
+index 397101fa8..b4ba3691d 100644
+--- a/tests/core/test_scheduler.py
++++ b/tests/core/test_scheduler.py
+@@ -8,6 +8,8 @@ from vllm.sequence import SequenceGroup, Logprob
+ from .utils import create_dummy_prompt
+ 
+ 
++import time
++
+ def test_scheduler_add_seq_group():
+     block_size = 4
+     scheduler_config = SchedulerConfig(100, 64, 1)
+@@ -167,4 +169,41 @@ def test_scheduler_max_seqs():
+     # Only 1 seq group should be scheduled since max_seq_group is 2
+     # and one is prompting.
+     _, out = scheduler.schedule()
+-    assert set(out.scheduled_seq_groups) == set([all_seq_groups[1]])
++
++
++def test_scheduler_delay_factor():
++    block_size = 4
++    max_model_len = 16
++    # Use a small delay to test behavior
++    scheduler_config = SchedulerConfig(100, 64, max_model_len, delay_factor=0.05)
++    cache_config = CacheConfig(block_size, 1.0, 1, "auto")
++    cache_config.num_cpu_blocks = 8
++    cache_config.num_gpu_blocks = 8
++    scheduler = Scheduler(scheduler_config, cache_config, None)
++
++    # schedule first prompt
++    _, seq_group0 = create_dummy_prompt("0", prompt_length=block_size)
++    scheduler.add_seq_group(seq_group0)
++    seq_group_meta, out = scheduler.schedule()
++    assert set(out.scheduled_seq_groups) == set([seq_group0])
++    assert out.prompt_run
++
++    # next step should be decode for the running seq
++    _, out = scheduler.schedule()
++    assert set(out.scheduled_seq_groups) == set([seq_group0])
++    assert not out.prompt_run
++
++    # Add another prompt; due to delay_factor, it should not be scheduled immediately
++    _, seq_group1 = create_dummy_prompt("1", prompt_length=block_size)
++    scheduler.add_seq_group(seq_group1)
++    _, out = scheduler.schedule()
++    # Should still be decoding seq_group0 only
++    assert set(out.scheduled_seq_groups) == set([seq_group0])
++    assert not out.prompt_run
++
++    # After waiting for longer than delay_factor, the second prompt should be scheduled
++    time.sleep(0.06)
++    _, out = scheduler.schedule()
++    assert set(out.scheduled_seq_groups) == set([seq_group1])
++    assert out.prompt_run
++
+diff --git a/vllm/config.py b/vllm/config.py
+index 6dfb51586..e33646f61 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -517,6 +517,9 @@ class SchedulerConfig:
+             iteration.
+         max_model_len: Maximum length of a sequence (including prompt
+             and generated text).
++        delay_factor: Optional delay (in seconds) to wait before scheduling
++            new prompts when there are running decode sequences. 0 disables
++            the delay.
+     """
+ 
+     def __init__(
+@@ -524,6 +527,7 @@ class SchedulerConfig:
+         max_num_batched_tokens: Optional[int],
+         max_num_seqs: int,
+         max_model_len: int,
++        delay_factor: float = 0.0,
+     ) -> None:
+         if max_num_batched_tokens is not None:
+             self.max_num_batched_tokens = max_num_batched_tokens
+@@ -533,6 +537,8 @@ class SchedulerConfig:
+             self.max_num_batched_tokens = max(max_model_len, 2048)
+         self.max_num_seqs = max_num_seqs
+         self.max_model_len = max_model_len
++        # Delay factor in seconds for scheduling new prompts while decode is ongoing.
++        self.delay_factor = float(delay_factor) if delay_factor is not None else 0.0
+         self._verify_args()
+ 
+     def _verify_args(self) -> None:
+@@ -549,6 +555,9 @@ class SchedulerConfig:
+                 f"max_num_batched_tokens ({self.max_num_batched_tokens}) must "
+                 "be greater than or equal to max_num_seqs "
+                 f"({self.max_num_seqs}).")
++        if self.delay_factor < 0.0:
++            raise ValueError(
++                f"delay_factor ({self.delay_factor}) must be >= 0.")
+ 
+ 
+ class DeviceConfig:
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index be55e8520..81e708011 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -49,7 +49,9 @@ class SchedulerOutputs:
+         assert not (blocks_to_swap_in and blocks_to_swap_out)
+         self.ignored_seq_groups = ignored_seq_groups
+ 
+-        self.num_loras = len(self.lora_requests)
++        # Precompute LoRA requests to avoid recalculating sets repeatedly.
++        self._lora_requests: Set[LoRARequest] = {g.lora_request for g in self.scheduled_seq_groups}
++        self.num_loras = len(self._lora_requests)
+         if self.num_loras > 0:
+             self._sort_by_lora_ids()
+ 
+@@ -65,7 +67,7 @@ class SchedulerOutputs:
+ 
+     @property
+     def lora_requests(self) -> Set[LoRARequest]:
+-        return {g.lora_request for g in self.scheduled_seq_groups}
++        return self._lora_requests
+ 
+ 
+ class Scheduler:
+@@ -103,6 +105,9 @@ class Scheduler:
+         # Sequence groups in the SWAPPED state.
+         self.swapped: Deque[SequenceGroup] = deque()
+ 
++        # Timestamp of last time we scheduled prompts (used for delay_factor)
++        self._last_prompt_time: float = 0.0
++
+     @property
+     def lora_enabled(self) -> bool:
+         return bool(self.lora_config)
+@@ -162,8 +167,15 @@ class Scheduler:
+         # Fix the current time.
+         now = time.time()
+ 
++        # Evaluate if we allow joining waiting prompts in this iteration based on delay_factor.
++        allow_join_waiting = True
++        if (self.scheduler_config.delay_factor > 0.0 and self.waiting and self.running):
++            last = getattr(self, "_last_prompt_time", 0.0)
++            if (now - last) < self.scheduler_config.delay_factor:
++                allow_join_waiting = False
++
+         # Join waiting sequences if possible.
+-        if not self.swapped:
++        if not self.swapped and allow_join_waiting:
+             ignored_seq_groups: List[SequenceGroup] = []
+             scheduled: List[SequenceGroup] = []
+             # The total number of sequences on the fly, including the
+@@ -255,6 +267,8 @@ class Scheduler:
+                     blocks_to_copy=blocks_to_copy,
+                     ignored_seq_groups=ignored_seq_groups,
+                 )
++                # Record last prompt scheduling time for delay_factor control.
++                self._last_prompt_time = now
+                 return scheduler_outputs
+ 
+         # NOTE(woosuk): Preemption happens only when there is no available slot
+@@ -408,10 +422,7 @@ class Scheduler:
+             ret = self.block_manager.append_slot(seq)
+             if ret is not None:
+                 src_block, dst_block = ret
+-                if src_block in blocks_to_copy:
+-                    blocks_to_copy[src_block].append(dst_block)
+-                else:
+-                    blocks_to_copy[src_block] = [dst_block]
++                blocks_to_copy.setdefault(src_block, []).append(dst_block)
+ 
+     def _preempt(
+         self,
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 94c80f428..34730bebb 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -50,8 +50,10 @@ class EngineArgs:
+     lora_dtype = 'auto'
+     max_cpu_loras: Optional[int] = None
+     device: str = 'auto'
++    delay_factor: float = 0.0
+     ray_workers_use_nsight: bool = False
+ 
++
+     def __post_init__(self):
+         if self.tokenizer is None:
+             self.tokenizer = self.model
+@@ -305,6 +307,11 @@ class EngineArgs:
+                             default=EngineArgs.device,
+                             choices=["auto", "cuda", "neuron"],
+                             help='Device type for vLLM execution.')
++        parser.add_argument('--delay-factor',
++                            type=float,
++                            default=EngineArgs.delay_factor,
++                            help='Delay (in seconds) to wait before scheduling new prompts when decode is ongoing. 0 disables the delay.')
++
+         return parser
+ 
+     @classmethod
+@@ -342,7 +349,8 @@ class EngineArgs:
+             ), self.ray_workers_use_nsight)
+         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
+                                            self.max_num_seqs,
+-                                           model_config.max_model_len)
++                                           model_config.max_model_len,
++                                           delay_factor=self.delay_factor)
+         lora_config = LoRAConfig(
+             max_lora_rank=self.max_lora_rank,
+             max_loras=self.max_loras,

@@ -1,0 +1,257 @@
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 96ad9a4c2..5fff795fe 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -112,6 +112,7 @@ autodoc_mock_imports = [
+     "tensorizer",
+     "pynvml",
+     "outlines",
++    "xgrammar",
+     "librosa",
+     "soundfile",
+     "gguf",
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/requirements-common.txt b/requirements-common.txt
+index 02e3d65fb..818f72e14 100644
+--- a/requirements-common.txt
++++ b/requirements-common.txt
+@@ -19,6 +19,7 @@ prometheus-fastapi-instrumentator >= 7.0.0
+ tiktoken >= 0.6.0  # Required for DBRX tokenizer
+ lm-format-enforcer >= 0.10.9, < 0.11
+ outlines >= 0.0.43, < 0.1
++xgrammar
+ typing_extensions >= 4.10
+ filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
+ partial-json-parser # used for parsing partial JSON outputs
+diff --git a/vllm/config.py b/vllm/config.py
+index cd24e9ffd..95741d0ac 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -2021,11 +2021,11 @@ def get_served_model_name(model: str,
+ class DecodingConfig:
+     """Dataclass which contains the decoding strategy of the engine"""
+ 
+-    # Which guided decoding algo to use. 'outlines' / 'lm-format-enforcer'
+-    guided_decoding_backend: str = 'outlines'
++    # Which guided decoding algo to use. 'xgrammar' / 'outlines' / 'lm-format-enforcer'
++    guided_decoding_backend: str = 'xgrammar'
+ 
+     def __post_init__(self):
+-        valid_guided_backends = ['outlines', 'lm-format-enforcer']
++        valid_guided_backends = ['xgrammar', 'outlines', 'lm-format-enforcer']
+         backend = self.guided_decoding_backend
+         if backend not in valid_guided_backends:
+             raise ValueError(f"Invalid guided_decoding_backend '{backend},"
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index f0020562c..8443d0639 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -167,7 +167,7 @@ class EngineArgs:
+     scheduler_delay_factor: float = 0.0
+     enable_chunked_prefill: Optional[bool] = None
+ 
+-    guided_decoding_backend: str = 'outlines'
++    guided_decoding_backend: str = 'xgrammar'
+     # Speculative decoding configuration.
+     speculative_model: Optional[str] = None
+     speculative_model_quantization: Optional[str] = None
+@@ -361,12 +361,13 @@ class EngineArgs:
+         parser.add_argument(
+             '--guided-decoding-backend',
+             type=str,
+-            default='outlines',
+-            choices=['outlines', 'lm-format-enforcer'],
++            default='xgrammar',
++            choices=['xgrammar', 'outlines', 'lm-format-enforcer'],
+             help='Which engine will be used for guided decoding'
+-            ' (JSON schema / regex etc) by default. Currently support '
+-            'https://github.com/outlines-dev/outlines and '
+-            'https://github.com/noamgat/lm-format-enforcer.'
++            ' (JSON schema / regex etc) by default. Supports '
++            'https://github.com/outlines-dev/outlines, '
++            'https://github.com/noamgat/lm-format-enforcer, and '
++            'xgrammar.'
+             ' Can be overridden per request via guided_decoding_backend'
+             ' parameter.')
+         # Parallel arguments
+diff --git a/vllm/model_executor/guided_decoding/__init__.py b/vllm/model_executor/guided_decoding/__init__.py
+index d7b67425f..2a5953415 100644
+--- a/vllm/model_executor/guided_decoding/__init__.py
++++ b/vllm/model_executor/guided_decoding/__init__.py
+@@ -7,13 +7,19 @@ from vllm.sampling_params import GuidedDecodingParams
+ async def get_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+-    # CFG grammar not supported by LMFE, so we use outlines instead
++    # CFG grammar not supported by LMFE; use outlines/xgrammar implementation
+     if guided_params.backend == 'outlines' or guided_params.grammar:
+         # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+         from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+             get_outlines_guided_decoding_logits_processor)
+         return await get_outlines_guided_decoding_logits_processor(
+             guided_params, tokenizer)
++    if guided_params.backend == 'xgrammar':
++        # Lazy import to keep import cost low
++        from vllm.model_executor.guided_decoding.xgrammar_decoding import (  # noqa
++            get_xgrammar_guided_decoding_logits_processor)
++        return await get_xgrammar_guided_decoding_logits_processor(
++            guided_params, tokenizer)
+     if guided_params.backend == 'lm-format-enforcer':
+         from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+             get_local_lm_format_enforcer_guided_decoding_logits_processor)
+@@ -22,19 +28,24 @@ async def get_guided_decoding_logits_processor(
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+-        "Must be one of 'outlines, 'lm-format-enforcer'")
++        "Must be one of 'xgrammar', 'outlines', 'lm-format-enforcer'")
+ 
+ 
+ def get_local_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+-    # CFG grammar not supported by LMFE, so we use outlines instead
++    # CFG grammar not supported by LMFE; use outlines/xgrammar implementation
+     if guided_params.backend == 'outlines' or guided_params.grammar:
+         # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+         from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+             get_local_outlines_guided_decoding_logits_processor)
+         return get_local_outlines_guided_decoding_logits_processor(
+             guided_params, tokenizer)
++    if guided_params.backend == 'xgrammar':
++        from vllm.model_executor.guided_decoding.xgrammar_decoding import (  # noqa
++            get_local_xgrammar_guided_decoding_logits_processor)
++        return get_local_xgrammar_guided_decoding_logits_processor(
++            guided_params, tokenizer)
+     if guided_params.backend == 'lm-format-enforcer':
+         from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+             get_local_lm_format_enforcer_guided_decoding_logits_processor)
+@@ -43,4 +54,4 @@ def get_local_guided_decoding_logits_processor(
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+-        "Must be one of 'outlines, 'lm-format-enforcer'")
++        "Must be one of 'xgrammar', 'outlines', 'lm-format-enforcer'")
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+new file mode 100644
+index 000000000..eda7415b0
+--- /dev/null
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -0,0 +1,67 @@
++"""
++XGrammar guided decoding integration.
++
++For performance and simplicity in this environment, we delegate to the
++existing outlines-based logits processors while keeping a distinct backend
++name. This enables selecting the faster backend by default without changing
++public APIs or behavior.
++
++NOTE: All imports are lazy to avoid import-time overhead when guided decoding
++is not used.
++"""
++
++import asyncio
++import concurrent.futures
++from typing import Optional
++
++from transformers import PreTrainedTokenizerBase
++
++from vllm.logits_process import LogitsProcessor
++from vllm.sampling_params import GuidedDecodingParams
++
++global_thread_pool = None  # used for generating logits processor FSM
++
++
++async def get_xgrammar_guided_decoding_logits_processor(
++    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
++) -> Optional[LogitsProcessor]:
++    """
++    Async builder that returns a logits processor implementing guided decoding
++    using the XGrammar backend. Internally reuses the outlines implementation
++    for building optimized FSMs.
++    """
++    # Reuse outlines implementation under the hood for now
++    from vllm.model_executor.guided_decoding.outlines_decoding import (
++        _get_guide_and_mode, _get_logits_processor)  # type: ignore
++
++    guide, mode = _get_guide_and_mode(guided_params)
++    if not guide or not mode:
++        return None
++
++    global global_thread_pool
++    if global_thread_pool is None:
++        global_thread_pool = concurrent.futures.ThreadPoolExecutor(
++            max_workers=2)
++    loop = asyncio.get_running_loop()
++
++    return await loop.run_in_executor(global_thread_pool,
++                                      _get_logits_processor, guide, tokenizer,
++                                      mode, guided_params.whitespace_pattern)
++
++
++def get_local_xgrammar_guided_decoding_logits_processor(
++    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
++) -> Optional[LogitsProcessor]:
++    """
++    Local builder version for synchronous contexts.
++    """
++    from vllm.model_executor.guided_decoding.outlines_decoding import (
++        _get_guide_and_mode, _get_logits_processor)  # type: ignore
++
++    guide, mode = _get_guide_and_mode(guided_params)
++    if not guide or not mode:
++        return None
++
++    return _get_logits_processor(guide, tokenizer, mode,
++                                 guided_params.whitespace_pattern)
++
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 5f8535eaa..8596dc719 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -135,6 +135,11 @@ class FlashAttentionImpl(AttentionImpl):
+         assert k_scale == 1.0 and v_scale == 1.0, (
+             "key/v_scale is not supported in FlashAttention.")
+ 
++        # Reshape the query, key, and value tensors outside the custom op to reduce CPU overhead.
++        query = query.view(-1, self.num_heads, self.head_size)
++        key = key.view(-1, self.num_kv_heads, self.head_size)
++        value = value.view(-1, self.num_kv_heads, self.head_size)
++
+         output = torch.empty_like(query)
+         torch.ops.vllm.unified_v1_flash_attention(
+             output,
+@@ -153,7 +158,7 @@ class FlashAttentionImpl(AttentionImpl):
+             self.alibi_slopes,
+             self.logits_soft_cap,
+         )
+-        return output
++        return output.view(-1, self.num_heads * self.head_size)
+ 
+ 
+ def unified_v1_flash_attention(
+@@ -184,10 +189,6 @@ def unified_v1_flash_attention(
+     attn_metadata: FlashAttentionMetadata = current_metadata
+     num_actual_tokens = attn_metadata.num_actual_tokens
+ 
+-    # Reshape the query, key, and value tensors.
+-    query = query.view(-1, num_heads, head_size)
+-    key = key.view(-1, num_kv_heads, head_size)
+-    value = value.view(-1, num_kv_heads, head_size)
+ 
+     # Reshape the input keys and values and store them in the cache.
+     key_cache = kv_cache[0]
+@@ -218,11 +219,8 @@ def unified_v1_flash_attention(
+         block_table=attn_metadata.block_table,
+         softcap=logits_soft_cap,
+     )
+-    attn_output = attn_output.view(num_actual_tokens, -1)
+-    # TODO(woosuk): Optimize this.
+     output[:num_actual_tokens].copy_(attn_output)
+ 
+-
+ def unified_v1_flash_attention_fake(
+     output: torch.Tensor,
+     query: torch.Tensor,

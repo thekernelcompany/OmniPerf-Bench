@@ -1,0 +1,398 @@
+diff --git a/benchmarks/kernels/benchmark_reshape_and_cache_flash.py b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+new file mode 100644
+index 000000000..e062d2016
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import argparse
++import math
++import time
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
++
++logger = init_logger(__name__)
++
++
++def _to_dtype(dtype_str: str) -> torch.dtype:
++    if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
++        return STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
++    raise ValueError(f"Unsupported dtype: {dtype_str}")
++
++
++@torch.inference_mode()
++def run_benchmark(
++    num_tokens: int,
++    num_heads: int,
++    head_size: int,
++    block_size: int,
++    model_dtype: str,
++    kv_cache_dtype: str,
++    iters: int,
++    warmup: int,
++    seed: int | None,
++) -> float:
++    assert torch.cuda.is_available(), "CUDA required for this benchmark"
++    device = torch.device("cuda")
++    current_platform.seed_everything(seed)
++
++    dtype = _to_dtype(model_dtype)
++
++    # Inputs
++    key = torch.empty((num_tokens, num_heads, head_size), device=device,
++                      dtype=dtype)
++    key.normal_(mean=0.0, std=1.0)
++    value = torch.empty_like(key).normal_(mean=0.0, std=1.0)
++
++    # Slot mapping: sequential
++    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.long)
++
++    # Caches with flash layout [num_blocks, block_size, num_heads, head_size]
++    num_blocks = math.ceil(num_tokens / block_size)
++    cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(kv_cache_dtype, dtype)
++    key_cache = torch.empty((num_blocks, block_size, num_heads, head_size),
++                            device=device, dtype=cache_dtype)
++    value_cache = torch.empty_like(key_cache)
++
++    # Scales (needed for fp8 path; ignored for others)
++    k_scale = torch.ones((), device=device, dtype=torch.float32)
++    v_scale = torch.ones((), device=device, dtype=torch.float32)
++
++    # Warmup
++    for _ in range(warmup):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                    slot_mapping, kv_cache_dtype, k_scale,
++                                    v_scale)
++    torch.cuda.synchronize()
++
++    # Timing
++    start = time.perf_counter()
++    for _ in range(iters):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                    slot_mapping, kv_cache_dtype, k_scale,
++                                    v_scale)
++    torch.cuda.synchronize()
++    end = time.perf_counter()
++
++    return (end - start) * 1000.0 / iters
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description="Benchmark reshape_and_cache_flash kernel")
++    parser.add_argument("--num-tokens", type=int, default=2048)
++    parser.add_argument("--num-heads", type=int, default=16)
++    parser.add_argument("--head-size", type=int, default=128)
++    parser.add_argument("--block-size", type=int, default=16)
++    parser.add_argument("--model-dtype", type=str, default="half",
++                        choices=["half", "bfloat16", "float"])  # inputs
++    parser.add_argument("--kv-cache-dtype",
++                        type=str,
++                        default="auto",
++                        choices=["auto", "half", "bfloat16", "float",
++                                 "fp8"])
++    parser.add_argument("--iters", type=int, default=20)
++    parser.add_argument("--warmup", type=int, default=3)
++    parser.add_argument("--seed", type=int, default=0)
++
++    args = parser.parse_args()
++
++    if not torch.cuda.is_available():
++        logger.warning("CUDA not available; skipping.")
++        return
++
++    ms = run_benchmark(args.num_tokens, args.num_heads, args.head_size,
++                       args.block_size, args.model_dtype, args.kv_cache_dtype,
++                       args.iters, args.warmup, args.seed)
++    print(f"reshape_and_cache_flash: {ms:.3f} ms/iter")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 88559c8fe..022c9506e 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -88,12 +88,10 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
+   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+     int64_t src_offset = src_block_offset + i;
+     int64_t dst_offset = dst_block_offset + i;
+-    key_cache[dst_offset] = key_cache[src_offset];
+-  }
+-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+-    int64_t src_offset = src_block_offset + i;
+-    int64_t dst_offset = dst_block_offset + i;
+-    value_cache[dst_offset] = value_cache[src_offset];
++    scalar_t tmp_k = key_cache[src_offset];
++    scalar_t tmp_v = value_cache[src_offset];
++    key_cache[dst_offset] = tmp_k;
++    value_cache[dst_offset] = tmp_v;
+   }
+ }
+ 
+@@ -282,25 +280,33 @@ __global__ void reshape_and_cache_flash_kernel(
+   }
+   const int64_t block_idx = slot_idx / block_size;
+   const int64_t block_offset = slot_idx % block_size;
+-  const int n = num_heads * head_size;
+-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+-    const int64_t src_key_idx = token_idx * key_stride + i;
+-    const int64_t src_value_idx = token_idx * value_stride + i;
+-    const int head_idx = i / head_size;
+-    const int head_offset = i % head_size;
+-    const int64_t tgt_key_value_idx = block_idx * block_stride +
+-                                      block_offset * page_stride +
+-                                      head_idx * head_stride + head_offset;
+-    scalar_t tgt_key = key[src_key_idx];
+-    scalar_t tgt_value = value[src_value_idx];
+-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+-      key_cache[tgt_key_value_idx] = tgt_key;
+-      value_cache[tgt_key_value_idx] = tgt_value;
+-    } else {
+-      key_cache[tgt_key_value_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, *k_scale);
+-      value_cache[tgt_key_value_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
++
++  // Precompute base pointers to reduce index math in the inner loop.
++  const scalar_t* __restrict__ key_base = key + token_idx * key_stride;
++  const scalar_t* __restrict__ value_base = value + token_idx * value_stride;
++  cache_t* __restrict__ key_cache_base =
++      key_cache + block_idx * block_stride + block_offset * page_stride;
++  cache_t* __restrict__ value_cache_base =
++      value_cache + block_idx * block_stride + block_offset * page_stride;
++
++  // Iterate over heads outside and head_size inside to avoid expensive
++  // div/mod operations on each iteration.
++  for (int head_idx = 0; head_idx < num_heads; ++head_idx) {
++    const int64_t src_head_off = static_cast<int64_t>(head_idx) * head_size;
++    const int64_t tgt_head_off = static_cast<int64_t>(head_idx) * head_stride;
++    for (int ho = threadIdx.x; ho < head_size; ho += blockDim.x) {
++      const scalar_t k_val = key_base[src_head_off + ho];
++      const scalar_t v_val = value_base[src_head_off + ho];
++      const int64_t tgt_idx = tgt_head_off + static_cast<int64_t>(ho);
++      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
++        key_cache_base[tgt_idx] = k_val;
++        value_cache_base[tgt_idx] = v_val;
++      } else {
++        key_cache_base[tgt_idx] =
++            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val, *k_scale);
++        value_cache_base[tgt_idx] =
++            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(v_val, *v_scale);
++      }
+     }
+   }
+ }
+@@ -441,7 +447,7 @@ void reshape_and_cache_flash(
+   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(num_heads * head_size, 512));
++  dim3 block(std::min(head_size, 512));
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..57387864e
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,113 @@
++diff --git a/benchmarks/kernels/benchmark_reshape_and_cache_flash.py b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
++new file mode 100644
++index 000000000..e062d2016
++--- /dev/null
+++++ b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
++@@ -0,0 +1,113 @@
+++# SPDX-License-Identifier: Apache-2.0
+++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+++from __future__ import annotations
+++
+++import argparse
+++import math
+++import time
+++
+++import torch
+++
+++from vllm import _custom_ops as ops
+++from vllm.logger import init_logger
+++from vllm.platforms import current_platform
+++from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+++
+++logger = init_logger(__name__)
+++
+++
+++def _to_dtype(dtype_str: str) -> torch.dtype:
+++    if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
+++        return STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
+++    raise ValueError(f"Unsupported dtype: {dtype_str}")
+++
+++
+++@torch.inference_mode()
+++def run_benchmark(
+++    num_tokens: int,
+++    num_heads: int,
+++    head_size: int,
+++    block_size: int,
+++    model_dtype: str,
+++    kv_cache_dtype: str,
+++    iters: int,
+++    warmup: int,
+++    seed: int | None,
+++) -> float:
+++    assert torch.cuda.is_available(), "CUDA required for this benchmark"
+++    device = torch.device("cuda")
+++    current_platform.seed_everything(seed)
+++
+++    dtype = _to_dtype(model_dtype)
+++
+++    # Inputs
+++    key = torch.empty((num_tokens, num_heads, head_size), device=device,
+++                      dtype=dtype)
+++    key.normal_(mean=0.0, std=1.0)
+++    value = torch.empty_like(key).normal_(mean=0.0, std=1.0)
+++
+++    # Slot mapping: sequential
+++    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.long)
+++
+++    # Caches with flash layout [num_blocks, block_size, num_heads, head_size]
+++    num_blocks = math.ceil(num_tokens / block_size)
+++    cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(kv_cache_dtype, dtype)
+++    key_cache = torch.empty((num_blocks, block_size, num_heads, head_size),
+++                            device=device, dtype=cache_dtype)
+++    value_cache = torch.empty_like(key_cache)
+++
+++    # Scales (needed for fp8 path; ignored for others)
+++    k_scale = torch.ones((), device=device, dtype=torch.float32)
+++    v_scale = torch.ones((), device=device, dtype=torch.float32)
+++
+++    # Warmup
+++    for _ in range(warmup):
+++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
+++                                    slot_mapping, kv_cache_dtype, k_scale,
+++                                    v_scale)
+++    torch.cuda.synchronize()
+++
+++    # Timing
+++    start = time.perf_counter()
+++    for _ in range(iters):
+++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
+++                                    slot_mapping, kv_cache_dtype, k_scale,
+++                                    v_scale)
+++    torch.cuda.synchronize()
+++    end = time.perf_counter()
+++
+++    return (end - start) * 1000.0 / iters
+++
+++
+++def main() -> None:
+++    parser = argparse.ArgumentParser(
+++        description="Benchmark reshape_and_cache_flash kernel")
+++    parser.add_argument("--num-tokens", type=int, default=2048)
+++    parser.add_argument("--num-heads", type=int, default=16)
+++    parser.add_argument("--head-size", type=int, default=128)
+++    parser.add_argument("--block-size", type=int, default=16)
+++    parser.add_argument("--model-dtype", type=str, default="half",
+++                        choices=["half", "bfloat16", "float"])  # inputs
+++    parser.add_argument("--kv-cache-dtype",
+++                        type=str,
+++                        default="auto",
+++                        choices=["auto", "half", "bfloat16", "float",
+++                                 "fp8"])
+++    parser.add_argument("--iters", type=int, default=20)
+++    parser.add_argument("--warmup", type=int, default=3)
+++    parser.add_argument("--seed", type=int, default=0)
+++
+++    args = parser.parse_args()
+++
+++    if not torch.cuda.is_available():
+++        logger.warning("CUDA not available; skipping.")
+++        return
+++
+++    ms = run_benchmark(args.num_tokens, args.num_heads, args.head_size,
+++                       args.block_size, args
+\ No newline at end of file
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 460e1c0b0..a5ce0b5e2 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -80,7 +80,12 @@ class TopKTopPSampler(nn.Module):
+         The logits tensor may be updated in-place.
+         """
+         logits = apply_top_k_top_p(logits, k, p)
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
++        # Compute softmax in float32 only when upcasting is needed.
++        # Avoids redundant casting when logits are already float32.
++        if logits.dtype == torch.float32:
++            probs = logits.softmax(dim=-1)
++        else:
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
+         return random_sample(probs, generators)
+ 
+     def forward_cuda(
+@@ -95,7 +100,10 @@ class TopKTopPSampler(nn.Module):
+             # We prefer `random_sample` over `flashinfer_sample` when sorting is
+             # not needed. This is because `random_sample` does not require
+             # CPU-GPU synchronization while `flashinfer_sample` does.
+-            probs = logits.softmax(dim=-1, dtype=torch.float32)
++            if logits.dtype == torch.float32:
++                probs = logits.softmax(dim=-1)
++            else:
++                probs = logits.softmax(dim=-1, dtype=torch.float32)
+             return random_sample(probs, generators)
+         if generators:
+             logger.warning_once("FlashInfer 0.2.3+ does not support "
+@@ -115,7 +123,10 @@ class TopKTopPSampler(nn.Module):
+         p: Optional[torch.Tensor],
+     ) -> torch.Tensor:
+         logits = apply_top_k_top_p_tpu(logits, k, p)
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
++        if logits.dtype == torch.float32:
++            probs = logits.softmax(dim=-1)
++        else:
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
+         return random_sample(probs, generators)
+ 
+ 
+@@ -280,15 +291,25 @@ def flashinfer_sample(
+     """
+     assert not (k is None and p is None)
+     if k is None:
+-        # Top-p only.
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+-        next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
+-            probs, p, deterministic=True)
++        # Top-p only. Prefer logits-based API to avoid softmax when available.
++        top_p_from_logits = getattr(flashinfer.sampling,
++                                    'top_p_sampling_from_logits', None)
++        if top_p_from_logits is not None:
++            next_token_ids = top_p_from_logits(logits, p, deterministic=True)
++        else:
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
++            next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
++                probs, p, deterministic=True)
+     elif p is None:
+-        # Top-k only.
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+-        next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
+-            probs, k, deterministic=True)
++        # Top-k only. Prefer logits-based API to avoid softmax when available.
++        top_k_from_logits = getattr(flashinfer.sampling,
++                                    'top_k_sampling_from_logits', None)
++        if top_k_from_logits is not None:
++            next_token_ids = top_k_from_logits(logits, k, deterministic=True)
++        else:
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
++            next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
++                probs, k, deterministic=True)
+     else:
+         # Both top-k and top-p.
+         next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(

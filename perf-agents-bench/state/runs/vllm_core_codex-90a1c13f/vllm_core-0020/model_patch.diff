@@ -1,0 +1,100 @@
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 5b5643748..bca5fa8e3 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -189,13 +189,42 @@ def gptq_marlin_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,
+ def scaled_fp8_quant(
+     input: torch.Tensor,
+     scale: Optional[torch.Tensor] = None,
++    batch_dim_padding: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Quantize input tensor to FP8 and return quantized tensor and scale.
++
++    This function supports both static and dynamic quantization: If a scale
++    tensor is provided, it will be used (static); otherwise a scale tensor is
++    allocated and populated by the kernel (dynamic). The function also allows
++    passing an optional padding hint for the first dimension to enable
++    downstream kernels to choose faster algorithms when applicable. Padding is
++    optional and not applied unless explicitly handled by downstream kernels.
++
++    Args:
++        input: Input tensor to be quantized to FP8.
++        scale: Optional scaling factor for FP8 quantization. If None, the
++            scale will be computed dynamically by the kernel.
++        batch_dim_padding: Optional hint to pad the first dimension of the
++            output for downstream kernels that may benefit from it. This
++            implementation does not modify shapes and serves as a forward-
++            compatible API extension.
++
++    Returns:
++        Tuple[torch.Tensor, torch.Tensor]: The quantized tensor (FP8) and the
++        corresponding scaling factor (FP32).
++    """
++    # Allocate output without zero-initialization. The kernel fully writes it.
+     output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
++
++    # For dynamic quantization, the kernel writes the scale value. No need to
++    # pay for zero-initialization here.
+     if scale is None:
+-        scale = torch.zeros(1, device=input.device, dtype=torch.float32)
++        scale = torch.empty(1, device=input.device, dtype=torch.float32)
+         vllm_ops.dynamic_scaled_fp8_quant(output, input, scale)
+     else:
+         vllm_ops.static_scaled_fp8_quant(output, input, scale)
++
+     return output, scale
+ 
+ 
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+index b57e1dde8..3f604ff44 100644
+--- a/vllm/model_executor/layers/quantization/fp8.py
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -191,6 +191,7 @@ class Fp8LinearMethod(LinearMethodBase):
+         else:
+             # WEIGHT_SCALE / WEIGHT
+             #   Loop over logical weights, requantizing with single scale.
++            # Cache the max reduction to avoid recomputation in the loop.
+             max_w_scale = layer.weight_scale.max()
+             start = 0
+             for idx, logical_width in enumerate(layer.logical_widths):
+@@ -199,7 +200,7 @@ class Fp8LinearMethod(LinearMethodBase):
+                                                   layer.weight_scale[idx])
+ 
+                 layer.weight[start:end, :] = per_tensor_quantize(
+-                    weight_dq, layer.weight_scale.max())
++                    weight_dq, max_w_scale)
+                 start = end
+             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+ 
+@@ -231,6 +232,7 @@ class Fp8LinearMethod(LinearMethodBase):
+         # ops.scaled_fp8_quant supports both dynamic and static quant.
+         #   If dynamic, layer.act_scale is None and x_scale computed from x.
+         #   If static,  layer.act_scale is scalar and x_scale set to act_scale.
++        # Pass through optional parameters supported by the underlying kernel.
+         qinput, x_scale = ops.scaled_fp8_quant(x, layer.act_scale)
+ 
+         # Fused GEMM_DQ
+@@ -248,13 +250,19 @@ class Fp8LinearMethod(LinearMethodBase):
+ 
+ def all_close_1d(x: torch.Tensor) -> bool:
+     assert len(x.shape) == 1
+-    return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
++    # Vectorized check to avoid Python-loop overhead
++    ref = x[0].expand_as(x)
++    return torch.allclose(x, ref)
++
++
++_FINFO_FP8_E4M3FN = torch.finfo(torch.float8_e4m3fn)
+ 
+ 
+ def per_tensor_quantize(tensor: torch.Tensor,
+                         inv_scale: float) -> torch.Tensor:
+-    finfo = torch.finfo(torch.float8_e4m3fn)
+-    qweight = (tensor / inv_scale).clamp(min=finfo.min, max=finfo.max)
++    # Avoid re-creating finfo on each call
++    qweight = (tensor / inv_scale).clamp(min=_FINFO_FP8_E4M3FN.min,
++                                         max=_FINFO_FP8_E4M3FN.max)
+     return qweight.to(torch.float8_e4m3fn)
+ 
+ 

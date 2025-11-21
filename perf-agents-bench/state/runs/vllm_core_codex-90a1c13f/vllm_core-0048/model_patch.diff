@@ -1,0 +1,122 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a0c25df6b..20517c8a4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,18 @@ cmake_minimum_required(VERSION 3.26)
+ # cmake --install . --component _C
+ project(vllm_extensions LANGUAGES CXX)
+ 
++# Default to an optimized build when unspecified
++if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
++endif()
++
++# Enable interprocedural optimization (LTO) for Release if supported
++include(CheckIPOSupported)
++check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
++if(_ipo_supported)
++  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON CACHE BOOL "Enable IPO for Release" FORCE)
++endif()
++
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+ 
+@@ -156,9 +168,21 @@ endif()
+ #
+ get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+ 
++# Drop device line information to reduce runtime overhead
++list(REMOVE_ITEM VLLM_GPU_FLAGS "-lineinfo")
++
+ #
+ # Set nvcc parallelism.
+ #
++# Auto-set nvcc parallelism to CPU count if not provided
++if(VLLM_GPU_LANG STREQUAL "CUDA" AND NOT DEFINED NVCC_THREADS)
++  include(ProcessorCount)
++  ProcessorCount(_NPROC)
++  if(_NPROC GREATER 0)
++    set(NVCC_THREADS ${_NPROC} CACHE STRING "NVCC parallel threads" FORCE)
++  endif()
++endif()
++
+ if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
+   list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
+ endif()
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 0e70d77e1..ac9437b24 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -233,7 +233,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Only relevant for models using ALiBi (e.g, MPT)
+         self.use_alibi = check_use_alibi(model_config)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -246,27 +246,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)
+@@ -484,14 +484,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.input_batch.block_table.commit(num_reqs)
+ 
+         # Get the number of scheduled tokens for each request.
+-        # TODO: The Python loop can be slow. Optimize.
+-        num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
+-        max_num_scheduled_tokens = 0
+-        for i, req_id in enumerate(self.input_batch.req_ids):
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens[i] = num_tokens
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
++        req_ids = self.input_batch.req_ids
++        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
++        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
++        max_num_scheduled_tokens = int(max(tokens))
+ 
+         # Get request indices.
+         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+@@ -1663,7 +1659,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         num_blocks, kv_cache_spec.block_size,
+                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                     dtype = kv_cache_spec.dtype
+-                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
++                    kv_caches[layer_name] = torch.empty(kv_cache_shape,
+                                                         dtype=dtype,
+                                                         device=self.device)
+                 else:

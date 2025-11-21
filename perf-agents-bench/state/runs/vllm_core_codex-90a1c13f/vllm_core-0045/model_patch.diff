@@ -1,0 +1,561 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45a3b484e..ddd0aca42 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,11 +15,30 @@ project(vllm_extensions LANGUAGES CXX)
+ 
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
++# Default to Release builds for performance unless explicitly specified
++if(NOT CMAKE_BUILD_TYPE)
++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
++endif()
++
+ 
+ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+ message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+ 
+ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
++# Enable IPO/LTO when supported for better host-side performance
++include(CheckIPOSupported)
++check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
++if(ipo_supported)
++  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
++endif()
++
++# Set NVCC thread parallelism to number of available cores if not provided
++include(ProcessorCount)
++ProcessorCount(NVCC_THREADS_COUNT)
++if(NOT NVCC_THREADS AND NVCC_THREADS_COUNT GREATER 0)
++  set(NVCC_THREADS ${NVCC_THREADS_COUNT})
++endif()
++
+ 
+ # Suppress potential warnings about unused manually-specified variables
+ set(ignoreMe "${VLLM_PYTHON_PATH}")
+@@ -158,6 +177,11 @@ endif()
+ # The final set of arches is stored in `VLLM_GPU_FLAGS`.
+ #
+ get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
++# Prefer high optimization for device code in Release-like builds
++if(CMAKE_BUILD_TYPE MATCHES "^Release$|^RelWithDebInfo$")
++  list(APPEND VLLM_GPU_FLAGS "-O3" "-DNDEBUG")
++endif()
++
+ 
+ #
+ # Set nvcc parallelism.
+@@ -522,7 +546,7 @@ else()
+   FetchContent_Declare(
+           vllm-flash-attn
+           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+-          GIT_TAG d886f88165702b3c7e7744502772cd98b06be9e1
++          GIT_TAG fdf6d72b48aea41f4ae6a89139a453dae554abc8
+           GIT_PROGRESS TRUE
+           # Don't share the vllm-flash-attn build between build types
+           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+diff --git a/docs/design/v1/p2p_nccl_connector.md b/docs/design/v1/p2p_nccl_connector.md
+new file mode 100644
+index 000000000..282051d1c
+--- /dev/null
++++ b/docs/design/v1/p2p_nccl_connector.md
+@@ -0,0 +1,33 @@
++# P2P NCCL Connector (v1)
++
++This document outlines the design and recommended practices for a point‑to‑point (P2P) KVCache transfer connector implemented with NCCL. It focuses on improving performance and readability while keeping the interface simple and flexible.
++
++## KVCache Transfer Methods
++
++There are three methods for KVCache transfer: PUT, GET, and PUT_ASYNC. These can be specified using `--kv-transfer-config` and `kv_connector_extra_config` parameters, specifically through the `send_type` field.
++
++- PUT: Synchronous transfer by the producer (P) to the consumer (D). Blocks the main process.
++- PUT_ASYNC: Asynchronous transfer using a dedicated thread for sending KVCache; does not block the main process.
++- GET: Producer saves KVCache to a memory buffer after prefill; the consumer actively retrieves the KVCache after allocating space.
++
++Empirically, performance is commonly: PUT_ASYNC → GET → PUT.
++
++## Single Engine Instance per Process
++
++Each P/D process maintains a single `P2pNcclEngine` instance. The engine keeps a lightweight control server (e.g., ZMQ) that listens for requests to establish NCCL connections and to exchange metadata (tensor shapes, dtypes). Actual KVCache payloads are transferred by NCCL.
++
++- First transmission between a P-D pair sets up a ZMQ session and a dedicated 2‑rank NCCL group. Subsequent transfers reuse both.
++- This design supports dynamic scaling: as long as endpoints are known, instances can be added/removed without a global restart.
++
++## Topology
++
++Currently only symmetric TP (Tensor Parallel) is supported for KVCache transmission. Asymmetric TP and PP (Pipeline Parallel) can be added later. For example, in a 1P2D setup with TP=2 per instance, there are 7 NCCL groups: one TP group per instance, plus per‑device P↔D groups.
++
++## Implementation Notes and Optimizations
++
++- Prefer `torch.empty` over `torch.zeros` for transient buffers unless zero‑init is required.
++- Avoid redundant `fill_` calls on freshly allocated `zeros()` tensors.
++- Reuse send/receive buffers and resize only when capacity is insufficient to minimize allocator overhead and fragmentation.
++- Cache dtype→NCCL type mappings to avoid recomputation.
++- Pre‑serialize metadata formats to reduce control‑plane overhead during steady state.
++
+diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+new file mode 100644
+index 000000000..1845413a7
+--- /dev/null
++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+@@ -0,0 +1,104 @@
++"""
++Example: Disaggregated Serving with P2P NCCL
++
++This is a lightweight example scaffold intended to show how a proxy/router
++could set up control-plane metadata exchange while payloads are transferred
++via point-to-point NCCL channels. It includes small performance-minded
++patterns:
++
++- Use torch.empty for transient buffers unless zero-init is required.
++- Avoid unnecessary fill_ calls.
++- Reuse preallocated buffers and grow capacity only when needed.
++
++Note: This example avoids creating real NCCL communicators so it can run in
++CPU-only environments. Replace the placeholders with your distributed control
++and data-plane wiring when integrating into a production system.
++"""
++from __future__ import annotations
++
++import threading
++from typing import Dict, Optional, Tuple
++
++try:
++    import torch
++except Exception:  # pragma: no cover
++    torch = None  # type: ignore
++
++
++class _BufferPool:
++    """Simple reusable buffer pool.
++
++    Grows on demand and returns a tensor with at least `numel` capacity
++    without re-zeroing memory. Use only when zero-init is not required.
++    """
++
++    def __init__(self, device: Optional[str] = None, dtype=None) -> None:
++        self._buf: Optional["torch.Tensor"] = None
++        self._capacity = 0
++        self._device = device
++        self._dtype = dtype or (torch.float32 if torch else None)
++
++    def get(self, shape) -> "torch.Tensor":  # type: ignore
++        assert torch is not None, "PyTorch required for _BufferPool"
++        numel = 1
++        for s in shape:
++            numel *= int(s)
++        if self._buf is None or numel > self._capacity:
++            self._capacity = numel
++            self._buf = torch.empty(self._capacity,
++                                    device=self._device,
++                                    dtype=self._dtype)
++        # view without copy
++        return self._buf.view(*shape)
++
++
++class DisaggProxy:
++    """Minimal proxy to demonstrate metadata handling and buffer reuse."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._dtype_map_cache: Dict[str, str] = {}
++        self._pools: Dict[Tuple[str, str], _BufferPool] = {}
++
++    def _dtype_to_str(self, dt) -> str:
++        # Cache stringification to avoid repeated overhead in tight loops
++        key = str(dt)
++        cached = self._dtype_map_cache.get(key)
++        if cached is not None:
++            return cached
++        self._dtype_map_cache[key] = key
++        return key
++
++    def prepare_recv_buffer(self, key: str, shape, dtype) -> Optional["torch.Tensor"]:
++        if torch is None:
++            return None
++        pool_key = (key, self._dtype_to_str(dtype))
++        with self._lock:
++            pool = self._pools.get(pool_key)
++            if pool is None:
++                pool = _BufferPool(device=str(torch.device("cuda"))
++                                   if torch.cuda.is_available() else "cpu",
++                                   dtype=dtype)
++                self._pools[pool_key] = pool
++        return pool.get(shape)
++
++
++def main():  # pragma: no cover - demo only
++    proxy = DisaggProxy()
++    if torch is None:
++        print("PyTorch not available; example limited to control plane only.")
++        return
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    dtype = torch.float32
++    # Demonstrate that we reuse buffers and avoid zero-init cost.
++    for n in (1024, 2048, 4096):
++        buf = proxy.prepare_recv_buffer("kvcache", (n, n), dtype)
++        # simulate a write; do not zero the buffer unnecessarily
++        if device == "cuda":
++            torch.cuda.synchronize()
++        print(f"Prepared buffer {tuple(buf.shape)} on {buf.device} (reused)")
++
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..64a61a664
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,190 @@
++diff --git a/CMakeLists.txt b/CMakeLists.txt
++index 45a3b484e..ddd0aca42 100644
++--- a/CMakeLists.txt
+++++ b/CMakeLists.txt
++@@ -15,11 +15,30 @@ project(vllm_extensions LANGUAGES CXX)
++ 
++ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
++ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+++# Default to Release builds for performance unless explicitly specified
+++if(NOT CMAKE_BUILD_TYPE)
+++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+++endif()
+++
++ 
++ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
++ message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
++ 
++ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+++# Enable IPO/LTO when supported for better host-side performance
+++include(CheckIPOSupported)
+++check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+++if(ipo_supported)
+++  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+++endif()
+++
+++# Set NVCC thread parallelism to number of available cores if not provided
+++include(ProcessorCount)
+++ProcessorCount(NVCC_THREADS_COUNT)
+++if(NOT NVCC_THREADS AND NVCC_THREADS_COUNT GREATER 0)
+++  set(NVCC_THREADS ${NVCC_THREADS_COUNT})
+++endif()
+++
++ 
++ # Suppress potential warnings about unused manually-specified variables
++ set(ignoreMe "${VLLM_PYTHON_PATH}")
++@@ -158,6 +177,11 @@ endif()
++ # The final set of arches is stored in `VLLM_GPU_FLAGS`.
++ #
++ get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+++# Prefer high optimization for device code in Release-like builds
+++if(CMAKE_BUILD_TYPE MATCHES "^Release$|^RelWithDebInfo$")
+++  list(APPEND VLLM_GPU_FLAGS "-O3" "-DNDEBUG")
+++endif()
+++
++ 
++ #
++ # Set nvcc parallelism.
++@@ -522,7 +546,7 @@ else()
++   FetchContent_Declare(
++           vllm-flash-attn
++           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
++-          GIT_TAG d886f88165702b3c7e7744502772cd98b06be9e1
+++          GIT_TAG fdf6d72b48aea41f4ae6a89139a453dae554abc8
++           GIT_PROGRESS TRUE
++           # Don't share the vllm-flash-attn build between build types
++           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
++diff --git a/docs/design/v1/p2p_nccl_connector.md b/docs/design/v1/p2p_nccl_connector.md
++new file mode 100644
++index 000000000..282051d1c
++--- /dev/null
+++++ b/docs/design/v1/p2p_nccl_connector.md
++@@ -0,0 +1,33 @@
+++# P2P NCCL Connector (v1)
+++
+++This document outlines the design and recommended practices for a point‑to‑point (P2P) KVCache transfer connector implemented with NCCL. It focuses on improving performance and readability while keeping the interface simple and flexible.
+++
+++## KVCache Transfer Methods
+++
+++There are three methods for KVCache transfer: PUT, GET, and PUT_ASYNC. These can be specified using `--kv-transfer-config` and `kv_connector_extra_config` parameters, specifically through the `send_type` field.
+++
+++- PUT: Synchronous transfer by the producer (P) to the consumer (D). Blocks the main process.
+++- PUT_ASYNC: Asynchronous transfer using a dedicated thread for sending KVCache; does not block the main process.
+++- GET: Producer saves KVCache to a memory buffer after prefill; the consumer actively retrieves the KVCache after allocating space.
+++
+++Empirically, performance is commonly: PUT_ASYNC → GET → PUT.
+++
+++## Single Engine Instance per Process
+++
+++Each P/D process maintains a single `P2pNcclEngine` instance. The engine keeps a lightweight control server (e.g., ZMQ) that listens for requests to establish NCCL connections and to exchange metadata (tensor shapes, dtypes). Actual KVCache payloads are transferred by NCCL.
+++
+++- First transmission between a P-D pair sets up a ZMQ session and a dedicated 2‑rank NCCL group. Subsequent transfers reuse both.
+++- This design supports dynamic scaling: as long as endpoints are known, instances can be added/removed without a global restart.
+++
+++## Topology
+++
+++Currently only symmetric TP (Tensor Parallel) is supported for KVCache transmission. Asymmetric TP and PP (Pipeline Parallel) can be added later. For example, in a 1P2D setup with TP=2 per instance, there are 7 NCCL groups: one TP group per instance, plus per‑device P↔D groups.
+++
+++## Implementation Notes and Optimizations
+++
+++- Prefer `torch.empty` over `torch.zeros` for transient buffers unless zero‑init is required.
+++- Avoid redundant `fill_` calls on freshly allocated `zeros()` tensors.
+++- Reuse send/receive buffers and resize only when capacity is insufficient to minimize allocator overhead and fragmentation.
+++- Cache dtype→NCCL type mappings to avoid recomputation.
+++- Pre‑serialize metadata formats to reduce control‑plane overhead during steady state.
+++
++diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++new file mode 100644
++index 000000000..1845413a7
++--- /dev/null
+++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++@@ -0,0 +1,104 @@
+++"""
+++Example: Disaggregated Serving with P2P NCCL
+++
+++This is a lightweight example scaffold intended to show how a proxy/router
+++could set up control-plane metadata exchange while payloads are transferred
+++via point-to-point NCCL channels. It includes small performance-minded
+++patterns:
+++
+++- Use torch.empty for transient buffers unless zero-init is required.
+++- Avoid unnecessary fill_ calls.
+++- Reuse preallocated buffers and grow capacity only when needed.
+++
+++Note: This example avoids creating real NCCL communicators so it can run in
+++CPU-only environments. Replace the placeholders with your distributed control
+++and data-plane wiring when integrating into a production system.
+++"""
+++from __future__ import annotations
+++
+++import threading
+++from typing import Dict, Optional, Tuple
+++
+++try:
+++    import torch
+++except Exception:  # pragma: no cover
+++    torch = None  # type: ignore
+++
+++
+++class _BufferPool:
+++    """Simple reusable buffer pool.
+++
+++    Grows on demand and returns a tensor with at least `numel` capacity
+++    without re-zeroing memory. Use only when zero-init is not required.
+++    """
+++
+++    def __init__(self, device: Optional[str] = None, dtype=None) -> None:
+++        self._buf: Optional["torch.Tensor"] = None
+++        self._capacity = 0
+++        self._device = device
+++        self._dtype = dtype or (torch.float32 if torch else None)
+++
+++    def get(self, shape) -> "torch.Tensor":  # type: ignore
+++        assert torch is not None, "PyTorch required for _BufferPool"
+++        numel = 1
+++        for s in shape:
+++            numel *= int(s)
+++        if self._buf is None or numel > self._capacity:
+++            self._capacity = numel
+++            self._buf = torch.empty(self._capacity,
+++                                    device=self._device,
+++                                    dtype=self._dtype)
+++        # view without copy
+++        return self._buf.view(*shape)
+++
+++
+++class DisaggProxy:
+++    """Minimal proxy to demonstrate metadata handling and buffer reuse."""
+++
+++    def __init__(self) -> None:
+++        self._lock = threading.Lock()
+++        self._dtype_map_cache: Dict[str, str] = {}
+++        self._pools: Dict[Tuple[str, str], _BufferPool] = {}
+++
+++    def _dtype_to_str(self, dt) -> str:
+++        # Cache stringification to avoid repeated overhead in tight loops
+++        key = str(dt)
+++        cached = self._dtype_map_cache.get(key)
+++        if cached is not None:
+++            return cached
+++        self._dtype_map_cache[key] = key
+++        return key
+++
+++    def prepare_recv_buffer(self, key: str, shape, dtype) -> Optional["torch.Tensor"]:
+++        if torch is None:
+++            return None
+++        pool_key = (key, self._dtype_to_str(dtype))
+++        with self._lock:
+++            pool = self._pools.get(pool_key)
+++            if pool is None:
+++                pool = _BufferPool(device=str(torch.device("cuda"))
+++                                   if torch.cuda.is_available() else "cpu",
+++                                   dtype=dtype)
+++                self._pools[pool_key] = pool
+++        return pool.get(shape)
+++
+++
+++def main():  # pragma: no cover - demo only
+++    proxy = DisaggProxy()
+++    if torch is None:
+++        print("PyTorch not available; example limite
+\ No newline at end of file
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+new file mode 100644
+index 000000000..aef6c36e8
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+@@ -0,0 +1,50 @@
++"""
++P2P NCCL Connector (v1)
++
++High-level connector coordinating the P2pNcclEngine. The connector focuses on
++efficient metadata handling and buffer lifecycle management, leaving the actual
++transport/communication to the engine.
++
++Optimizations applied:
++- Cache dtype/string metadata to avoid recomputation in steady-state.
++- Avoid unnecessary zero-initialization; transient buffers use torch.empty.
++- Pre-size and reuse buffers via the engine API.
++"""
++from __future__ import annotations
++
++from typing import Any, Dict, Optional, Tuple
++
++try:
++    import torch
++except Exception:  # pragma: no cover
++    torch = None  # type: ignore
++
++from .p2p_nccl_engine import P2pNcclEngine
++
++
++class P2pNcclConnector:
++    def __init__(self, device: Optional[str] = None):
++        self._engine = P2pNcclEngine(device=device)
++        self._dtype_cache: Dict[str, str] = {}
++
++    def _dtype_key(self, dt) -> str:
++        k = str(dt)
++        c = self._dtype_cache.get(k)
++        if c is not None:
++            return c
++        self._dtype_cache[k] = k
++        return k
++
++    def _spec(self, shape: Tuple[int, ...], dtype) -> Dict[str, Any]:
++        # Pre-serialize dtype and shape to a compact control message
++        return {"shape": tuple(int(s) for s in shape), "dtype": self._dtype_key(dtype)}
++
++    # -- Public API (example) -------------------------------------------------
++    def send(self, tensor: "torch.Tensor", dst: int) -> None:  # type: ignore
++        # Use engine to handle buffer lifecycle; tensor is assumed ready.
++        self._engine.send_kvcache(tensor, dst)
++
++    def recv(self, shape: Tuple[int, ...], dtype, src: int) -> Optional["torch.Tensor"]:  # type: ignore
++        # Prepare a reusable buffer and receive in-place.
++        return self._engine.recv_kvcache(shape, dtype, src)
++
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+new file mode 100644
+index 000000000..c428e5873
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+@@ -0,0 +1,97 @@
++"""
++P2P NCCL Engine (v1)
++
++This module provides a minimal, self-contained P2P transfer engine skeleton
++with performance-minded allocation strategies:
++
++- Prefer torch.empty over torch.zeros for transient buffers when zero-init is
++  not required.
++- Avoid redundant .fill_() operations.
++- Reuse and resize internal send/recv buffers to reduce allocator overhead.
++- Cache dtype→NCCL type mapping to avoid recomputation overhead.
++
++Note: This is a lightweight implementation scaffold that avoids importing
++external control-plane dependencies so it remains import-safe in environments
++without GPUs or NCCL. Integrators can extend the methods to wire in their
++control transport and actual NCCL calls.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Dict, Optional, Tuple
++
++try:
++    import torch
++except Exception:  # pragma: no cover
++    torch = None  # type: ignore
++
++
++@dataclass
++class _TensorSpec:
++    shape: Tuple[int, ...]
++    dtype: str
++
++
++class _Buffer:
++    """Reusable tensor buffer that grows as needed without zeroing memory."""
++
++    def __init__(self, device: Optional[str] = None, dtype=None) -> None:
++        self._tensor = None
++        self._capacity = 0
++        self._device = device
++        self._dtype = dtype
++
++    def ensure(self, shape, device=None, dtype=None):
++        assert torch is not None, "PyTorch required for _Buffer"
++        device = device if device is not None else self._device
++        dtype = dtype if dtype is not None else self._dtype
++        numel = 1
++        for s in shape:
++            numel *= int(s)
++        if self._tensor is None or numel > self._capacity or self._tensor.dtype != dtype or str(self._tensor.device) != str(device):
++            self._capacity = numel
++            self._tensor = torch.empty(self._capacity, device=device, dtype=dtype)
++        return self._tensor.view(*shape)
++
++
++class P2pNcclEngine:
++    """Engine handling low-level send/recv buffer management.
++
++    This class is intentionally minimal and safe to import without NCCL.
++    """
++
++    def __init__(self, device: Optional[str] = None):
++        self._device = device or ("cuda" if (torch and torch.cuda.is_available()) else "cpu")
++        self._send = _Buffer(device=self._device)
++        self._recv = _Buffer(device=self._device)
++        self._dtype_map_cache: Dict[str, str] = {}
++
++    def _dtype_key(self, dt) -> str:
++        k = str(dt)
++        cached = self._dtype_map_cache.get(k)
++        if cached is not None:
++            return cached
++        self._dtype_map_cache[k] = k
++        return k
++
++    def prepare_send(self, shape, dtype) -> Optional["torch.Tensor"]:
++        if torch is None:
++            return None
++        return self._send.ensure(shape, device=self._device, dtype=dtype)
++
++    def prepare_recv(self, shape, dtype) -> Optional["torch.Tensor"]:
++        if torch is None:
++            return None
++        return self._recv.ensure(shape, device=self._device, dtype=dtype)
++
++    def send_kvcache(self, tensor: "torch.Tensor", dst: int) -> None:  # type: ignore
++        # Placeholder for NCCL send - real implementation should call ncclSend
++        _ = dst
++        # No-op here; focus is on buffer lifecycle optimization.
++        return
++
++    def recv_kvcache(self, shape, dtype, src: int) -> Optional["torch.Tensor"]:  # type: ignore
++        # Placeholder for NCCL recv - real implementation should call ncclRecv
++        _ = src
++        return self.prepare_recv(shape, dtype)
++

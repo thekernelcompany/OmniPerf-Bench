@@ -1,0 +1,381 @@
+diff --git a/benchmark/benchmark_latency.py b/benchmark/benchmark_latency.py
+new file mode 100644
+index 000000000..a0a77bd81
+--- /dev/null
++++ b/benchmark/benchmark_latency.py
+@@ -0,0 +1,55 @@
++import argparse
++import time
++from typing import List
++
++import torch
++
++from cacheflow.master.simple_frontend import SimpleFrontend
++from cacheflow.master.server import (Server, add_server_arguments,
++                                     initialize_ray_cluster)
++from cacheflow.sampling_params import SamplingParams
++from cacheflow.utils import get_gpu_memory, get_cpu_memory
++
++
++def main(args: argparse.Namespace):
++    assert args.pipeline_parallel_size == 1, (
++        'Pipeline parallelism is not supported yet.')
++
++    (num_nodes, num_devices_per_node, distributed_init_method,
++     all_stage_devices) = initialize_ray_cluster(address='local',
++                                                 num_gpus=args.tensor_parallel_size)
++
++    server = Server(args.model,
++                    tensor_parallel_size=args.tensor_parallel_size,
++                    pipeline_parallel_size=args.pipeline_parallel_size,
++                    seed=args.seed,
++                    dtype=args.dtype,
++                    worker_use_ray=True)
++
++    frontend = SimpleFrontend(server)
++
++    prompts: List[str] = ["Hello world!"] * args.num_prompts
++    params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=args.max_tokens)
++
++    # Warmup
++    frontend.generate(prompts[:2], params)
++
++    t0 = time.time()
++    frontend.generate(prompts, params)
++    t1 = time.time()
++    print({
++        "num_prompts": args.num_prompts,
++        "max_tokens": args.max_tokens,
++        "latency_s": round(t1 - t0, 3),
++    })
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    add_server_arguments(parser)
++    parser.add_argument('--num-prompts', type=int, default=8)
++    parser.add_argument('--max-tokens', type=int, default=8)
++    parser.add_argument('--dtype', type=str, default='float16')
++    parser.add_argument('--seed', type=int, default=0)
++    args = parser.parse_args()
++    main(args)
+diff --git a/cacheflow/models/attention.py b/cacheflow/models/attention.py
+index 8b132e442..7d1353f56 100644
+--- a/cacheflow/models/attention.py
++++ b/cacheflow/models/attention.py
+@@ -34,11 +34,16 @@ class GPTCacheFlowAttention(nn.Module):
+             raise ValueError('FlashAttention does not support head_size > 128.')
+ 
+         device = query.device
+-        prefix_sum = [0]
+-        for prompt_len in prompt_lens:
+-            prefix_sum.append(prefix_sum[-1] + prompt_len)
+-        prefix_sum = torch.tensor(prefix_sum, dtype=torch.int, device=device)
+-        max_prompt_len = max(prompt_lens)
++        # Compute prefix_sum more efficiently on device using cumsum.
++        if prompt_lens:
++            lens = torch.tensor(prompt_lens, dtype=torch.int, device=device)
++            prefix_sum = torch.empty(lens.numel() + 1, dtype=torch.int, device=device)
++            prefix_sum[0] = 0
++            torch.cumsum(lens, dim=0, out=prefix_sum[1:])
++            max_prompt_len = int(lens.max().item())
++        else:
++            prefix_sum = torch.zeros(1, dtype=torch.int, device=device)
++            max_prompt_len = 0
+ 
+         # FIXME(woosuk): Unnecessary copy. Optimize this.
+         qkv = torch.stack([query, key, value], dim=1)
+diff --git a/cacheflow/models/utils.py b/cacheflow/models/utils.py
+index 84e7fbce6..bd7b49bee 100644
+--- a/cacheflow/models/utils.py
++++ b/cacheflow/models/utils.py
+@@ -20,5 +20,6 @@ def get_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
+ 
+ def get_dtype_size(dtype: Union[torch.dtype, str]) -> int:
+     torch_dtype = get_torch_dtype(dtype)
+-    return torch.tensor([], dtype=torch_dtype).element_size()
+-
++    # Use empty tensor construction to avoid Python-list to tensor overhead.
++    # Shape-0 empty tensor suffices for querying element size.
++    return torch.empty((), dtype=torch_dtype).element_size()
+diff --git a/cacheflow/parallel_utils/tensor_parallel/layers.py b/cacheflow/parallel_utils/tensor_parallel/layers.py
+index 978ca04e6..63c647002 100644
+--- a/cacheflow/parallel_utils/tensor_parallel/layers.py
++++ b/cacheflow/parallel_utils/tensor_parallel/layers.py
+@@ -198,8 +198,8 @@ class VocabParallelEmbedding(torch.nn.Module):
+             # Build the mask.
+             input_mask = (input_ < self.vocab_start_index) | \
+                          (input_ >= self.vocab_end_index)
+-            # Mask the input.
+-            masked_input = input_.clone() - self.vocab_start_index
++            # Mask the input without redundant clone.
++            masked_input = input_ - self.vocab_start_index
+             masked_input[input_mask] = 0
+         else:
+             masked_input = input_
+@@ -210,7 +210,7 @@ class VocabParallelEmbedding(torch.nn.Module):
+                                       self.sparse)
+         # Mask the output embedding.
+         if self.tensor_model_parallel_size > 1:
+-            output_parallel[input_mask, :] = 0.0
++            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0.0)
+         # Reduce across all the model parallel GPUs.
+         output = reduce_from_tensor_model_parallel_region(output_parallel)
+         return output
+@@ -270,7 +270,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+             total_input = all_gather_buffer
+         else:
+             total_input = input
+-        grad_input = grad_output.matmul(weight)
++        # Preallocate grad_input buffer and compute in-place to reduce allocations
++        grad_input = get_global_memory_buffer().get_tensor(list(input.size()), input.dtype, "mpu_grad_input")
++        torch.matmul(grad_output, weight, out=grad_input)
+ 
+         if ctx.sequence_parallel:
+             handle.wait()
+@@ -279,7 +281,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
+                                        grad_output.shape[2])
+         total_input = total_input.view(total_input.shape[0] * total_input.shape[1],
+-				       total_input.shape[2])
++                                       total_input.shape[2])
+ 
+         if ctx.async_grad_allreduce:
+             # Asynchronous all-reduce
+@@ -291,9 +293,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
+         if ctx.sequence_parallel:
+             assert not ctx.async_grad_allreduce
+             dim_size = list(input.size())
+-            sub_grad_input = torch.empty(dim_size, dtype=input.dtype,
+-                                         device=torch.cuda.current_device(),
+-                                         requires_grad=False)
++            sub_grad_input = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_sub_grad_input")
+             # reduce_scatter
+             handle = torch.distributed._reduce_scatter_base(sub_grad_input, grad_input,
+                                                             group=get_tensor_model_parallel_group(),
+diff --git a/cacheflow/worker/cache_engine.py b/cacheflow/worker/cache_engine.py
+index 164b2a2a6..7064f741d 100644
+--- a/cacheflow/worker/cache_engine.py
++++ b/cacheflow/worker/cache_engine.py
+@@ -32,6 +32,10 @@ class CacheEngine:
+         self.num_cpu_blocks = num_cpu_blocks
+         self.dtype = dtype
+ 
++        # Cache the element size in bytes to avoid recomputation.
++        # Using empty((), ...) avoids Python list to tensor overhead.
++        self._dtype_element_size = torch.empty((), dtype=self.dtype).element_size()
++
+         # Initialize the cache.
+         self.gpu_cache = self.allocate_gpu_cache()
+         self.cpu_cache = self.allocate_cpu_cache()
+@@ -43,7 +47,7 @@ class CacheEngine:
+         self.events = [torch.cuda.Event() for _ in range(num_layers)]
+ 
+     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
+-        element_size = torch.tensor([], dtype=self.dtype).element_size()
++        element_size = self._dtype_element_size
+         x = 16 // element_size
+         return (
+             self.num_heads,
+diff --git a/cacheflow/worker/worker.py b/cacheflow/worker/worker.py
+index f309cf12f..7beb210b9 100644
+--- a/cacheflow/worker/worker.py
++++ b/cacheflow/worker/worker.py
+@@ -80,8 +80,8 @@ class Worker:
+             world_size=world_size,
+             rank=rank,
+         )
+-        # A small all_reduce for warmup.
+-        torch.distributed.all_reduce(torch.zeros(1).cuda())
++        # A small all_reduce for warmup. Avoid zero-initialization cost.
++        torch.distributed.all_reduce(torch.empty(1, device='cuda'))
+         initialize_model_parallel(tensor_parallel_size,
+                                   pipeline_parallel_size)
+ 
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..31919469f
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,180 @@
++diff --git a/benchmark/benchmark_latency.py b/benchmark/benchmark_latency.py
++new file mode 100644
++index 000000000..a0a77bd81
++--- /dev/null
+++++ b/benchmark/benchmark_latency.py
++@@ -0,0 +1,55 @@
+++import argparse
+++import time
+++from typing import List
+++
+++import torch
+++
+++from cacheflow.master.simple_frontend import SimpleFrontend
+++from cacheflow.master.server import (Server, add_server_arguments,
+++                                     initialize_ray_cluster)
+++from cacheflow.sampling_params import SamplingParams
+++from cacheflow.utils import get_gpu_memory, get_cpu_memory
+++
+++
+++def main(args: argparse.Namespace):
+++    assert args.pipeline_parallel_size == 1, (
+++        'Pipeline parallelism is not supported yet.')
+++
+++    (num_nodes, num_devices_per_node, distributed_init_method,
+++     all_stage_devices) = initialize_ray_cluster(address='local',
+++                                                 num_gpus=args.tensor_parallel_size)
+++
+++    server = Server(args.model,
+++                    tensor_parallel_size=args.tensor_parallel_size,
+++                    pipeline_parallel_size=args.pipeline_parallel_size,
+++                    seed=args.seed,
+++                    dtype=args.dtype,
+++                    worker_use_ray=True)
+++
+++    frontend = SimpleFrontend(server)
+++
+++    prompts: List[str] = ["Hello world!"] * args.num_prompts
+++    params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=args.max_tokens)
+++
+++    # Warmup
+++    frontend.generate(prompts[:2], params)
+++
+++    t0 = time.time()
+++    frontend.generate(prompts, params)
+++    t1 = time.time()
+++    print({
+++        "num_prompts": args.num_prompts,
+++        "max_tokens": args.max_tokens,
+++        "latency_s": round(t1 - t0, 3),
+++    })
+++
+++
+++if __name__ == '__main__':
+++    parser = argparse.ArgumentParser()
+++    add_server_arguments(parser)
+++    parser.add_argument('--num-prompts', type=int, default=8)
+++    parser.add_argument('--max-tokens', type=int, default=8)
+++    parser.add_argument('--dtype', type=str, default='float16')
+++    parser.add_argument('--seed', type=int, default=0)
+++    args = parser.parse_args()
+++    main(args)
++diff --git a/cacheflow/models/attention.py b/cacheflow/models/attention.py
++index 8b132e442..7d1353f56 100644
++--- a/cacheflow/models/attention.py
+++++ b/cacheflow/models/attention.py
++@@ -34,11 +34,16 @@ class GPTCacheFlowAttention(nn.Module):
++             raise ValueError('FlashAttention does not support head_size > 128.')
++ 
++         device = query.device
++-        prefix_sum = [0]
++-        for prompt_len in prompt_lens:
++-            prefix_sum.append(prefix_sum[-1] + prompt_len)
++-        prefix_sum = torch.tensor(prefix_sum, dtype=torch.int, device=device)
++-        max_prompt_len = max(prompt_lens)
+++        # Compute prefix_sum more efficiently on device using cumsum.
+++        if prompt_lens:
+++            lens = torch.tensor(prompt_lens, dtype=torch.int, device=device)
+++            prefix_sum = torch.empty(lens.numel() + 1, dtype=torch.int, device=device)
+++            prefix_sum[0] = 0
+++            torch.cumsum(lens, dim=0, out=prefix_sum[1:])
+++            max_prompt_len = int(lens.max().item())
+++        else:
+++            prefix_sum = torch.zeros(1, dtype=torch.int, device=device)
+++            max_prompt_len = 0
++ 
++         # FIXME(woosuk): Unnecessary copy. Optimize this.
++         qkv = torch.stack([query, key, value], dim=1)
++diff --git a/cacheflow/models/utils.py b/cacheflow/models/utils.py
++index 84e7fbce6..bd7b49bee 100644
++--- a/cacheflow/models/utils.py
+++++ b/cacheflow/models/utils.py
++@@ -20,5 +20,6 @@ def get_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
++ 
++ def get_dtype_size(dtype: Union[torch.dtype, str]) -> int:
++     torch_dtype = get_torch_dtype(dtype)
++-    return torch.tensor([], dtype=torch_dtype).element_size()
++-
+++    # Use empty tensor construction to avoid Python-list to tensor overhead.
+++    # Shape-0 empty tensor suffices for querying element size.
+++    return torch.empty((), dtype=torch_dtype).element_size()
++diff --git a/cacheflow/parallel_utils/tensor_parallel/layers.py b/cacheflow/parallel_utils/tensor_parallel/layers.py
++index 978ca04e6..63c647002 100644
++--- a/cacheflow/parallel_utils/tensor_parallel/layers.py
+++++ b/cacheflow/parallel_utils/tensor_parallel/layers.py
++@@ -198,8 +198,8 @@ class VocabParallelEmbedding(torch.nn.Module):
++             # Build the mask.
++             input_mask = (input_ < self.vocab_start_index) | \
++                          (input_ >= self.vocab_end_index)
++-            # Mask the input.
++-            masked_input = input_.clone() - self.vocab_start_index
+++            # Mask the input without redundant clone.
+++            masked_input = input_ - self.vocab_start_index
++             masked_input[input_mask] = 0
++         else:
++             masked_input = input_
++@@ -210,7 +210,7 @@ class VocabParallelEmbedding(torch.nn.Module):
++                                       self.sparse)
++         # Mask the output embedding.
++         if self.tensor_model_parallel_size > 1:
++-            output_parallel[input_mask, :] = 0.0
+++            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0.0)
++         # Reduce across all the model parallel GPUs.
++         output = reduce_from_tensor_model_parallel_region(output_parallel)
++         return output
++@@ -270,7 +270,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
++             total_input = all_gather_buffer
++         else:
++             total_input = input
++-        grad_input = grad_output.matmul(weight)
+++        # Preallocate grad_input buffer and compute in-place to reduce allocations
+++        grad_input = get_global_memory_buffer().get_tensor(list(input.size()), input.dtype, "mpu_grad_input")
+++        torch.matmul(grad_output, weight, out=grad_input)
++ 
++         if ctx.sequence_parallel:
++             handle.wait()
++@@ -279,7 +281,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
++         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
++                                        grad_output.shape[2])
++         total_input = total_input.view(total_input.shape[0] * total_input.shape[1],
++-				       total_input.shape[2])
+++                                       total_input.shape[2])
++ 
++         if ctx.async_grad_allreduce:
++             # Asynchronous all-reduce
++@@ -291,9 +293,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
++         if ctx.sequence_parallel:
++             assert not ctx.async_grad_allreduce
++             dim_size = list(input.size())
++-            sub_grad_input = torch.empty(dim_size, dtype=input.dtype,
++-                                         device=torch.cuda.current_device(),
++-                                         requires_grad=False)
+++            sub_grad_input = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_sub_grad_input")
++             # reduce_scatter
++             handle = torch.distributed._reduce_scatter_base(sub_grad_input, grad_input,
++                                                             group=get_tensor_model_parallel_group(),
++diff --git a/cacheflow/worker/cache_engine.py b/cacheflow/worker/cache_engine.py
++index 164b2a2a6..7064f741d 100644
++--- a/cacheflow/worker/cache_engine.py
+++++ b/cacheflow/worker/cache_engine.py
++@@ -32,6 +32,10 @@ class CacheEngine:
++         self.num_cpu_blocks = num_cpu_blocks
++         self.dtype = dtype
++ 
+++        # Cache the element size in bytes to avoid recomputation.
+++        # Using empty((), ...) avoids Python list to tensor overhead.
+++        self._dtype_element_size = torch.empty((), dtype=self.dtype).element_size()
+++
++         # Initialize the cache.
++         self.gpu_cache = self.allocate_gpu_cache()
++         self.cpu_cache = self.allocate_cpu_cache()
++@@ -43,7 +47,7 @@ class CacheEngine:
++         self.events = [torch.cuda.Event() for _ in range(num_layers)]
++ 
++     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
++-        element_size = torch.tensor([], dtype=self.dtype).element_size()
+++        element_size = self._dtype_element_size
++         x = 16 // element_size
++         return (
++             self.num_heads,
++diff --git a/cacheflow/worker/worker.py b/cacheflow/w
+\ No newline at end of file

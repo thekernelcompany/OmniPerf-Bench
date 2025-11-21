@@ -1,0 +1,155 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 622aca66a..ad26d3c51 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -336,9 +336,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+ 
+         # Assign the self-attention block tables for each sequence.
+         if len(wait_seqs) == 1:
+-            self.block_tables[wait_seqs[0].seq_id] = block_table
++            self.block_tables[seq.seq_id] = block_table
+         else:
+-            for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
++            for seq in wait_seqs:
+                 self.block_tables[seq.seq_id] = block_table.copy()
+ 
+         # Allocate encoder sequence
+diff --git a/vllm/executor/ray_gpu_executor.py b/vllm/executor/ray_gpu_executor.py
+index 4a6825c01..c83b215ac 100644
+--- a/vllm/executor/ray_gpu_executor.py
++++ b/vllm/executor/ray_gpu_executor.py
+@@ -119,6 +119,9 @@ class RayGPUExecutor(DistributedGPUExecutor):
+         driver_ip = get_ip()
+         logger.info("driver_ip: %s", driver_ip)
+         worker_wrapper_kwargs = self._get_worker_wrapper_args()
++
++        # First create all workers to minimize per-actor control plane cost.
++        created_workers: List[RayWorkerWrapper] = []
+         for bundle_id, bundle in enumerate(placement_group.bundle_specs):
+             if not bundle.get("GPU", 0):
+                 continue
+@@ -134,20 +137,36 @@ class RayGPUExecutor(DistributedGPUExecutor):
+                 scheduling_strategy=scheduling_strategy,
+                 **ray_remote_kwargs,
+             )(RayWorkerWrapper).remote(**worker_wrapper_kwargs)
++            created_workers.append(worker)
+ 
+-            if self.use_ray_spmd_worker:
+-                self.workers.append(worker)
++        # Classify workers once with a single batched IP lookup.
++        if self.use_ray_spmd_worker:
++            self.workers = created_workers
++        else:
++            # Fetch all IPs in one go.
++            ip_refs = [w.get_node_ip.remote() for w in created_workers]
++            ips: List[str] = ray.get(ip_refs)
++            # Pick the first worker colocated with the driver as the dummy.
++            driver_idx: Optional[int] = None
++            for idx, ip in enumerate(ips):
++                if ip == driver_ip:
++                    driver_idx = idx
++                    break
++            if driver_idx is not None:
++                self.driver_dummy_worker = created_workers[driver_idx]
++                self.driver_worker = RayWorkerWrapper(**worker_wrapper_kwargs)
++                # All other workers become remote workers.
++                self.workers = [
++                    w for i, w in enumerate(created_workers) if i != driver_idx
++                ]
++                # Keep a parallel list of IPs for the remote workers only.
++                worker_ips = [
++                    ip for i, ip in enumerate(ips) if i != driver_idx
++                ]
+             else:
+-                worker_ip = ray.get(worker.get_node_ip.remote())
+-                if worker_ip == driver_ip and self.driver_dummy_worker is None:
+-                    # If the worker is on the same node as the driver, we use it
+-                    # as the resource holder for the driver process.
+-                    self.driver_dummy_worker = worker
+-                    self.driver_worker = RayWorkerWrapper(
+-                        **worker_wrapper_kwargs)
+-                else:
+-                    # Else, added to the list of workers.
+-                    self.workers.append(worker)
++                # No GPU on driver node; keep all as remote workers.
++                self.workers = created_workers
++                worker_ips = ips
+ 
+         logger.debug("workers: %s", self.workers)
+         logger.debug("driver_dummy_worker: %s", self.driver_dummy_worker)
+@@ -157,31 +176,22 @@ class RayGPUExecutor(DistributedGPUExecutor):
+                 "adjusting the Ray placement group or running the driver on a "
+                 "GPU node.")
+ 
+-        worker_ips = [
+-            ray.get(worker.get_node_ip.remote())  # type: ignore[attr-defined]
+-            for worker in self.workers
+-        ]
++        # Prepare counts and sort using already-fetched IPs without extra RPCs.
+         ip_counts: Dict[str, int] = {}
+         for ip in worker_ips:
+             ip_counts[ip] = ip_counts.get(ip, 0) + 1
+ 
+-        def sort_by_driver_then_worker_ip(worker):
+-            """
+-            Sort the workers based on 3 properties:
+-            1. If the worker is on the same node as the driver (vllm engine),
+-                it should be placed first.
+-            2. Then, if the worker is on a node with fewer workers, it should
+-                be placed first.
+-            3. Finally, if the work is on a node with smaller IP address, it
+-                should be placed first.
+-            """
+-            ip = ray.get(worker.get_node_ip.remote())
++        # Pair workers with their IPs to sort deterministically.
++        worker_ip_pairs = list(zip(self.workers, worker_ips))
++
++        def sort_key(pair: Tuple[RayWorkerWrapper, str]):
++            ip = pair[1]
+             return (ip != driver_ip, ip_counts[ip], ip)
+ 
+-        # After sorting, the workers on the same node will be
+-        # close to each other, and the workers on the driver
+-        # node will be placed first.
+-        self.workers = sorted(self.workers, key=sort_by_driver_then_worker_ip)
++        # After sorting, colocated workers are grouped and driver-node workers
++        # come first.
++        worker_ip_pairs.sort(key=sort_key)
++        self.workers = [w for (w, _) in worker_ip_pairs]
+ 
+         # Get the set of GPU IDs used on each node.
+         worker_node_and_gpu_ids = self._run_workers("get_node_and_gpu_ids",
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477efc5..963e37b94 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -655,15 +655,26 @@ class SequenceGroup:
+         return [seq for seq in self.seqs if not seq.is_finished()]
+ 
+     def get_finished_seqs(self) -> List[Sequence]:
++        if self.is_single_seq:
++            return self.seqs if self.seqs[0].is_finished() else []
++
+         return [seq for seq in self.seqs if seq.is_finished()]
+ 
+     def update_num_computed_tokens(self, num_new_computed_tokens: int):
+         """Update number of tokens computed so far."""
++        if self.is_single_seq:
++            seq = self.seqs[0]
++            if not seq.is_finished():
++                seq.data.update_num_computed_tokens(num_new_computed_tokens)
++            return
+         for seq in self.seqs:
+             if not seq.is_finished():
+                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+     def get_num_uncomputed_tokens(self) -> int:
++        if self.is_single_seq:
++            seq = self.seqs[0]
++            return 0 if seq.is_finished() else seq.data.get_num_uncomputed_tokens()
+         num_uncomputed_tokens = 0
+         for seq in self.seqs:
+             if not seq.is_finished():

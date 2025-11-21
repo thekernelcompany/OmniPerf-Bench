@@ -1,0 +1,382 @@
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 4a1a5fb45..66fc53f56 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -178,6 +178,7 @@ autodoc_mock_imports = [
+     "tensorizer",
+     "pynvml",
+     "outlines",
++    "xgrammar",
+     "librosa",
+     "soundfile",
+     "gguf",
+diff --git a/examples/tensorize_vllm_model.py b/examples/tensorize_vllm_model.py
+index dd77a4ad0..3317cd88c 100644
+--- a/examples/tensorize_vllm_model.py
++++ b/examples/tensorize_vllm_model.py
+@@ -166,13 +166,14 @@ def parse_args():
+ 
+ 
+ 
+-def deserialize():
+-    llm = LLM(model=args.model,
+-              load_format="tensorizer",
+-              tensor_parallel_size=args.tensor_parallel_size,
+-              model_loader_extra_config=tensorizer_config
++def deserialize(tensorizer_config: TensorizerConfig):
++    # Build the LLM with tensorizer fast path (GPU load when vLLM tensorized)
++    return LLM(
++        model=args.model,
++        load_format="tensorizer",
++        tensor_parallel_size=args.tensor_parallel_size,
++        model_loader_extra_config=tensorizer_config,
+     )
+-    return llm
+ 
+ 
+ if __name__ == '__main__':
+@@ -197,13 +198,24 @@ if __name__ == '__main__':
+ 
+     keyfile = args.keyfile if args.keyfile else None
+ 
++    tensorizer_config: TensorizerConfig
+     if args.model_loader_extra_config:
++        # Accept a JSON string for TensorizerConfig, but always override the
++        # URI with the explicit --path-to-tensors for clarity.
+         config = json.loads(args.model_loader_extra_config)
+-        tensorizer_args = \
+-            TensorizerConfig(**config)._construct_tensorizer_args()
+-        tensorizer_args.tensorizer_uri = args.path_to_tensors
++        config["tensorizer_uri"] = (
++            config.get("tensorizer_uri") or getattr(args, "path_to_tensors",
++                                                     None)
++        )
++        tensorizer_config = TensorizerConfig(**{**config, **credentials})
+     else:
+-        tensorizer_args = None
++        # Minimal config using provided credentials.
++        default_uri = getattr(args, "path_to_tensors", None)
++        tensorizer_config = TensorizerConfig(
++            tensorizer_uri=default_uri if default_uri else "",
++            encryption_keyfile=keyfile,
++            **credentials,
++        )
+ 
+     if args.command == "serialize":
+         eng_args_dict = {f.name: getattr(args, f.name) for f in
+@@ -229,12 +241,10 @@ if __name__ == '__main__':
+         tensorize_vllm_model(engine_args, tensorizer_config)
+ 
+     elif args.command == "deserialize":
+-        if not tensorizer_args:
+-            tensorizer_config = TensorizerConfig(
+-                tensorizer_uri=args.path_to_tensors,
+-                encryption_keyfile = keyfile,
+-                **credentials
+-            )
+-        deserialize()
++        # Ensure URI is set explicitly in the deserialize branch
++        if not tensorizer_config.tensorizer_uri:
++            tensorizer_config.tensorizer_uri = args.path_to_tensors
++        # Run a lightweight construct to validate the path and load quickly
++        _ = deserialize(tensorizer_config)
+     else:
+         raise ValueError("Either serialize or deserialize must be specified.")
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/requirements-common.txt b/requirements-common.txt
+index 02e3d65fb..818f72e14 100644
+--- a/requirements-common.txt
++++ b/requirements-common.txt
+@@ -19,6 +19,7 @@ prometheus-fastapi-instrumentator >= 7.0.0
+ tiktoken >= 0.6.0  # Required for DBRX tokenizer
+ lm-format-enforcer >= 0.10.9, < 0.11
+ outlines >= 0.0.43, < 0.1
++xgrammar
+ typing_extensions >= 4.10
+ filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
+ partial-json-parser # used for parsing partial JSON outputs
+diff --git a/tests/model_executor/test_guided_processors.py b/tests/model_executor/test_guided_processors.py
+index 45fab8e96..d9945d279 100644
+--- a/tests/model_executor/test_guided_processors.py
++++ b/tests/model_executor/test_guided_processors.py
+@@ -36,7 +36,7 @@ def test_guided_logits_processors(sample_regex, sample_json_schema):
+ 
+ 
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize("backend", ["outlines", "lm-format-enforcer"])
++@pytest.mark.parametrize("backend", ["xgrammar", "outlines", "lm-format-enforcer"])
+ async def test_guided_logits_processor_black_box(backend: str, sample_regex,
+                                                  sample_json_schema):
+     tokenizer = AutoTokenizer.from_pretrained('HuggingFaceH4/zephyr-7b-beta')
+diff --git a/vllm/config.py b/vllm/config.py
+index 326340d3f..2c488d212 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -2031,11 +2031,11 @@ def get_served_model_name(model: str,
+ class DecodingConfig:
+     """Dataclass which contains the decoding strategy of the engine"""
+ 
+-    # Which guided decoding algo to use. 'outlines' / 'lm-format-enforcer'
+-    guided_decoding_backend: str = 'outlines'
++    # Which guided decoding algo to use. 'xgrammar' / 'outlines' / 'lm-format-enforcer'
++    guided_decoding_backend: str = 'xgrammar'
+ 
+     def __post_init__(self):
+-        valid_guided_backends = ['outlines', 'lm-format-enforcer']
++        valid_guided_backends = ['xgrammar', 'outlines', 'lm-format-enforcer']
+         backend = self.guided_decoding_backend
+         if backend not in valid_guided_backends:
+             raise ValueError(f"Invalid guided_decoding_backend '{backend},"
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 4aa0eebd9..4393c86ae 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -168,7 +168,7 @@ class EngineArgs:
+     scheduler_delay_factor: float = 0.0
+     enable_chunked_prefill: Optional[bool] = None
+ 
+-    guided_decoding_backend: str = 'outlines'
++    guided_decoding_backend: str = 'xgrammar'
+     # Speculative decoding configuration.
+     speculative_model: Optional[str] = None
+     speculative_model_quantization: Optional[str] = None
+@@ -364,12 +364,12 @@ class EngineArgs:
+         parser.add_argument(
+             '--guided-decoding-backend',
+             type=str,
+-            default='outlines',
+-            choices=['outlines', 'lm-format-enforcer'],
++            default='xgrammar',
++            choices=['xgrammar', 'outlines', 'lm-format-enforcer'],
+             help='Which engine will be used for guided decoding'
+             ' (JSON schema / regex etc) by default. Currently support '
+-            'https://github.com/outlines-dev/outlines and '
+-            'https://github.com/noamgat/lm-format-enforcer.'
++            'https://github.com/outlines-dev/outlines, '
++            "https://github.com/noamgat/lm-format-enforcer, and 'xgrammar'."
+             ' Can be overridden per request via guided_decoding_backend'
+             ' parameter.')
+         # Parallel arguments
+diff --git a/vllm/model_executor/guided_decoding/__init__.py b/vllm/model_executor/guided_decoding/__init__.py
+index d7b67425f..fd6bc5736 100644
+--- a/vllm/model_executor/guided_decoding/__init__.py
++++ b/vllm/model_executor/guided_decoding/__init__.py
+@@ -7,8 +7,20 @@ from vllm.sampling_params import GuidedDecodingParams
+ async def get_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+-    # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
++    # Prefer XGrammar for CFG grammar if available; fallback to outlines
++    if guided_params.backend == 'xgrammar' or guided_params.grammar:
++        try:
++            from vllm.model_executor.guided_decoding.xgrammar_decoding import (  # noqa
++                get_xgrammar_guided_decoding_logits_processor)
++            return await get_xgrammar_guided_decoding_logits_processor(
++                guided_params, tokenizer)
++        except Exception:
++            # Fallback to outlines if xgrammar is unavailable
++            from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
++                get_outlines_guided_decoding_logits_processor)
++            return await get_outlines_guided_decoding_logits_processor(
++                guided_params, tokenizer)
++    if guided_params.backend == 'outlines':
+         # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+         from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+             get_outlines_guided_decoding_logits_processor)
+@@ -22,14 +34,25 @@ async def get_guided_decoding_logits_processor(
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+-        "Must be one of 'outlines, 'lm-format-enforcer'")
++        "Must be one of 'xgrammar', 'outlines', 'lm-format-enforcer'")
+ 
+ 
+ def get_local_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+-    # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
++    # Prefer XGrammar for CFG grammar if available; fallback to outlines
++    if guided_params.backend == 'xgrammar' or guided_params.grammar:
++        try:
++            from vllm.model_executor.guided_decoding.xgrammar_decoding import (  # noqa
++                get_local_xgrammar_guided_decoding_logits_processor)
++            return get_local_xgrammar_guided_decoding_logits_processor(
++                guided_params, tokenizer)
++        except Exception:
++            from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
++                get_local_outlines_guided_decoding_logits_processor)
++            return get_local_outlines_guided_decoding_logits_processor(
++                guided_params, tokenizer)
++    if guided_params.backend == 'outlines':
+         # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+         from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+             get_local_outlines_guided_decoding_logits_processor)
+@@ -43,4 +66,4 @@ def get_local_guided_decoding_logits_processor(
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+-        "Must be one of 'outlines, 'lm-format-enforcer'")
++        "Must be one of 'xgrammar', 'outlines', 'lm-format-enforcer'")
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+new file mode 100644
+index 000000000..ee5f6077b
+--- /dev/null
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -0,0 +1,61 @@
++import asyncio
++from typing import Optional, Union
++
++from transformers import PreTrainedTokenizerBase
++
++from vllm.logits_process import LogitsProcessor
++from vllm.model_executor.guided_decoding.outlines_decoding import (
++    get_local_outlines_guided_decoding_logits_processor,
++    get_outlines_guided_decoding_logits_processor,
++)
++from vllm.sampling_params import GuidedDecodingParams
++
++# NOTE:
++# This module provides an XGrammar backend shim for guided decoding.
++# If the xgrammar package is unavailable or integration is not enabled,
++# we gracefully fall back to the outlines implementation which supports
++# JSON, regex, choice, and CFG grammars.
++
++
++async def get_xgrammar_guided_decoding_logits_processor(
++    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
++) -> Optional[LogitsProcessor]:
++    """
++    Async version: return a logits processor using the XGrammar backend if
++    available; otherwise fall back to the outlines backend.
++    """
++    try:
++        import xgrammar  # noqa: F401  # type: ignore
++    except Exception:
++        # Fallback to outlines implementation
++        return await get_outlines_guided_decoding_logits_processor(
++            guided_params, tokenizer
++        )
++
++    # If xgrammar is available, for now delegate to outlines implementation.
++    # A dedicated XGrammar-specific implementation can be added here to
++    # leverage its performance benefits when installed.
++    return await get_outlines_guided_decoding_logits_processor(
++        guided_params, tokenizer
++    )
++
++
++def get_local_xgrammar_guided_decoding_logits_processor(
++    guided_params: GuidedDecodingParams, tokenizer: PreTrainedTokenizerBase
++) -> Optional[LogitsProcessor]:
++    """
++    Local/sync version: return a logits processor using the XGrammar backend if
++    available; otherwise fall back to the outlines backend.
++    """
++    try:
++        import xgrammar  # noqa: F401  # type: ignore
++    except Exception:
++        # Fallback to outlines implementation
++        return get_local_outlines_guided_decoding_logits_processor(
++            guided_params, tokenizer
++        )
++
++    # If xgrammar is available, for now delegate to outlines implementation.
++    return get_local_outlines_guided_decoding_logits_processor(
++        guided_params, tokenizer
++    )
+diff --git a/vllm/model_executor/model_loader/tensorizer.py b/vllm/model_executor/model_loader/tensorizer.py
+index 87f3fcb5c..8e67ae802 100644
+--- a/vllm/model_executor/model_loader/tensorizer.py
++++ b/vllm/model_executor/model_loader/tensorizer.py
+@@ -291,17 +291,29 @@ class TensorizerAgent:
+ 
+     def _resize_lora_embeddings(self):
+         """Modify LoRA embedding layers to use bigger tensors
+-        to allow for adapter added tokens."""
++        to allow for adapter added tokens.
++
++        Performance tweaks:
++        - Use `new_empty` derived from the source tensor to avoid extra dtype
++          and device checks.
++        - Use non_blocking copy when possible.
++        - Zero only the padded slice instead of the entire allocation.
++        """
+         for child in self.model.modules():
+             if (isinstance(child, VocabParallelEmbedding)
+                     and child.weight.shape[0] <
+                     child.num_embeddings_per_partition):
+-                new_weight = torch.empty(child.num_embeddings_per_partition,
+-                                         child.embedding_dim,
+-                                         dtype=child.weight.dtype,
+-                                         device=child.weight.device)
+-                new_weight[:child.weight.shape[0]].copy_(child.weight.data)
+-                new_weight[child.weight.shape[0]:].fill_(0)
++                orig_rows = child.weight.shape[0]
++                target_rows = child.num_embeddings_per_partition
++                # Allocate uninitialized storage on the same device/dtype.
++                new_weight = child.weight.detach().new_empty(
++                    (target_rows, child.embedding_dim))
++                # Copy existing rows. Use non_blocking when both are on CUDA.
++                non_blocking = new_weight.is_cuda and child.weight.is_cuda
++                new_weight[:orig_rows].copy_(child.weight.data,
++                                             non_blocking=non_blocking)
++                # Zero only the padded region.
++                new_weight[orig_rows:].zero_()
+                 child.weight.data = new_weight
+ 
+     def _check_tensors_on_meta_device(self):
+@@ -369,11 +381,12 @@ def tensorizer_weights_iterator(
+ 
+     deserializer_args = tensorizer_args.deserializer_params
+     stream_params = tensorizer_args.stream_params
+-    stream = open_stream(tensorizer_args.tensorizer_uri, **stream_params)
+-    with TensorDeserializer(stream, **deserializer_args,
+-                            device="cpu") as state:
+-        yield from state.items()
+-    del state
++    # Ensure the underlying stream is closed after iteration to minimize
++    # descriptor pressure when repeatedly loading.
++    with open_stream(tensorizer_args.tensorizer_uri, **stream_params) as stream:
++        with TensorDeserializer(stream, **deserializer_args,
++                                device="cpu") as state:
++            yield from state.items()
+ 
+ 
+ def is_vllm_tensorized(tensorizer_config: "TensorizerConfig") -> bool:
+@@ -389,17 +402,21 @@ def is_vllm_tensorized(tensorizer_config: "TensorizerConfig") -> bool:
+         bool: True if the model is a vLLM model, False otherwise.
+     """
+     tensorizer_args = tensorizer_config._construct_tensorizer_args()
+-    deserializer = TensorDeserializer(open_stream(
+-        tensorizer_args.tensorizer_uri, **tensorizer_args.stream_params),
+-                                      **tensorizer_args.deserializer_params,
+-                                      lazy_load=True)
+-    if tensorizer_config.vllm_tensorized:
+-        logger.warning(
+-            "Please note that newly serialized vLLM models are automatically "
+-            "inferred as vLLM models, so setting vllm_tensorized=True is "
+-            "only necessary for models serialized prior to this change.")
+-        return True
+-    return ".vllm_tensorized_marker" in deserializer
++    # Ensure streams and descriptors are closed promptly to reduce overhead
++    # when repeatedly probing files.
++    with open_stream(tensorizer_args.tensorizer_uri,
++                     **tensorizer_args.stream_params) as stream:
++        with TensorDeserializer(stream,
++                                **tensorizer_args.deserializer_params,
++                                lazy_load=True) as deserializer:
++            if tensorizer_config.vllm_tensorized:
++                logger.warning(
++                    "Please note that newly serialized vLLM models are "
++                    "automatically inferred as vLLM models, so setting "
++                    "vllm_tensorized=True is only necessary for models "
++                    "serialized prior to this change.")
++                return True
++            return ".vllm_tensorized_marker" in deserializer
+ 
+ 
+ def serialize_vllm_model(

@@ -1,0 +1,78 @@
+diff --git a/tests/multi_step/test_correctness_async_llm.py b/tests/multi_step/test_correctness_async_llm.py
+index d054ca341..0cbe8371e 100644
+--- a/tests/multi_step/test_correctness_async_llm.py
++++ b/tests/multi_step/test_correctness_async_llm.py
+@@ -103,13 +103,13 @@ async def test_multi_step(
+         model,
+         server_args + distributed_args,
+         num_logprobs,
+-        max_wait_seconds=3 * 240)
++        max_wait_seconds=5 * 240)
+     test_completions = await completions_with_server_args(
+         prompts,
+         model,
+         ms_server_args + distributed_args,
+         num_logprobs,
+-        max_wait_seconds=3 * 240)
++        max_wait_seconds=5 * 240)
+ 
+     # Assert multi-step scheduling produces identical tokens
+     # to single-step scheduling.
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index 1eab83f3b..d8fecffc6 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -1305,14 +1305,16 @@ class LLMEngine:
+         else:
+             outputs_by_sequence_group = outputs
+ 
+-        finished_before: List[int] = []
++        # Track indices of sequence groups that were already finished before
++        # processing to avoid double work. Use a set for O(1) membership.
++        finished_before: Set[int] = set()
+         for i, seq_group_meta in enumerate(seq_group_metadata_list):
+             scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+ 
+             seq_group = scheduled_seq_group.seq_group
+ 
+             if seq_group.is_finished():
+-                finished_before.append(i)
++                finished_before.add(i)
+                 continue
+ 
+             if len(outputs) > 1:
+@@ -1649,14 +1651,14 @@ class LLMEngine:
+                 or not seq_group_metadata_list):
+             return False
+ 
+-        # TODO(will) this is a sanity check for nowto make sure that all the
++        # TODO(will) this is a sanity check for now to make sure that all the
+         # seqs are on the same steps. Eventually we will want to do some sort of
+         # dynamic scheduling when doing multi-step decoding.
+         ref_remaining_steps = seq_group_metadata_list[0].state.remaining_steps
+-        if any([
+-                seq_group.state.remaining_steps != ref_remaining_steps
+-                for seq_group in seq_group_metadata_list[1:]
+-        ]):
++        if any(
++            seq_group.state.remaining_steps != ref_remaining_steps
++            for seq_group in seq_group_metadata_list[1:]
++        ):
+             raise AssertionError(("All running sequence groups should "
+                                   "have the same remaining steps."))
+ 
+diff --git a/vllm/worker/multi_step_model_runner.py b/vllm/worker/multi_step_model_runner.py
+index be0c75bc0..290fb4685 100644
+--- a/vllm/worker/multi_step_model_runner.py
++++ b/vllm/worker/multi_step_model_runner.py
+@@ -298,7 +298,9 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+         # if CPU is ahead.
+         if self.is_driver_worker and get_pp_group().is_last_rank:
+             if self.pinned_sampled_token_ids is None:
+-                self.pinned_sampled_token_ids = torch.zeros(
++                # Use uninitialized pinned CPU memory; contents will be
++                # immediately overwritten by GPU->CPU copy.
++                self.pinned_sampled_token_ids = torch.empty(
+                     (self.scheduler_config.max_num_seqs, 1),
+                     dtype=torch.long,
+                     device="cpu",

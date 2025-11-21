@@ -1,0 +1,62 @@
+diff --git a/vllm/model_executor/layers/rotary_embedding.py b/vllm/model_executor/layers/rotary_embedding.py
+index 70463ecd9..82a656d7b 100644
+--- a/vllm/model_executor/layers/rotary_embedding.py
++++ b/vllm/model_executor/layers/rotary_embedding.py
+@@ -205,8 +205,11 @@ class RotaryEmbedding(CustomOp):
+     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+         from vllm._ipex_ops import ipex_ops as ops
+ 
+-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
+-                                                   dtype=query.dtype)
++        # Avoid expensive __setattr__ calls by only updating when needed
++        if self.cos_sin_cache.device != positions.device or \
++                self.cos_sin_cache.dtype != query.dtype:
++            self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
++                                                       dtype=query.dtype)
+         # ops.rotary_embedding()/batched_rotary_embedding()
+         # are in-place operations that update the query and key tensors.
+         if key is None:
+@@ -320,8 +323,11 @@ class RotaryEmbedding(CustomOp):
+         if offsets is not None:
+             positions = positions + offsets
+ 
+-        self.cos_sin_cache = self.cos_sin_cache.to(query.device,
+-                                                   dtype=query.dtype)
++        # Avoid redundant dtype/device casts on every call
++        if self.cos_sin_cache.device != query.device or \
++                self.cos_sin_cache.dtype != query.dtype:
++            self.cos_sin_cache = self.cos_sin_cache.to(query.device,
++                                                       dtype=query.dtype)
+ 
+         positions = positions.flatten()
+         num_tokens = positions.shape[0]
+@@ -966,7 +972,9 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
+         key: Optional[torch.Tensor] = None,
+     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+         assert key is not None
+-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(query.device)
++        # Avoid reassigning buffer unless device actually changes
++        if self.cos_sin_cache.device != query.device:
++            self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+         query_ = torch.view_as_complex(query.float().reshape(
+             *query.shape[:-1], -1, 2))
+         key_ = torch.view_as_complex(key.float().reshape(
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index 83e181116..21e62d83f 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -515,10 +515,13 @@ class MLACommonMetadataBuilder(Generic[M]):
+                                        chunk_starts + max_context_chunk)
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+ 
+-                cu_seq_lens_cpu = torch.zeros(num_chunks,
++                # Use empty + explicit initialization to avoid zeroing the
++                # entire tensor, which is unnecessary work.
++                cu_seq_lens_cpu = torch.empty(num_chunks,
+                                               self._num_prefills + 1,
+                                               dtype=torch.int32,
+                                               pin_memory=True)
++                cu_seq_lens_cpu[:, 0] = 0
+                 torch.cumsum(chunk_seq_lens,
+                              dim=1,
+                              out=cu_seq_lens_cpu[:, 1:],

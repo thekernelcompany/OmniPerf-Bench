@@ -1,0 +1,259 @@
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index d073dd6d2..7a096c857 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -22,8 +22,12 @@ __global__ void rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Precompute the base offset for the current token to reduce
++  // expensive integer multiplications inside the loops.
++  const int base = blockIdx.x * hidden_size;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input[base + idx];
+     variance += x * x;
+   }
+ 
+@@ -32,14 +36,16 @@ __global__ void rms_norm_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    const float x = (float)input[base + idx];
++    // Compute in float and cast once to avoid extra casts and improve ILP.
++    const float w = (float)weight[idx];
++    out[base + idx] = (scalar_t)(x * s_variance * w);
+   }
+ }
+ 
+@@ -71,8 +77,10 @@ fused_add_rms_norm_kernel(
+   auto* __restrict__ weight_v =
+       reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
+ 
++  const int base = blockIdx.x * vec_hidden_size;
++
+   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+-    int id = blockIdx.x * vec_hidden_size + idx;
++    int id = base + idx;
+     _f16Vec<scalar_t, width> temp = input_v[id];
+     temp += residual_v[id];
+     variance += temp.sum_squares();
+@@ -84,12 +92,13 @@ fused_add_rms_norm_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+-    int id = blockIdx.x * vec_hidden_size + idx;
++    int id = base + idx;
+     _f16Vec<scalar_t, width> temp = residual_v[id];
+     temp *= s_variance;
+     temp *= weight_v[idx];
+@@ -110,12 +119,13 @@ fused_add_rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  const int base = blockIdx.x * hidden_size;
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    scalar_t z = input[base + idx];
++    z += residual[base + idx];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual[base + idx] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -123,14 +133,15 @@ fused_add_rms_norm_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    input[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    const float x = (float)residual[base + idx];
++    const float w = (float)weight[idx];
++    input[base + idx] = (scalar_t)(x * s_variance * w);
+   }
+ }
+ 
+@@ -148,7 +159,10 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
+   int num_tokens = input.numel() / hidden_size;
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(hidden_size, 1024));
++  // Use a smaller block size when we have many tokens to improve latency
++  // hiding and resident blocks per SM. This mirrors the fused kernel below.
++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
++  dim3 block(std::min(hidden_size, max_block_size));
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&] {
+diff --git a/csrc/layernorm_quant_kernels.cu b/csrc/layernorm_quant_kernels.cu
+index d595b9e88..731900004 100644
+--- a/csrc/layernorm_quant_kernels.cu
++++ b/csrc/layernorm_quant_kernels.cu
+@@ -31,8 +31,9 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  const int base = blockIdx.x * hidden_size;
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input[base + idx];
+     variance += x * x;
+   }
+ 
+@@ -41,7 +42,8 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+@@ -49,10 +51,11 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   float const scale_inv = 1.0f / *scale;
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    const float x = (float)input[base + idx];
++    const float w = (float)weight[idx];
++    const float out_norm = x * s_variance * w;
++    out[base + idx] = scaled_fp8_conversion<true, fp8_type>(out_norm,
++                                                            scale_inv);
+   }
+ }
+ 
+@@ -86,8 +89,9 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   auto* __restrict__ weight_v =
+       reinterpret_cast<const _f16Vec<scalar_t, width>*>(weight);
+ 
++  const int base = blockIdx.x * vec_hidden_size;
+   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+-    int id = blockIdx.x * vec_hidden_size + idx;
++    int id = base + idx;
+     _f16Vec<scalar_t, width> temp = input_v[id];
+     temp += residual_v[id];
+     variance += temp.sum_squares();
+@@ -99,7 +103,8 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+@@ -107,7 +112,7 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   float const scale_inv = 1.0f / *scale;
+ 
+   for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+-    int id = blockIdx.x * vec_hidden_size + idx;
++    int id = base + idx;
+     _f16Vec<scalar_t, width> temp = residual_v[id];
+     temp *= s_variance;
+     temp *= weight_v[idx];
+@@ -134,12 +139,13 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  const int base = blockIdx.x * hidden_size;
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    scalar_t z = input[base + idx];
++    z += residual[base + idx];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual[base + idx] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -147,7 +153,8 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+ 
+   if (threadIdx.x == 0) {
+-    s_variance = rsqrtf(variance / hidden_size + epsilon);
++    const float inv_hidden_size = 1.0f / static_cast<float>(hidden_size);
++    s_variance = rsqrtf(variance * inv_hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+@@ -155,10 +162,11 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   float const scale_inv = 1.0f / *scale;
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    const float x = (float)residual[base + idx];
++    const float w = (float)weight[idx];
++    const float out_norm = x * s_variance * w;
++    out[base + idx] = scaled_fp8_conversion<true, fp8_type>(out_norm,
++                                                            scale_inv);
+   }
+ }
+ 
+@@ -173,7 +181,9 @@ void rms_norm_static_fp8_quant(torch::Tensor& out,     // [..., hidden_size]
+   int num_tokens = input.numel() / hidden_size;
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(hidden_size, 1024));
++  // Align block size heuristic with unfused kernel for better occupancy.
++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
++  dim3 block(std::min(hidden_size, max_block_size));
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_TYPES(
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 5106b9914..ba4b11c70 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -822,11 +822,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
+             device: torch.device) -> IntermediateTensors:
+         return IntermediateTensors({
+             "hidden_states":
+-            torch.zeros((batch_size, self.config.hidden_size),
++            torch.empty((batch_size, self.config.hidden_size),
+                         dtype=dtype,
+                         device=device),
+             "residual":
+-            torch.zeros((batch_size, self.config.hidden_size),
++            torch.empty((batch_size, self.config.hidden_size),
+                         dtype=dtype,
+                         device=device),
+         })

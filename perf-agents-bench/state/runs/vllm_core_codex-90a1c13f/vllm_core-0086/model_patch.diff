@@ -1,0 +1,177 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index a9f036fa2..35afbc8ae 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -91,7 +91,8 @@ def _get_logits(hidden_states: torch.Tensor, embedding: torch.Tensor,
+     # Get the logits for the next tokens.
+     logits = torch.matmul(hidden_states, embedding.t())
+     if embedding_bias is not None:
+-        logits += embedding_bias
++        # In-place add to avoid creating a new tensor.
++        logits.add_(embedding_bias)
+     logits = tensor_model_parallel_all_gather(logits)
+     # Remove paddings in vocab (if any).
+     logits = logits[:, :vocab_size]
+@@ -165,23 +166,32 @@ def _apply_penalties(
+         # Return early if all sequences have zero penalties.
+         return logits
+ 
+-    max_output_len = max(len(tokens) for tokens in output_tokens)
+-    padded_output_tokens = [
+-        tokens + [vocab_size] * (max_output_len - len(tokens))
+-        for tokens in output_tokens
+-    ]
+-    output_tokens_tensor = torch.tensor(padded_output_tokens,
+-                                        dtype=torch.long,
+-                                        device=logits.device)
+-
+-    # Compute the bin counts for the output tokens.
+-    # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+-                             dtype=torch.long,
+-                             device=logits.device)
+-    bin_counts.scatter_add_(1, output_tokens_tensor,
+-                            torch.ones_like(output_tokens_tensor))
+-    bin_counts = bin_counts[:, :vocab_size]  # Remove the padding bin.
++    # Compute the bin counts for output tokens without padding or large zero
++    # buffers. Flatten all tokens and use a single bincount over global
++    # indices: seq_id * vocab_size + token_id.
++    flat_tokens: List[int] = []
++    flat_seq_ids: List[int] = []
++    for i, tokens in enumerate(output_tokens):
++        if not tokens:
++            continue
++        flat_tokens.extend(tokens)
++        flat_seq_ids.extend([i] * len(tokens))
++
++    if flat_tokens:
++        token_tensor = torch.tensor(flat_tokens,
++                                    dtype=torch.long,
++                                    device=logits.device)
++        seq_tensor = torch.tensor(flat_seq_ids,
++                                  dtype=torch.long,
++                                  device=logits.device)
++        global_idx = seq_tensor * vocab_size + token_tensor
++        counts_1d = torch.bincount(global_idx,
++                                   minlength=num_seqs * vocab_size)
++        bin_counts = counts_1d.view(num_seqs, vocab_size)
++    else:
++        bin_counts = torch.zeros((num_seqs, vocab_size),
++                                 dtype=torch.long,
++                                 device=logits.device)
+ 
+     frequency_penalties = torch.tensor(frequency_penalties,
+                                        dtype=logits.dtype,
+@@ -235,22 +245,22 @@ def _apply_top_p_top_k(
+     top_ps: List[float],
+     top_ks: List[int],
+ ) -> torch.Tensor:
+-    p = torch.tensor(top_ps, dtype=logits.dtype, device=logits.device)
+-    k = torch.tensor(top_ks, dtype=torch.int, device=logits.device)
++    # Prefer as_tensor to avoid unnecessary copies.
++    p = torch.as_tensor(top_ps, dtype=logits.dtype, device=logits.device)
++    k = torch.as_tensor(top_ks, dtype=torch.int, device=logits.device)
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=True)
+ 
+     # Apply top-p.
+     probs_sort = logits_sort.softmax(dim=-1)
+     probs_sum = probs_sort.cumsum(dim=-1)
+     top_p_mask = (probs_sum - probs_sort) > p.unsqueeze(dim=1)
+-    logits_sort[top_p_mask] = -float("inf")
++    logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Apply top-k.
+     # Create a mask for the top-k elements.
+-    top_k_mask = torch.arange(logits_idx.shape[-1], device=logits_idx.device)
+-    top_k_mask = top_k_mask.expand(logits_idx.shape[0], -1)
+-    top_k_mask = top_k_mask >= k.unsqueeze(dim=1)
+-    logits_sort[top_k_mask] = -float("inf")
++    col_idx = torch.arange(logits_idx.shape[-1], device=logits_idx.device)
++    top_k_mask = col_idx.unsqueeze(0) >= k.unsqueeze(1)
++    logits_sort.masked_fill_(top_k_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+     logits = torch.gather(logits_sort,
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 6dafdac96..3a43a77b5 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -81,20 +81,21 @@ def _convert_tokens_to_string_with_added_encoders(
+     # even when the loop body is very simple.
+     sub_texts = []
+     current_sub_text = []
++    cts = tokenizer.convert_tokens_to_string
++    added_vocab = tokenizer.get_added_vocab()
++    all_special_tokens = set(tokenizer.all_special_tokens) if skip_special_tokens else None
+     for token in output_tokens:
+-        if skip_special_tokens and token in tokenizer.all_special_tokens:
++        if skip_special_tokens and token in all_special_tokens:  # type: ignore[arg-type]
+             continue
+-        if token in tokenizer.added_tokens_encoder:
++        if token in added_vocab:
+             if current_sub_text:
+-                sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-                sub_texts.append(sub_text)
++                sub_texts.append(cts(current_sub_text))
+                 current_sub_text = []
+             sub_texts.append(token)
+         else:
+             current_sub_text.append(token)
+     if current_sub_text:
+-        sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-        sub_texts.append(sub_text)
++        sub_texts.append(cts(current_sub_text))
+     return " ".join(sub_texts)
+ 
+ 
+@@ -129,16 +130,23 @@ def detokenize_incrementally(
+     # The prefix text is necessary only to defeat cleanup algorithms in
+     # the decode which decide to add a space or not depending on the
+     # surrounding ids.
+-    if not getattr(tokenizer, "added_tokens_encoder", {}):
+-        prefix_text = tokenizer.convert_tokens_to_string(
+-            output_tokens[prefix_offset:read_offset])
++    if tokenizer.is_fast or not tokenizer.get_added_vocab():
++        prefix_slice = output_tokens[prefix_offset:read_offset]
++        if prefix_slice:
++            prefix_text = tokenizer.convert_tokens_to_string(prefix_slice)
++        else:
++            prefix_text = ""
+         new_text = tokenizer.convert_tokens_to_string(
+             output_tokens[prefix_offset:])
+     else:
+-        prefix_text = _convert_tokens_to_string_with_added_encoders(
+-            tokenizer,
+-            output_tokens[prefix_offset:read_offset],
+-            skip_special_tokens=skip_special_tokens)
++        prefix_slice = output_tokens[prefix_offset:read_offset]
++        if prefix_slice:
++            prefix_text = _convert_tokens_to_string_with_added_encoders(
++                tokenizer,
++                prefix_slice,
++                skip_special_tokens=skip_special_tokens)
++        else:
++            prefix_text = ""
+         new_text = _convert_tokens_to_string_with_added_encoders(
+             tokenizer,
+             output_tokens[prefix_offset:],
+diff --git a/vllm/worker/worker.py b/vllm/worker/worker.py
+index 5b0a60dbf..ce26c673e 100644
+--- a/vllm/worker/worker.py
++++ b/vllm/worker/worker.py
+@@ -355,8 +355,10 @@ def _init_distributed_environment(
+             init_method=distributed_init_method,
+         )
+ 
+-    # A small all_reduce for warmup.
+-    torch.distributed.all_reduce(torch.zeros(1).cuda())
++    # A small all_reduce for warmup. Avoid zero-initialization overhead
++    # since the value is not used.
++    _dummy = torch.empty(1, device="cuda")
++    torch.distributed.all_reduce(_dummy)
+     initialize_model_parallel(parallel_config.tensor_parallel_size,
+                               parallel_config.pipeline_parallel_size)
+ 

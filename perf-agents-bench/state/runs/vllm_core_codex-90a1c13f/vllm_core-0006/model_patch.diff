@@ -1,0 +1,151 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/attention/ops/triton_unified_attention.py b/vllm/attention/ops/triton_unified_attention.py
+index c65f09523..e89f3f4f2 100644
+--- a/vllm/attention/ops/triton_unified_attention.py
++++ b/vllm/attention/ops/triton_unified_attention.py
+@@ -108,6 +108,7 @@ def kernel_unified_attention_2d(
+ 
+     offs_m = tl.arange(0, BLOCK_M)
+     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    offs_n = tl.arange(0, BLOCK_SIZE)
+     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+ 
+     query_offset_0 = cur_batch_in_all_start_index + query_pos
+@@ -146,13 +147,25 @@ def kernel_unified_attention_2d(
+                               other=0.0)
+ 
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
++    # compute the length of the longest sequence prefix spanned by any
++    # query token in the current q_block (q_block_local_idx)
++    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
++        BLOCK_M - 1) // num_queries_per_kv + 1
++
++    # adjust for potential padding in the last q_block by considering the
++    # actual sequence length
++    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
++
++    # calculate the number of tiles (blocks) that need to be processed to
++    # cover the longest sequence prefix (due to causal masking, blocks beyond
++    # this prefix can be skipped)
++    num_blocks = cdiv_fn(max_seq_prefix_len, BLOCK_SIZE)
+ 
+     # iterate through tiles
+     for j in range(0, num_blocks):
+ 
+         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+ 
+-        offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+         v_offset = (physical_block_idx * stride_v_cache_0 +
+                     kv_head_idx * stride_v_cache_2 +
+@@ -195,9 +208,7 @@ def kernel_unified_attention_2d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -316,6 +327,7 @@ def kernel_unified_attention_3d(
+ 
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
++    offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+     # number of segments for this particular sequence
+     num_segments = NUM_SEGMENTS_PER_SEQ
+@@ -363,6 +375,19 @@ def kernel_unified_attention_3d(
+                               other=0.0)
+ 
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
++    # compute the length of the longest sequence prefix spanned by any
++    # query token in the current q_block (q_block_local_idx)
++    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
++        BLOCK_M - 1) // num_queries_per_kv + 1
++
++    # adjust for potential padding in the last q_block by considering the
++    # actual sequence length
++    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
++
++    # calculate the number of tiles (blocks) that need to be processed to
++    # cover the longest sequence prefix (due to causal masking, blocks beyond
++    # this prefix can be skipped)
++    num_blocks = cdiv_fn(max_seq_prefix_len, BLOCK_SIZE)
+ 
+     # iterate through tiles within current segment
+     for j in range(
+@@ -371,7 +396,6 @@ def kernel_unified_attention_3d(
+     ):
+         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+ 
+-        offs_n = tl.arange(0, BLOCK_SIZE)
+ 
+         v_offset = (physical_block_idx * stride_v_cache_0 +
+                     kv_head_idx * stride_v_cache_2 +
+@@ -414,9 +438,7 @@ def kernel_unified_attention_3d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+diff --git a/vllm/utils/__init__.py b/vllm/utils/__init__.py
+index bfdbd6824..bb29cdb82 100644
+--- a/vllm/utils/__init__.py
++++ b/vllm/utils/__init__.py
+@@ -711,7 +711,8 @@ def make_async(
+     """
+ 
+     def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> asyncio.Future:
+-        loop = asyncio.get_event_loop()
++        # Use get_running_loop which avoids deprecated behavior and is faster.
++        loop = asyncio.get_running_loop()
+         p_func = partial(func, *args, **kwargs)
+         return loop.run_in_executor(executor=executor, func=p_func)
+ 
+@@ -733,6 +734,9 @@ async def merge_async_iterators(
+     When it yields, it yields a tuple (i, item) where i is the index of the
+     iterator that yields the item.
+     """
++    # Fast paths for trivial cases
++    if len(iterators) == 0:
++        return
+     if len(iterators) == 1:
+         # Fast-path single iterator case.
+         async for item in iterators[0]:
+@@ -787,20 +791,20 @@ def get_ip() -> str:
+     # IP is not set, try to get it from the network interface
+ 
+     # try ipv4
+-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+     try:
+-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+-        return s.getsockname()[0]
++        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
++            s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
++            return s.getsockname()[0]
+     except Exception:
+         pass
+ 
+     # try ipv6
+     try:
+-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+         # Google's public DNS server, see
+         # https://developers.google.com/speed/public-dns/docs/using#addresses
+-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+-        return s.getsockname()[0]
++        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
++            s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
++            return s.getsockname()[0]
+     except Exception:
+         pass
+ 

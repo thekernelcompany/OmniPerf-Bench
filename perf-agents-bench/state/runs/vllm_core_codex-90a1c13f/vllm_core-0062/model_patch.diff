@@ -1,0 +1,129 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index af4671ec2..1bb0e8633 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -139,11 +139,22 @@ class SchedulerOutputs:
+         # Swap in and swap out should never happen at the same time.
+         assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
+ 
+-        self.num_loras: int = len(self.lora_requests)
++        # Single pass over scheduled groups to compute counts for LoRA and
++        # prompt-adapter requests, avoiding repeated set construction.
++        lora_reqs: Set[LoRARequest] = set()
++        prompt_adapter_reqs: Set[PromptAdapterRequest] = set()
++        for g in self.scheduled_seq_groups:
++            sg = g.seq_group
++            if sg.lora_request is not None:
++                lora_reqs.add(sg.lora_request)
++            if sg.prompt_adapter_request is not None:
++                prompt_adapter_reqs.add(sg.prompt_adapter_request)
++
++        self.num_loras = len(lora_reqs)
+         if self.num_loras > 0:
+             self._sort_by_lora_ids()
+ 
+-        self.num_prompt_adapters: int = len(self.prompt_adapter_requests)
++        self.num_prompt_adapters = len(prompt_adapter_reqs)
+ 
+     def is_empty(self) -> bool:
+         # NOTE: We do not consider the ignored sequence groups.
+@@ -1255,7 +1266,8 @@ class Scheduler:
+                 encoder_seq_data = None
+                 cross_block_table = None
+ 
+-            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
++            running_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
++            for seq in running_seqs:
+                 seq_id = seq.seq_id
+                 seq_data[seq_id] = seq.data
+                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+@@ -1264,7 +1276,7 @@ class Scheduler:
+             if self.cache_config.enable_prefix_caching:
+                 common_computed_block_nums = (
+                     self.block_manager.get_common_computed_block_ids(
+-                        seq_group.get_seqs(status=SequenceStatus.RUNNING)))
++                        running_seqs))
+ 
+             do_sample = True
+             is_prompt = seq_group.is_prefill()
+@@ -1544,16 +1556,16 @@ class Scheduler:
+             self.last_prompt_latency = now - self.prev_time
+         self.prev_time, self.prev_prompt = now, False
+         # Delay scheduling prompts to let waiting queue fill up
+-        if self.scheduler_config.delay_factor > 0 and self.waiting:
+-            earliest_arrival_time = min(
+-                [e.metrics.arrival_time for e in self.waiting])
+-            passed_delay = (
+-                (now - earliest_arrival_time) >
+-                (self.scheduler_config.delay_factor * self.last_prompt_latency)
+-                or not self.running)
+-        else:
+-            passed_delay = True
+-        return passed_delay
++        delay_factor = self.scheduler_config.delay_factor
++        if delay_factor <= 0 or not self.waiting:
++            return True
++        # If there is no running request, don't wait.
++        if not self.running:
++            return True
++        earliest_arrival_time = min(e.metrics.arrival_time
++                                    for e in self.waiting)
++        return (now - earliest_arrival_time) > (delay_factor *
++                                                self.last_prompt_latency)
+ 
+     def _get_num_lookahead_slots(self, is_prefill: bool,
+                                  enable_chunking: bool) -> int:
+@@ -1597,10 +1609,9 @@ class Scheduler:
+ 
+         Returns 0 if the new token cannot be computed due to token budget.
+         """
+-        num_new_tokens = 0
+         seqs = seq_group.get_seqs(status=status)
+-        for seq in seqs:
+-            num_new_tokens += seq.get_num_new_tokens()
++        # Use built-in sum to reduce Python-loop overhead.
++        num_new_tokens = sum(seq.get_num_new_tokens() for seq in seqs)
+         assert num_new_tokens > 0
+         # Chunk if a running request cannot fit in the given budget.
+         # If number of seq > 1, it means it is doing beam search
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 8aed0fead..f30cdd3b0 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -90,8 +90,8 @@ class LlamaMLP(nn.Module):
+         self.act_fn = SiluAndMul()
+ 
+     def forward(self, x):
+-        gate_up, _ = self.gate_up_proj(x)
+-        x = self.act_fn(gate_up)
++        x, _ = self.gate_up_proj(x)
++        x = self.act_fn(x)
+         x, _ = self.down_proj(x)
+         return x
+ 
+@@ -134,6 +134,7 @@ class LlamaAttention(nn.Module):
+         self.q_size = self.num_heads * self.head_dim
+         self.kv_size = self.num_kv_heads * self.head_dim
+         self.scaling = self.head_dim**-0.5
++        self._split_sizes = [self.q_size, self.kv_size, self.kv_size]
+         self.rope_theta = rope_theta
+         self.max_position_embeddings = max_position_embeddings
+ 
+@@ -184,11 +185,11 @@ class LlamaAttention(nn.Module):
+         attn_metadata: AttentionMetadata,
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
+-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q, k, v = qkv.split(self._split_sizes, dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
+         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+-        output, _ = self.o_proj(attn_output)
+-        return output
++        attn_output, _ = self.o_proj(attn_output)
++        return attn_output
+ 
+ 
+ class LlamaDecoderLayer(nn.Module):

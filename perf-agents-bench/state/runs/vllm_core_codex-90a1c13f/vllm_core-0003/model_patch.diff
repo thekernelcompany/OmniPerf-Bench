@@ -1,0 +1,142 @@
+diff --git a/csrc/moe/moe_align_sum_kernels.cu b/csrc/moe/moe_align_sum_kernels.cu
+index d7be76945..2817c8612 100644
+--- a/csrc/moe/moe_align_sum_kernels.cu
++++ b/csrc/moe/moe_align_sum_kernels.cu
+@@ -86,6 +86,13 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
+          i += block_size) {
+       expert_ids[i / block_size] = threadIdx.x;
+     }
++    // Fill padding slots in sorted_token_ids with sentinel (numel)
++    int32_t start = cumsum[threadIdx.x];
++    int32_t end = cumsum[threadIdx.x + 1];
++    int32_t total_tokens = tokens_cnts[index(num_experts, blockDim.x, threadIdx.x)];
++    for (int32_t i = start + total_tokens; i < end; ++i) {
++      sorted_token_ids[i] = static_cast<int32_t>(numel);
++    }
+   }
+ 
+   /**
+@@ -172,6 +179,13 @@ __global__ void moe_align_block_size_global_mem_kernel(
+          i += block_size) {
+       expert_ids[i / block_size] = threadIdx.x;
+     }
++    // Fill padding slots in sorted_token_ids with sentinel (numel)
++    int32_t start = cumsum[threadIdx.x];
++    int32_t end = cumsum[threadIdx.x + 1];
++    int32_t total_tokens = tokens_cnts[index(num_experts, blockDim.x, threadIdx.x)];
++    for (int32_t i = start + total_tokens; i < end; ++i) {
++      sorted_token_ids[i] = static_cast<int32_t>(numel);
++    }
+   }
+ 
+   /**
+@@ -254,6 +268,15 @@ __global__ void sgl_moe_align_block_size_kernel(
+          i += block_size) {
+       expert_ids[i / block_size] = threadIdx.x;
+     }
++    // Fill padding slots in sorted_token_ids with sentinel (numel)
++    int32_t start = cumsum[threadIdx.x];
++    int32_t end = cumsum[threadIdx.x + 1];
++    int warp_idx = threadIdx.x / experts_per_warp;
++    int expert_offset = threadIdx.x % experts_per_warp;
++    int32_t total_tokens = shared_counts[warp_idx][expert_offset];
++    for (int32_t i = start + total_tokens; i < end; ++i) {
++      sorted_token_ids[i] = static_cast<int32_t>(numel);
++    }
+   }
+ }
+ 
+@@ -397,7 +420,7 @@ void sgl_moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+         auto options_int =
+             torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+         torch::Tensor cumsum_buffer =
+-            torch::zeros({num_experts + 1}, options_int);
++            torch::empty({num_experts + 1}, options_int);
+ 
+         auto align_kernel =
+             vllm::moe::sgl_moe_align_block_size_kernel<scalar_t>;
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 00260313e..bc60cccd6 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -521,6 +521,13 @@ def moe_align_block_size_stage4(
+         tl.store(sorted_token_ids_ptr + rank_post_pad, i)
+         tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
+ 
++    # Fill padded positions for this expert with sentinel (numel)
++    # Total tokens for this expert after counting is in the last row
++    total_cnt = tl.load(tokens_cnts_ptr + num_experts * num_experts + pid)
++    pad_start = tl.load(cumsum_ptr + pid) + total_cnt
++    for i in range(pad_start, end_idx):
++        tl.store(sorted_token_ids_ptr + i, numel)
++
+ 
+ # Triton implementation based on:
+ # https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0
+@@ -537,9 +544,12 @@ def moe_align_block_size_triton(
+     tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    # Use empty to avoid zero-initialization cost; only cumsum[0] must be 0
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    # Ensure the starting offset is zero
++    cumsum[0].zero_()
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -624,11 +634,9 @@ def moe_align_block_size(
+     sorted_ids = torch.empty((max_num_tokens_padded, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+-    # Expert ids must be zeroed out to prevent index out of bounds error while
+-    # mapping global expert ids to local expert ids in expert parallelism.
+-    expert_ids = torch.zeros((max_num_m_blocks, ),
++    # Expert ids buffer will be fully written by the kernel; avoid zeroing.
++    expert_ids = torch.empty((max_num_m_blocks, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+     num_tokens_post_pad = torch.empty((1),
+@@ -994,7 +1002,8 @@ def grouped_topk(hidden_states: torch.Tensor,
+                                    -1).max(dim=-1).values  # [n, n_group]
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
+                            sorted=False)[1]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
++    group_mask = torch.empty_like(group_scores)
++
+     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+     score_mask = group_mask.unsqueeze(-1).expand(
+         num_token, num_expert_group,
+@@ -1240,15 +1249,19 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+ 
+     config = get_config_func(M)
+ 
+-    intermediate_cache1 = torch.empty((M, top_k_num, N),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
++    # We can reuse the memory between these because by the time we need
++    # cache3, we're done with cache1
++    cache13 = torch.empty(M * top_k_num * max(N, w2.shape[1]),
++                          device=hidden_states.device,
++                          dtype=hidden_states.dtype)
++    intermediate_cache1 = cache13[:M * top_k_num * N].view(
++        (M, topk_ids.shape[1], N))
++    # This needs separate memory since it's used concurrently with cache1
+     intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                       device=hidden_states.device,
+                                       dtype=hidden_states.dtype)
+-    intermediate_cache3 = torch.empty((M, top_k_num, w2.shape[1]),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
++    intermediate_cache3 = cache13[:M * top_k_num * w2.shape[1]].view(
++        (M, topk_ids.shape[1], w2.shape[1]))
+ 
+     if hidden_states.dtype == torch.bfloat16:
+         compute_type = tl.bfloat16

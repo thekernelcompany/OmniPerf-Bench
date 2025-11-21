@@ -1,0 +1,79 @@
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+index 3ff162170..b15f12cda 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+@@ -82,27 +82,29 @@ def scaled_mm_kernel(a_ptr, b_ptr, scale_a_ptr, scale_b_ptr, c_ptr, bias_ptr,
+         b_ptrs += BLOCK_SIZE_K * stride_bk
+ 
+     # Apply scale at end.
+-    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
++    # Load and broadcast scales; avoid redundant, always-true mask terms.
++    masks_scale_a = masks_scale_am[:, None]
+     scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
+     # Need to broadcast to the appropriate size, if scale_a is already
+     # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
+     # for scale_b below.
+     scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+-    accumulator = scale_a * accumulator.to(tl.float32)
++    # Convert once to fp32 and apply scales.
++    accumulator = accumulator.to(tl.float32)
++    accumulator = scale_a * accumulator
+ 
+-    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
++    masks_scale_b = masks_scale_bn[:, None]
+     scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+-    accumulator = scale_b.T * accumulator.to(tl.float32)
++    accumulator = scale_b.T * accumulator
+ 
+     # Convert to output format.
+     c = accumulator.to(c_ptr.type.element_ty)
+ 
+     # Add bias, it's already in output format, so add it after conversion.
+     if bias_ptr:
+-        offsets_bias = offsets_bn
+-        bias_ptrs = bias_ptr + offsets_bias
+-        bias_mask = offsets_bias < N
++        bias_ptrs = bias_ptr + offsets_bn
++        bias_mask = masks_bn
+         bias = tl.load(bias_ptrs, bias_mask)
+         c += bias
+ 
+@@ -128,7 +130,8 @@ def triton_scaled_mm(input: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None,
+                      block_size_m: int = 32,
+                      block_size_n: int = 32,
+-                     block_size_k: int = 32) -> torch.Tensor:
++                     block_size_k: int = 32,
++                     use_heuristic: bool = True) -> torch.Tensor:
+     M, K = input.shape
+     N = weight.shape[1]
+ 
+@@ -148,6 +151,20 @@ def triton_scaled_mm(input: torch.Tensor,
+     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(
+         N, META['BLOCK_SIZE_N']), )
+ 
++    # Heuristically tune tile sizes for improved performance on common shapes.
++    if use_heuristic:
++        is_small_N = N < 8192
++        next_pow2_m = max(32, triton.next_power_of_2(M))
++        if next_pow2_m <= 32:
++            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
++        elif next_pow2_m <= 64:
++            tile_shape = (64, 64, 256)
++        elif next_pow2_m <= 128:
++            tile_shape = (64, 128, 128)
++        else:
++            tile_shape = (128, 128, 128)
++        block_size_m, block_size_n, block_size_k = tile_shape
++
+     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+ 
+     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+@@ -180,5 +197,4 @@ def triton_scaled_mm(input: torch.Tensor,
+                            BLOCK_SIZE_K=block_size_k,
+                            BLOCK_SIZE_SCALE_A=block_size_sa,
+                            BLOCK_SIZE_SCALE_B=block_size_sb)
+-
+-    return result.to(out_dtype)
++    return result

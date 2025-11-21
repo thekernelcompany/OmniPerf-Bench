@@ -1,0 +1,82 @@
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index 2d8594cb8..a58bf8170 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -240,6 +240,9 @@ class XGrammarLogitsProcessor:
+     matchers: list[xgr.GrammarMatcher] = field(default_factory=list)
+     batch_size: int = field(default=1)
+     prefilled: bool = field(default=False)
++    # Cache for device-resident token bitmasks to avoid per-step allocation
++    _device_bitmask_cache: dict[str, torch.Tensor] = field(
++        default_factory=dict)
+ 
+     def __getstate__(self) -> dict[str, Any]:
+         return {'config': self.config}
+@@ -252,6 +255,7 @@ class XGrammarLogitsProcessor:
+         self.batch_size = 1
+         self.token_bitmask = None  # type: ignore[assignment]
+         self.prefilled = False
++        self._device_bitmask_cache = {}
+ 
+     def _ensure_ctx(self):
+         """Lazily initialize the processor in the worker process"""
+@@ -278,6 +282,14 @@ class XGrammarLogitsProcessor:
+             ]
+             self.token_bitmask = xgr.allocate_token_bitmask(
+                 self.batch_size, self.config.vocab_size)
++            # Pin CPU memory to enable faster, non-blocking H2D copies
++            # when running on CUDA. Safe no-op when CUDA is unavailable.
++            if torch.cuda.is_available():
++                try:
++                    self.token_bitmask = self.token_bitmask.pin_memory()
++                except RuntimeError:
++                    # Some backends may not support pinning; continue safely.
++                    pass
+ 
+         if not self.prefilled:
+             # Have not sampled a token yet
+@@ -299,18 +311,33 @@ class XGrammarLogitsProcessor:
+         # fill_next_token_bitmask so we move it to the device of scores
+         device_type = scores.device.type
+         dtype = scores.dtype
+-        if device_type != "cuda":
+-            # xgrammar on cpu only supports float32 scores
++        if device_type == "cuda":
++            # Avoid per-call allocation by reusing a device-side buffer.
++            dev = scores.device
++            dev_key = str(dev)
++            t_dev = self._device_bitmask_cache.get(dev_key)
++            if (t_dev is None or t_dev.shape != self.token_bitmask.shape
++                    or t_dev.dtype != self.token_bitmask.dtype
++                    or t_dev.device != dev):
++                t_dev = torch.empty_like(self.token_bitmask, device=dev)
++                self._device_bitmask_cache[dev_key] = t_dev
++
++            # Async H2D copy (requires pinned host memory for full benefit)
++            t_dev.copy_(self.token_bitmask, non_blocking=True)
++
++            # On GPU, shape mismatches are tolerated by the kernel; no unsqueeze
++            xgr.apply_token_bitmask_inplace(scores, t_dev)
++        else:
++            # xgrammar on CPU only supports float32 scores
+             # see: https://github.com/mlc-ai/xgrammar/blob/c1b64920cad24f44f235778c1c00bb52d57da01a/python/xgrammar/kernels/apply_token_bitmask_inplace_cpu.py#L22
+-            scores = scores.to("cpu").float().unsqueeze(0)
+-
+-        # Note: In this method, if the tensors have different dimensions
+-        # on CPU device fails, but on GPU it runs without error. Hence the
+-        # unsqueeze above for scores, to match the token bitmask shape
+-        xgr.apply_token_bitmask_inplace(scores,
+-                                        self.token_bitmask.to(scores.device))
+-        if device_type != "cuda":
+-            scores = scores.to(dtype).to(device_type).squeeze()
++            scores = scores.to("cpu", dtype=torch.float32).unsqueeze(0)
++
++            # Note: On CPU, tensor dims must match; hence unsqueeze above.
++            # Pass the host bitmask directly.
++            xgr.apply_token_bitmask_inplace(scores, self.token_bitmask)
++
++            # Single conversion back to original device and dtype.
++            scores = scores.to(device_type, dtype=dtype).squeeze()
+ 
+         return scores
+ 

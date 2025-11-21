@@ -1,0 +1,367 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 9bb11907f..288b72381 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import atexit
++import gc
+ import importlib
+ import inspect
+ import multiprocessing
+@@ -104,6 +105,10 @@ async def lifespan(app: FastAPI):
+             task.add_done_callback(_running_tasks.remove)
+         else:
+             task = None
++
++        # Mark the startup heap as static so that it's ignored by GC to reduce pause times.
++        gc.collect()
++        gc.freeze()
+         try:
+             yield
+         finally:
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 14e41346d..693314e03 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -19,6 +19,13 @@ from vllm.utils import random_uuid, resolve_obj_by_qualname
+ 
+ logger = init_logger(__name__)
+ 
++
++# Fast path for integer epoch time used in default_factory
++_time = time.time
++
++def _now_int() -> int:
++    return int(_time())
++
+ # torch is mocked during docs generation,
+ # so we have to provide the values as literals
+ _MOCK_LONG_INFO = Namespace(min=-9223372036854775808, max=9223372036854775807)
+@@ -73,7 +80,7 @@ class ErrorResponse(OpenAIBaseModel):
+ class ModelPermission(OpenAIBaseModel):
+     id: str = Field(default_factory=lambda: f"modelperm-{random_uuid()}")
+     object: str = "model_permission"
+-    created: int = Field(default_factory=lambda: int(time.time()))
++    created: int = Field(default_factory=_now_int)
+     allow_create_engine: bool = False
+     allow_sampling: bool = True
+     allow_logprobs: bool = True
+@@ -88,7 +95,7 @@ class ModelPermission(OpenAIBaseModel):
+ class ModelCard(OpenAIBaseModel):
+     id: str
+     object: str = "model"
+-    created: int = Field(default_factory=lambda: int(time.time()))
++    created: int = Field(default_factory=_now_int)
+     owned_by: str = "vllm"
+     root: Optional[str] = None
+     parent: Optional[str] = None
+@@ -170,10 +177,12 @@ def get_logits_processors(processors: Optional[LogitsProcessors],
+                           pattern: Optional[str]) -> Optional[List[Any]]:
+     if processors and pattern:
+         logits_processors = []
++        compiled = re.compile(pattern)
++        match = compiled.match
+         for processor in processors:
+             qualname = processor if isinstance(processor,
+                                                str) else processor.qualname
+-            if not re.match(pattern, qualname):
++            if not match(qualname):
+                 raise ValueError(
+                     f"Logits processor '{qualname}' is not allowed by this "
+                     "server. See --logits-processor-pattern engine argument "
+diff --git a/vllm/logits_process.py b/vllm/logits_process.py
+index 7716ccd27..6450c1954 100644
+--- a/vllm/logits_process.py
++++ b/vllm/logits_process.py
+@@ -50,8 +50,22 @@ class NoBadWordsLogitsProcessor:
+     _NEUTRAL_LOGIT = 0.0
+ 
+     def __init__(self, bad_words_ids: List[List[int]]):
++        # Store as provided for API compatibility
+         self.bad_words_ids = bad_words_ids
+-        self.word_bias: torch.FloatTensor = None
++        # Lazily constructed tensor for single-token biases;
++        # set to None when no single-token bad words exist to avoid allocations.
++        self.word_bias: torch.FloatTensor | None = None
++        # Precompute structures for faster matching and lazy allocations.
++        self._single_token_ids: List[int] = []
++        self._multi_token_rules: List[Tuple[Tuple[int, ...], int]] = []
++        for ids in bad_words_ids:
++            if not ids:
++                continue
++            if len(ids) == 1:
++                self._single_token_ids.append(ids[0])
++            else:
++                # (prefix tuple, last token id)
++                self._multi_token_rules.append((tuple(ids[:-1]), ids[-1]))
+ 
+     def __call__(
+         self,
+@@ -61,29 +75,49 @@ class NoBadWordsLogitsProcessor:
+         if self.word_bias is None:
+             self._init_word_bias(logits=logits)
+ 
+-        last_token_bias = torch.zeros_like(logits)
+-
+-        for bad_word_ids in self.bad_words_ids:
+-            if len(bad_word_ids) == 1:  # 1-token words already processed
+-                continue
+-
+-            if len(bad_word_ids) > len(past_tokens_ids) + 1:
++        # Base logits to return; avoid unnecessary allocation when no single
++        # token bad words.
++        if self.word_bias is None:
++            out = logits
++        else:
++            out = logits + self.word_bias
++
++        # Fast path: no multi-token rules
++        if not self._multi_token_rules:
++            return out
++
++        pt_len = len(past_tokens_ids)
++        matched_indices: List[int] = []
++        seen = set()
++        # Cache suffix tuples by length to avoid repeated slicing/boxing.
++        needed_lengths = set()
++        for prefix, _ in self._multi_token_rules:
++            k = len(prefix)
++            if k <= pt_len:
++                needed_lengths.add(k)
++        suffix_by_k = {k: tuple(past_tokens_ids[-k:]) for k in needed_lengths}
++
++        for prefix, last_token_id in self._multi_token_rules:
++            k = len(prefix)
++            if k > pt_len:
+                 continue
++            # Compare suffix with expected prefix
++            if suffix_by_k[k] == prefix:
++                if last_token_id not in seen:
++                    seen.add(last_token_id)
++                    matched_indices.append(last_token_id)
+ 
+-            prefix_length = len(bad_word_ids) - 1
+-            last_token_id = bad_word_ids[-1]
+-            actual_prefix = past_tokens_ids[-prefix_length:]
+-            expected_prefix = bad_word_ids[:prefix_length]
+-
+-            assert len(actual_prefix) == len(expected_prefix)
+-
+-            is_match = tuple(actual_prefix) == tuple(expected_prefix)
+-            last_token_bias[last_token_id] += (self._SMALLEST_LOGIT if is_match
+-                                               else self._NEUTRAL_LOGIT)
++        if not matched_indices:
++            return out
+ 
+-        logits = logits + self.word_bias + last_token_bias
++        # Ensure we do not mutate input logits tensor if no base addition
++        if out is logits:
++            out = logits.clone()
++        # Apply -inf to matched last token indices
++        for idx in matched_indices:
++            out[idx] = self._SMALLEST_LOGIT
+ 
+-        return logits
++        return out
+ 
+     def _init_word_bias(self, logits: torch.FloatTensor) -> None:
+         # Code based on NoBadWordsLogitsProcessor and SequenceBiasLogitsProcessor  # noqa: E501
+@@ -93,14 +127,17 @@ class NoBadWordsLogitsProcessor:
+ 
+         self._check_token_ids_bounds(vocab_size=vocab_size)
+ 
++        if not self._single_token_ids:
++            # No single-token bad words; skip allocating a full-size bias tensor.
++            self.word_bias = None
++            return
++
+         self.word_bias = torch.zeros((vocab_size, ),
+                                      dtype=torch.float,
+                                      device=logits.device)
+ 
+-        for bad_word_ids in self.bad_words_ids:
+-            if len(bad_word_ids) == 1:
+-                bad_word_id = bad_word_ids[-1]
+-                self.word_bias[bad_word_id] = self._SMALLEST_LOGIT
++        for bad_word_id in self._single_token_ids:
++            self.word_bias[bad_word_id] = self._SMALLEST_LOGIT
+ 
+     def _check_token_ids_bounds(self, vocab_size: int) -> None:
+         invalid_token_ids = []
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index b4d3e4411..e50a1da7d 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -205,10 +205,13 @@ class AsyncLLM(EngineClient):
+ 
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
++            get_nowait = q.get_nowait
++            get = q.get
++            qsize = q.qsize
+             while True:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() if q.qsize() > 0 else await q.get()
++                out = get_nowait() if qsize() > 0 else await get()
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+@@ -229,24 +232,26 @@ class AsyncLLM(EngineClient):
+         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
+ 
+         try:
++            get_output_async = self.engine_core.get_output_async
++            process_outputs = self.output_processor.process_outputs
++            abort_requests_async = self.engine_core.abort_requests_async
++            log_stats = self._log_stats
+             while True:
+                 # 1) Pull EngineCoreOutputs from the EngineCore.
+-                outputs = await self.engine_core.get_output_async()
++                outputs = await get_output_async()
+ 
+                 # 2) Process EngineCoreOutputs.
+-                processed_outputs = self.output_processor.process_outputs(
+-                    outputs.outputs)
++                processed_outputs = process_outputs(outputs.outputs)
+                 # NOTE: RequestOutputs are pushed to their queues.
+                 assert len(processed_outputs.request_outputs) == 0
+ 
+                 # 3) Abort any reqs that finished due to stop strings.
+-                await self.engine_core.abort_requests_async(
+-                    processed_outputs.reqs_to_abort)
++                await abort_requests_async(processed_outputs.reqs_to_abort)
+ 
+                 # 4) Logging.
+                 # TODO(rob): make into a coroutine and launch it in
+                 # background thread once we add Prometheus.
+-                self._log_stats(
++                log_stats(
+                     scheduler_stats=outputs.scheduler_stats,
+                     iteration_stats=processed_outputs.iteration_stats,
+                 )
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 19b89003c..12d546ebe 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -111,7 +111,7 @@ class InprocClient(EngineCoreClient):
+         self.engine_core.add_request(request)
+ 
+     def abort_requests(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             self.engine_core.abort_requests(request_ids)
+ 
+     def shutdown(self) -> None:
+@@ -231,7 +231,7 @@ class SyncMPClient(MPClient):
+         self._send_input(EngineCoreRequestType.ADD, request)
+ 
+     def abort_requests(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             self._send_input(EngineCoreRequestType.ABORT, request_ids)
+ 
+     def profile(self, is_start: bool = True) -> None:
+@@ -273,7 +273,7 @@ class AsyncMPClient(MPClient):
+         await self._send_input(EngineCoreRequestType.ADD, request)
+ 
+     async def abort_requests_async(self, request_ids: List[str]) -> None:
+-        if len(request_ids) > 0:
++        if request_ids:
+             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+ 
+     async def profile_async(self, is_start: bool = True) -> None:
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 749f4f504..b1f35de96 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -21,6 +21,17 @@ class OutputProcessorOutput:
+ 
+ class RequestState:
+ 
++    __slots__ = (
++        "request_id",
++        "prompt",
++        "prompt_token_ids",
++        "prompt_len",
++        "detokenizer",
++        "is_prefilling",
++        "queue",
++    )
++
++
+     def __init__(
+         self,
+         request_id: str,
+@@ -134,17 +145,19 @@ class OutputProcessor:
+         request_outputs: List[RequestOutput] = []
+         reqs_to_abort: List[str] = []
+         iteration_stats = IterationStats(self.log_stats)
++        request_states = self.request_states
++        iteration_stats_update = iteration_stats.update_from_output
++        make_request_output = self._make_request_output
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+-            req_state = self.request_states.get(req_id)
++            req_state = request_states.get(req_id)
+             if req_state is None:
+                 # Ignore output for already-aborted request.
+                 continue
+ 
+             # 1) Compute stats for this iteration.
+-            iteration_stats.update_from_output(engine_core_output,
+-                                               req_state.is_prefilling,
+-                                               req_state.prompt_len)
++            iteration_stats_update(engine_core_output, req_state.is_prefilling,
++                                   req_state.prompt_len)
+             req_state.is_prefilling = False
+ 
+             # 2) Detokenize the token ids into text.
+@@ -152,8 +165,8 @@ class OutputProcessor:
+                 engine_core_output)
+ 
+             # 3) Create and handle RequestOutput objects.
+-            if request_output := self._make_request_output(
+-                    req_state, detokenizer_output):
++            if request_output := make_request_output(req_state,
++                                                     detokenizer_output):
+                 if req_state.queue is not None:
+                     # AsyncLLM: put into queue for handling by generate().
+                     req_state.queue.put_nowait(request_output)
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 45450165e..436bd04cf 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -15,6 +15,28 @@ if TYPE_CHECKING:
+ 
+ class Request:
+ 
++    __slots__ = (
++        "request_id",
++        "sampling_params",
++        "eos_token_id",
++        "metrics",
++        "lora_request",
++        "status",
++        "stop_reason",
++        "max_tokens",
++        "prompt",
++        "prompt_token_ids",
++        "num_prompt_tokens",
++        "_output_token_ids",
++        "_all_token_ids",
++        "num_computed_tokens",
++        "mm_positions",
++        "mm_inputs",
++        "mm_hashes",
++        "_kv_block_hashes",
++    )
++
++
+     def __init__(
+         self,
+         request_id: str,

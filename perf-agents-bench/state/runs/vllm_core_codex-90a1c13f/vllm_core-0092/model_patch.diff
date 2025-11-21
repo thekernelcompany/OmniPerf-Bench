@@ -1,0 +1,285 @@
+diff --git a/benchmarks/kernels/benchmark_reshape_and_cache_flash.py b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+new file mode 100644
+index 000000000..4ab002c38
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: Apache-2.0
++# Benchmark for reshape_and_cache_flash kernel
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass
++from typing import Optional
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.utils import (
++    STR_DTYPE_TO_TORCH_DTYPE,
++    FlexibleArgumentParser,
++    create_kv_caches_with_random_flash,
++)
++
++logger = init_logger(__name__)
++
++
++@dataclass
++class BenchmarkConfig:
++    # problem sizes
++    num_tokens: int = 4096
++    num_heads: int = 32
++    head_size: int = 128
++    block_size: int = 16
++    num_layers: int = 1
++
++    # dtypes
++    model_dtype: str = "bfloat16"
++    cache_dtype: str = "auto"
++
++    # runtime
++    iters: int = 50
++    warmup: int = 10
++    seed: int = 0
++    device: str = "cuda"
++
++
++def _make_slot_mapping(num_tokens: int, block_size: int) -> torch.Tensor:
++    # map tokens to slots in blocks [0..num_blocks*block_size)
++    # keep it simple and contiguous for bandwidth stress
++    num_blocks = (num_tokens + block_size - 1) // block_size
++    slots = torch.arange(num_tokens, dtype=torch.long, device="cuda")
++    # in flash layout, slot==token for contiguous case
++    return slots
++
++
++@torch.inference_mode()
++def run_benchmark(cfg: BenchmarkConfig) -> dict:
++    torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cfg.model_dtype]
++    current_platform.seed_everything(cfg.seed)
++
++    # inputs
++    key = torch.empty((cfg.num_tokens, cfg.num_heads, cfg.head_size),
++                      dtype=torch_dtype,
++                      device=cfg.device).uniform_(-0.5, 0.5)
++    value = torch.empty_like(key).uniform_(-0.5, 0.5)
++
++    # kv caches in flash layout
++    num_blocks = (cfg.num_tokens + cfg.block_size - 1) // cfg.block_size
++    key_caches, value_caches = create_kv_caches_with_random_flash(
++        num_blocks=num_blocks,
++        block_size=cfg.block_size,
++        num_layers=cfg.num_layers,
++        num_heads=cfg.num_heads,
++        head_size=cfg.head_size,
++        cache_dtype=cfg.cache_dtype,
++        model_dtype=torch_dtype,
++        device=cfg.device,
++        seed=cfg.seed,
++    )
++    key_cache = key_caches[0]
++    value_cache = value_caches[0]
++
++    slot_mapping = _make_slot_mapping(cfg.num_tokens, cfg.block_size)
++
++    # fake scales (ignored unless fp8)
++    k_scale = torch.ones((), dtype=torch.float32, device=cfg.device)
++    v_scale = torch.ones((), dtype=torch.float32, device=cfg.device)
++
++    # warmup
++    for _ in range(cfg.warmup):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                    slot_mapping, cfg.cache_dtype, k_scale,
++                                    v_scale)
++    torch.cuda.synchronize()
++
++    # measure
++    t0 = time.perf_counter()
++    for _ in range(cfg.iters):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                    slot_mapping, cfg.cache_dtype, k_scale,
++                                    v_scale)
++    torch.cuda.synchronize()
++    t1 = time.perf_counter()
++
++    elapsed_s = (t1 - t0) / cfg.iters
++    bytes_moved = (
++        # read key/value
++        key.numel() * key.element_size() * 2
++        + key_cache.numel() * key_cache.element_size()
++        + value_cache.numel() * value_cache.element_size()
++    )
++    gbps = bytes_moved / elapsed_s / 1e9
++
++    return {
++        "time_ms": elapsed_s * 1e3,
++        "gbps": gbps,
++        "tokens": cfg.num_tokens,
++        "heads": cfg.num_heads,
++        "head_size": cfg.head_size,
++        "block_size": cfg.block_size,
++        "dtype": str(torch_dtype).replace("torch.", ""),
++        "cache_dtype": cfg.cache_dtype,
++    }
++
++
++def main(argv: Optional[list[str]] = None) -> None:
++    parser = FlexibleArgumentParser(
++        description="Benchmark reshape_and_cache_flash kernel",
++    )
++    parser.add_argument("--num-tokens", type=int, default=4096)
++    parser.add_argument("--num-heads", type=int, default=32)
++    parser.add_argument("--head-size", type=int, default=128)
++    parser.add_argument("--block-size", type=int, default=16)
++    parser.add_argument("--iters", type=int, default=50)
++    parser.add_argument("--warmup", type=int, default=10)
++    parser.add_argument("--model-dtype",
++                        type=str,
++                        default="bfloat16",
++                        choices=["float", "half", "bfloat16"])
++    parser.add_argument("--cache-dtype",
++                        type=str,
++                        default="auto",
++                        choices=["auto", "float", "half", "bfloat16", "fp8"])  # noqa: E501
++    parser.add_argument("--device", type=str, default="cuda")
++    parser.add_argument("--seed", type=int, default=0)
++    args = parser.parse_args(argv)
++
++    cfg = BenchmarkConfig(num_tokens=args.num_tokens,
++                          num_heads=args.num_heads,
++                          head_size=args.head_size,
++                          block_size=args.block_size,
++                          iters=args.iters,
++                          warmup=args.warmup,
++                          model_dtype=args.model_dtype,
++                          cache_dtype=args.cache_dtype,
++                          device=args.device,
++                          seed=args.seed)
++
++    logger.info("Running reshape_and_cache_flash benchmark: %s", cfg)
++    stats = run_benchmark(cfg)
++    logger.info("Result: time_per_iter_ms=%.3f, GB/s=%.2f", stats["time_ms"],
++                stats["gbps"])
++
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index d06eac2b3..5c221a6fd 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -230,23 +230,38 @@ __global__ void reshape_and_cache_kernel(
+   const int64_t block_offset = slot_idx % block_size;
+ 
+   const int n = num_heads * head_size;
++  const int64_t src_key_base = static_cast<int64_t>(token_idx) * key_stride;
++  const int64_t src_value_base = static_cast<int64_t>(token_idx) * value_stride;
++  const int head_size_div_x = head_size / x;
++  const int per_head_stride = head_size_div_x * block_size * x;
++  const int64_t key_block_base = static_cast<int64_t>(block_idx) *
++                                 static_cast<int64_t>(num_heads) *
++                                 static_cast<int64_t>(per_head_stride);
++  const int64_t key_block_offset_base = static_cast<int64_t>(block_offset) * x;
++  const int64_t value_block_base = static_cast<int64_t>(block_idx) *
++                                   static_cast<int64_t>(num_heads) *
++                                   static_cast<int64_t>(head_size) *
++                                   static_cast<int64_t>(block_size) +
++                                   static_cast<int64_t>(block_offset);
++  const float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 1.0f : *k_scale;
++  const float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 1.0f : *v_scale;
++  
++  #pragma unroll 4
+   for (int i = threadIdx.x; i < n; i += blockDim.x) {
+-    const int64_t src_key_idx = token_idx * key_stride + i;
+-    const int64_t src_value_idx = token_idx * value_stride + i;
++    const int64_t src_key_idx = src_key_base + i;
++    const int64_t src_value_idx = src_value_base + i;
+ 
+     const int head_idx = i / head_size;
+     const int head_offset = i % head_size;
+     const int x_idx = head_offset / x;
+     const int x_offset = head_offset % x;
+ 
+-    const int64_t tgt_key_idx =
+-        block_idx * num_heads * (head_size / x) * block_size * x +
+-        head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
+-        block_offset * x + x_offset;
+-    const int64_t tgt_value_idx =
+-        block_idx * num_heads * head_size * block_size +
+-        head_idx * head_size * block_size + head_offset * block_size +
+-        block_offset;
++    const int64_t tgt_key_idx = key_block_base +
++                                static_cast<int64_t>(head_idx) * per_head_stride +
++                                static_cast<int64_t>(x_idx) * (block_size * x) +
++                                key_block_offset_base + x_offset;
++    const int64_t tgt_value_idx = value_block_base +
++                                  static_cast<int64_t>(i) * block_size;
+     scalar_t tgt_key = key[src_key_idx];
+     scalar_t tgt_value = value[src_value_idx];
+     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+@@ -254,9 +269,9 @@ __global__ void reshape_and_cache_kernel(
+       value_cache[tgt_value_idx] = tgt_value;
+     } else {
+       key_cache[tgt_key_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, *k_scale);
++          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, k_scale_val);
+       value_cache[tgt_value_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
++          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, v_scale_val);
+     }
+   }
+ }
+@@ -282,24 +297,28 @@ __global__ void reshape_and_cache_flash_kernel(
+   const int64_t block_idx = slot_idx / block_size;
+   const int64_t block_offset = slot_idx % block_size;
+   const int n = num_heads * head_size;
++  const int64_t src_key_base = static_cast<int64_t>(token_idx) * key_stride;
++  const int64_t src_value_base = static_cast<int64_t>(token_idx) * value_stride;
++  const int64_t dst_base = static_cast<int64_t>(block_idx) * block_stride +
++                           static_cast<int64_t>(block_offset) * n;
++  const float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 1.0f : *k_scale;
++  const float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 1.0f : *v_scale;
++
++  #pragma unroll 4
+   for (int i = threadIdx.x; i < n; i += blockDim.x) {
+-    const int64_t src_key_idx = token_idx * key_stride + i;
+-    const int64_t src_value_idx = token_idx * value_stride + i;
+-    const int head_idx = i / head_size;
+-    const int head_offset = i % head_size;
+-    const int64_t tgt_key_value_idx = block_idx * block_stride +
+-                                      block_offset * num_heads * head_size +
+-                                      head_idx * head_size + head_offset;
++    const int64_t src_key_idx = src_key_base + i;
++    const int64_t src_value_idx = src_value_base + i;
++    const int64_t dst_idx = dst_base + i;
+     scalar_t tgt_key = key[src_key_idx];
+     scalar_t tgt_value = value[src_value_idx];
+     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+-      key_cache[tgt_key_value_idx] = tgt_key;
+-      value_cache[tgt_key_value_idx] = tgt_value;
++      key_cache[dst_idx] = tgt_key;
++      value_cache[dst_idx] = tgt_value;
+     } else {
+-      key_cache[tgt_key_value_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, *k_scale);
+-      value_cache[tgt_key_value_idx] =
+-          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
++      key_cache[dst_idx] =
++          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, k_scale_val);
++      value_cache[dst_idx] =
++          fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, v_scale_val);
+     }
+   }
+ }
+@@ -438,7 +457,7 @@ void reshape_and_cache_flash(
+   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(num_heads * head_size, 512));
++  dim3 block(std::min(num_heads * head_size, 1024));
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 

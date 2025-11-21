@@ -1,0 +1,124 @@
+diff --git a/tests/weight_loading/test_weight_loading.py b/tests/weight_loading/test_weight_loading.py
+index e456bfab8..fd6539d06 100644
+--- a/tests/weight_loading/test_weight_loading.py
++++ b/tests/weight_loading/test_weight_loading.py
+@@ -12,7 +12,9 @@ MODEL_NAME = os.environ.get("MODEL_NAME",
+                             "robertgshaw2/zephyr-7b-beta-channelwise-gptq")
+ REVISION = os.environ.get("REVISION", "main")
+ QUANTIZATION = os.environ.get("QUANTIZATION", "gptq_marlin")
+-MIN_CAPABILITY = os.environ.get("MIN_CAPABILITY", "89")
++# Lower the default minimum capability to broaden GPU support and avoid
++# unnecessarily skipping tests on capable devices.
++MIN_CAPABILITY = os.environ.get("MIN_CAPABILITY", "80")
+ 
+ 
+ @pytest.mark.skipif(
+diff --git a/vllm/model_executor/layers/quantization/awq_marlin.py b/vllm/model_executor/layers/quantization/awq_marlin.py
+index a43b2e597..34892cd1a 100644
+--- a/vllm/model_executor/layers/quantization/awq_marlin.py
++++ b/vllm/model_executor/layers/quantization/awq_marlin.py
+@@ -134,6 +134,29 @@ class AWQMarlinConfig(QuantizationConfig):
+                     self.full_config).get_quant_method(layer, prefix)
+             return AWQMarlinLinearMethod(self)
+         elif isinstance(layer, FusedMoE):
++            # Prefer the WNA16 MoE kernel by default for large expert counts
++            # when compatible, which can reduce overhead and improve
++            # performance on many-expert MoEs.
++            try:
++                num_experts = getattr(layer, "num_experts", None)
++                if num_experts is not None and num_experts >= 64:
++                    # Local import to avoid circular import on module load.
++                    from vllm.model_executor.layers.quantization.moe_wna16 import (  # noqa: E501
++                        MoeWNA16Config)
++                    cfg = {
++                        "quant_method": "awq",
++                        "bits": self.weight_bits,
++                        "group_size": self.group_size,
++                        "zero_point": self.zero_point,
++                        "lm_head": self.lm_head_quantized,
++                        "modules_to_not_convert": self.modules_to_not_convert,
++                    }
++                    if MoeWNA16Config.is_moe_wna16_compatible(cfg):
++                        return MoeWNA16Config.from_config(cfg).get_quant_method(
++                            layer, prefix)
++            except Exception:
++                # Fall back to Marlin MoE if any issue occurs.
++                pass
+             return AWQMoEMethod(self)
+         return None
+ 
+diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
+index 0a9d86b00..035f0a621 100644
+--- a/vllm/model_executor/layers/quantization/gptq_marlin.py
++++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
+@@ -160,6 +160,28 @@ class GPTQMarlinConfig(QuantizationConfig):
+     ) -> Optional[Union["GPTQMarlinLinearMethod", "GPTQMarlinMoEMethod",
+                         UnquantizedLinearMethod, UnquantizedEmbeddingMethod]]:
+         if isinstance(layer, FusedMoE):
++            # For many-expert MoEs, prefer the WNA16 MoE kernel where
++            # compatible as it can reduce routing/memory overhead.
++            try:
++                num_experts = getattr(layer, "num_experts", None)
++                if num_experts is not None and num_experts >= 64:
++                    # Local import to avoid circular import on module load.
++                    from vllm.model_executor.layers.quantization.moe_wna16 import (  # noqa: E501
++                        MoeWNA16Config)
++                    cfg = {
++                        "quant_method": "gptq",
++                        "bits": self.weight_bits,
++                        "group_size": self.group_size,
++                        "desc_act": self.desc_act,
++                        "sym": self.is_sym,
++                        "lm_head": self.lm_head_quantized,
++                    }
++                    if MoeWNA16Config.is_moe_wna16_compatible(cfg):
++                        return MoeWNA16Config.from_config(cfg).get_quant_method(
++                            layer, prefix)
++            except Exception:
++                # If any issue arises, fall back to Marlin MoE.
++                pass
+             return GPTQMarlinMoEMethod(self)
+         return get_linear_quant_method(self, layer, prefix,
+                                        GPTQMarlinLinearMethod)
+diff --git a/vllm/model_executor/layers/quantization/moe_wna16.py b/vllm/model_executor/layers/quantization/moe_wna16.py
+index b9460e7d7..eca5cec3b 100644
+--- a/vllm/model_executor/layers/quantization/moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/moe_wna16.py
+@@ -217,7 +217,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         layer.register_parameter("w2_qweight", w2_qweight)
+         set_weight_attrs(w2_qweight, extra_weight_attrs)
+ 
+-        w13_scales = torch.nn.Parameter(torch.zeros(
++        # Scales and zero-points are immediately loaded from checkpoints; avoid
++        # the extra memset by using empty() instead of zeros().
++        w13_scales = torch.nn.Parameter(torch.empty(
+             num_experts,
+             2 * intermediate_size_per_partition,
+             hidden_size // group_size,
+@@ -226,7 +228,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         layer.register_parameter("w13_scales", w13_scales)
+         set_weight_attrs(w13_scales, extra_weight_attrs)
+ 
+-        w2_scales = torch.nn.Parameter(torch.zeros(
++        w2_scales = torch.nn.Parameter(torch.empty(
+             num_experts,
+             hidden_size,
+             intermediate_size_per_partition // group_size,
+@@ -236,7 +238,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         set_weight_attrs(w2_scales, extra_weight_attrs)
+ 
+         if self.quant_config.has_zp:
+-            w13_qzeros = torch.nn.Parameter(torch.zeros(
++            w13_qzeros = torch.nn.Parameter(torch.empty(
+                 num_experts,
+                 2 * intermediate_size_per_partition // bit8_pack_factor,
+                 hidden_size // group_size,
+@@ -245,7 +247,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+             layer.register_parameter("w13_qzeros", w13_qzeros)
+             set_weight_attrs(w13_qzeros, extra_weight_attrs)
+ 
+-            w2_qzeros = torch.nn.Parameter(torch.zeros(
++            w2_qzeros = torch.nn.Parameter(torch.empty(
+                 num_experts,
+                 hidden_size // bit8_pack_factor,
+                 intermediate_size_per_partition // group_size,

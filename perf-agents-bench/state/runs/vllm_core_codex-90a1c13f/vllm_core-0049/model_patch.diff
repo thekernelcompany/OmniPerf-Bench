@@ -1,0 +1,356 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/core/test_block_manager.py b/tests/core/test_block_manager.py
+index 44ac05a14..9e42ad8f9 100644
+--- a/tests/core/test_block_manager.py
++++ b/tests/core/test_block_manager.py
+@@ -4,7 +4,7 @@ from typing import List
+ 
+ from vllm import SamplingParams
+ from vllm.block import PhysicalTokenBlock
+-from vllm.core.block_manager import (BlockAllocator, BlockSpaceManager,
++from vllm.core.block_manager import (UncachedBlockAllocator, BlockSpaceManager,
+                                      AllocStatus)
+ from vllm.utils import Device
+ from vllm.sequence import Sequence, SequenceGroup, SequenceStatus, Logprob
+@@ -15,7 +15,7 @@ from .utils import create_dummy_prompt
+ def test_block_allocator_allocate():
+     block_size = 4
+     num_cpu_blocks = 4
+-    cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
++    cpu_allocator = UncachedBlockAllocator(Device.CPU, block_size, num_cpu_blocks)
+ 
+     # Allocate all available cpu blocks.
+     num_free = num_cpu_blocks
+@@ -24,7 +24,7 @@ def test_block_allocator_allocate():
+         block = cpu_allocator.allocate()
+         num_free -= 1
+ 
+-        assert block.block_hash not in cpu_allocator.evictor
++        assert block not in cpu_allocator.free_blocks
+         assert cpu_allocator.get_num_free_blocks() == num_free
+ 
+     with pytest.raises(ValueError):
+@@ -34,14 +34,14 @@ def test_block_allocator_allocate():
+ def test_block_allocator_free():
+     block_size = 4
+     num_cpu_blocks = 4
+-    cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
++    cpu_allocator = UncachedBlockAllocator(Device.CPU, block_size, num_cpu_blocks)
+ 
+     # Allocate all available cpu blocks.
+     blocks: List[PhysicalTokenBlock] = []
+     for _ in range(num_cpu_blocks):
+         block = cpu_allocator.allocate()
+         blocks.append(block)
+-        assert block.block_hash not in cpu_allocator.evictor
++        assert block not in cpu_allocator.free_blocks
+ 
+     # Free all allocated cpu blocks.
+     num_free = 0
+@@ -49,7 +49,7 @@ def test_block_allocator_free():
+     for block in blocks:
+         cpu_allocator.free(block)
+         num_free += 1
+-        assert block.block_hash in cpu_allocator.evictor
++        assert block in cpu_allocator.free_blocks
+         assert cpu_allocator.get_num_free_blocks() == num_free
+ 
+         with pytest.raises(ValueError):
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+new file mode 100644
+index 000000000..e85bca18b
+--- /dev/null
++++ b/vllm/_custom_ops.py
+@@ -0,0 +1,57 @@
++from __future__ import annotations
++
++from typing import Optional, Type
++
++import torch
++
++__all__ = [
++    "cutlass_scaled_mm_dq",
++]
++
++
++@torch.no_grad()
++def cutlass_scaled_mm_dq(a: torch.Tensor,
++                         b: torch.Tensor,
++                         scale_a: Optional[torch.Tensor],
++                         scale_b: Optional[torch.Tensor],
++                         out_dtype: Type[torch.dtype]) -> torch.Tensor:
++    """Fallback implementation of scaled matmul with dequantization semantics.
++
++    This function mirrors the interface of the optimized CUTLASS kernel, but
++    implements a fast PyTorch fallback with attention to allocation overheads:
++    - Uses torch.empty for outputs instead of torch.zeros
++    - Avoids redundant dtype conversions
++    - Ensures contiguous inputs for better GEMM performance
++    """
++    assert a.dim() == 2 and b.dim() == 2, "a and b must be 2D"
++    assert a.shape[1] == b.shape[0], "incompatible shapes for matmul"
++
++    # Ensure contiguous for mm path
++    a_ = a if a.is_contiguous() else a.contiguous()
++    b_ = b if b.is_contiguous() else b.contiguous()
++
++    # Optionally apply scales without mutating inputs
++    if scale_a is not None:
++        # Allocate ephemeral buffer with empty to avoid zero-initialization
++        a_buf = torch.empty_like(a_)
++        torch.mul(a_, scale_a, out=a_buf)
++        a_ = a_buf
++    if scale_b is not None:
++        b_buf = torch.empty_like(b_)
++        torch.mul(b_, scale_b, out=b_buf)
++        b_ = b_buf
++
++    target_dtype = out_dtype
++    if a_.dtype is not target_dtype:
++        a_ = a_.to(target_dtype)
++    if b_.dtype is not target_dtype:
++        b_ = b_.to(target_dtype)
++
++    # Allocate result with empty (no zero fill) and compute result
++    m, n = a_.shape[0], b_.shape[1]
++    # Note: torch.mm doesn't support out=..., so compute then cast/copy if needed
++    out = torch.mm(a_, b_)
++    if out.dtype is not target_dtype:
++        out = out.to(target_dtype)
++    return out
++
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a565..bd9143bf2 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -10,6 +10,72 @@ from vllm.utils import Device
+ from vllm.core.evictor import Evictor, EvictionPolicy, make_evictor
+ 
+ 
++
++
++class UncachedBlockAllocator:
++    """A lightweight allocator for when prefix caching is disabled.
++
++    Uses a simple free list of PhysicalTokenBlock objects to avoid the
++    overhead of maintaining hash-indexed structures and eviction policies.
++    """
++
++    def __init__(self, device: Device, block_size: int, num_blocks: int) -> None:
++        self.device = device
++        self.block_size = block_size
++        self.num_blocks = num_blocks
++        self.current_num_blocks = 0
++        self.free_blocks: List[PhysicalTokenBlock] = []
++        self._default_hash_ctr = count()
++
++    def allocate(self,
++                 block_hash: Optional[int] = None,
++                 num_hashed_tokens: int = 0) -> PhysicalTokenBlock:
++        # Reuse freed blocks if available.
++        if self.free_blocks:
++            block = self.free_blocks.pop()
++            assert block.ref_count == 0
++            # Update block metadata to reflect new usage
++            block.block_hash = (next(self._default_hash_ctr)
++                                if block_hash is None else block_hash)
++            block.num_hashed_tokens = num_hashed_tokens
++            block.computed = False
++            block.ref_count = 1
++            return block
++
++        # Allocate a new block if capacity allows
++        if self.current_num_blocks < self.num_blocks:
++            new_block = PhysicalTokenBlock(device=self.device,
++                                           block_number=self.current_num_blocks,
++                                           block_size=self.block_size,
++                                           block_hash=(next(self._default_hash_ctr)
++                                                       if block_hash is None else block_hash),
++                                           num_hashed_tokens=num_hashed_tokens)
++            self.current_num_blocks += 1
++            new_block.ref_count = 1
++            return new_block
++
++        # Out of capacity and no reusable blocks
++        raise ValueError("No usable cache memory left")
++
++    def free(self, block: PhysicalTokenBlock) -> None:
++        if block.ref_count == 0:
++            raise ValueError(f"Double free! {block} is already freed.")
++        block.ref_count -= 1
++        if block.ref_count == 0:
++            block.computed = False
++            self.free_blocks.append(block)
++
++    def contains_block(self, block_hash: int) -> bool:
++        # No hashing/caching in uncached mode
++        return False
++
++    def update_hash(self, block_hash: int, block: PhysicalTokenBlock) -> None:
++        # Simply update the hash on the block
++        block.block_hash = block_hash
++
++    def get_num_free_blocks(self) -> int:
++        return (self.num_blocks - self.current_num_blocks + len(self.free_blocks))
++
+ class BlockAllocator:
+     """Manages free physical token blocks for a device.
+ 
+@@ -154,14 +220,23 @@ class BlockSpaceManager:
+         self.enable_caching = enable_caching
+ 
+         self.watermark_blocks = int(watermark * num_gpu_blocks)
+-        self.gpu_allocator = BlockAllocator(Device.GPU,
+-                                            block_size,
+-                                            num_gpu_blocks,
+-                                            enable_caching=enable_caching)
+-        self.cpu_allocator = BlockAllocator(Device.CPU,
+-                                            block_size,
+-                                            num_cpu_blocks,
+-                                            enable_caching=enable_caching)
++        if enable_caching:
++            self.gpu_allocator = BlockAllocator(Device.GPU,
++                                                block_size,
++                                                num_gpu_blocks,
++                                                enable_caching=enable_caching)
++            self.cpu_allocator = BlockAllocator(Device.CPU,
++                                                block_size,
++                                                num_cpu_blocks,
++                                                enable_caching=enable_caching)
++        else:
++            # Use a lightweight allocator when caching is disabled for better perf
++            self.gpu_allocator = UncachedBlockAllocator(Device.GPU,
++                                                        block_size,
++                                                        num_gpu_blocks)
++            self.cpu_allocator = UncachedBlockAllocator(Device.CPU,
++                                                        block_size,
++                                                        num_cpu_blocks)
+         # Mapping: seq_id -> BlockTable.
+         self.block_tables: Dict[int, BlockTable] = {}
+ 
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a97..802d5cc34 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -70,31 +70,19 @@ class LRUEvictor(Evictor):
+         if len(free_blocks) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
++        # Single-pass selection of eviction candidate: lowest timestamp, then max num_hashed_tokens
++        evicted_block: Optional[PhysicalTokenBlock] = None
++        lowest_timestamp = None
++        highest_num_hashed_tokens = -1
+         for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
++            ts = block.last_accessed
++            if lowest_timestamp is None or ts < lowest_timestamp:
++                lowest_timestamp = ts
++                highest_num_hashed_tokens = block.num_hashed_tokens
++                evicted_block = block
++            elif ts == lowest_timestamp and block.num_hashed_tokens > highest_num_hashed_tokens:
+                 highest_num_hashed_tokens = block.num_hashed_tokens
+-
+-        evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
+                 evicted_block = block
+-                break
+ 
+         assert evicted_block is not None
+ 
+diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
+new file mode 100644
+index 000000000..da4d9fafa
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/fp8.py
+@@ -0,0 +1,72 @@
++from __future__ import annotations
++
++from typing import Optional, Type
++
++import os
++import torch
++
++try:
++    # Preferred import when package is installed
++    from vllm._custom_ops import cutlass_scaled_mm_dq  # type: ignore
++except Exception:
++    # Fallback: import by file path to avoid importing vllm/__init__.py
++    import importlib.util
++    from pathlib import Path
++    _root = Path(__file__).resolve().parents[3]
++    _cops_path = _root / "_custom_ops.py"
++    _spec = importlib.util.spec_from_file_location("vllm__custom_ops_fallback",
++                                                  _cops_path)
++    _mod = importlib.util.module_from_spec(_spec) if _spec else None
++    if _spec is None or _spec.loader is None:
++        raise
++    _spec.loader.exec_module(_mod)  # type: ignore[arg-type]
++    cutlass_scaled_mm_dq = _mod.cutlass_scaled_mm_dq  # type: ignore[attr-defined]
++
++# Keep parity with other modules
++ACTIVATION_SCHEMES = ["static", "dynamic"]
++
++
++def _use_cutlass_fp8_kernels() -> bool:
++    # Toggle via env var; default to True if available in the future
++    v = os.environ.get("VLLM_USE_CUTLASS_FP8", "1")
++    return v not in ("0", "false", "False")
++
++
++@torch.no_grad()
++def fp8_scaled_mm(a: torch.Tensor,
++                  b: torch.Tensor,
++                  scale_a: Optional[torch.Tensor],
++                  scale_b: Optional[torch.Tensor],
++                  out_dtype: Type[torch.dtype]) -> torch.Tensor:
++    """Scaled matrix multiply that prefers optimized kernels when available.
++
++    Optimizations:
++    - Uses torch.empty internally (via _custom_ops) to avoid zero fill
++    - Minimizes redundant dtype casts
++    - Chooses torch.mm for 2D inputs
++    """
++    # Currently always route to our fast fallback which is allocation-aware
++    if _use_cutlass_fp8_kernels():
++        return cutlass_scaled_mm_dq(a, b, scale_a, scale_b, out_dtype)
++
++    # Fallback: pure torch path, still optimized for allocations
++    a_ = a if a.is_contiguous() else a.contiguous()
++    b_ = b if b.is_contiguous() else b.contiguous()
++
++    if scale_a is not None:
++        a_buf = torch.empty_like(a_)
++        torch.mul(a_, scale_a, out=a_buf)
++        a_ = a_buf
++    if scale_b is not None:
++        b_buf = torch.empty_like(b_)
++        torch.mul(b_, scale_b, out=b_buf)
++        b_ = b_buf
++
++    if a_.dtype is not out_dtype:
++        a_ = a_.to(out_dtype)
++    if b_.dtype is not out_dtype:
++        b_ = b_.to(out_dtype)
++    out = torch.mm(a_, b_)
++    if out.dtype is not out_dtype:
++        out = out.to(out_dtype)
++    return out

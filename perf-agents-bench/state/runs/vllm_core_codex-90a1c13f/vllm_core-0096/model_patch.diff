@@ -1,0 +1,138 @@
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index 0b0f52167..0df9d8f6b 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -471,13 +471,17 @@ class MLACommonMetadataBuilder(Generic[M]):
+               common_prefix_len: int) -> M:
+         assert self._num_decodes + self._num_prefills == num_reqs
+ 
++        # Note: be careful with CPU <-> GPU transfers here to avoid
++        # unnecessary synchronizations on the default stream.
+         device = self.runner.device
+-        query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
+-            device, non_blocking=True)
+-        seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(device,
+-                                                          non_blocking=True)
++        # Fetch block table device tensor first to avoid accidental syncs later.
+         block_table = (
+             self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
++        # Host tensors copied once; keep CPU views for small scalar reductions.
++        query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
++            device, non_blocking=True)
++        seq_lens_cpu = self.runner.seq_lens_cpu[:num_reqs]
++        seq_lens = seq_lens_cpu.to(device, non_blocking=True)
+         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
+             device, non_blocking=True).long()
+         input_positions = self.runner.positions_cpu[:num_actual_tokens].to(
+@@ -490,16 +494,21 @@ class MLACommonMetadataBuilder(Generic[M]):
+ 
+             context_lens_cpu = self.runner.input_batch.\
+                 num_computed_tokens_cpu_tensor[reqs_start:num_reqs]
+-            context_lens = context_lens_cpu.to(device, non_blocking=True)
++
++            # Avoid GPU syncs by checking context presence on CPU first.
++            has_context = context_lens_cpu.max().item() > 0
+ 
+             chunked_context_metadata = None
+-            if self.chunked_prefill_enabled and self._num_prefills > 0 \
+-                and context_lens.max() > 0:
++            if self.chunked_prefill_enabled and self._num_prefills > 0 and \
++                    has_context:
+                 # NOTE: it is recommend you read the `Chunked Prefill` section
+                 # in the comment at the top of the file before trying to
+                 # understand the following code
+ 
+-                num_prefills_with_context = (context_lens > 0).sum().item()
++                # Compute simple reductions on CPU to avoid device -> host
++                # synchronizations.
++                num_prefills_with_context = int(
++                    (context_lens_cpu > 0).sum().item())
+ 
+                 # currently we allocate an equal amount of workspace for each
+                 # prefill in the batch, we could probably use a more advanced
+@@ -516,12 +525,14 @@ class MLACommonMetadataBuilder(Generic[M]):
+                                                self.page_size)
+ 
+                 assert max_context_chunk > 0
+-                num_chunks = cdiv(context_lens.max(), max_context_chunk)
++                num_chunks = cdiv(context_lens_cpu.max().item(),
++                                   max_context_chunk)
+ 
+                 # if `max_context_chunk = 256`, `num_chunks = 3`, and
+                 #   `num_prefills_with_context = 4`, create a tensor that looks
+                 # like
+                 #  [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512]]
++                context_lens = context_lens_cpu.to(device, non_blocking=True)
+                 chunk_starts = \
+                     torch.arange(num_chunks, device=device, dtype=torch.int32) \
+                     .unsqueeze(1).expand(-1, self._num_prefills) \
+@@ -531,14 +542,17 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
++                # Prepend an initial zero without allocating an entire zeros
++                # tensor that we immediately concatenate.
++                cu_seq_lens = torch.empty((num_chunks, self._num_prefills + 1),
++                                          dtype=torch.int32,
++                                          device=device)
++                cu_seq_lens[:, 0] = 0
++                cu_seq_lens[:, 1:] = _chunk_cu_seq_lens
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=cu_seq_lens,
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -553,7 +567,8 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 block_table=block_table[reqs_start:, ...],
+                 query_start_loc=query_start_loc[reqs_start:] -
+                 query_start_loc[reqs_start],
+-                max_query_len=seq_lens[reqs_start:].max().item(),
++                # Avoid device sync by using CPU reduction for this scalar.
++                max_query_len=seq_lens_cpu[reqs_start:].max().item(),
+                 chunked_context=chunked_context_metadata,
+             )
+ 
+@@ -863,6 +878,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         output = None
+         iters = len(prefill_metadata.chunked_context.seq_tot)
+         workspace = prefill_metadata.chunked_context.workspace
++        # Reuse merge buffers to avoid per-iteration allocations.
++        merge_output_tmp = None
++        merge_output_lse_tmp = None
+ 
+         for i in range(iters):
+             toks = prefill_metadata.chunked_context.seq_tot[i]
+@@ -912,18 +930,20 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                if merge_output_tmp is None:
++                    merge_output_tmp = torch.empty_like(output)
++                    merge_output_lse_tmp = torch.empty_like(output_lse)
+                 merge_attn_states(
+-                    output=output_tmp,
+-                    output_lse=output_lse_tmp,
++                    output=merge_output_tmp,
++                    output_lse=merge_output_lse_tmp,
+                     prefix_output=output,
+                     prefix_lse=output_lse,
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                # Ping-pong buffers without new allocations.
++                output, merge_output_tmp = merge_output_tmp, output
++                output_lse, merge_output_lse_tmp = merge_output_lse_tmp, output_lse
+ 
+         return output, output_lse
+ 

@@ -1,0 +1,231 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index d025f1257..0017dabad 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -108,12 +108,16 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts, )
++    # token counters must be zero-initialized as kernels increment values
+     tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    # cumsum is fully written during stage3 except index 0; avoid full memset
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    # Ensure cumsum[0] is a valid starting point for expert 0
++    cumsum[0] = 0
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -200,14 +204,13 @@ def moe_align_block_size(
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+     if pad_sorted_ids:
+         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
++    # Pre-allocate buffers without unnecessary initialization; we will fill
++    # only the regions that are actually used once we know the post-pad size.
+     sorted_ids = torch.empty((max_num_tokens_padded, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+-    # Expert ids must be zeroed out to prevent index out of bounds error while
+-    # mapping global expert ids to local expert ids in expert parallelism.
+-    expert_ids = torch.zeros((max_num_m_blocks, ),
++    expert_ids = torch.empty((max_num_m_blocks, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+     num_tokens_post_pad = torch.empty((1),
+@@ -215,13 +218,62 @@ def moe_align_block_size(
+                                       device=topk_ids.device)
+     if num_experts >= 224:
+         if envs.VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON or num_experts != 256:
+-            moe_align_block_size_triton(
++            # For the Triton path, compute cumsum first to know the exact
++            # number of tokens after padding, then initialize only the used
++            # regions of the output buffers to minimize memory traffic.
++            numel = topk_ids.numel()
++            grid = (num_experts, )
++            tokens_cnts = torch.zeros((num_experts + 1, num_experts),
++                                      dtype=torch.int32,
++                                      device=topk_ids.device)
++            cumsum = torch.empty((num_experts + 1, ),
++                                 dtype=torch.int32,
++                                 device=topk_ids.device)
++            cumsum[0] = 0
++            tokens_per_thread = ceil_div(numel, num_experts)
++
++            moe_align_block_size_stage1[grid](
+                 topk_ids,
++                tokens_cnts,
++                num_experts,
++                numel,
++                tokens_per_thread,
++            )
++            moe_align_block_size_stage2[grid](
++                tokens_cnts,
++                num_experts,
++            )
++            moe_align_block_size_stage3[(1, )](
++                num_tokens_post_pad,
++                tokens_cnts,
++                cumsum,
+                 num_experts,
+                 block_size,
++            )
++
++            # Initialize only the used portion of sorted_ids to the padding
++            # sentinel; stage4 will overwrite entries corresponding to real
++            # tokens.
++            used_tokens = int(num_tokens_post_pad.item())
++            if used_tokens > 0:
++                sorted_ids[:used_tokens].fill_(topk_ids.numel())
++
++            # Zero out the trailing expert_ids beyond the used M blocks so
++            # that downstream expert_map indexing is always safe.
++            used_m_blocks = (used_tokens + block_size - 1) // block_size
++            if used_m_blocks < max_num_m_blocks:
++                expert_ids[used_m_blocks:].zero_()
++
++            moe_align_block_size_stage4[grid](
++                topk_ids,
+                 sorted_ids,
+                 expert_ids,
+-                num_tokens_post_pad,
++                tokens_cnts,
++                cumsum,
++                num_experts,
++                block_size,
++                numel,
++                tokens_per_thread,
+             )
+         else:
+             # Currently requires num_experts=256
+@@ -233,9 +285,21 @@ def moe_align_block_size(
+                 expert_ids,
+                 num_tokens_post_pad,
+             )
++            used_tokens = int(num_tokens_post_pad.item())
++            used_m_blocks = (used_tokens + block_size - 1) // block_size
++            if used_m_blocks < max_num_m_blocks:
++                expert_ids[used_m_blocks:].zero_()
+     else:
++        # For the CUDA path, we do not know the used lengths a priori,
++        # so keep the original behavior for sorted_ids, but avoid zeoring the
++        # full expert_ids buffer by zeroing only the unused tail afterwards.
++        sorted_ids[:].fill_(topk_ids.numel())
+         ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+                                  expert_ids, num_tokens_post_pad)
++        used_tokens = int(num_tokens_post_pad.item())
++        used_m_blocks = (used_tokens + block_size - 1) // block_size
++        if used_m_blocks < max_num_m_blocks:
++            expert_ids[used_m_blocks:].zero_()
+     if expert_map is not None:
+         expert_ids = expert_map[expert_ids]
+ 
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 5d8b3f423..eaaa48cdd 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -89,18 +89,18 @@ class TopKTopPSampler(nn.Module):
+         p: Optional[torch.Tensor],
+     ) -> torch.Tensor:
+         """More optimized implementation for top-k and top-p sampling."""
+-        probs = logits.softmax(dim=-1, dtype=torch.float32)
+         if k is None and p is None:
+             # We prefer `random_sample` over `flashinfer_sample` when sorting is
+             # not needed. This is because `random_sample` does not require
+             # CPU-GPU synchronization while `flashinfer_sample` does.
++            probs = logits.softmax(dim=-1, dtype=torch.float32)
+             return random_sample(probs, generators)
+         if generators:
+             logger.warning("FlashInfer 0.2.3+ does not support "
+                            "per-request generators. Falling back to "
+                            "PyTorch-native implementation.")
+             return self.forward_native(logits, generators, k, p)
+-        return flashinfer_sample(probs, k, p, generators)
++        return flashinfer_sample(logits, k, p, generators)
+ 
+     def forward_tpu(
+         self,
+@@ -200,7 +200,7 @@ def apply_top_k_top_p(
+         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
++    logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+     return logits
+ 
+ 
+@@ -254,12 +254,12 @@ def random_sample(
+ 
+ 
+ def flashinfer_sample(
+-    probs: torch.Tensor,
++    logits: torch.Tensor,
+     k: Optional[torch.Tensor],
+     p: Optional[torch.Tensor],
+     generators: dict[int, torch.Generator],
+ ) -> torch.Tensor:
+-    """Sample from the probabilities using FlashInfer.
++    """Sample from the logits using FlashInfer.
+ 
+     Statistically, this function is equivalent to the `random_sample` function.
+     However, this function is faster because it avoids sorting the logits tensor
+@@ -275,17 +275,45 @@ def flashinfer_sample(
+     """
+     assert not (k is None and p is None)
+ 
++    # Prefer logits-based FlashInfer APIs when available to avoid redundant
++    # softmax on the host side. Fallback to *_from_probs if necessary.
++    fi = flashinfer.sampling
++
++    def _to_probs(x: torch.Tensor) -> torch.Tensor:
++        return x.softmax(dim=-1, dtype=torch.float32)
++
+     if k is None:
+         # Top-p only.
+-        next_token_ids = flashinfer.sampling.top_p_sampling_from_probs(
+-            probs, p, deterministic=True)
++        if hasattr(fi, 'top_p_sampling_from_logits'):
++            next_token_ids = fi.top_p_sampling_from_logits(
++                logits, p, deterministic=True)
++        elif hasattr(fi, 'top_p_sampling'):
++            next_token_ids = fi.top_p_sampling(
++                logits, p, deterministic=True)
++        else:
++            next_token_ids = fi.top_p_sampling_from_probs(
++                _to_probs(logits), p, deterministic=True)
+     elif p is None:
+         # Top-k only.
+-        next_token_ids = flashinfer.sampling.top_k_sampling_from_probs(
+-            probs, k, deterministic=True)
++        if hasattr(fi, 'top_k_sampling_from_logits'):
++            next_token_ids = fi.top_k_sampling_from_logits(
++                logits, k, deterministic=True)
++        elif hasattr(fi, 'top_k_sampling'):
++            next_token_ids = fi.top_k_sampling(
++                logits, k, deterministic=True)
++        else:
++            next_token_ids = fi.top_k_sampling_from_probs(
++                _to_probs(logits), k, deterministic=True)
+     else:
+         # Both top-k and top-p.
+-        next_token_ids = (flashinfer.sampling.top_k_top_p_sampling_from_probs(
+-            probs, k, p, deterministic=True))
++        if hasattr(fi, 'top_k_top_p_sampling_from_logits'):
++            next_token_ids = fi.top_k_top_p_sampling_from_logits(
++                logits, k, p, deterministic=True)
++        elif hasattr(fi, 'top_k_top_p_sampling'):
++            next_token_ids = fi.top_k_top_p_sampling(
++                logits, k, p, deterministic=True)
++        else:
++            next_token_ids = fi.top_k_top_p_sampling_from_probs(
++                _to_probs(logits), k, p, deterministic=True)
+ 
+     return next_token_ids.view(-1)

@@ -1,0 +1,144 @@
+diff --git a/tests/v1/test_serial_utils.py b/tests/v1/test_serial_utils.py
+index bc0e0cbd8..e241633ba 100644
+--- a/tests/v1/test_serial_utils.py
++++ b/tests/v1/test_serial_utils.py
+@@ -50,7 +50,9 @@ def test_encode_decode():
+         large_non_contig_tensor=torch.rand(1024, 512)[:, 10:20],
+     )
+ 
+-    encoder = MsgpackEncoder()
++    # Use a smaller threshold to inline fewer arrays into the main buffer,
++    # increasing zero-copy behavior during decoding.
++    encoder = MsgpackEncoder(size_threshold=256)
+     decoder = MsgpackDecoder(MyType)
+ 
+     encoded = encoder.encode(obj)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f80bf878f..9e9af1687 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -90,6 +90,7 @@ if TYPE_CHECKING:
+     V_SCALE_CONSTANT: int = 100
+     VLLM_SERVER_DEV_MODE: bool = False
+     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
++    VLLM_V1_MSGPACK_MIN_NOCOPY_BUF_SIZE: int = 512
+     VLLM_MLA_DISABLE: bool = False
+     VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON: bool = False
+     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
+@@ -134,7 +135,7 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
+ 
+ # begin-env-vars-definition
+ 
+-environment_variables: dict[str, Callable[[], Any]] = {
++    environment_variables: dict[str, Callable[[], Any]] = {
+ 
+     # ================== Installation Time Env Vars ==================
+ 
+@@ -316,6 +317,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_LOGGING_PREFIX":
+     lambda: os.getenv("VLLM_LOGGING_PREFIX", ""),
+ 
++    # Minimum size in bytes for array/tensor payloads that will be kept
++    # as separate buffers in v1 msgpack serialization, to avoid copying
++    # into the main buffer. Lower values increase the number of aux buffers
++    # (and reduce copying), while higher values inline more data.
++    # Defaults to 512 bytes.
++    "VLLM_V1_MSGPACK_MIN_NOCOPY_BUF_SIZE":
++    lambda: int(os.getenv("VLLM_V1_MSGPACK_MIN_NOCOPY_BUF_SIZE", "512")),
++
+     # if set, vllm will call logits processors in a thread pool with this many
+     # threads. This is useful when using custom logits processors that either
+     # (a) launch additional CUDA kernels or (b) do significant CPU-bound work
+@@ -711,8 +720,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+ 
+ def __getattr__(name: str):
+     # lazy evaluation of environment variables
+-    if name in environment_variables:
+-        return environment_variables[name]()
++    # During module import, this function can be invoked before
++    # `environment_variables` is defined. Handle that gracefully.
++    envmap = globals().get("environment_variables")
++    if envmap is None:
++        # Module is still initializing. Provide safe defaults for early access
++        # and fallback to raw environment for others.
++        if name == "VLLM_CONFIGURE_LOGGING":
++            return 1
++        return os.environ.get(name)
++    if name in envmap:
++        return envmap[name]()
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+diff --git a/vllm/v1/serial_utils.py b/vllm/v1/serial_utils.py
+index 3af6793fd..8a6582851 100644
+--- a/vllm/v1/serial_utils.py
++++ b/vllm/v1/serial_utils.py
+@@ -11,13 +11,16 @@ import numpy as np
+ import torch
+ import zmq
+ from msgspec import msgpack
++import os
+ 
+ CUSTOM_TYPE_PICKLE = 1
+ CUSTOM_TYPE_CLOUDPICKLE = 2
+ CUSTOM_TYPE_RAW_VIEW = 3
+ 
+-# TODO calibrate this size
+-MIN_NOCOPY_BUF_SIZE = 512
++# Default threshold for when to avoid copying array data into the main
++# msgpack buffer. Can be tuned via encoder arg or env var.
++_DEFAULT_MIN_NOCOPY_BUF_SIZE = int(
++    os.getenv("VLLM_V1_MSGPACK_MIN_NOCOPY_BUF_SIZE", "512"))
+ 
+ bytestr = Union[bytes, bytearray, memoryview, zmq.Frame]
+ 
+@@ -29,7 +32,13 @@ class MsgpackEncoder:
+     not thread-safe when encoding tensors / numpy arrays.
+     """
+ 
+-    def __init__(self):
++    def __init__(self, *, size_threshold: Optional[int] = None):
++        # Use a configurable size threshold for deciding when to inline
++        # array/tensor payloads vs. when to keep them as separate buffers.
++        # Lower values will inline fewer arrays (more aux buffers).
++        # Higher values will inline more arrays (fewer aux buffers).
++        self.size_threshold: int = (size_threshold if size_threshold is not None
++                                    else _DEFAULT_MIN_NOCOPY_BUF_SIZE)
+         self.encoder = msgpack.Encoder(enc_hook=self.enc_hook)
+         # This is used as a local stash of buffers that we can then access from
+         # our custom `msgspec` hook, `enc_hook`. We don't have a way to
+@@ -77,8 +86,9 @@ class MsgpackEncoder:
+         self, obj: np.ndarray
+     ) -> tuple[str, tuple[int, ...], Union[int, memoryview]]:
+         assert self.aux_buffers is not None
+-        arr_data = obj.data if obj.data.c_contiguous else obj.tobytes()
+-        if not obj.shape or obj.nbytes < MIN_NOCOPY_BUF_SIZE:
++        # Prefer zero-copy when C-contiguous; otherwise fall back to bytes.
++        arr_data = memoryview(obj) if obj.flags.c_contiguous else obj.tobytes()
++        if not obj.shape or obj.nbytes < self.size_threshold:
+             # Encode small arrays and scalars inline. Using this extension type
+             # ensures we can avoid copying when decoding.
+             data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr_data)
+@@ -106,6 +116,8 @@ class MsgpackDecoder:
+                                        ext_hook=self.ext_hook,
+                                        dec_hook=self.dec_hook)
+         self.aux_buffers: Sequence[bytestr] = ()
++        # Cache np.dtype objects to avoid repeated parsing of dtype strings
++        self._dtype_cache: dict[str, np.dtype] = {}
+ 
+     def decode(self, bufs: Union[bytestr, Sequence[bytestr]]) -> Any:
+         if isinstance(bufs, (bytes, bytearray, memoryview, zmq.Frame)):
+@@ -131,7 +143,12 @@ class MsgpackDecoder:
+     def _decode_ndarray(self, arr: Any) -> np.ndarray:
+         dtype, shape, data = arr
+         buffer = self.aux_buffers[data] if isinstance(data, int) else data
+-        return np.ndarray(buffer=buffer, dtype=np.dtype(dtype), shape=shape)
++        # Reuse cached dtype objects for lower overhead
++        dt = self._dtype_cache.get(dtype)
++        if dt is None:
++            dt = np.dtype(dtype)
++            self._dtype_cache[dtype] = dt
++        return np.ndarray(buffer=buffer, dtype=dt, shape=shape)
+ 
+     def ext_hook(self, code: int, data: memoryview) -> Any:
+         if code == CUSTOM_TYPE_RAW_VIEW:

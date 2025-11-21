@@ -1,0 +1,376 @@
+diff --git a/.buildkite/run-tpu-test.sh b/.buildkite/run-tpu-test.sh
+new file mode 100644
+index 000000000..920c5363d
+--- /dev/null
++++ b/.buildkite/run-tpu-test.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++remove_docker_container() {
++  if [ -n "$(docker ps -aq -f name=tpu-test)" ]; then
++    docker rm -f tpu-test || true
++  fi
++}
++
++trap remove_docker_container EXIT
++
++# For HF_TOKEN.
++source /etc/environment || true
++
++# Run a simple end-to-end example and TPU smoke tests.
++docker run --privileged --net host --shm-size=16G -it -e HF_TOKEN=$HF_TOKEN --name tpu-test vllm-tpu \
++  /bin/bash -c "python3 -m pip install git+https://github.com/thuml/depyf.git && \
++               python3 -m pip install pytest && \
++               pytest -v -s /workspace/vllm/tests/tpu/test_custom_dispatcher.py && \
++               python3 /workspace/vllm/tests/tpu/test_compilation.py && \
++               python3 /workspace/vllm/examples/offline_inference_tpu.py"
++
+diff --git a/.buildkite/test-pipeline.yaml b/.buildkite/test-pipeline.yaml
+index cee5e7e9d..2ffb8affc 100644
+--- a/.buildkite/test-pipeline.yaml
++++ b/.buildkite/test-pipeline.yaml
+@@ -72,6 +72,10 @@ steps:
+   command: pytest -v -s kernels --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+   parallelism: 4
+ 
++- label: Compile Wrapper Test
++  commands:
++    - pytest -v -s ./compile/test_wrapper.py
++
+ - label: Models Test
+   #mirror_hardwares: [amd]
+   commands:
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/compile/test_wrapper.py b/tests/compile/test_wrapper.py
+new file mode 100644
+index 000000000..8d1856b54
+--- /dev/null
++++ b/tests/compile/test_wrapper.py
+@@ -0,0 +1,24 @@
++from typing import Optional
++
++import torch
++
++
++def _fn(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
++    return (torch.tanh(x) * scale).sum()
++
++
++def test_compile_cached_matches_python():
++    x = torch.randn(128)
++    from vllm.compilation.wrapper import compile_cached
++    compiled = compile_cached(_fn, backend="eager", dynamic=True)
++    out_python = _fn(x, 0.5)
++    out_compiled = compiled(x, 0.5)
++    assert torch.allclose(out_python, out_compiled)
++
++
++def test_compile_cached_reuses_compiled_callable():
++    from vllm.compilation.wrapper import compile_cached
++    c1 = compile_cached(_fn, backend="eager", dynamic=True)
++    c2 = compile_cached(_fn, backend="eager", dynamic=True)
++    assert c1 is c2
++
+diff --git a/tests/tpu/__init__.py b/tests/tpu/__init__.py
+new file mode 100644
+index 000000000..8b1378917
+--- /dev/null
++++ b/tests/tpu/__init__.py
+@@ -0,0 +1 @@
++
+diff --git a/tests/tpu/test_custom_dispatcher.py b/tests/tpu/test_custom_dispatcher.py
+new file mode 100644
+index 000000000..8851b4a07
+--- /dev/null
++++ b/tests/tpu/test_custom_dispatcher.py
+@@ -0,0 +1,16 @@
++def test_custom_dispatcher_smoke():
++    # Smoke test that we can import the vllm compile wrapper and use it.
++    try:
++        from vllm.compilation.wrapper import compile_cached
++    except Exception as e:  # pragma: no cover - CI-only check
++        raise AssertionError(f"Failed to import compile wrapper: {e}")
++
++    import torch
++
++    def f(x: torch.Tensor) -> torch.Tensor:
++        return torch.relu(x).sum()
++
++    compiled = compile_cached(f, backend="eager", dynamic=True)
++    out = compiled(torch.randn(8))
++    assert out.shape == ()
++
+diff --git a/vllm/compilation/__init__.py b/vllm/compilation/__init__.py
+new file mode 100644
+index 000000000..14998567e
+--- /dev/null
++++ b/vllm/compilation/__init__.py
+@@ -0,0 +1,3 @@
++# Expose compile wrapper utilities.
++from .wrapper import compile_cached  # noqa: F401
++
+diff --git a/vllm/compilation/wrapper.py b/vllm/compilation/wrapper.py
+new file mode 100644
+index 000000000..3b6cea3a2
+--- /dev/null
++++ b/vllm/compilation/wrapper.py
+@@ -0,0 +1,120 @@
++from __future__ import annotations
++
++import threading
++import weakref
++from typing import Any, Callable, Dict, Hashable, Optional, Tuple
++
++try:
++    import torch  # type: ignore
++except Exception:  # pragma: no cover - torch might be unavailable in some envs
++    torch = None  # type: ignore
++
++
++_cache_lock = threading.Lock()
++
++
++class _FnEntry:
++    """Holds cached compiled variants for a single Python function.
++
++    We avoid repeated compilation and reduce Dynamo guard evaluation overhead
++    by reusing the same compiled callable when compile options are identical.
++    """
++
++    __slots__ = ("variants",)
++
++    def __init__(self) -> None:
++        # Map from options-key -> compiled function
++        self.variants: Dict[Tuple[Hashable, ...], Callable[..., Any]] = {}
++
++
++# Weak map so entries are dropped if the original function is GC'ed.
++_FN_CACHE: "weakref.WeakKeyDictionary[Callable[..., Any], _FnEntry]" = (
++    weakref.WeakKeyDictionary()
++)
++
++
++def _options_key(
++    *,
++    backend: Optional[str],
++    mode: Optional[str],
++    dynamic: Optional[bool],
++    fullgraph: Optional[bool],
++    options: Optional[Dict[str, Any]],
++) -> Tuple[Hashable, ...]:
++    # Normalize compile options into a hashable key.
++    opts_tuple: Tuple[Tuple[str, Any], ...] = tuple(
++        sorted((options or {}).items())
++    )
++    return (
++        ("backend", backend),
++        ("mode", mode),
++        ("dynamic", bool(dynamic) if dynamic is not None else None),
++        ("fullgraph", bool(fullgraph) if fullgraph is not None else None),
++        ("options", opts_tuple),
++    )
++
++
++def _torch_compile_available() -> bool:
++    return bool(torch is not None and hasattr(torch, "compile"))
++
++
++def compile_cached(
++    fn: Callable[..., Any],
++    *,
++    backend: Optional[str] = None,
++    mode: Optional[str] = None,
++    dynamic: Optional[bool] = None,
++    fullgraph: Optional[bool] = None,
++    options: Optional[Dict[str, Any]] = None,
++) -> Callable[..., Any]:
++    """Compile a function with torch.compile and cache the result.
++
++    This avoids recompiling the same function and reduces the per-call guard
++    checks by consistently reusing the same compiled callable.
++    If torch.compile is unavailable, returns the original function.
++
++    Args:
++        fn: Python callable to compile.
++        backend: torch.compile backend (e.g., "inductor", "eager").
++        mode: torch.compile mode.
++        dynamic: Whether to allow dynamic shapes.
++        fullgraph: Whether to require a full-graph compile.
++        options: Additional options dictionary passed to torch.compile.
++
++    Returns:
++        A callable that is either the compiled function or the original.
++    """
++    if not _torch_compile_available():
++        return fn
++
++    key = _options_key(
++        backend=backend,
++        mode=mode,
++        dynamic=dynamic,
++        fullgraph=fullgraph,
++        options=options,
++    )
++
++    with _cache_lock:
++        entry = _FN_CACHE.get(fn)
++        if entry is None:
++            entry = _FnEntry()
++            _FN_CACHE[fn] = entry
++        compiled = entry.variants.get(key)
++        if compiled is None:
++            compiled = torch.compile(
++                fn,
++                backend=backend,
++                mode=mode,
++                dynamic=dynamic,  # type: ignore[arg-type]
++                fullgraph=fullgraph,  # type: ignore[arg-type]
++                options=options,
++            )
++            entry.variants[key] = compiled
++        return compiled
++
++
++__all__ = [
++    "compile_cached",
++]
++
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 91cc8f3be..bcd2f313e 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -201,6 +201,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+     # Both spawn and fork work
+     "VLLM_WORKER_MULTIPROC_METHOD":
+     lambda: os.getenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn"),
++
++    # Enable torch.compile wrapper utilities to reduce guard overhead.
++    # Set to 0 to disable and use raw torch.compile directly.
++    "VLLM_TORCH_COMPILE_USE_WRAPPER":
++    lambda: bool(int(os.getenv("VLLM_TORCH_COMPILE_USE_WRAPPER", "1"))),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d2053..da0e29c57 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -320,7 +320,7 @@ def _random_sample(
+         seq_group has do_sample=False, tuple contains ([], [])
+     """
+     # Find the maximum best_of value of the prompt phase requests.
+-    random_samples = random_samples.cpu()
++    random_samples = random_samples.to('cpu')
+     sample_idx = 0
+     results: SampleResultType = []
+     for seq_group in selected_seq_groups:
+@@ -721,7 +721,7 @@ def _get_logprobs(
+     next_token_ids: List[int] = []
+     # The largest requested number of logprobs. We find logprobs as many as the
+     # largest num logprobs in this API.
+-    largest_num_logprobs = 1
++    largest_num_logprobs = 0
+ 
+     # Select indices to compute logprob from, ranks of token ids, and the top
+     # k token ids from logprobs.
+@@ -730,8 +730,7 @@ def _get_logprobs(
+         sampling_params = seq_group.sampling_params
+ 
+         # Update indices and tokens for prompt logprobs.
+-        if (seq_group.is_prompt
+-                and sampling_params.prompt_logprobs is not None):
++        if seq_group.is_prompt and sampling_params.prompt_logprobs is not None:
+             largest_num_logprobs = max(largest_num_logprobs,
+                                        sampling_params.prompt_logprobs)
+             next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+@@ -763,15 +762,12 @@ def _get_logprobs(
+ 
+     query_indices_gpu = torch.tensor(query_indices, device=logprobs.device)
+     next_token_ids_gpu = torch.tensor(next_token_ids, device=logprobs.device)
++    logprobs_selected = logprobs.index_select(0, query_indices_gpu)
+ 
+-    # (num_selected_query_tokens, num_logprobs). Note that query_indices can
+-    # contain duplicates if beam search is enabled.
+-    selected_logprobs = logprobs[[
+-        query_indices_gpu,
+-        next_token_ids_gpu,
+-    ]]
++    # (num_selected_query_tokens,)
++    selected_logprobs = logprobs_selected.gather(1, next_token_ids_gpu.unsqueeze(1)).squeeze(1)
+     ranks = _get_ranks(
+-        logprobs[query_indices_gpu],
++        logprobs_selected,
+         next_token_ids_gpu,
+     )
+     assert selected_logprobs.shape[0] == ranks.shape[0]
+@@ -779,16 +775,17 @@ def _get_logprobs(
+     # Logprobs of topk tokens for a batch of sequence groups.
+     # (num_query_tokens_across_batch).
+     if largest_num_logprobs > 0:
+-        top_logprobs, top_token_ids = torch.topk(logprobs,
++        top_logprobs, top_token_ids = torch.topk(logprobs_selected,
+                                                  largest_num_logprobs,
+                                                  dim=-1)
+-        top_logprobs = top_logprobs.cpu()
+-        top_token_ids = top_token_ids.cpu()
+     else:
+         top_logprobs, top_token_ids = None, None
+ 
+-    selected_logprobs = selected_logprobs.cpu()
+-    ranks = ranks.cpu()
++    selected_logprobs = selected_logprobs.to('cpu')
++    ranks = ranks.to('cpu')
++    if top_logprobs is not None and top_token_ids is not None:
++        top_logprobs = top_logprobs.to('cpu')
++        top_token_ids = top_token_ids.to('cpu')
+ 
+     # Find prompt/sample logprobs.
+     prompt_logprobs_per_seq_group: List[Optional[PromptLogprobs]] = []
+@@ -828,7 +825,7 @@ def _get_prompt_logprob_if_needed(
+ 
+     # Find prompt logprobs
+     prompt_logprobs: Optional[PromptLogprobs] = None
+-    if (is_prompt and sampling_params.prompt_logprobs is not None):
++    if is_prompt and sampling_params.prompt_logprobs is not None:
+         prompt_logprobs = []
+         num_logprobs = sampling_params.prompt_logprobs
+         next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+diff --git a/vllm/worker/tpu_model_runner.py b/vllm/worker/tpu_model_runner.py
+new file mode 100644
+index 000000000..bf91ae30c
+--- /dev/null
++++ b/vllm/worker/tpu_model_runner.py
+@@ -0,0 +1,30 @@
++from __future__ import annotations
++
++from typing import Callable, Optional
++
++try:
++    import torch  # type: ignore
++except Exception:  # pragma: no cover - torch may be unavailable
++    torch = None  # type: ignore
++
++try:
++    from vllm.compilation.wrapper import compile_cached
++except Exception:  # pragma: no cover - fallback if import fails
++    def compile_cached(fn: Callable, **_: object) -> Callable:  # type: ignore
++        return fn
++
++
++class TpuModelRunner:
++    """Minimal TPU runner stub that uses the compile wrapper.
++
++    This is a lightweight placeholder to validate integration points without
++    introducing TPU-only dependencies in generic environments.
++    """
++
++    def __init__(self, backend: Optional[str] = None) -> None:
++        self._backend = backend
++
++    def compile(self, fn: Callable) -> Callable:
++        # Prefer dynamic shapes to minimize recompilations during runs.
++        return compile_cached(fn, backend=self._backend, dynamic=True)
++

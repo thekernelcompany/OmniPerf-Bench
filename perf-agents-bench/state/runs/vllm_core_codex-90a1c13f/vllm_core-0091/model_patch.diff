@@ -1,0 +1,439 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index f4081766e..702eec58d 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -135,6 +135,94 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
+         blocks[1:2] + blocks[3:] + [block_to_remove]
+ 
+ 
++def test_free_kv_cache_block_queue_append_n():
++    # Create an empty FreeKVCacheBlockQueue with no blocks
++    queue = FreeKVCacheBlockQueue([])
++    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
++
++    # Append 0 block: fake_head->fake_tail, num_free_blocks stays 0
++    queue.append_n([])
++    assert queue.num_free_blocks == 0
++    assert (queue.fake_free_list_head.next_free_block
++            is queue.fake_free_list_tail)
++    assert (queue.fake_free_list_tail.prev_free_block
++            is queue.fake_free_list_head)
++
++    # Append 1 block: fake_head->b0->fake_tail
++    queue.append_n(blocks[0:1])
++    assert queue.num_free_blocks == 1
++    assert queue.free_list_head is blocks[0]
++    assert queue.free_list_tail is blocks[0]
++    assert queue.fake_free_list_head.next_free_block is blocks[0]
++    assert blocks[0].prev_free_block is queue.fake_free_list_head
++    assert blocks[0].next_free_block is queue.fake_free_list_tail
++    assert queue.fake_free_list_tail.prev_free_block is blocks[0]
++
++    # Append 2 blocks: fake_head->b0->b4->b5->fake_tail
++    queue.append_n(blocks[4:6])
++    assert queue.num_free_blocks == 3
++    assert queue.free_list_head is blocks[0]
++    assert queue.free_list_tail is blocks[5]
++    assert blocks[0].prev_free_block is queue.fake_free_list_head
++    assert blocks[0].next_free_block is blocks[4]
++    assert blocks[4].prev_free_block is blocks[0]
++    assert blocks[4].next_free_block is blocks[5]
++    assert blocks[5].prev_free_block is blocks[4]
++    assert blocks[5].next_free_block is queue.fake_free_list_tail
++    assert queue.fake_free_list_tail.prev_free_block is blocks[5]
++
++    # Append 2 more blocks: fake_head->b0->b4->b5->b2->b3->fake_tail
++    queue.append_n(blocks[2:4])
++    assert queue.num_free_blocks == 5
++    assert queue.free_list_head is blocks[0]
++    assert queue.free_list_tail is blocks[3]
++    # Validate a couple of links in the chain
++    assert blocks[5].next_free_block is blocks[2]
++    assert blocks[2].prev_free_block is blocks[5]
++    assert blocks[3].next_free_block is queue.fake_free_list_tail
++
++
++def test_free_kv_cache_block_queue_popleft_n():
++    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
++    queue = FreeKVCacheBlockQueue(blocks)
++
++    # Pop 0 block
++    popped0 = queue.popleft_n(0)
++    assert popped0 == []
++    assert queue.num_free_blocks == 6
++    assert queue.free_list_head is blocks[0]
++    assert queue.free_list_tail is blocks[5]
++
++    # Pop 1 block: returns [b0]
++    popped1 = queue.popleft_n(1)
++    assert [blk.block_id for blk in popped1] == [0]
++    assert queue.num_free_blocks == 5
++    assert queue.free_list_head is blocks[1]
++    assert queue.free_list_tail is blocks[5]
++    assert queue.fake_free_list_head.next_free_block is blocks[1]
++    assert blocks[1].prev_free_block is queue.fake_free_list_head
++
++    # Pop 2 blocks: returns [b1, b2]
++    popped2 = queue.popleft_n(2)
++    assert [blk.block_id for blk in popped2] == [1, 2]
++    assert queue.num_free_blocks == 3
++    assert queue.free_list_head is blocks[3]
++    assert queue.free_list_tail is blocks[5]
++
++    # Pop 3 more (all remaining): returns [b3, b4, b5]
++    popped3 = queue.popleft_n(3)
++    assert [blk.block_id for blk in popped3] == [3, 4, 5]
++    assert queue.num_free_blocks == 0
++    assert queue.free_list_head is None
++    assert queue.free_list_tail is None
++    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
++    assert queue.fake_free_list_tail.prev_free_block is queue.fake_free_list_head
++
++    # Pop from empty should raise
++    with pytest.raises(ValueError):
++        queue.popleft_n(1)
++
++
+ def test_generate_block_hash_extra_keys():
+     request = make_request(
+         request_id=0,
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index bab99fe37..1712b5d98 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -89,14 +89,34 @@ class FreeKVCacheBlockQueue:
+     def __init__(self, blocks: List[KVCacheBlock]) -> None:
+         self.num_free_blocks = len(blocks)
+ 
+-        # Initialize the doubly linked list of free blocks.
+-        self.free_list_head: Optional[KVCacheBlock] = blocks[0]
+-        self.free_list_tail: Optional[KVCacheBlock] = blocks[-1]
+-        for i in range(self.num_free_blocks):
+-            if i > 0:
+-                blocks[i].prev_free_block = blocks[i - 1]
+-            if i < self.num_free_blocks - 1:
+-                blocks[i].next_free_block = blocks[i + 1]
++        # Sentinel nodes to simplify pointer manipulation and avoid
++        # repeated None checks on hot paths. These are internal-only
++        # and should not be exposed to callers.
++        self.fake_free_list_head = KVCacheBlock(block_id=-1)
++        self.fake_free_list_tail = KVCacheBlock(block_id=-2)
++        # Link sentinels together initially.
++        self.fake_free_list_head.next_free_block = self.fake_free_list_tail
++        self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
++
++        # Initialize the doubly linked list of free blocks between sentinels.
++        if self.num_free_blocks > 0:
++            # Stitch the provided blocks together.
++            for i in range(self.num_free_blocks):
++                prev_blk = blocks[i - 1] if i > 0 else self.fake_free_list_head
++                next_blk = (blocks[i + 1]
++                            if i < self.num_free_blocks - 1 else
++                            self.fake_free_list_tail)
++                blocks[i].prev_free_block = prev_blk
++                blocks[i].next_free_block = next_blk
++                prev_blk.next_free_block = blocks[i]
++                next_blk.prev_free_block = blocks[i]
++
++            self.free_list_head = blocks[0]
++            self.free_list_tail = blocks[-1]
++        else:
++            # Empty free list.
++            self.free_list_head = None
++            self.free_list_tail = None
+ 
+     def popleft(self) -> KVCacheBlock:
+         """Pop the first free block and reduce num_free_blocks by 1.
+@@ -111,6 +131,63 @@ class FreeKVCacheBlockQueue:
+         self.remove(block)
+         return block
+ 
++    def popleft_n(self, n: int) -> List[KVCacheBlock]:
++        """Pop the first n free blocks in a single pass.
++
++        Args:
++            n: Number of blocks to pop. Must be >= 0 and <= num_free_blocks.
++
++        Returns:
++            A list containing the popped blocks in order from head to tail.
++        """
++        if n < 0:
++            raise ValueError(f"n must be non-negative, got {n}")
++        if n == 0:
++            return []
++        if n > self.num_free_blocks:
++            raise ValueError(
++                f"Requested {n} blocks but only {self.num_free_blocks} are available"
++            )
++
++        # Fetch the head and locate the nth block.
++        first = self.free_list_head
++        assert first is not None  # guarded by checks above
++        last = first
++        for _ in range(n - 1):
++            assert last.next_free_block is not None
++            last = last.next_free_block
++
++        # Detach [first, last] from the list between sentinels.
++        prev_node = first.prev_free_block
++        next_node = last.next_free_block
++        assert prev_node is not None and next_node is not None
++        prev_node.next_free_block = next_node
++        next_node.prev_free_block = prev_node
++
++        # Fix endpoints of the popped chain.
++        first.prev_free_block = None
++        last.next_free_block = None
++
++        # Update head/tail and counters.
++        if next_node is self.fake_free_list_tail:
++            # List becomes empty after popping everything.
++            self.free_list_head = None
++            self.free_list_tail = None
++        else:
++            self.free_list_head = next_node
++        self.num_free_blocks -= n
++
++        # Collect popped blocks without additional traversals.
++        popped: List[KVCacheBlock] = []
++        cur = first
++        while True:
++            popped.append(cur)
++            if cur is last:
++                break
++            assert cur.next_free_block is not None
++            cur = cur.next_free_block
++        return popped
++
+     def remove(self, block: KVCacheBlock) -> None:
+         """Remove a block in the free list and reduce num_free_blocks by 1.
+         
+@@ -126,10 +203,14 @@ class FreeKVCacheBlockQueue:
+ 
+         if block == self.free_list_head:
+             # Update the head if the block is the head.
+-            self.free_list_head = block.next_free_block
++            self.free_list_head = (block.next_free_block
++                                   if block.next_free_block is not
++                                   self.fake_free_list_tail else None)
+         if block == self.free_list_tail:
+             # Update the tail if the block is the tail.
+-            self.free_list_tail = block.prev_free_block
++            self.free_list_tail = (block.prev_free_block
++                                   if block.prev_free_block is not
++                                   self.fake_free_list_head else None)
+ 
+         # Remove the block from the linked list.
+         block.prev_free_block = block.next_free_block = None
+@@ -143,29 +224,72 @@ class FreeKVCacheBlockQueue:
+             block: The block to append.
+         """
+         if self.free_list_tail is not None:
+-            # Link the last block to the new block.
++            # Link the last real block to the new block.
+             self.free_list_tail.next_free_block = block
+             block.prev_free_block = self.free_list_tail
++            # Link the new block to the tail sentinel.
++            block.next_free_block = self.fake_free_list_tail
++            self.fake_free_list_tail.prev_free_block = block
+             self.free_list_tail = block
+         else:
+-            # The free list is empty.
+-            assert self.free_list_head is None
++            # The free list is empty. Attach between sentinels.
++            self.fake_free_list_head.next_free_block = block
++            block.prev_free_block = self.fake_free_list_head
++            block.next_free_block = self.fake_free_list_tail
++            self.fake_free_list_tail.prev_free_block = block
+             self.free_list_head = self.free_list_tail = block
+ 
+-        block.next_free_block = None
+         self.num_free_blocks += 1
+ 
++    def append_n(self, blocks: List[KVCacheBlock]) -> None:
++        """Append multiple blocks in one pass. No-ops on empty input.
++
++        Args:
++            blocks: The blocks to append, in order.
++        """
++        if not blocks:
++            return
++
++        # Stitch the provided blocks together as a chain first.
++        for i, blk in enumerate(blocks):
++            prev_blk = blocks[i - 1] if i > 0 else None
++            next_blk = blocks[i + 1] if i + 1 < len(blocks) else None
++            blk.prev_free_block = prev_blk
++            blk.next_free_block = next_blk
++
++        first, last = blocks[0], blocks[-1]
++        if self.free_list_tail is not None:
++            # Connect existing tail -> first and last -> tail sentinel.
++            tail = self.free_list_tail
++            tail.next_free_block = first
++            first.prev_free_block = tail
++            last.next_free_block = self.fake_free_list_tail
++            self.fake_free_list_tail.prev_free_block = last
++            self.free_list_tail = last
++        else:
++            # Empty list: insert between sentinels.
++            self.fake_free_list_head.next_free_block = first
++            first.prev_free_block = self.fake_free_list_head
++            last.next_free_block = self.fake_free_list_tail
++            self.fake_free_list_tail.prev_free_block = last
++            self.free_list_head = first
++            self.free_list_tail = last
++
++        self.num_free_blocks += len(blocks)
++
+     def get_all_free_blocks(self) -> List[KVCacheBlock]:
+         """Get all free blocks in the free list. Mainly used for testing.
+         
+         Returns:
+             A list of free blocks.
+         """
+-        ret = []
++        ret: List[KVCacheBlock] = []
+         curr_block = self.free_list_head
+         while curr_block is not None:
+             ret.append(curr_block)
+-            curr_block = curr_block.next_free_block
++            curr_block = (curr_block.next_free_block
++                          if curr_block.next_free_block is not
++                          self.fake_free_list_tail else None)
+         return ret
+ 
+ 
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index acc3a944e..32aee44e3 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -8,7 +8,7 @@ import torch
+ class SamplerOutput:
+ 
+     # [num_reqs]
+-    sampled_token_ids: List[int]
++    sampled_token_ids: torch.Tensor
+ 
+     # [num_reqs, max_num_logprobs + 1]
+     logprob_token_ids: Optional[torch.Tensor]
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 7cd42ca21..9ad665a64 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -50,9 +50,8 @@ class Sampler(nn.Module):
+         # Use int32 to reduce the tensor size.
+         sampled = sampled.to(torch.int32)
+ 
+-        # NOTE: CPU-GPU synchronization happens here.
+         sampler_output = SamplerOutput(
+-            sampled_token_ids=sampled.tolist(),
++            sampled_token_ids=sampled,
+             logprob_token_ids=topk_indices,
+             logprobs=topk_logprobs,
+             prompt_logprob_token_ids=None,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 4b3c325de..08f554a45 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -136,10 +136,10 @@ class GPUModelRunner:
+         self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+ 
+@@ -155,16 +155,16 @@ class GPUModelRunner:
+             # identical position IDs, making M-RoPE functionally equivalent to
+             # 1D-RoPE.
+             # See page 5 of https://arxiv.org/abs/2409.12191
+-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
++            self.mrope_positions = torch.empty((3, self.max_num_tokens + 1),
+                                                dtype=torch.int64,
+                                                device=self.device)
+-            self.mrope_positions_cpu = torch.zeros(
++            self.mrope_positions_cpu = torch.empty(
+                 (3, self.max_num_tokens + 1),
+                 dtype=torch.int64,
+                 device="cpu",
+                 pin_memory=self.pin_memory)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -176,27 +176,27 @@ class GPUModelRunner:
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)
+@@ -775,7 +775,12 @@ class GPUModelRunner:
+             sampling_metadata=sampling_metadata,
+         )
+ 
+-        sampled_token_ids = sampler_output.sampled_token_ids
++        sampled_token_ids_t = sampler_output.sampled_token_ids
++        sampled_token_ids_cpu = (sampled_token_ids_t.cpu()
++                                 if sampled_token_ids_t.is_cuda
++                                 else sampled_token_ids_t)
++        sampled_token_ids_list = sampled_token_ids_cpu.tolist()
++
+         # TODO(woosuk): The following loop can be slow since it iterates over
+         # the requests one by one. Optimize.
+         num_reqs = self.input_batch.num_reqs
+@@ -787,7 +792,7 @@ class GPUModelRunner:
+             assert seq_len <= req_state.num_tokens
+             if seq_len == req_state.num_tokens:
+                 # Append the sampled token to the output token ids.
+-                token_id = sampled_token_ids[i]
++                token_id = sampled_token_ids_list[i]
+                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
+                 self.input_batch.num_tokens[i] += 1
+                 req_state.output_token_ids.append(token_id)
+@@ -817,7 +822,7 @@ class GPUModelRunner:
+         model_runner_output = ModelRunnerOutput(
+             req_ids=req_ids,
+             req_id_to_index=self.input_batch.req_id_to_index,
+-            sampled_token_ids=sampled_token_ids,
++            sampled_token_ids=sampled_token_ids_list,
+             logprob_token_ids_cpu=logprob_token_ids,
+             logprobs_cpu=logprobs,
+         )

@@ -1,0 +1,116 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/attention/backends/triton_mla.py b/vllm/attention/backends/triton_mla.py
+index e06f7d54e..1350b1fcc 100644
+--- a/vllm/attention/backends/triton_mla.py
++++ b/vllm/attention/backends/triton_mla.py
+@@ -79,7 +79,8 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
+         B = q_nope.shape[0]
+ 
+         q = torch.cat([q_nope, q_pe], dim=-1)
+-        o = torch.zeros(B,
++        # Allocate output without zero-initialization; kernel fully writes it.
++        o = torch.empty(B,
+                         self.num_heads,
+                         self.kv_lora_rank,
+                         dtype=q.dtype,
+diff --git a/vllm/attention/layer.py b/vllm/attention/layer.py
+index f9c2d4f49..a4391a295 100644
+--- a/vllm/attention/layer.py
++++ b/vllm/attention/layer.py
+@@ -205,7 +205,8 @@ class Attention(nn.Module):
+         if self.use_output:
+             output_shape = (output_shape
+                             if output_shape is not None else query.shape)
+-            output = torch.zeros(output_shape,
++            # Avoid zero-initialization; attention kernels write full output.
++            output = torch.empty(output_shape,
+                                  dtype=query.dtype,
+                                  device=query.device)
+             hidden_size = output_shape[-1]
+diff --git a/vllm/model_executor/layers/fused_moe/fused_batched_moe.py b/vllm/model_executor/layers/fused_moe/fused_batched_moe.py
+index 61247e930..cc34415cc 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_batched_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_batched_moe.py
+@@ -534,7 +534,7 @@ class BatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         else:
+             b_type = quant_config.quant_dtype
+ 
+-        b_a1 = torch.zeros(
++        b_a1 = torch.empty(
+             (num_local_experts, self.max_num_tokens, hidden_dim),
+             dtype=b_type,
+             device=a1.device)
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index d0d8c7d6f..e6baf4c58 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -679,7 +679,7 @@ class FusedMoEModularKernel(torch.nn.Module):
+         """
+ 
+         a1 = hidden_states
+-        output = a1 if inplace else torch.zeros_like(a1)
++        output = a1 if inplace else torch.empty_like(a1)
+ 
+         local_num_experts = w1.size(0)
+         if global_num_experts == -1:
+diff --git a/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py b/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py
+index 9a5315b8b..785b284a9 100644
+--- a/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py
++++ b/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py
+@@ -115,11 +115,11 @@ class TopKWeightAndReduceNaiveBatched(mk.TopKWeightAndReduce):
+         K = fused_expert_output.size(-1)
+ 
+         if output is None:
+-            output = torch.zeros((num_tokens, K),
++            output = torch.empty((num_tokens, K),
+                                  device=fused_expert_output.device,
+                                  dtype=fused_expert_output.dtype)
+-        else:
+-            output.fill_(0)
++
++        initialized = torch.zeros((num_tokens,), dtype=torch.bool, device=fused_expert_output.device)
+ 
+         assert output.size() == (num_tokens, K), (
+             f"Expected output size {(num_tokens, K)}, but got {output.size()}")
+@@ -132,8 +132,20 @@ class TopKWeightAndReduceNaiveBatched(mk.TopKWeightAndReduce):
+             topks = torch.any(matching_tokens, dim=1).flatten()
+             rows = torch.count_nonzero(topks)
+             rhs = fused_expert_output[expert_id - first_expert, :rows, :]
+-            if not apply_router_weight_on_input:
+-                rhs.mul_(topk_weights[matching_tokens].view(rhs.size(0), 1))
+-            output[topks] = output[topks] + rhs
++            if rows > 0:
++                idx = torch.nonzero(topks, as_tuple=False).squeeze(1)
++                new_rows_mask = ~initialized[idx]
++                if not apply_router_weight_on_input:
++                    rhs.mul_(topk_weights[matching_tokens].view(rhs.size(0), 1))
++                if new_rows_mask.any():
++                    output[idx[new_rows_mask]] = rhs[new_rows_mask]
++                old_rows_mask = ~new_rows_mask
++                if old_rows_mask.any():
++                    output[idx[old_rows_mask]] = output[idx[old_rows_mask]] + rhs[old_rows_mask]
++                initialized[idx] = True
++
++        # Zero rows that received no contributions from local experts
++        if (~initialized).any():
++            output[~initialized] = 0
+ 
+         return output
+diff --git a/vllm/model_executor/layers/quantization/utils/quant_utils.py b/vllm/model_executor/layers/quantization/utils/quant_utils.py
+index 54361a232..7d03d0832 100644
+--- a/vllm/model_executor/layers/quantization/utils/quant_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/quant_utils.py
+@@ -241,9 +241,8 @@ def permute_rows(q_w: torch.Tensor,
+     orig_device = q_w.device
+     k_size, _ = q_w.shape
+ 
+-    g_idx = torch.zeros((k_size, ), dtype=torch.int32)
+-    for i in range(k_size):
+-        g_idx[i] = i // group_size
++    # Vectorized group index computation; avoids Python loop and zero-init
++    g_idx = (torch.arange(k_size, dtype=torch.int32) // group_size)
+ 
+     # Simulate act_order by doing a random permutation on K
+     rand_perm = test_perm if test_perm is not None else torch.randperm(k_size)

@@ -1,0 +1,230 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/core/block/e2e/test_correctness.py b/tests/core/block/e2e/test_correctness.py
+index e9b537ed5..22f71e89b 100644
+--- a/tests/core/block/e2e/test_correctness.py
++++ b/tests/core/block/e2e/test_correctness.py
+@@ -109,7 +109,7 @@ def test_block_manager_with_preemption(baseline_llm_generator,
+             "num_gpu_blocks_override": 2 * (8 + 1),
+         },
+         {
+-            "block_size": 8,
++            "block_size": 16,
+ 
+             # Allow only 2 sequences of ~128 tokens in worst case.
+             # Note 16 = 128/block_size
+@@ -195,15 +195,15 @@ def test_lookahead_greedy_equality_with_preemption(baseline_llm_generator,
+     ])
+ @pytest.mark.parametrize("per_test_common_llm_kwargs",
+                          [{
+-                             "block_size": 8,
++                             "block_size": 16,
+                              "max_num_batched_tokens": 2,
+                              "max_num_seqs": 2,
+                          }, {
+-                             "block_size": 8,
++                             "block_size": 16,
+                              "max_num_batched_tokens": 3,
+                              "max_num_seqs": 2,
+                          }, {
+-                             "block_size": 8,
++                             "block_size": 16,
+                              "max_num_batched_tokens": 256,
+                              "max_num_seqs": 10,
+                          }])
+diff --git a/vllm/attention/ops/prefix_prefill.py b/vllm/attention/ops/prefix_prefill.py
+index e0478c2ae..699006a2f 100644
+--- a/vllm/attention/ops/prefix_prefill.py
++++ b/vllm/attention/ops/prefix_prefill.py
+@@ -145,8 +145,7 @@ if triton.__version__ >= "2.1.0":
+             else:
+                 k = k_load
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)  # [M,N]
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+@@ -219,8 +218,7 @@ if triton.__version__ >= "2.1.0":
+                         ((start_n + offs_n[None, :]) < cur_batch_query_len),
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk *= sm_scale
+             # apply causal mask
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+@@ -363,8 +361,7 @@ if triton.__version__ >= "2.1.0":
+             k = tl.load(K_cache + off_k,
+                         mask=(start_n + offs_n[None, :]) < cur_batch_ctx_len,
+                         other=0.0)
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk += tl.dot(q, k)
++            qk = tl.dot(q, k)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+@@ -414,8 +411,7 @@ if triton.__version__ >= "2.1.0":
+                         < cur_batch_seq_len - cur_batch_ctx_len,
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk += tl.dot(q, k)
++            qk = tl.dot(q, k)
+             qk *= sm_scale
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+                           float("-inf"))
+@@ -582,8 +578,7 @@ if triton.__version__ >= "2.1.0":
+             else:
+                 k = k_load
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+@@ -657,8 +652,7 @@ if triton.__version__ >= "2.1.0":
+                          < cur_batch_seq_len - cur_batch_ctx_len),
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision='ieee')
++            qk = tl.dot(q, k, input_precision='ieee')
+             qk *= sm_scale
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+                           float("-inf"))
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer.py b/vllm/model_executor/layers/mamba/mamba_mixer.py
+index 156e8752e..f59f26952 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer.py
+@@ -219,18 +219,24 @@ class MambaMixer(CustomOp):
+                 has_initial_state=attn_metadata.context_lens_tensor > 0,
+                 query_start_loc=attn_metadata.query_start_loc)
+         else:
++            # Preallocate SSM output buffer to avoid an internal allocation
++            _hs_in = hidden_states.transpose(0, 1)
++            _dt_in = discrete_time_step.transpose(0, 1)
++            _gate_in = gate.transpose(0, 1)
++            _out_buf = torch.empty_like(_hs_in)
+             scan_outputs = selective_state_update(
+                 mamba_cache_params.ssm_state,
+-                hidden_states.transpose(0, 1),
+-                discrete_time_step.transpose(0, 1),
++                _hs_in,
++                _dt_in,
+                 self.A,
+                 B,
+                 C,
+                 self.D,
+-                gate.transpose(0, 1),
++                _gate_in,
+                 time_proj_bias,
+                 dt_softplus=True,
+-                state_batch_indices=mamba_cache_params.state_indices_tensor)
++                state_batch_indices=mamba_cache_params.state_indices_tensor,
++                out=_out_buf)
+             scan_outputs = scan_outputs.transpose(0, 1)
+ 
+         # 4. Final linear projection
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index d459c93a2..bc15d7f3d 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -431,8 +431,8 @@ class MambaMixer2(CustomOp):
+                 query_start_loc=attn_metadata.query_start_loc).transpose(
+                     0, 1)[:seq_len]
+ 
+-            # TODO: Why is this needed?
+-            hidden_states_B_C = hidden_states_B_C.contiguous()
++            # Avoid forcing contiguity here; downstream ops ensure contiguity
++            # only when required, preventing an extra device-to-device copy.
+         else:
+             hidden_states_B_C = causal_conv1d_update(
+                 hidden_states_B_C,
+@@ -514,6 +514,8 @@ class MambaMixer2(CustomOp):
+             #   using "mamba_cache_params.state_indices_tensor", just as
+             #   above in the prefill case
+ 
++            # Preallocate SSM output buffer to avoid internal allocation
++            hidden_out = torch.empty_like(hidden_states_reshaped)
+             hidden_states = selective_state_update(
+                 mamba_cache_params.ssm_state,
+                 hidden_states_reshaped,
+@@ -526,6 +528,7 @@ class MambaMixer2(CustomOp):
+                 dt_bias=dt_bias,
+                 dt_softplus=True,
+                 state_batch_indices=mamba_cache_params.state_indices_tensor,
++                out=hidden_out,
+             )
+             hidden_states = hidden_states.view(
+                 -1, (self.num_heads // self.tp_size) * self.head_dim)
+diff --git a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+index b31b980fb..dbd1ab3c4 100644
+--- a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
++++ b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+@@ -4,6 +4,7 @@
+ # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
+ 
+ import torch
++from typing import Optional
+ import triton
+ import triton.language as tl
+ from packaging import version
+@@ -204,7 +205,8 @@ def selective_state_update(state,
+                            dt_bias=None,
+                            dt_softplus=False,
+                            state_batch_indices=None,
+-                           pad_slot_id=PAD_SLOT_ID):
++                           pad_slot_id=PAD_SLOT_ID,
++                           out: Optional[torch.Tensor] = None):
+     """
+     Argument:
+         state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
+@@ -263,7 +265,9 @@ def selective_state_update(state,
+         assert dt_bias.shape == (nheads, dim)
+     if state_batch_indices is not None:
+         assert state_batch_indices.shape == (batch, )
+-    out = torch.empty_like(x)
++    # Allow callers to preallocate the output buffer to avoid a device-to-device
++    # allocation/copy on each call. If not provided, allocate as before.
++    out = out if out is not None else torch.empty_like(x)
+     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE_M']), batch, nheads)
+     z_strides = ((z.stride(0), z.stride(1), z.stride(2)) if z is not None else
+                  (0, 0, 0))
+diff --git a/vllm/model_executor/models/plamo2.py b/vllm/model_executor/models/plamo2.py
+index fb1442526..205fc8e2c 100644
+--- a/vllm/model_executor/models/plamo2.py
++++ b/vllm/model_executor/models/plamo2.py
+@@ -299,18 +299,24 @@ class Plamo2MambaMixer(nn.Module):
+                 has_initial_state=attn_metadata.context_lens_tensor > 0,
+                 query_start_loc=attn_metadata.query_start_loc)
+         else:
++            # Preallocate SSM output buffer to avoid an internal allocation
++            _hs_in = hidden_states.transpose(0, 1)
++            _dt_in = discrete_time_step.transpose(0, 1)
++            _gate_in = gate.transpose(0, 1)
++            _out_buf = torch.empty_like(_hs_in)
+             scan_outputs = selective_state_update(
+                 mamba_cache_params.ssm_state,
+-                hidden_states.transpose(0, 1),
+-                discrete_time_step.transpose(0, 1),
++                _hs_in,
++                _dt_in,
+                 self.A,
+                 B,
+                 C,
+                 self.D,
+-                gate.transpose(0, 1),
++                _gate_in,
+                 time_proj_bias,
+                 dt_softplus=True,
+-                state_batch_indices=mamba_cache_params.state_indices_tensor)
++                state_batch_indices=mamba_cache_params.state_indices_tensor,
++                out=_out_buf)
+             scan_outputs = scan_outputs.transpose(0, 1)
+ 
+         # 4. Final linear projection

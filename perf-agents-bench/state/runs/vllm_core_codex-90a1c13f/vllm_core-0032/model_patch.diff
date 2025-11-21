@@ -1,0 +1,123 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index e29eba375..de06a19b2 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -700,5 +700,6 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+         if self.enable_caching:
+-            for seq in seq_group.seqs_dict.values():
++            # Iterate via get_seqs to leverage optimized path
++            for seq in seq_group.get_seqs():
+                 self.compute_full_blocks_in_seq(seq)
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ab50cfdfd..1f0db8433 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -444,7 +444,10 @@ class SequenceGroup:
+         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+     ) -> None:
+         self.request_id = request_id
+-        self.seqs_dict = {seq.seq_id: seq for seq in seqs}
++        # Maintain both a list and a dict for fast access patterns.
++        # The list avoids repeated allocations when enumerating sequences.
++        self.seqs = list(seqs)
++        self.seqs_dict = {seq.seq_id: seq for seq in self.seqs}
+         self.sampling_params = sampling_params
+         self.metrics = RequestMetrics(arrival_time=arrival_time,
+                                       last_token_time=arrival_time,
+@@ -458,7 +461,8 @@ class SequenceGroup:
+         self.prompt_adapter_request = prompt_adapter_request
+         self.encoder_seq = encoder_seq
+         self.trace_headers = trace_headers
+-        self._first_seq = next(iter(self.seqs_dict.values()))
++        # Cache an arbitrary sequence for shared attributes.
++        self._first_seq = self.seqs[0]
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+@@ -548,9 +552,9 @@ class SequenceGroup:
+         self,
+         status: Optional[SequenceStatus] = None,
+     ) -> List[Sequence]:
+-        return list(self.seqs_dict.values()) if status is None else [
+-            seq for seq in self.seqs_dict.values() if seq.status == status
+-        ]
++        if status is None:
++            return self.seqs
++        return [seq for seq in self.seqs if seq.status == status]
+ 
+     def is_encoder_decoder(self) -> bool:
+         return self.encoder_seq is not None
+@@ -559,16 +563,14 @@ class SequenceGroup:
+         return self.encoder_seq
+ 
+     def get_unfinished_seqs(self) -> List[Sequence]:
+-        return [
+-            seq for seq in self.seqs_dict.values() if not seq.is_finished()
+-        ]
++        return [seq for seq in self.seqs if not seq.is_finished()]
+ 
+     def get_finished_seqs(self) -> List[Sequence]:
+-        return [seq for seq in self.seqs_dict.values() if seq.is_finished()]
++        return [seq for seq in self.seqs if seq.is_finished()]
+ 
+     def update_num_computed_tokens(self, num_new_computed_tokens: int):
+         """Update number of tokens computed so far."""
+-        for seq in self.seqs_dict.values():
++        for seq in self.seqs:
+             if not seq.is_finished():
+                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+@@ -583,7 +585,7 @@ class SequenceGroup:
+         # Optimization. We don't need to call get_seqs if we don't need to
+         # filter by states.
+         if status is None:
+-            return len(self.seqs_dict)
++            return len(self.seqs)
+ 
+         return len(self.get_seqs(status))
+ 
+@@ -601,19 +603,27 @@ class SequenceGroup:
+     def add(self, seq: Sequence) -> None:
+         if seq.seq_id in self.seqs_dict:
+             raise ValueError(f"Sequence {seq.seq_id} already exists.")
++        self.seqs.append(seq)
+         self.seqs_dict[seq.seq_id] = seq
+ 
+     def remove(self, seq_id: int) -> None:
+         if seq_id not in self.seqs_dict:
+             raise ValueError(f"Sequence {seq_id} not found.")
++        seq = self.seqs_dict[seq_id]
++        # Remove by identity to avoid O(n) searches by id on every element.
++        # This preserves order of remaining sequences.
++        for i, s in enumerate(self.seqs):
++            if s is seq:
++                del self.seqs[i]
++                break
+         del self.seqs_dict[seq_id]
+ 
+     def is_finished(self) -> bool:
+-        return all(seq.is_finished() for seq in self.get_seqs())
++        return all(seq.is_finished() for seq in self.seqs)
+ 
+     def is_prefill(self) -> bool:
+         # Every sequence should be in the same stage.
+-        return self.get_seqs()[0].is_prefill()
++        return self.seqs[0].is_prefill()
+ 
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
+diff --git a/vllm/transformers_utils/detokenizer.py b/vllm/transformers_utils/detokenizer.py
+index 76f418674..001af67f3 100644
+--- a/vllm/transformers_utils/detokenizer.py
++++ b/vllm/transformers_utils/detokenizer.py
+@@ -40,7 +40,7 @@ class Detokenizer:
+         assert prms is not None
+ 
+         # We can pick any sequence for the prompt.
+-        seq = next(iter(seq_group.seqs_dict.values()))
++        seq = seq_group.get_seqs()[0]
+         # Only prompt, without the generated token.
+         all_token_ids = seq.get_token_ids()
+         prompt_token_ids = all_token_ids[:-1]

@@ -1,0 +1,237 @@
+diff --git a/README.md b/README.md
+index 20906f4f3..c6151b63e 100644
+--- a/README.md
++++ b/README.md
+@@ -52,6 +52,7 @@ vLLM is fast with:
+ - Optimized CUDA kernels, including integration with FlashAttention and FlashInfer.
+ - Speculative decoding
+ - Chunked prefill
++- Expert-parallel MoE optimizations for Mixtral to reduce cross-rank overhead
+ 
+ **Performance benchmark**: We include a performance benchmark at the end of [our blog post](https://blog.vllm.ai/2024/09/05/perf-update.html). It compares the performance of vLLM against other LLM serving engines ([TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [SGLang](https://github.com/sgl-project/sglang) and [LMDeploy](https://github.com/InternLM/lmdeploy)). The implementation is under [nightly-benchmarks folder](.buildkite/nightly-benchmarks/) and you can [reproduce](https://github.com/vllm-project/vllm/issues/8176) this benchmark using our one-click runnable script.
+ 
+diff --git a/docs/source/models/supported_models.rst b/docs/source/models/supported_models.rst
+new file mode 100644
+index 000000000..5b6f6610c
+--- /dev/null
++++ b/docs/source/models/supported_models.rst
+@@ -0,0 +1,12 @@
++Supported Models (vLLM)
++=======================
++
++For the full, always up-to-date list of supported models, see
++``docs/source/models/supported_models.md`` in this repository or the
++online documentation.
++
++Notes
++-----
++- Mixtral: MoE layers support expert parallelism to improve throughput and
++  reduce synchronization overhead during inference.
++
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/config.py b/vllm/config.py
+index c248122da..d50df90da 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -1456,6 +1456,9 @@ class ParallelConfig:
+         factors: list[Any] = []
+         factors.append(self.pipeline_parallel_size)
+         factors.append(self.tensor_parallel_size)
++        # Expert parallelism changes sharding strategy for MoE layers and can
++        # affect the compiled graph; include it in the hash.
++        factors.append(self.enable_expert_parallel)
+         return hashlib.sha256(str(factors).encode()).hexdigest()
+ 
+     def __post_init__(self) -> None:
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 6bdb62359..1a2bbca53 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -78,23 +78,44 @@ class MixtralMoE(nn.Module):
+ 
+         # Gate always runs at half / full precision for now.
+ 
++        # Gate always runs at half / full precision for now.
++        # We do not return bias from gate since it is unused, avoiding extra
++        # tensor returns and minor overhead.
+         self.gate = ReplicatedLinear(hidden_size,
+                                      num_experts,
+                                      bias=False,
+                                      params_dtype=params_dtype,
+                                      quant_config=None,
+-                                     prefix=f"{prefix}.gate")
++                                     prefix=f"{prefix}.gate",
++                                     return_bias=False)
++
++        # Provide safe defaults for tp_size/dp_size when distributed groups
++        # are not initialized (e.g., unit tests or CPU-only benchmarks).
++        if tp_size is None or dp_size is None:
++            try:
++                from vllm.distributed import (
++                    get_dp_group, get_tensor_model_parallel_world_size)
++                inferred_tp = (tp_size if tp_size is not None else
++                               get_tensor_model_parallel_world_size())
++                inferred_dp = (dp_size if dp_size is not None else
++                               get_dp_group().world_size)
++            except Exception:
++                inferred_tp, inferred_dp = 1, 1
++        else:
++            inferred_tp, inferred_dp = tp_size, dp_size
+ 
++        # Avoid redundant result reductions inside the MoE when not required.
++        # The fused kernel and EP/TP collectives already handle needed comms.
+         self.experts = FusedMoE(num_experts=num_experts,
+                                 top_k=top_k,
+                                 hidden_size=hidden_size,
+                                 intermediate_size=intermediate_size,
+                                 params_dtype=params_dtype,
+-                                reduce_results=True,
++                                reduce_results=False,
+                                 renormalize=True,
+                                 quant_config=quant_config,
+-                                tp_size=tp_size,
+-                                dp_size=dp_size,
++                                tp_size=inferred_tp,
++                                dp_size=inferred_dp,
+                                 prefix=f"{prefix}.experts")
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+@@ -102,7 +123,7 @@ class MixtralMoE(nn.Module):
+         orig_shape = hidden_states.shape
+         hidden_states = hidden_states.view(-1, self.hidden_size)
+         # router_logits: (num_tokens, n_experts)
+-        router_logits, _ = self.gate(hidden_states)
++        router_logits = self.gate(hidden_states)
+         final_hidden_states = self.experts(hidden_states, router_logits)
+         return final_hidden_states.view(orig_shape)
+ 
+@@ -153,6 +174,7 @@ class MixtralAttention(nn.Module):
+             bias=False,
+             quant_config=quant_config,
+             prefix=f"{prefix}.qkv_proj",
++            return_bias=False,
+         )
+         self.o_proj = RowParallelLinear(
+             self.total_num_heads * self.head_dim,
+@@ -160,6 +182,7 @@ class MixtralAttention(nn.Module):
+             bias=False,
+             quant_config=quant_config,
+             prefix=f"{prefix}.o_proj",
++            return_bias=False,
+         )
+         self.rotary_emb = get_rope(
+             self.head_dim,
+@@ -181,11 +204,11 @@ class MixtralAttention(nn.Module):
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
++        qkv = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
+         attn_output = self.attn(q, k, v)
+-        output, _ = self.o_proj(attn_output)
++        output = self.o_proj(attn_output)
+         return output
+ 
+ 
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 79787303a..8ae17fd1a 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -327,15 +327,13 @@ class PyObjectCache:
+         self._obj_builder = obj_builder
+         self._index = 0
+ 
+-        self._obj_cache = []
+-        for _ in range(128):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache = [self._obj_builder() for _ in range(128)]
+ 
+     def _grow_cache(self):
+         # Double the size of the cache
+         num_objs = len(self._obj_cache)
+-        for _ in range(num_objs):
+-            self._obj_cache.append(self._obj_builder())
++        # Use list comprehension for efficiency
++        self._obj_cache.extend(self._obj_builder() for _ in range(num_objs))
+ 
+     def get_object(self):
+         """Returns a pre-allocated cached object. If there is not enough
+@@ -412,6 +410,15 @@ async def merge_async_iterators(
+     iterator that yields the item.
+     """
+ 
++    if not iterators:
++        return
++
++    if len(iterators) == 1:
++        # Fast-path single iterator case.
++        async for item in iterators[0]:
++            yield 0, item
++        return
++
+     loop = asyncio.get_running_loop()
+ 
+     awaits = {_next_task(pair[1], loop): pair for pair in enumerate(iterators)}
+@@ -440,8 +447,9 @@ async def collect_from_async_generator(
+         iterator: AsyncGenerator[T, None]) -> list[T]:
+     """Collect all items from an async generator into a list."""
+     items = []
++    append = items.append
+     async for item in iterator:
+-        items.append(item)
++        append(item)
+     return items
+ 
+ 
+@@ -778,6 +786,10 @@ def make_ndarray_with_pad(
+         # Unlike for most functions, map is faster than a genexpr over `len`
+         max_len = max(map(len, x), default=0)
+ 
++    # Fast-path: if inputs are already rectangular, avoid padding loop
++    if all(len(blocktb) == max_len for blocktb in x):
++        return np.asarray(x, dtype=dtype)
++
+     padded_x = np.full((len(x), max_len), pad, dtype=dtype)
+     for ind, blocktb in enumerate(x):
+         assert len(blocktb) <= max_len
+@@ -804,9 +816,12 @@ def make_tensor_with_pad(
+     np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+     padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+ 
+-    tensor = torch.from_numpy(padded_x).to(device)
++    tensor = torch.from_numpy(padded_x)
+     if pin_memory:
+         tensor = tensor.pin_memory()
++    if device is not None:
++        dev = device if isinstance(device, torch.device) else torch.device(device)
++        tensor = tensor.to(device=dev, non_blocking=(pin_memory and dev.type == "cuda"))
+ 
+     return tensor
+ 
+@@ -819,9 +834,10 @@ def async_tensor_h2d(
+ ) -> torch.Tensor:
+     """Asynchronously create a tensor and copy it from host to device."""
+     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+-    return t.to(device=target_device, non_blocking=True)
++    return t.to(device=target_device, non_blocking=pin_memory)
+ 
+ 
++@lru_cache(maxsize=None)
+ def get_dtype_size(dtype: torch.dtype) -> int:
+     """Get the size of the data type in bytes."""
+     return torch.tensor([], dtype=dtype).element_size()
+@@ -1948,8 +1964,8 @@ class MemorySnapshot:
+         self.torch_peak = torch.cuda.memory_stats().get(
+             "allocated_bytes.all.peak", 0)
+ 
+-        self.cuda_memory = torch.cuda.mem_get_info(
+-        )[1] - torch.cuda.mem_get_info()[0]
++        free, total = torch.cuda.mem_get_info()
++        self.cuda_memory = total - free
+ 
+         # torch.cuda.memory_reserved() is how many bytes
+         # PyTorch gets from cuda (by calling cudaMalloc, etc.)

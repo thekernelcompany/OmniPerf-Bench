@@ -1,0 +1,255 @@
+diff --git a/.buildkite/test-pipeline.yaml b/.buildkite/test-pipeline.yaml
+index 4feea786f..d2259ecac 100644
+--- a/.buildkite/test-pipeline.yaml
++++ b/.buildkite/test-pipeline.yaml
+@@ -60,11 +60,12 @@ steps:
+   mirror_hardwares: [amd]
+   commands:
+     # install aws cli for llava_example.py
+-    - pip install awscli
++    - pip install awscli tensorizer
+     - python3 offline_inference.py
+     - python3 offline_inference_with_prefix.py
+     - python3 llm_engine_example.py
+     - python3 llava_example.py
++    - python3 tensorize_vllm_model.py --model facebook/opt-125m serialize --serialized-directory /tmp/ --suffix v1 && python3 tensorize_vllm_model.py --model facebook/opt-125m deserialize --path-to-tensors /tmp/vllm/facebook/opt-125m/v1/model.tensors
+ 
+ - label: Kernels Test %N
+   command: pytest -v -s kernels --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+diff --git a/examples/tensorize_vllm_model.py b/examples/tensorize_vllm_model.py
+index e2456168d..aa9cff677 100644
+--- a/examples/tensorize_vllm_model.py
++++ b/examples/tensorize_vllm_model.py
+@@ -1,6 +1,7 @@
+ import argparse
+ import dataclasses
+ import os
++import json
+ import time
+ import uuid
+ from functools import partial
+@@ -188,6 +189,7 @@ def serialize():
+     model = (engine.model_executor.driver_worker.
+              model_runner.model)
+ 
++    make_model_contiguous(model)
+     encryption_params = EncryptionParams.random() if keyfile else None
+     if keyfile:
+         with _write_stream(keyfile) as stream:
+@@ -211,7 +213,7 @@ def deserialize():
+         model = model_class(config)
+ 
+     before_mem = get_mem_usage()
+-    start = time.time()
++    start = time.perf_counter()
+ 
+     if keyfile:
+         with _read_stream(keyfile) as stream:
+@@ -223,7 +225,7 @@ def deserialize():
+     with (_read_stream(model_path)) as stream, TensorDeserializer(
+             stream, **tensorizer_args.deserializer_params) as deserializer:
+         deserializer.load_into_module(model)
+-        end = time.time()
++        end = time.perf_counter()
+ 
+     # Brag about how fast we are.
+     total_bytes_str = convert_bytes(deserializer.total_tensor_bytes)
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 91cc8f3be..68d8a074d 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -145,7 +145,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+ 
+     # S3 access information, used for tensorizer to load model from S3
+     "S3_ACCESS_KEY_ID":
+-    lambda: os.environ.get("S3_ACCESS_KEY", None),
++    lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
+     "S3_SECRET_ACCESS_KEY":
+     lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
+     "S3_ENDPOINT_URL":
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index a84f56290..4bf22dd38 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -177,7 +177,11 @@ def _apply_min_tokens_penalty(
+             seqs_to_penalize = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+-                if len(seq_data.output_token_ids) < min_tokens:
++                # Use array-backed length check to avoid Python list overhead.
++                output_len = (len(seq_data.output_token_ids_array)
++                              if hasattr(seq_data, 'output_token_ids_array')
++                              else len(seq_data.output_token_ids))
++                if output_len < min_tokens:
+                     seqs_to_penalize.append(j)
+ 
+             if seqs_to_penalize:
+@@ -1063,7 +1067,10 @@ def _get_next_prompt_tokens(seq_group: SequenceGroupToSample) -> List[int]:
+     assert len(seq_ids) == 1
+     seq_data = seq_group.seq_data[seq_ids[0]]
+     computed_len = seq_data.get_num_computed_tokens()
+-    prompt_tokens = seq_data.prompt_token_ids
++    # Prefer array-backed tokens if available for faster slicing.
++    prompt_tokens = (seq_data.prompt_token_ids_array
++                     if hasattr(seq_data, 'prompt_token_ids_array')
++                     else seq_data.prompt_token_ids)
+     # +1 because we are looking for a next prompt token.
+     next_token_index_start = computed_len + 1
+     next_token_index_end = min(computed_len + query_len + 1,
+diff --git a/vllm/model_executor/model_loader/tensorizer.py b/vllm/model_executor/model_loader/tensorizer.py
+index 219a2a392..a7701e869 100644
+--- a/vllm/model_executor/model_loader/tensorizer.py
++++ b/vllm/model_executor/model_loader/tensorizer.py
+@@ -293,7 +293,7 @@ class TensorizerAgent:
+                                          dtype=child.weight.dtype,
+                                          device=child.weight.device)
+                 new_weight[:child.weight.shape[0]].copy_(child.weight.data)
+-                new_weight[child.weight.shape[0]:].fill_(0)
++                new_weight[child.weight.shape[0]:].zero_()
+                 child.weight.data = new_weight
+ 
+     def _check_tensors_on_meta_device(self):
+@@ -337,7 +337,7 @@ class TensorizerAgent:
+         duration = end - start
+         per_second = convert_bytes(deserializer.total_tensor_bytes / duration)
+         after_mem = get_mem_usage()
+-        deserializer.close()
++
+         logger.info("Deserialized %s in %0.2fs, %s/s", total_bytes_str,
+                     end - start, per_second)
+         logger.info("Memory usage before: %s", before_mem)
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 9969c4596..c8e4b6ba4 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -1,4 +1,5 @@
+ import random
++from array import array
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional, Tuple
+ 
+@@ -319,8 +320,9 @@ class SamplingTensors:
+             user-defined seed for each sequence.
+         extra_entropy: extra entropy to use when generating seeds.
+         """
+-        prompt_tokens: List[List[int]] = []
+-        output_tokens: List[List[int]] = []
++        # Use Python array('I') where possible for faster padding and slicing.
++        prompt_tokens: List[object] = []  # List[List[int] | array]
++        output_tokens: List[object] = []  # List[List[int] | array]
+         top_ks: List[int] = []
+         temperatures: List[float] = []
+         top_ps: List[float] = []
+@@ -386,16 +388,21 @@ class SamplingTensors:
+                 presence_penalties += [0] * prefill_len
+                 frequency_penalties += [0] * prefill_len
+                 repetition_penalties += [1] * prefill_len
+-                prompt_tokens.extend([] for _ in range(prefill_len))
+-                output_tokens.extend([] for _ in range(prefill_len))
++                prompt_tokens.extend(array('I') for _ in range(prefill_len))
++                output_tokens.extend(array('I') for _ in range(prefill_len))
+ 
+             if seq_group.do_sample:
+                 sample_lens = len(seq_group.sample_indices)
+                 assert sample_lens == len(seq_ids)
+                 for seq_id in seq_ids:
+                     seq_data = seq_group.seq_data[seq_id]
+-                    prompt_tokens.append(seq_data.prompt_token_ids)
+-                    output_tokens.append(seq_data.output_token_ids)
++                    # Prefer array-backed storage if available.
++                    p_tokens = (getattr(seq_data, 'prompt_token_ids_array',
++                                        seq_data.prompt_token_ids))
++                    o_tokens = (getattr(seq_data, 'output_token_ids_array',
++                                        seq_data.output_token_ids))
++                    prompt_tokens.append(p_tokens)
++                    output_tokens.append(o_tokens)
+                 temperatures += [temperature] * len(seq_ids)
+                 top_ps += [top_p] * len(seq_ids)
+                 top_ks += [top_k] * len(seq_ids)
+@@ -436,8 +443,8 @@ class SamplingTensors:
+                    frequency_penalties: List[float],
+                    repetition_penalties: List[float],
+                    sampling_seeds: List[int], sample_indices: List[int],
+-                   prompt_tokens: List[List[int]],
+-                   output_tokens: List[List[int]], vocab_size: int,
++                   prompt_tokens: List[object],
++                   output_tokens: List[object], vocab_size: int,
+                    extra_seeds_to_generate: int, device: torch.device,
+                    dtype: torch.dtype) -> "SamplingTensors":
+         # Note that the performance will be very bad without
+@@ -445,16 +452,32 @@ class SamplingTensors:
+         pin_memory = is_pin_memory_available()
+         prompt_max_len = max([len(tokens) for tokens in prompt_tokens],
+                              default=0)
+-        prompt_padded_tokens = [
+-            tokens + [vocab_size] * (prompt_max_len - len(tokens))
+-            for tokens in prompt_tokens
+-        ]
+         output_max_len = max([len(tokens) for tokens in output_tokens],
+                              default=0)
+-        output_padded_tokens = [
+-            tokens + [vocab_size] * (output_max_len - len(tokens))
+-            for tokens in output_tokens
+-        ]
++
++        prompt_padded_tokens: List[object] = []
++        for tokens in prompt_tokens:
++            pad = prompt_max_len - len(tokens)
++            if pad <= 0:
++                prompt_padded_tokens.append(tokens)
++            else:
++                if isinstance(tokens, array):
++                    prompt_padded_tokens.append(
++                        tokens + (array('I', [vocab_size]) * pad))
++                else:
++                    prompt_padded_tokens.append(tokens + [vocab_size] * pad)
++
++        output_padded_tokens: List[object] = []
++        for tokens in output_tokens:
++            pad = output_max_len - len(tokens)
++            if pad <= 0:
++                output_padded_tokens.append(tokens)
++            else:
++                if isinstance(tokens, array):
++                    output_padded_tokens.append(
++                        tokens + (array('I', [vocab_size]) * pad))
++                else:
++                    output_padded_tokens.append(tokens + [vocab_size] * pad)
+ 
+         temperatures_t = torch.tensor(
+             temperatures,
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 46ac33b7e..284d3de3f 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -1,4 +1,5 @@
+ """Sequence and its related classes."""
++from array import array
+ import copy
+ import enum
+ from abc import ABC, abstractmethod
+@@ -120,8 +121,13 @@ class SequenceData:
+         if output_token_ids is None:
+             output_token_ids = []
+ 
++        # Keep original lists for API compatibility
+         self.prompt_token_ids = prompt_token_ids
+         self.output_token_ids = output_token_ids
++        # Add array-backed storage to speed padding/slicing in hot paths
++        # Use 32-bit unsigned integers, sufficient for token ids
++        self.prompt_token_ids_array = array('I', prompt_token_ids)
++        self.output_token_ids_array = array('I', output_token_ids)
+         self.cumulative_logprob = 0.0
+         # The number of tokens that are computed (that run against the model).
+         self._num_computed_tokens = 0
+@@ -129,6 +135,7 @@ class SequenceData:
+ 
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self.output_token_ids.append(token_id)
++        self.output_token_ids_array.append(token_id)
+         self.cumulative_logprob += logprob
+ 
+     def get_len(self) -> int:
