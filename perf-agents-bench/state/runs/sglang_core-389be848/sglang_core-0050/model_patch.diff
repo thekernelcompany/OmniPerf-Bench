@@ -1,0 +1,104 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index c9e7547bf..ca25d026f 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -44,6 +44,12 @@ if _is_cuda or _is_hip:
+     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+ 
+ 
++# Simple per-device buffer cache to avoid repeated allocations
++_moe_align_buf_cache: Dict[
++    Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]
++] = {}
++
++
+ @triton.jit
+ def write_zeros_to_output(
+     c_ptr,
+@@ -565,6 +571,8 @@ def moe_align_block_size_stage3(
+     num_experts: tl.constexpr,
+     block_size: tl.constexpr,
+ ):
++    # Ensure cumsum[0] is zero even if uninitialized buffer is provided
++    tl.store(cumsum_ptr + 0, 0)
+     last_cumsum = 0
+     off_cnt = num_experts * num_experts
+     for i in range(1, num_experts + 1):
+@@ -614,10 +622,21 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts,)
+-    tokens_cnts = torch.zeros(
+-        (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
+-    )
+-    cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
++    # Reuse cached buffers when shape/device match to reduce allocation overhead
++    cache_key = (topk_ids.device, int(num_experts))
++    tokens_cnts: torch.Tensor
++    cumsum: torch.Tensor
++    cached = _moe_align_buf_cache.get(cache_key)
++    if cached is None or cached[0].shape != (num_experts + 1, num_experts):
++        tokens_cnts = torch.empty(
++            (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
++        )
++        cumsum = torch.empty((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
++        _moe_align_buf_cache[cache_key] = (tokens_cnts, cumsum)
++    else:
++        tokens_cnts, cumsum = cached
++    # Zero only the rows written by stage1 (rows 1..num_experts)
++    tokens_cnts[1:, :].zero_()
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -695,7 +714,6 @@ def moe_align_block_size(
+     sorted_ids = torch.empty(
+         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+     )
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty(
+         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+@@ -711,13 +729,13 @@ def moe_align_block_size(
+             num_tokens_post_pad,
+         )
+     else:
+-        token_cnts_buffer = torch.zeros(
+-            (num_experts + 1) * num_experts,
+-            dtype=torch.int32,
+-            device=topk_ids.device,
++        # token_cnts_buffer is unused in native kernel; pass a minimal buffer
++        token_cnts_buffer = torch.empty(
++            (1,), dtype=torch.int32, device=topk_ids.device
+         )
+-        cumsum_buffer = torch.zeros(
+-            num_experts + 1, dtype=torch.int32, device=topk_ids.device
++        # Native kernel writes cumsum completely, no need to pre-initialize
++        cumsum_buffer = torch.empty(
++            (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+         )
+ 
+         sgl_moe_align_block_size(
+diff --git a/sgl-kernel/csrc/moe/moe_align_kernel.cu b/sgl-kernel/csrc/moe/moe_align_kernel.cu
+index 6ffa73924..7c872a136 100644
+--- a/sgl-kernel/csrc/moe/moe_align_kernel.cu
++++ b/sgl-kernel/csrc/moe/moe_align_kernel.cu
+@@ -91,6 +91,19 @@ __global__ void moe_align_block_size_kernel(
+ 
+   __syncthreads();
+ 
++  // Initialize sorted_token_ids with sentinel values (numel) for all padded slots
++  // so we can avoid an extra device-wide fill from Python.
++  // Each thread takes care of one expert's padded span.
++  if (threadIdx.x < num_experts) {
++    int start = cumsum[threadIdx.x];
++    int end = cumsum[threadIdx.x + 1];
++    for (int i = start; i < end; ++i) {
++      sorted_token_ids[i] = static_cast<int32_t>(numel);
++    }
++  }
++
++  __syncthreads();
++
+   if (threadIdx.x < num_experts) {
+     for (int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i += block_size) {
+       expert_ids[i / block_size] = threadIdx.x;

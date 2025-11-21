@@ -1,0 +1,135 @@
+diff --git a/README.md b/README.md
+index 2ac666c6b..93ca1f79d 100644
+--- a/README.md
++++ b/README.md
+@@ -378,6 +378,15 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
+ ```
+ - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+ 
++- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
++```
++# Node 0
++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 0
++
++# Node 1
++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 1
++```
++
+ ### Supported Models
+ - Llama
+ - Mistral
+diff --git a/benchmark/latency_throughput/bench_one.py b/benchmark/latency_throughput/bench_one.py
+index cfd96b54c..51de90949 100644
+--- a/benchmark/latency_throughput/bench_one.py
++++ b/benchmark/latency_throughput/bench_one.py
+@@ -14,6 +14,9 @@ import requests
+ def run_one_batch_size(bs):
+     url = f"{args.host}:{args.port}"
+     max_new_tokens = args.max_tokens
++    # Cache commonly used lens to avoid repeated attribute access
++    input_len = args.input_len if args.input_len else 1
++    output_len = max_new_tokens
+ 
+     if args.input_len:
+         input_ids = [
+@@ -94,10 +97,14 @@ def run_one_batch_size(bs):
+         ret = response
+     else:
+         ret = response.json()
+-    print(ret)
++    # Avoid printing full payloads to reduce I/O overhead
++    if isinstance(ret, dict):
++        print({k: ret.get(k) for k in list(ret.keys())[:3]})
++    else:
++        print(str(ret)[:200])
+ 
+-    output_throughput = bs * max_new_tokens / latency
+-    overall_throughput = bs * (args.input_len + max_new_tokens) / latency
++    output_throughput = bs * output_len / latency
++    overall_throughput = bs * (input_len + output_len) / latency
+     print(f"latency: {latency:.2f} s")
+     print(f"decode throughput: {output_throughput:.2f} token/s")
+     print(f"overall throughput: {overall_throughput:.2f} token/s")
+@@ -105,8 +112,8 @@ def run_one_batch_size(bs):
+     with open("results.jsonl", "a") as fout:
+         res = {
+             "backend": args.backend,
+-            "input_len": args.input_len,
+-            "output_len": args.max_tokens,
++            "input_len": input_len,
++            "output_len": output_len,
+             "batch_size": bs,
+             "latency": latency,
+             "output_throughput": output_throughput,
+diff --git a/benchmark/latency_throughput/bench_serving.py b/benchmark/latency_throughput/bench_serving.py
+index 23e8245f2..97df86f68 100644
+--- a/benchmark/latency_throughput/bench_serving.py
++++ b/benchmark/latency_throughput/bench_serving.py
+@@ -175,15 +175,16 @@ async def send_request(
+ 
+     if backend != "ginfer":
+         timeout = aiohttp.ClientTimeout(total=3 * 3600)
+-        async with aiohttp.ClientSession(timeout=timeout) as session:
++        connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
++        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+             while True:
+                 async with session.post(
+                     api_url, headers=headers, json=pload
+                 ) as response:
+-                    chunks = []
++                    buf = bytearray()
+                     async for chunk, _ in response.content.iter_chunks():
+-                        chunks.append(chunk)
+-                output = b"".join(chunks).decode("utf-8")
++                        buf.extend(chunk)
++                output = bytes(buf).decode("utf-8")
+                 output = json.loads(output)
+ 
+                 # Re-send the request if it failed.
+diff --git a/python/sglang/README.md b/python/sglang/README.md
+index c8c093706..7de19ef4f 100644
+--- a/python/sglang/README.md
++++ b/python/sglang/README.md
+@@ -3,10 +3,10 @@
+ - `backend`: Various backends for the language interpreter.
+ - `lang`: The frontend language.
+ - `srt`: The runtime for running local models.
++- SRT supports tensor parallelism across multiple nodes via `--nnodes` and `--node-rank` in `server_args`.
+ - `test`: Test utilities.
+ - `api.py`: Public API.
+ - `bench_latency.py`: Benchmark utilities.
+ - `global_config.py`: The global configs and constants.
+ - `launch_server.py`: The entry point of launching local server.
+ - `utils.py`: Common utilities.
+-
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index d68d9af32..0b0d3283e 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -187,8 +187,9 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        # Use empty to avoid unnecessary memory initialization.
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index 6cda67dea..4953b7fc2 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -207,8 +207,9 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
+             logger.info(
+                 f"[node_rank={server_args.node_rank}]: Listen for connections..."
+             )
++            # Avoid busy-wait to reduce CPU burn while waiting for rank 0.
+             while True:
+-                pass
++                time.sleep(0.1)
+ 
+     # Launch processes
+     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)

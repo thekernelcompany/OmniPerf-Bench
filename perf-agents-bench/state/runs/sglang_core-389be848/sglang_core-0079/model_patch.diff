@@ -1,0 +1,76 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 181ac7eef..763689ad0 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -129,8 +129,11 @@ class BaseTokenToKVPool:
+         return select_index.to(self.device, non_blocking=True)
+ 
+     def free(self, free_index: torch.Tensor):
++        # Move to CPU only if needed; reduce redundant host copies
++        if free_index.device.type != "cpu":
++            free_index = free_index.cpu()
+         if self.is_not_in_free_group:
+-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
++            self.free_slots = torch.concat((self.free_slots, free_index))
+         else:
+             self.free_group.append(free_index)
+ 
+@@ -141,11 +144,20 @@ class BaseTokenToKVPool:
+     def free_group_end(self):
+         self.is_not_in_free_group = True
+         if self.free_group:
+-            self.free(torch.concat(self.free_group))
++            # Merge once and free; indices may already be on CPU
++            merged = torch.concat(self.free_group)
++            self.free(merged)
+ 
+     def clear(self):
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
++        free = torch.arange(1, self.size + 1, dtype=torch.int32)
++        # Pin host memory to accelerate non_blocking device transfers when using CUDA
++        if isinstance(self.device, str) and self.device.startswith("cuda"):
++            try:
++                free = free.pin_memory()
++            except Exception:
++                pass
++        self.free_slots = free
+         self.is_in_free_group = False
+         self.free_group = []
+ 
+@@ -221,21 +233,22 @@ class MHATokenToKVPool(BaseTokenToKVPool):
+         cache_v: torch.Tensor,
+     ):
+         layer_id = layer.layer_id
+-        copy_two_array(
+-            loc,
+-            self.k_buffer[layer_id],
+-            cache_k,
+-            self.v_buffer[layer_id],
+-            cache_v,
+-            self.dtype,
+-            self.store_dtype,
+-        )
++        # Avoid compiled helper overhead; conditionally cast then assign
++        if cache_k.dtype != self.dtype:
++            cache_k = cache_k.to(self.dtype)
++            cache_v = cache_v.to(self.dtype)
++        if self.store_dtype != self.dtype:
++            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
++            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
++        else:
++            self.k_buffer[layer_id][loc] = cache_k
++            self.v_buffer[layer_id][loc] = cache_v
+ 
+ 
+-@torch.compile(dynamic=True)
+-def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
+-    dst_1[loc] = src_1.to(dtype).view(store_dtype)
+-    dst_2[loc] = src_2.to(dtype).view(store_dtype)
++# Note: A previously used compiled helper was removed since the
++# compilation overhead and dependency on system headers could slow
++# things down or fail in minimal environments. Direct assignment in
++# set_kv_buffer with light dtype handling is preferred.
+ 
+ 
+ class MLATokenToKVPool(BaseTokenToKVPool):

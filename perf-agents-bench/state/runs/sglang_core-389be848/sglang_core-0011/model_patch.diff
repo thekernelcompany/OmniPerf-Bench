@@ -1,0 +1,183 @@
+diff --git a/docs/backend/server_arguments.md b/docs/backend/server_arguments.md
+index 36c44b57e..50b888cbf 100644
+--- a/docs/backend/server_arguments.md
++++ b/docs/backend/server_arguments.md
+@@ -221,3 +221,4 @@ Please consult the documentation below and [server_args.py](https://github.com/s
+ | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
+ | `flashinfer_mla_disable_ragged` | Disable the use of the [ragged prefill](https://github.com/flashinfer-ai/flashinfer/blob/5751fc68f109877f6e0fc54f674cdcdef361af56/docs/tutorials/kv_layout.rst#L26) wrapper for the FlashInfer MLA attention backend. Ragged prefill increases throughput by computing MHA instead of paged MLA when there is no prefix match. Only use it when FlashInfer is being used as the MLA backend. | `False` |
+ | `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
++| `enable_dp_lm_head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | `False` |
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index 2cc399ab7..f7edfac61 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -252,12 +252,21 @@ def dp_scatter(
+         )
+ 
+ 
+-def tp_reduce_scatter(
++def attn_tp_reduce_scatter(
+     output: torch.Tensor,
+     input_list: List[torch.Tensor],
+ ):
+     return get_attention_tp_group().reduce_scatter(output, input_list)
+ 
+ 
+-def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
++def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
+     return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
++
++
++# Backward-compatible aliases
++def tp_reduce_scatter(output: torch.Tensor, input_list: List[torch.Tensor]):
++    return attn_tp_reduce_scatter(output, input_list)
++
++
++def tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
++    return attn_tp_all_gather(output_list, input_)
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 4958c6d04..b2836f8f7 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -32,6 +32,7 @@ from sglang.srt.layers.dp_attention import (
+     dp_scatter,
+     get_attention_dp_rank,
+     get_attention_dp_size,
++    get_attention_tp_group,
+ )
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from sglang.srt.managers.schedule_batch import global_server_args_dict
+@@ -177,7 +178,7 @@ class LogitsMetadata:
+         else:
+             dp_local_start_pos = cumtokens[dp_rank - 1]
+         dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+-        gathered_buffer = torch.zeros(
++        gathered_buffer = torch.empty(
+             (
+                 sum(self.global_num_tokens_for_logprob_cpu),
+                 hidden_states.shape[1],
+@@ -216,6 +217,9 @@ class LogitsProcessor(nn.Module):
+         self.debug_tensor_dump_output_folder = global_server_args_dict.get(
+             "debug_tensor_dump_output_folder", None
+         )
++        self.enable_dp_lm_head = global_server_args_dict.get(
++            "enable_dp_lm_head", False
++        )
+ 
+     def forward(
+         self,
+@@ -442,7 +446,11 @@ class LogitsProcessor(nn.Module):
+             logits.mul_(self.logit_scale)
+ 
+         if self.do_tensor_parallel_all_gather:
+-            logits = tensor_model_parallel_all_gather(logits)
++            if self.enable_dp_lm_head and get_attention_dp_size() != 1:
++                # Gather logits across attention TP group to avoid DP cross-group all-gather
++                logits = get_attention_tp_group().all_gather(logits)
++            else:
++                logits = tensor_model_parallel_all_gather(logits)
+ 
+         if self.do_tensor_parallel_all_gather_dp_attn:
+             logits, global_logits = (
+diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
+index ebc148feb..31fb67e9d 100644
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -463,7 +463,7 @@ class VocabParallelEmbedding(torch.nn.Module):
+         if not self.use_presharded_weights:
+             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+-        param[loaded_weight.shape[0] :].data.fill_(0)
++        # Avoid unnecessary writes to the padded tail; values will be masked or truncated at use sites.
+ 
+     def forward(self, input_):
+         if self.tp_size > 1:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index a797a7f3a..2b48c26da 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -74,6 +74,7 @@ global_server_args_dict = {
+     "disable_radix_cache": ServerArgs.disable_radix_cache,
+     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+     "enable_dp_attention": ServerArgs.enable_dp_attention,
++    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
+     "enable_ep_moe": ServerArgs.enable_ep_moe,
+     "enable_nan_detection": ServerArgs.enable_nan_detection,
+     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+@@ -1024,14 +1025,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 9770de1c3..6a0ed00bc 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -41,8 +41,8 @@ from sglang.srt.layers.dp_attention import (
+     get_attention_dp_size,
+     get_attention_tp_rank,
+     get_attention_tp_size,
+-    tp_all_gather,
+-    tp_reduce_scatter,
++    attn_tp_all_gather as tp_all_gather,
++    attn_tp_reduce_scatter as tp_reduce_scatter,
+ )
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index ab884ad9d..f69fb576b 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -45,6 +45,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from sglang.srt.managers.schedule_batch import global_server_args_dict
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import (
+     default_weight_loader,
+@@ -284,6 +285,7 @@ class LlamaModel(nn.Module):
+                 config.hidden_size,
+                 quant_config=quant_config,
+                 prefix=add_prefix("embed_tokens", prefix),
++                enable_tp=not global_server_args_dict["enable_dp_attention"],
+             )
+         else:
+             self.embed_tokens = PPMissingLayer()
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2e3b6c4df..bc98d0c89 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -188,6 +188,8 @@ class ServerArgs:
+     disable_chunked_prefix_cache: bool = False
+     disable_fast_image_processor: bool = False
+     mm_attention_backend: Optional[str] = None
++    # Enable vocabulary-parallel LM head across attention TP group
++    enable_dp_lm_head: bool = False
+ 
+     # Debug tensor dumps
+     debug_tensor_dump_output_folder: Optional[str] = None
+@@ -1055,6 +1057,11 @@ class ServerArgs:
+             action="store_true",
+             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+         )
++        parser.add_argument(
++            "--enable-dp-lm-head",
++            action="store_true",
++            help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups when DP attention is active.",
++        )
+         parser.add_argument(
+             "--enable-ep-moe",
+             action="store_true",

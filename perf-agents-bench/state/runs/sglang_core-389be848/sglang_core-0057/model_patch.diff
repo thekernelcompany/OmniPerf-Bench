@@ -1,0 +1,466 @@
+diff --git a/python/sglang/srt/constrained/__init__.py b/python/sglang/srt/constrained/__init__.py
+index c47c5c8dd..398becc31 100644
+--- a/python/sglang/srt/constrained/__init__.py
++++ b/python/sglang/srt/constrained/__init__.py
+@@ -24,31 +24,92 @@ try:
+     from outlines.caching import cache as disk_cache
+     from outlines.caching import disable_cache
+     from outlines.fsm.guide import RegexGuide
+-    from outlines.fsm.regex import FSMInfo, make_byte_level_fsm, make_deterministic_fsm
++    from outlines.fsm.regex import (
++        FSMInfo,
++        make_byte_level_fsm,
++        make_deterministic_fsm,
++    )
+     from outlines.models.transformers import TransformerTokenizer
+ except ImportError as e:
+-    print(
+-        f'\nError: {e}. Please install a new version of outlines by `pip install "outlines>=0.0.44"`\n'
+-    )
+-    raise
++    # Fall back to lightweight dummies so importing modules that reference
++    # constrained decoding does not hard-require outlines unless actually used.
++    # A clear error will be raised upon invocation of these dummies.
++    def _missing_outlines(*args, **kwargs):  # pragma: no cover
++        raise ImportError(
++            f"{e}. Please install a new version of outlines by `pip install \"outlines>=0.0.44\"`"
++        )
++
++    class _DummyRegexGuide:
++        def __init__(self, *args, **kwargs):  # pragma: no cover
++            _missing_outlines()
++
++    class _DummyFSMInfo:
++        pass
++
++    def _dummy_make_byte_level_fsm(*args, **kwargs):  # pragma: no cover
++        _missing_outlines()
++
++    def _dummy_make_deterministic_fsm(*args, **kwargs):  # pragma: no cover
++        _missing_outlines()
++
++    class _DummyTransformerTokenizer:  # pragma: no cover
++        def __init__(self, *args, **kwargs):
++            _missing_outlines()
++
++    def _dummy_cache(*args, **kwargs):  # pragma: no cover
++        _missing_outlines()
++
++    def _dummy_disable_cache(*args, **kwargs):  # pragma: no cover
++        _missing_outlines()
++
++    disk_cache = _dummy_cache
++    disable_cache = _dummy_disable_cache
++    RegexGuide = _DummyRegexGuide
++    FSMInfo = _DummyFSMInfo
++    make_byte_level_fsm = _dummy_make_byte_level_fsm
++    make_deterministic_fsm = _dummy_make_deterministic_fsm
++    TransformerTokenizer = _DummyTransformerTokenizer
+ 
+ try:
+     from outlines.fsm.json_schema import build_regex_from_object
+ except ImportError:
+-    # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
+-    # which only accepts string schema as input.
+-    from outlines.fsm.json_schema import build_regex_from_schema
+-
+-    def build_regex_from_object(
+-        object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+-    ):
+-        if isinstance(object, type(BaseModel)):
+-            schema = json.dumps(object.model_json_schema())
+-        elif isinstance(object, Dict):
+-            schema = json.dumps(object)
+-        else:
+-            schema = object
+-        return build_regex_from_schema(schema, whitespace_pattern)
++    try:
++        # Since outlines 0.0.32, build_regex_from_object is replaced by build_regex_from_schema,
++        # which only accepts string schema as input.
++        from outlines.fsm.json_schema import build_regex_from_schema
++
++        def build_regex_from_object(
++            object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
++        ):
++            if isinstance(object, type(BaseModel)):
++                schema = json.dumps(object.model_json_schema())
++            elif isinstance(object, Dict):
++                schema = json.dumps(object)
++            else:
++                schema = object
++            return build_regex_from_schema(schema, whitespace_pattern)
++    except ImportError:
++        # outlines.fsm.json_schema is unavailable entirely
++        def build_regex_from_object(*args, **kwargs):  # pragma: no cover
++            raise ImportError(
++                "outlines.fsm.json_schema is not available. Install outlines>=0.0.44."
++            )
++
++try:
++    # Optional accelerated grammar backend (if available)
++    from xgrammar import (
++        GrammarMatcher,
++        GrammarMatcherInitContext,
++        GrammarMatcherInitContextCache,
++    )
++except ImportError:
++    # Gracefully fall back if xgrammar is not installed
++    class _Dummy:
++        pass
++
++    GrammarMatcher = _Dummy
++    GrammarMatcherInitContext = _Dummy
++    GrammarMatcherInitContextCache = _Dummy
+ 
+ 
+ __all__ = [
+@@ -60,4 +121,8 @@ __all__ = [
+     "disk_cache",
+     "disable_cache",
+     "make_byte_level_fsm",
++    # Optional xgrammar exports
++    "GrammarMatcher",
++    "GrammarMatcherInitContext",
++    "GrammarMatcherInitContextCache",
+ ]
+diff --git a/python/sglang/srt/constrained/bnf_cache.py b/python/sglang/srt/constrained/bnf_cache.py
+new file mode 100644
+index 000000000..e7884d12f
+--- /dev/null
++++ b/python/sglang/srt/constrained/bnf_cache.py
+@@ -0,0 +1,64 @@
++"""
++Lightweight cache helpers for constrained-decoding grammars.
++
++This module provides a simple in-memory cache for BNF/JSON-schema to
++regex conversions, avoiding repeated expensive builds when the same
++schema is reused across requests.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from typing import Dict, Optional, Union
++
++from . import build_regex_from_object
++
++
++def _hash_key(obj: Union[str, dict]) -> str:
++    if isinstance(obj, str):
++        data = obj.encode("utf-8")
++    else:
++        data = json.dumps(obj, sort_keys=True).encode("utf-8")
++    return hashlib.sha256(data).hexdigest()
++
++
++@dataclass
++class CachedRegex:
++    pattern: str
++    whitespace_pattern: Optional[str]
++
++
++class BNFRegexCache:
++    """A minimal LRU-like cache for schema->regex conversions.
++
++    This is intentionally simple and lock-free as it is read-heavy and
++    per-process. If needed, it can be extended to an actual LRU.
++    """
++
++    def __init__(self, max_size: int = 256):
++        self._max_size = max_size
++        self._store: Dict[str, CachedRegex] = {}
++
++    def get_or_build(
++        self, obj: Union[str, dict], whitespace_pattern: Optional[str] = None
++    ) -> str:
++        key = _hash_key({"obj": obj, "ws": whitespace_pattern})
++        found = self._store.get(key)
++        if found is not None:
++            return found.pattern
++
++        # Build with outlines helper
++        pattern = build_regex_from_object(obj, whitespace_pattern)
++
++        if len(self._store) >= self._max_size:
++            # Pop an arbitrary item to keep memory bounded
++            self._store.pop(next(iter(self._store)))
++        self._store[key] = CachedRegex(pattern, whitespace_pattern)
++        return pattern
++
++
++# Module-level default cache
++default_bnf_regex_cache = BNFRegexCache()
++
+diff --git a/python/sglang/srt/constrained/grammar.py b/python/sglang/srt/constrained/grammar.py
+new file mode 100644
+index 000000000..902591b68
+--- /dev/null
++++ b/python/sglang/srt/constrained/grammar.py
+@@ -0,0 +1,59 @@
++"""
++Unified grammar utilities that can leverage either outlines or xgrammar.
++
++These helpers keep runtime flexible while enabling faster backends
++when available, without changing public APIs elsewhere.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Optional, Sequence
++
++from . import (
++    GrammarMatcher,
++    GrammarMatcherInitContext,
++    GrammarMatcherInitContextCache,
++    RegexGuide,
++)
++from .bnf_cache import default_bnf_regex_cache
++
++
++def compile_regex_from_schema(schema: Any, whitespace_pattern: Optional[str] = None) -> str:
++    """Compile a JSON schema or BNF-like object to a regex string with caching."""
++    return default_bnf_regex_cache.get_or_build(schema, whitespace_pattern)
++
++
++def build_regex_guide_from_schema(schema: Any, whitespace_pattern: Optional[str] = None) -> RegexGuide:
++    """Build an outlines RegexGuide using a cached regex from schema."""
++    pattern = compile_regex_from_schema(schema, whitespace_pattern)
++    return RegexGuide(pattern)
++
++
++def maybe_build_xgrammar_context(
++    tokenizer, grammar: str
++) -> Optional[GrammarMatcherInitContext]:
++    """Attempt to initialize an xgrammar context if available.
++
++    If xgrammar is not installed, returns None. Callers can fall back to
++    outlines-based RegexGuide in that case.
++    """
++    try:
++        if GrammarMatcherInitContext is object or GrammarMatcherInitContext is None:  # type: ignore[attr-defined]
++            return None
++    except Exception:
++        return None
++
++    return GrammarMatcherInitContext(tokenizer, grammar)
++
++
++def match_with_xgrammar(
++    matcher_ctx: GrammarMatcherInitContext,
++    init_cache: Optional[GrammarMatcherInitContextCache],
++    token_ids: Sequence[int],
++) -> Optional[GrammarMatcher]:
++    """Create a GrammarMatcher if xgrammar is available, else return None."""
++    try:
++        return GrammarMatcher(matcher_ctx, init_cache, token_ids)
++    except Exception:
++        return None
++
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index fcd06d8cc..f6b04fb4d 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -548,8 +548,9 @@ class ScheduleBatch:
+                     or len(req.prefix_indices) >= im.num_image_tokens
+                 )
+ 
+-        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(
+-            self.device, non_blocking=True
++        # Allocate directly on the target device to avoid host->device copies
++        self.encoder_lens = torch.tensor(
++            self.encoder_lens_cpu, dtype=torch.int32, device=self.device
+         )
+ 
+         # Strip encoder infos
+@@ -579,23 +580,19 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Reassign
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+-            self.device, non_blocking=True
++        self.input_ids = torch.tensor(
++            sum(input_ids, []), dtype=torch.int32, device=self.device
+         )
++        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+-                self.device, non_blocking=True
+-            )
++            self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+-                self.device, non_blocking=True
++            self.encoder_out_cache_loc = torch.empty(
++                0, dtype=torch.int32, device=self.device
+             )
+         else:
+             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
+@@ -650,15 +647,13 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Set fields
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
+-        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+-            self.device, non_blocking=True
++        self.input_ids = torch.tensor(
++            sum(input_ids, []), dtype=torch.int32, device=self.device
+         )
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+-            self.device, non_blocking=True
++        self.req_pool_indices = torch.tensor(
++            req_pool_indices, dtype=torch.int32, device=self.device
+         )
++        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+ 
+         self.out_cache_loc = out_cache_loc
+ 
+@@ -931,8 +926,8 @@ class ScheduleBatch:
+             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+ 
+         self.reqs = [self.reqs[i] for i in keep_indices]
+-        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+-            self.device, non_blocking=True
++        new_indices = torch.tensor(
++            keep_indices, dtype=torch.int32, device=self.device
+         )
+         self.req_pool_indices = self.req_pool_indices[new_indices]
+         self.seq_lens = self.seq_lens[new_indices]
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index 27a2d07fb..09e22cbd2 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -52,23 +52,21 @@ class SamplingBatchInfo:
+     ):
+         reqs = batch.reqs
+         device = batch.device
+-        temperatures = (
+-            torch.tensor(
+-                [r.sampling_params.temperature for r in reqs],
+-                dtype=torch.float,
+-            )
+-            .view(-1, 1)
+-            .to(device, non_blocking=True)
+-        )
++        # Allocate tensors directly on the target device to avoid extra host->device copies
++        temperatures = torch.tensor(
++            [r.sampling_params.temperature for r in reqs],
++            dtype=torch.float,
++            device=device,
++        ).view(-1, 1)
+         top_ps = torch.tensor(
+-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
++        )
+         top_ks = torch.tensor(
+-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
++        )
+         min_ps = torch.tensor(
+-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
++        )
+ 
+         ret = cls(
+             temperatures=temperatures,
+@@ -128,10 +126,9 @@ class SamplingBatchInfo:
+             else:
+                 if self.linear_penalties is None:
+                     bs = self.penalizer_orchestrator.batch.batch_size()
++                    # Start from zeros as the neutral element for additive penalties
+                     self.linear_penalties = torch.zeros(
+-                        (bs, self.vocab_size),
+-                        dtype=torch.float32,
+-                        device=self.device,
++                        (bs, self.vocab_size), dtype=torch.float32, device=self.device
+                     )
+                 self.linear_penalties = penalizer.apply(self.linear_penalties)
+ 
+@@ -141,18 +138,16 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
+-        self.vocab_mask = torch.zeros(
+-            len(self.temperatures),
+-            self.vocab_size,
+-            dtype=torch.bool,
+-            device=self.device,
++        # Initialize mask with ones and then zero out allowed tokens.
++        # This avoids creating all-zero tensors and per-row fill_ operations.
++        bs = len(self.temperatures)
++        self.vocab_mask = torch.ones(
++            bs, self.vocab_size, dtype=torch.bool, device=self.device
+         )
+         for i, regex_fsm in enumerate(self.regex_fsms):
+             if regex_fsm is not None:
+-                self.vocab_mask[i].fill_(1)
+-                self.vocab_mask[i][
+-                    regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
+-                ] = 0
++                tokens = regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
++                self.vocab_mask[i][tokens] = 0
+ 
+     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
+         if self.penalizer_orchestrator:
+@@ -180,16 +175,11 @@ class SamplingBatchInfo:
+     ):
+         # bias tensor can be None
+         if lhs is not None or rhs is not None:
+-            shape, dtype = None, None
+-            if lhs is not None:
+-                shape, dtype = lhs.shape[1:], lhs.dtype
+-            else:
+-                shape, dtype = rhs.shape[1:], rhs.dtype
+-            with torch.dtype(dtype):
+-                if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
+-                if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++            shape, dtype = (lhs.shape[1:], lhs.dtype) if lhs is not None else (rhs.shape[1:], rhs.dtype)
++            if lhs is None:
++                lhs = torch.full((bs1, *shape), fill_value=default, dtype=dtype, device=device)
++            if rhs is None:
++                rhs = torch.full((bs2, *shape), fill_value=default, dtype=dtype, device=device)
+             return torch.cat([lhs, rhs])
+ 
+         return None
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 6ccd89185..2b7702884 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -63,6 +63,8 @@ class ServerArgs:
+     stream_interval: int = 1
+     random_seed: Optional[int] = None
+     constrained_json_whitespace_pattern: Optional[str] = None
++    # Constrained decoding backend: 'auto', 'outlines', or 'xgrammar'
++    grammar_backend: str = "auto"
+ 
+     # Logging
+     log_level: str = "info"
+@@ -319,6 +321,13 @@ class ServerArgs:
+             action="store_true",
+             help="Whether to use a CausalLM as an embedding model.",
+         )
++        parser.add_argument(
++            "--grammar-backend",
++            type=str,
++            default=ServerArgs.grammar_backend,
++            choices=["auto", "outlines", "xgrammar"],
++            help="Backend for constrained decoding grammar. Default is 'auto'.",
++        )
+         parser.add_argument(
+             "--mem-fraction-static",
+             type=float,

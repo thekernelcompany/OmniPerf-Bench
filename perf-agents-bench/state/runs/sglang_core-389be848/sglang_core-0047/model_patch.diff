@@ -1,0 +1,121 @@
+diff --git a/python/sglang/srt/constrained/outlines_backend.py b/python/sglang/srt/constrained/outlines_backend.py
+index cc68b97f8..0d8ffeac4 100644
+--- a/python/sglang/srt/constrained/outlines_backend.py
++++ b/python/sglang/srt/constrained/outlines_backend.py
+@@ -81,9 +81,23 @@ class OutlinesGrammar(BaseGrammarObject):
+     ):
+         self.state = next_state
+ 
+-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
+-        vocab_mask.fill_(1)
+-        vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
++    def allocate_vocab_mask(
++        self, vocab_size: int, batch_size: int, device
++    ) -> torch.Tensor:
++        # Allocate without initializing to avoid redundant memset.
++        # Individual rows will be filled on demand.
++        return torch.empty(batch_size, vocab_size, dtype=torch.bool, device=device)
++
++    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
++        # Work on a single row to reduce unnecessary writes.
++        row = vocab_mask[idx]
++        row.fill_(1)
++        row[self.guide.get_next_instruction(self.state).tokens] = 0
++
++    @staticmethod
++    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
++        # In-place to avoid an extra tensor allocation.
++        logits.masked_fill_(vocab_mask, float("-inf"))
+ 
+     def copy(self):
+         return OutlinesGrammar(self.guide, self.jump_forward_map)
+diff --git a/python/sglang/srt/constrained/xgrammar_backend.py b/python/sglang/srt/constrained/xgrammar_backend.py
+index ab4df5c98..2bae7f527 100644
+--- a/python/sglang/srt/constrained/xgrammar_backend.py
++++ b/python/sglang/srt/constrained/xgrammar_backend.py
+@@ -80,11 +80,20 @@ class XGrammarGrammar(BaseGrammarObject):
+         for i in range(k, len(new_output_ids)):
+             assert self.matcher.accept_token(new_output_ids[i])
+ 
+-    def fill_vocab_mask(self, vocab_mask: torch.Tensor):
++    def allocate_vocab_mask(
++        self, vocab_size: int, batch_size: int, device
++    ) -> torch.Tensor:
++        # Start with uninitialized memory; rows will be populated on demand.
++        return torch.empty(batch_size, vocab_size, dtype=torch.bool, device=device)
++
++    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+         # Note that this bitmask is a bitset, not bool
+         bitmask = self.matcher.get_next_token_bitmask()
+-        # Mask the tokens that are not allowed
+-        vocab_mask[
++        # Mask the tokens that are not allowed for this row only
++        row = vocab_mask[idx]
++        # Ensure the row starts with no mask for allowed tokens
++        row.fill_(0)
++        row[
+             self.matcher.get_rejected_tokens_from_bitmask(bitmask, self.vocab_size)
+         ] = 1
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 02750d5df..25181fc28 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -645,7 +645,7 @@ class ModelRunner:
+ 
+         # Apply regex vocab_mask
+         if sampling_info.vocab_mask is not None:
+-            logits = logits.masked_fill(sampling_info.vocab_mask, float("-inf"))
++            logits.masked_fill_(sampling_info.vocab_mask, float("-inf"))
+ 
+         return logits
+ 
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index a341c2b17..0c5eead8c 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -137,15 +137,18 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
+-        self.vocab_mask = torch.zeros(
+-            len(self.temperatures),
+-            self.vocab_size,
+-            dtype=torch.bool,
+-            device=self.device,
++        bs = len(self.temperatures)
++        # Allocate without initialization; fill rows on demand to reduce redundant memset.
++        self.vocab_mask = torch.empty(
++            bs, self.vocab_size, dtype=torch.bool, device=self.device
+         )
+         for i, grammar in enumerate(self.grammars):
+             if grammar is not None:
+-                grammar.fill_vocab_mask(self.vocab_mask[i])
++                # Let the grammar populate the mask for this row only
++                grammar.fill_vocab_mask(self.vocab_mask, i)
++            else:
++                # No grammar for this request -> no masking
++                self.vocab_mask[i].fill_(0)
+ 
+     def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
+         if self.penalizer_orchestrator:
+@@ -178,11 +181,14 @@ class SamplingBatchInfo:
+                 shape, dtype = lhs.shape[1:], lhs.dtype
+             else:
+                 shape, dtype = rhs.shape[1:], rhs.dtype
+-            with torch.dtype(dtype):
+-                if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
+-                if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++            if lhs is None:
++                lhs = torch.full(
++                    (bs1, *shape), default, dtype=dtype, device=device
++                )
++            if rhs is None:
++                rhs = torch.full(
++                    (bs2, *shape), default, dtype=dtype, device=device
++                )
+             return torch.cat([lhs, rhs])
+ 
+         return None

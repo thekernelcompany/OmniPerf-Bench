@@ -1,0 +1,119 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 32a11c15c..4af19e6da 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
+ 
+ import asyncio
+ import dataclasses
++import json
+ import logging
+ import multiprocessing as multiprocessing
+ import os
+@@ -259,6 +260,43 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+             return _create_error_response(e)
+ 
+ 
++@app.api_route("/generate_from_file", methods=["POST"])
++async def generate_from_file_request(file: UploadFile, request: Request):
++    """Handle a generate request by reading input_embeds from an uploaded file.
++
++    This endpoint exists to speed up and simplify processing of large
++    input_embeds payloads by avoiding JSON coercion into the request body.
++    The uploaded file content should be a JSON array compatible with
++    GenerateReqInput.input_embeds.
++    """
++    try:
++        content = await file.read()
++        # Use orjson if available (imported above) for faster loads; fall back to json
++        try:
++            input_embeds = orjson.loads(content)
++        except Exception:
++            # Fallback to stdlib json if orjson fails due to unexpected encoding
++            input_embeds = json.loads(content.decode("utf-8"))
++
++        obj = GenerateReqInput(
++            input_embeds=input_embeds,
++            sampling_params={
++                # Reasonable defaults for non-stream generation
++                "repetition_penalty": 1.2,
++                "temperature": 0.2,
++                "max_new_tokens": 512,
++            },
++        )
++
++        ret = await _global_state.tokenizer_manager.generate_request(
++            obj, request
++        ).__anext__()
++        return ret
++    except ValueError as e:
++        logger.error(f"Error in generate_from_file: {e}")
++        return _create_error_response(e)
++
++
+ @app.api_route("/encode", methods=["POST", "PUT"])
+ async def encode_request(obj: EmbeddingReqInput, request: Request):
+     """Handle an embedding request."""
+diff --git a/test/srt/test_input_embeddings.py b/test/srt/test_input_embeddings.py
+index 015aabe78..26248c5bc 100644
+--- a/test/srt/test_input_embeddings.py
++++ b/test/srt/test_input_embeddings.py
+@@ -1,4 +1,5 @@
+ import json
++import io
+ import unittest
+ 
+ import requests
+@@ -50,6 +51,27 @@ class TestInputEmbeds(unittest.TestCase):
+             "error": f"Request failed with status {response.status_code}: {response.text}"
+         }
+ 
++    def send_request_file(self, embeddings):
++        """Send a POST request with embeddings as an uploaded file.
++
++        This avoids the overhead of embedding JSON in the request body and
++        leverages the optimized /generate_from_file endpoint.
++        """
++        content = json.dumps(embeddings).encode("utf-8")
++        files = {
++            "file": ("input_embeds.json", io.BytesIO(content), "application/json")
++        }
++        response = requests.post(
++            self.base_url + "/generate_from_file",
++            files=files,
++            timeout=30,
++        )
++        if response.status_code == 200:
++            return response.json()
++        return {
++            "error": f"Request failed with status {response.status_code}: {response.text}"
++        }
++
+     def test_text_based_response(self):
+         """Print API response using text-based input."""
+         for text in self.texts:
+@@ -77,6 +99,15 @@ class TestInputEmbeds(unittest.TestCase):
+                 f"Embeddings Input (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
+             )
+ 
++    def test_embedding_based_response_from_file(self):
++        """Print API response using input embeddings via file upload."""
++        for text in self.texts:
++            embeddings = self.generate_input_embeddings(text)
++            response = self.send_request_file(embeddings)
++            print(
++                f"Embeddings Input via file (for text '{text}'):\nResponse: {json.dumps(response, indent=2)}\n{'-' * 80}"
++            )
++
+     def test_compare_text_vs_embedding(self):
+         """Print responses for both text-based and embedding-based inputs."""
+         for text in self.texts:
+@@ -96,6 +127,8 @@ class TestInputEmbeds(unittest.TestCase):
+             # Get responses
+             text_response = self.send_request(text_payload)
+             embed_response = self.send_request(embed_payload)
++            # Also exercise file-based path
++            _ = self.send_request_file(embeddings)
+             # Print responses
+             print(
+                 f"Text Input: {text}\nText-Based Response: {json.dumps(text_response, indent=2)}\n"

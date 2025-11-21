@@ -1,0 +1,130 @@
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index 00ada2955..0b8d4fcb0 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -21,10 +21,10 @@ class FinishReason(Enum):
+ 
+ 
+ class Req:
+-    def __init__(self, rid):
++    def __init__(self, rid, input_text=None, input_ids=None):
+         self.rid = rid
+-        self.input_text = None
+-        self.input_ids = []
++        self.input_text = input_text
++        self.input_ids = list(input_ids) if input_ids is not None else []
+         self.output_ids = []
+         self.pixel_values = None
+         self.image_size = None
+@@ -221,11 +221,19 @@ class Batch:
+             ] = out_cache_loc[pt : pt + extend_lens[i]]
+             pt += extend_lens[i]
+ 
+-        # Handle logit bias
+-        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+-        for i in range(bs):
+-            if reqs[i].sampling_params.dtype == "int":
+-                logit_bias[i] = int_token_logit_bias
++        # Handle logit bias (vectorized assignment to reduce per-row overhead)
++        logit_bias = torch.empty((bs, vocab_size), dtype=torch.float32, device=device)
++        logit_bias.zero_()
++        mask = torch.tensor(
++            [getattr(r.sampling_params, "dtype", None) == "int" for r in reqs],
++            dtype=torch.bool,
++            device=device,
++        )
++        if mask.any():
++            int_token_logit_bias = int_token_logit_bias.to(
++                device=device, dtype=torch.float32, non_blocking=True
++            )
++            logit_bias[mask] = int_token_logit_bias
+ 
+         # Set fields
+         self.input_ids = torch.tensor(
+diff --git a/python/sglang/srt/managers/router/manager.py b/python/sglang/srt/managers/router/manager.py
+index 0732d0fa8..15ce48481 100644
+--- a/python/sglang/srt/managers/router/manager.py
++++ b/python/sglang/srt/managers/router/manager.py
+@@ -46,7 +46,8 @@ class RouterManager:
+                 if has_finished:
+                     await asyncio.sleep(self.extend_dependency_time)
+ 
+-            await asyncio.sleep(0.0006)
++            # Shorter sleep improves streaming latency while yielding the loop
++            await asyncio.sleep(0.0003)
+ 
+     async def loop_for_recv_requests(self):
+         while True:
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 199a8974b..2f1546fd1 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -225,9 +225,7 @@ class ModelRpcServer(rpyc.Service):
+         self,
+         recv_req: TokenizedGenerateReqInput,
+     ):
+-        req = Req(recv_req.rid)
+-        req.input_text = recv_req.input_text
+-        req.input_ids = recv_req.input_ids
++        req = Req(recv_req.rid, recv_req.input_text, recv_req.input_ids)
+         req.pixel_values = recv_req.pixel_values
+         req.image_size = recv_req.image_size
+         if req.pixel_values is not None:
+diff --git a/python/sglang/srt/managers/router/model_runner.py b/python/sglang/srt/managers/router/model_runner.py
+index c85ec534d..9375a9357 100644
+--- a/python/sglang/srt/managers/router/model_runner.py
++++ b/python/sglang/srt/managers/router/model_runner.py
+@@ -86,9 +86,10 @@ class InputMetadata:
+     decode_wrapper = None
+ 
+     def init_flashinfer_args(self, tp_size):
+-        self.kv_indptr = torch.zeros(
++        self.kv_indptr = torch.empty(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_indices = torch.cat(
+             [
+@@ -112,9 +113,10 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.zeros(
++            self.qo_indptr = torch.empty(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
++            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+             self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper()
+             self.prefill_wrapper.begin_forward(
+@@ -139,7 +141,8 @@ class InputMetadata:
+ 
+     def init_extend_args(self):
+         self.extend_seq_lens = self.seq_lens - self.prefix_lens
+-        self.extend_start_loc = torch.zeros_like(self.seq_lens)
++        self.extend_start_loc = torch.empty_like(self.seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.max_extend_len = int(torch.max(self.extend_seq_lens))
+ 
+@@ -159,7 +162,8 @@ class InputMetadata:
+         return_logprob=False,
+     ):
+         batch_size = len(req_pool_indices)
+-        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc[0] = 0
+         start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+         total_num_tokens = int(torch.sum(seq_lens))
+         max_seq_len = int(torch.max(seq_lens))
+@@ -253,7 +257,8 @@ class ModelRunner:
+ 
+         # A small all_reduce for warmup.
+         if self.tp_size > 1:
+-            torch.distributed.all_reduce(torch.zeros(1).cuda())
++            _tmp = torch.empty(1, device="cuda")
++            torch.distributed.all_reduce(_tmp)
+         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
+ 
+         total_gpu_memory = get_available_gpu_memory(

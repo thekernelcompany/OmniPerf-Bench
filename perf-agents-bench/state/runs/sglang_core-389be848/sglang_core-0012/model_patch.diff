@@ -1,0 +1,54 @@
+diff --git a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+index f1ee5d40e..d3b995492 100644
+--- a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
++++ b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+@@ -156,7 +156,9 @@ __inline__ __device__ void block_barrier(
+     int const tidx,
+     int const bidx,
+     int const grid_size) {
+-  if constexpr (!start) {
++  // Only synchronize threads when entering the first barrier of the kernel
++  // or when a fence is explicitly required to ensure ordering.
++  if constexpr (start || need_fence) {
+     __syncthreads();
+   }
+   // After this function, the block of id == bidx of each GPU has reached the barrier
+@@ -183,7 +185,11 @@ __inline__ __device__ void block_barrier(
+     }
+   }
+ 
+-  __syncthreads();
++  // Avoid an unconditional sync here; rely on conditional syncs above
++  // to reduce barrier overhead when unnecessary.
++  if constexpr (start || need_fence) {
++    __syncthreads();
++  }
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>
+@@ -251,10 +257,12 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+     }
+ 
+     // Sum the values from the different ranks.
++    // Initialize from the first rank to avoid extra zero-initialization
++    // and reduce the number of additions.
+     PackedStruct sums;
+-    sums.packed = {0, 0, 0, 0};
++    sums.packed = vals[0].packed;
+ #pragma unroll
+-    for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
++    for (int rank = 1; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+       sums.packed = add128b(sums, vals[rank]);
+     }
+@@ -262,6 +270,10 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+     // Store to the destination buffer.
+     *reinterpret_cast<int4*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[iter_offset]) = sums.packed;
+   }
++  // Ensure all participating blocks have completed their writes and
++  // signal completion to peers before exiting the kernel.
++  block_barrier<false>(
++      params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>

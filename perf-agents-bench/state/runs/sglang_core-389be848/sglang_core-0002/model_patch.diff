@@ -1,0 +1,64 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index f95c30786..0981192f9 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -49,9 +49,13 @@ class LogitsProcessor(nn.Module):
+         else:
+             prefill_top_logprobs, decode_top_logprobs = [], []
+             pt = 0
+-            # NOTE: the GPU-CPU overhead can be reduced
+-            extend_seq_lens_cpu = input_metadata.extend_seq_lens
+-            for i in range(len(input_metadata.extend_seq_lens)):
++            # Reduce per-iteration device transfers by converting once to CPU list
++            extend_seq_lens_cpu = (
++                input_metadata.extend_seq_lens.cpu().tolist()
++                if isinstance(input_metadata.extend_seq_lens, torch.Tensor)
++                else input_metadata.extend_seq_lens
++            )
++            for i in range(len(extend_seq_lens_cpu)):
+                 if extend_seq_lens_cpu[i] == 0:
+                     continue
+                 k = input_metadata.top_logprobs_nums[i]
+@@ -98,7 +102,10 @@ class LogitsProcessor(nn.Module):
+                     all_logits = tensor_model_parallel_all_gather(all_logits)
+                 all_logits = all_logits[:, : self.config.vocab_size]
+ 
+-            all_logprobs = torch.log(torch.softmax(all_logits.float(), dim=-1) + 1e-6)
++            # Use in-place log_softmax on a reused buffer to reduce allocations
++            all_logprobs = all_logits.float()
++            all_logits = None  # release reference early
++            all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
+ 
+             prefill_top_logprobs, decode_top_logprobs = self._get_top_logprobs(
+                 all_logprobs, input_metadata
+@@ -119,10 +126,12 @@ class LogitsProcessor(nn.Module):
+ 
+                 # Compute the logprobs and normalized logprobs for the prefill tokens.
+                 # Note that we pad a zero at the end of each sequence for easy computation.
+-                prefill_token_logprobs = all_logprobs[
+-                    torch.arange(all_logprobs.shape[0], device="cuda"),
+-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
+-                ]
++                # Build indices efficiently without redundant tensor creations
++                row_ids = torch.arange(
++                    all_logprobs.shape[0], device=input_ids.device
++                )
++                next_ids = torch.cat([input_ids[1:], input_ids.new_zeros((1,) )])
++                prefill_token_logprobs = all_logprobs[row_ids, next_ids]
+ 
+                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
+                     prefill_token_logprobs, input_metadata
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index f283635c3..86e7eb277 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -589,7 +589,8 @@ class ModelRpcServer:
+                     + len(req.output_ids)
+                     - req.prompt_tokens,
+                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+-                    "finish_reason": req.finish_reason,
++                    # Ensure a cheap, JSON-serializable finish reason
++                    "finish_reason": str(req.finish_reason),
+                     "hit_stop_str": req.hit_stop_str,
+                 }
+                 if req.return_logprob:

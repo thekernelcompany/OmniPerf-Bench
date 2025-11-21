@@ -1,0 +1,164 @@
+diff --git a/python/sglang/srt/managers/router/radix_cache.py b/python/sglang/srt/managers/router/radix_cache.py
+index 6ee670309..e96c834c8 100644
+--- a/python/sglang/srt/managers/router/radix_cache.py
++++ b/python/sglang/srt/managers/router/radix_cache.py
+@@ -1,6 +1,5 @@
+ import heapq
+ import time
+-from collections import defaultdict
+ from dataclasses import dataclass
+ from typing import Tuple
+ 
+@@ -8,22 +7,38 @@ import torch
+ 
+ 
+ class TreeNode:
++    __slots__ = (
++        "children",
++        "parent",
++        "key",
++        "value",
++        "ref_counter",
++        "last_access_time",
++    )
++
+     def __init__(self):
+-        self.children = defaultdict(TreeNode)
++        # dict is slightly lighter/faster than defaultdict here as we
++        # always create children explicitly.
++        self.children = {}
+         self.parent = None
++        # Key of this node in parent's children dict (cached for O(1) delete)
++        self.key = None
+         self.value = None
+         self.ref_counter = 0
+-        self.last_access_time = time.time()
++        # Monotonic clock is faster and not subject to system time changes
++        self.last_access_time = time.monotonic()
+ 
+     def __lt__(self, other):
+         return self.last_access_time < other.last_access_time
+ 
+ 
+ def match(key, seq):
++    # Fast prefix match without iterator/tuple overhead
++    n = len(key)
++    m = len(seq)
++    lim = n if n < m else m
+     i = 0
+-    for k, w in zip(key, seq):
+-        if k != w:
+-            break
++    while i < lim and key[i] == seq[i]:
+         i += 1
+     return i
+ 
+@@ -37,6 +52,8 @@ class RadixCache:
+ 
+     def reset(self):
+         self.root_node = TreeNode()
++        # Root has no key in parent
++        self.root_node.key = []
+         self.root_node.value = []
+         self.root_node.ref_counter = 1
+         self.evictable_size_ = 0
+@@ -49,7 +66,11 @@ class RadixCache:
+         last_node = [self.root_node]
+         self._match_prefix_helper(self.root_node, key, value, last_node)
+         if value:
+-            value = torch.concat(value)
++            # Avoid an extra allocation when only one segment matched
++            if len(value) == 1:
++                value = value[0]
++            else:
++                value = torch.concat(value)
+         return value, last_node[0]
+ 
+     def insert(self, key, value=None):
+@@ -114,9 +135,13 @@ class RadixCache:
+ 
+     ##### Internal Helper Functions #####
+     def _match_prefix_helper(self, node, key, value, last_node):
+-        node.last_access_time = time.time()
++        node.last_access_time = time.monotonic()
+ 
++        # Scan children to find the matching prefix
+         for c_key, child in node.children.items():
++            # Quick reject by first element to avoid full match cost
++            if len(c_key) == 0 or len(key) == 0 or c_key[0] != key[0]:
++                continue
+             prefix_len = match(c_key, key)
+             if prefix_len != 0:
+                 if prefix_len < len(c_key):
+@@ -130,22 +155,37 @@ class RadixCache:
+                 break
+ 
+     def _split_node(self, key, child, split_len):
+-        # new_node -> child
++        # Split child into new_node (prefix) -> child (suffix)
+         new_node = TreeNode()
+-        new_node.children = {key[split_len:]: child}
++        prefix_key = key[:split_len]
++        suffix_key = key[split_len:]
++
++        new_node.children = {suffix_key: child}
+         new_node.parent = child.parent
+         new_node.ref_counter = child.ref_counter
+         new_node.value = child.value[:split_len]
++        new_node.key = prefix_key
++
++        # Update child
+         child.parent = new_node
+         child.value = child.value[split_len:]
+-        new_node.parent.children[key[:split_len]] = new_node
+-        del new_node.parent.children[key]
++        child.key = suffix_key
++
++        # Update parent's mapping
++        parent = new_node.parent
++        parent.children[prefix_key] = new_node
++        # Remove old edge
++        del parent.children[key]
+         return new_node
+ 
+     def _insert_helper(self, node, key, value):
+-        node.last_access_time = time.time()
++        node.last_access_time = time.monotonic()
+ 
++        # Find a child to descend/split
+         for c_key, child in node.children.items():
++            # Quick reject by first element
++            if len(c_key) == 0 or len(key) == 0 or c_key[0] != key[0]:
++                continue
+             prefix_len = match(c_key, key)
+ 
+             if prefix_len == len(c_key):
+@@ -166,6 +206,7 @@ class RadixCache:
+             new_node = TreeNode()
+             new_node.parent = node
+             new_node.value = value
++            new_node.key = key
+             node.children[key] = new_node
+             self.evictable_size_ += len(value)
+         return 0
+@@ -176,11 +217,15 @@ class RadixCache:
+             self._print_helper(child, indent=indent + 2)
+ 
+     def _delete_leaf(self, node):
+-        for k, v in node.parent.children.items():
+-            if v == node:
+-                break
+-        del node.parent.children[k]
+-        self.evictable_size_ -= len(k)
++        # O(1) delete using cached key
++        parent = node.parent
++        if parent is None:
++            return
++        k = node.key
++        if k in parent.children:
++            del parent.children[k]
++        # Adjust evictable size by the actual value length
++        self.evictable_size_ -= len(node.value)
+ 
+     def _total_size_helper(self, node):
+         x = len(node.value)
