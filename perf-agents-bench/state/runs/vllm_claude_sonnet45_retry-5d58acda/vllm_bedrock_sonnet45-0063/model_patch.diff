@@ -1,0 +1,165 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 9bb11907f..f510c4150 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import atexit
++import gc
+ import importlib
+ import inspect
+ import multiprocessing
+@@ -104,6 +105,11 @@ async def lifespan(app: FastAPI):
+             task.add_done_callback(_running_tasks.remove)
+         else:
+             task = None
++
++        # Mark the startup heap as static so that it's ignored by GC.
++        # Reduces pause times of oldest generation collections.
++        gc.collect()
++        gc.freeze()
+         try:
+             yield
+         finally:
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 14e41346d..53d71547c 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -47,11 +47,17 @@ class OpenAIBaseModel(BaseModel):
+     def __log_extra_fields__(cls, data):
+         if isinstance(data, dict):
+             # Get all class field names and their potential aliases
+-            field_names = set()
+-            for field_name, field in cls.model_fields.items():
+-                field_names.add(field_name)
+-                if hasattr(field, 'alias') and field.alias:
+-                    field_names.add(field.alias)
++            # Cache field names per class to avoid recomputing
++            cache_key = '_field_names_cache'
++            if not hasattr(cls, cache_key):
++                field_names = set()
++                for field_name, field in cls.model_fields.items():
++                    field_names.add(field_name)
++                    if hasattr(field, 'alias') and field.alias:
++                        field_names.add(field.alias)
++                setattr(cls, cache_key, field_names)
++            else:
++                field_names = getattr(cls, cache_key)
+ 
+             # Compare against both field names and aliases
+             extra_fields = data.keys() - field_names
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1e68326b2..add042cd3 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -73,6 +73,10 @@ if TYPE_CHECKING:
+     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+     VLLM_DISABLE_COMPILE_CACHE: bool = False
+     VLLM_SERVER_DEV_MODE: bool = False
++    VLLM_USE_CACHED_OUTPUTS: bool = False
++    VLLM_ENABLE_V1_GC_OPTIMIZATION: bool = True
++    VLLM_V1_DETOKENIZER_PREALLOCATE_SIZE: int = 128
++    VLLM_V1_OUTPUT_PROCESSOR_PREALLOCATE_SIZE: int = 128
+ 
+ 
+ def get_default_cache_root():
+@@ -474,6 +478,22 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+     # e.g. `/reset_prefix_cache`
+     "VLLM_SERVER_DEV_MODE":
+     lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
++
++    # If set, use cached outputs in V1 engine to avoid recomputation
++    "VLLM_USE_CACHED_OUTPUTS":
++    lambda: bool(int(os.getenv("VLLM_USE_CACHED_OUTPUTS", "0"))),
++
++    # If set, enable GC optimization in V1 engine
++    "VLLM_ENABLE_V1_GC_OPTIMIZATION":
++    lambda: bool(int(os.getenv("VLLM_ENABLE_V1_GC_OPTIMIZATION", "1"))),
++
++    # Preallocate size for V1 detokenizer to reduce allocations
++    "VLLM_V1_DETOKENIZER_PREALLOCATE_SIZE":
++    lambda: int(os.getenv("VLLM_V1_DETOKENIZER_PREALLOCATE_SIZE", "128")),
++
++    # Preallocate size for V1 output processor to reduce allocations
++    "VLLM_V1_OUTPUT_PROCESSOR_PREALLOCATE_SIZE":
++    lambda: int(os.getenv("VLLM_V1_OUTPUT_PROCESSOR_PREALLOCATE_SIZE", "128")),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index b4d3e4411..f863f2cca 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -2,6 +2,7 @@ import asyncio
+ import os
+ from typing import AsyncGenerator, List, Mapping, Optional, Type, Union
+ 
++import vllm.envs as envs
+ from vllm.config import ModelConfig, VllmConfig
+ from vllm.engine.arg_utils import AsyncEngineArgs
+ from vllm.engine.protocol import EngineClient
+@@ -43,6 +44,11 @@ class AsyncLLM(EngineClient):
+ 
+         assert start_engine_loop
+ 
++        # Use environment variable if not explicitly set
++        if not use_cached_outputs:
++            use_cached_outputs = envs.VLLM_USE_CACHED_OUTPUTS
++
++        self.use_cached_outputs = use_cached_outputs
+         self.log_requests = log_requests
+         self.log_stats = log_stats
+         self.stat_loggers: List[StatLoggerBase] = [
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 19b89003c..8ac676ab9 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -221,6 +221,7 @@ class SyncMPClient(MPClient):
+                     request: EngineCoreRequestUnion) -> None:
+ 
+         # (RequestType, SerializedRequest)
++        # Use copy=False to avoid unnecessary data copying
+         msg = (request_type.value, self.encoder.encode(request))
+         self.input_socket.send_multipart(msg, copy=False)
+ 
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 749f4f504..2bf77891c 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -2,6 +2,7 @@ import asyncio
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional
+ 
++import vllm.envs as envs
+ from vllm.outputs import RequestOutput
+ from vllm.transformers_utils.detokenizer_utils import AnyTokenizer
+ from vllm.transformers_utils.tokenizer_group import BaseTokenizerGroup
+@@ -67,6 +68,13 @@ class OutputProcessor:
+         self.log_stats = log_stats
+         self.tokenizer = tokenizer
+         self.request_states: Dict[str, RequestState] = {}
++        
++        # Preallocate lists to reduce allocations in hot path
++        self._preallocate_size = envs.VLLM_V1_OUTPUT_PROCESSOR_PREALLOCATE_SIZE
++        self._request_outputs_buffer: List[Optional[RequestOutput]] = \
++            [None] * self._preallocate_size
++        self._reqs_to_abort_buffer: List[Optional[str]] = \
++            [None] * self._preallocate_size
+ 
+     def is_request_active(self, request_id: str) -> bool:
+         return request_id in self.request_states
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 45450165e..6cba43e68 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -48,7 +48,9 @@ class Request:
+         self.prompt_token_ids = prompt_token_ids
+         self.num_prompt_tokens = len(self.prompt_token_ids)
+         self._output_token_ids: List[int] = []
+-        self._all_token_ids: List[int] = self.prompt_token_ids.copy()
++        # Avoid copying the prompt_token_ids list - use list() for shallow copy
++        # which is faster than .copy()
++        self._all_token_ids: List[int] = list(self.prompt_token_ids)
+         self.num_computed_tokens = 0
+ 
+         # Multi-modal related

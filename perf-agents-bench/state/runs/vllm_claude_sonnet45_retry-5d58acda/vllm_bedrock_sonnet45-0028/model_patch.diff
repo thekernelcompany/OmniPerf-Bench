@@ -1,0 +1,94 @@
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index b4e0101a0..3aa45640b 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -11,7 +11,8 @@ from tests.v1.attention.utils import (BatchSpec, _Backend,
+                                       create_vllm_config,
+                                       get_attention_backend)
+ from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, cdiv
+-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
++from vllm.v1.attention.backends.utils import (CommonAttentionMetadata,
++                                              set_kv_cache_layout)
+ from vllm.v1.kv_cache_interface import FullAttentionSpec
+ 
+ BACKENDS_TO_TEST = [
+@@ -155,7 +156,9 @@ def create_and_prepopulate_kv_cache(
+         perm = torch.arange(
+             1, blocks_end)  # Sequential order starting from block 1
+ 
+-    inv_perm = torch.zeros(blocks_end, dtype=torch.long, device=device)
++    # Optimize: Use torch.empty instead of torch.zeros since we fill all values
++    inv_perm = torch.empty(blocks_end, dtype=torch.long, device=device)
++    inv_perm[0] = 0  # Set the null block explicitly
+     inv_perm[1:] = torch.argsort(
+         perm) + 1  # Add 1 to account for starting from block 1
+     kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
+@@ -212,7 +215,7 @@ def run_attention_backend(backend: _Backend, kv_cache_spec: FullAttentionSpec,
+ 
+         from vllm.v1.attention.backends.flashinfer import PerLayerParameters
+ 
+-        def mock_get_per_layer_parameters(vllm_config):
++        def mock_get_per_layer_parameters(vllm_config, impl_cls):
+             # Return mock parameters for a single layer
+             head_size = vllm_config.model_config.get_head_size()
+             return {
+@@ -297,7 +300,8 @@ def test_backend_correctness(batch_spec_name: str, model: str):
+     5. Comparing the vLLM backend's output to the ground-truth SDPA output.
+     """
+     batch_spec = BATCH_SPECS[batch_spec_name]
+-    vllm_config = create_vllm_config(model_name=model)
++    vllm_config = create_vllm_config(model_name=model,
++                                     max_model_len=max(batch_spec.seq_lens))
+     device = torch.device("cuda:0")
+ 
+     kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+diff --git a/tests/v1/attention/utils.py b/tests/v1/attention/utils.py
+index 30cfbdda5..938516533 100644
+--- a/tests/v1/attention/utils.py
++++ b/tests/v1/attention/utils.py
+@@ -43,12 +43,15 @@ def create_common_attn_metadata(
+         max_block_idx: int = 1000) -> CommonAttentionMetadata:
+     """Create CommonAttentionMetadata from a BatchSpec and ModelParams."""
+     # Create query start locations
+-    query_start_loc = torch.zeros(batch_spec.batch_size + 1,
++    # Optimize: Use preallocated tensor instead of torch.zeros + assignment
++    query_lens_tensor = torch.tensor(batch_spec.query_lens,
++                                     dtype=torch.int32,
++                                     device=device)
++    query_start_loc = torch.empty(batch_spec.batch_size + 1,
+                                   dtype=torch.int32,
+                                   device=device)
+-    query_start_loc[1:] = torch.tensor(batch_spec.query_lens,
+-                                       dtype=torch.int32,
+-                                       device=device).cumsum(0)
++    query_start_loc[0] = 0
++    torch.cumsum(query_lens_tensor, dim=0, out=query_start_loc[1:])
+     query_start_loc_cpu = query_start_loc.cpu()
+     num_tokens = batch_spec.compute_num_tokens()
+ 
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 953ef26c8..8ec700111 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -422,12 +422,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 < block_table_bounds.unsqueeze(1))
+         paged_kv_indices = block_table_tensor[mask]
+ 
+-        paged_kv_indptr = torch.cat([
+-            torch.zeros(1,
+-                        dtype=block_table_bounds.dtype,
+-                        device=block_table_bounds.device),
+-            block_table_bounds.cumsum(dim=0, dtype=torch.int32)
+-        ])
++        # Optimize: Use preallocated tensor instead of torch.zeros + cat
++        paged_kv_indptr = torch.empty(len(block_table_bounds) + 1,
++                                      dtype=torch.int32,
++                                      device=block_table_bounds.device)
++        paged_kv_indptr[0] = 0
++        torch.cumsum(block_table_bounds,
++                     dim=0,
++                     dtype=torch.int32,
++                     out=paged_kv_indptr[1:])
+ 
+         paged_kv_last_page_len = seq_lens % page_size
+         paged_kv_last_page_len = torch.where(paged_kv_last_page_len == 0,

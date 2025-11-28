@@ -1,0 +1,124 @@
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index ed7e06cab..f815b60b3 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -1,6 +1,7 @@
+ import enum
++import heapq
+ from abc import ABC, abstractmethod
+-from typing import OrderedDict, Tuple
++from typing import Dict, List, Tuple
+ 
+ 
+ class EvictionPolicy(enum.Enum):
+@@ -75,8 +76,14 @@ class LRUEvictor(Evictor):
+     highest num_hashed_tokens value, then one will be chose arbitrarily
+     """
+ 
++    # CLEANUP_THRESHOLD determines the maximum allowable size of the priority
++    # queue relative to the free table size. When this threshold is exceeded,
++    # a cleanup operation is triggered to reduce memory usage.
++    CLEANUP_THRESHOLD = 50
++
+     def __init__(self):
+-        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()
++        self.free_table: Dict[int, BlockMetaData] = {}
++        self.priority_queue: List[Tuple[float, int, int]] = []
+ 
+     def __contains__(self, block_id: int) -> bool:
+         return block_id in self.free_table
+@@ -85,39 +92,76 @@ class LRUEvictor(Evictor):
+         if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block, evicted_block_id = None, None
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block is None:
+-                evicted_block, evicted_block_id = block, _id
++        # Use lazy deletion: pop from heap until we find a valid block
++        while self.priority_queue:
++            last_accessed, neg_num_hashed_tokens, block_id = heapq.heappop(
++                self.priority_queue)
++            
++            # Check if block is still in free_table (lazy deletion)
++            if block_id not in self.free_table:
+                 continue
+-            if evicted_block.last_accessed < block.last_accessed:
+-                break
+-            if evicted_block.num_hashed_tokens < block.num_hashed_tokens:
+-                evicted_block, evicted_block_id = block, _id
+-
+-        assert evicted_block is not None
+-        assert evicted_block_id is not None
+-        self.free_table.pop(evicted_block_id)
+-
+-        return evicted_block_id, evicted_block.content_hash
++            
++            block = self.free_table[block_id]
++            # Check if the metadata matches (block wasn't updated)
++            if block.last_accessed == last_accessed:
++                # Found valid block to evict
++                self.free_table.pop(block_id)
++                return block_id, block.content_hash
++        
++        # If we get here, all heap entries were stale, rebuild heap
++        self._rebuild_priority_queue()
++        
++        # Try again with rebuilt heap
++        if self.priority_queue:
++            last_accessed, neg_num_hashed_tokens, block_id = heapq.heappop(
++                self.priority_queue)
++            block = self.free_table[block_id]
++            self.free_table.pop(block_id)
++            return block_id, block.content_hash
++        
++        raise ValueError("No usable cache memory left")
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+             last_accessed: float):
+         self.free_table[block_id] = BlockMetaData(content_hash,
+                                                   num_hashed_tokens,
+                                                   last_accessed)
++        # Push to priority queue: (last_accessed, -num_hashed_tokens, block_id)
++        # Negative num_hashed_tokens for max-heap behavior on ties
++        heapq.heappush(self.priority_queue,
++                      (last_accessed, -num_hashed_tokens, block_id))
++        
++        # Cleanup if priority queue gets too large
++        if len(self.priority_queue) > len(
++                self.free_table) * self.CLEANUP_THRESHOLD:
++            self._rebuild_priority_queue()
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        block = self.free_table[block_id]
++        block.last_accessed = last_accessed
++        # Push updated entry to priority queue (old entry becomes stale)
++        heapq.heappush(self.priority_queue,
++                      (last_accessed, -block.num_hashed_tokens, block_id))
++        
++        # Cleanup if priority queue gets too large
++        if len(self.priority_queue) > len(
++                self.free_table) * self.CLEANUP_THRESHOLD:
++            self._rebuild_priority_queue()
+ 
+     def remove(self, block_id: int):
+         if block_id not in self.free_table:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+         self.free_table.pop(block_id)
++        # Note: We don't remove from priority_queue, lazy deletion handles it
++
++    def _rebuild_priority_queue(self):
++        """Rebuild the priority queue from current free_table to remove stale entries"""
++        self.priority_queue = []
++        for block_id, block in self.free_table.items():
++            heapq.heappush(
++                self.priority_queue,
++                (block.last_accessed, -block.num_hashed_tokens, block_id))
+ 
+     @property
+     def num_blocks(self) -> int:

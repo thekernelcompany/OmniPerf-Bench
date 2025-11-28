@@ -1,0 +1,81 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index d07527304..1e200b4a2 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -1,6 +1,6 @@
+ """A layer that samples the next tokens from the model's outputs."""
+ import itertools
+-from typing import Dict, List, Optional, Tuple
++from typing import Dict, List, Optional, Tuple, Union
+ 
+ import torch
+ import torch.nn as nn
+@@ -89,6 +89,7 @@ def _get_bin_counts_and_mask(
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     # Compute the bin counts for the tokens.
+     # vocab_size + 1 for padding.
++    # Use torch.zeros since scatter_add_ requires initialized values
+     bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
+@@ -361,13 +362,15 @@ def _sample_with_torch(
+         num_tokens = len(sample_indices)
+         if num_tokens == 0:
+             continue
++        # Convert to long once to avoid repeated conversions
++        sample_indices_long = sample_indices.long()
+         seq_group_ids = categorized_seq_group_ids[sampling_type]
+         seq_groups = [sampling_metadata.seq_groups[i] for i in seq_group_ids]
+         is_prompts = [i < sampling_metadata.num_prompts for i in seq_group_ids]
+         sample_metadata[sampling_type] = (seq_group_ids, seq_groups,
+                                           is_prompts, sample_indices)
+         if sampling_type == SamplingType.GREEDY:
+-            greedy_samples = torch.argmax(logprobs[sample_indices.long()],
++            greedy_samples = torch.argmax(logprobs[sample_indices_long],
+                                           dim=-1)
+         elif sampling_type in (SamplingType.RANDOM, SamplingType.RANDOM_SEED):
+             max_best_of_in_batch = 1
+@@ -381,7 +384,7 @@ def _sample_with_torch(
+                 "generators": sampling_metadata.generators,
+             }
+             multinomial_samples[sampling_type] = _multinomial(
+-                probs[sample_indices.long()], max_best_of_in_batch,
++                probs[sample_indices_long], max_best_of_in_batch,
+                 **seeded_args)
+         elif sampling_type == SamplingType.BEAM:
+             beam_search_logprobs = logprobs[sample_indices]
+@@ -506,22 +509,30 @@ def _sample(
+     #                                   sampling_tensors)
+ 
+ 
+-def _get_ranks(x: torch.Tensor, indices: List[int]) -> torch.Tensor:
++def _get_ranks(x: torch.Tensor,
++               indices: Union[List[int], torch.Tensor]) -> torch.Tensor:
+     """
+     This function calculates the ranks of the chosen tokens in a logprob tensor.
+ 
+     Args:
+         x (torch.Tensor): 2D logprob tensor of shape (N, M)
+                         where N is the no. of tokens and M is the vocab dim.
+-        indices (List[int]): List of chosen token indices.
++        indices (Union[List[int], torch.Tensor]): List or tensor of chosen token indices.
+ 
+     Returns:
+         torch.Tensor: 1D tensor of shape (N,) where N is the no. of tokens.
+                     Each element in the returned tensor represents the rank 
+                     of the chosen token in the input logprob tensor.
+     """
+-    vals = x[range(len(x)), indices]
+-    return (x > vals[:, None]).long().sum(1) + 1
++    # Convert indices to tensor if it's a list for better performance
++    if isinstance(indices, list):
++        indices = torch.tensor(indices, device=x.device, dtype=torch.long)
++    
++    # Use torch.arange with device specification instead of range()
++    vals = x[torch.arange(0, len(x), device=x.device, dtype=torch.long),
++             indices]
++    # Use in-place add_ instead of + 1 for better performance
++    return (x > vals[:, None]).long().sum(1).add_(1)
+ 
+ 
+ def _get_logprobs(

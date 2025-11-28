@@ -1,0 +1,66 @@
+diff --git a/vllm/model_executor/models/llama4.py b/vllm/model_executor/models/llama4.py
+index 8785e9dcf..51efbfe20 100644
+--- a/vllm/model_executor/models/llama4.py
++++ b/vllm/model_executor/models/llama4.py
+@@ -37,7 +37,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ 
+ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+-from .utils import (AutoWeightsLoader, extract_layer_index,
++from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
+                     is_pp_missing_parameter)
+ 
+ 
+@@ -50,7 +50,7 @@ class Llama4MoE(nn.Module):
+         topk: int,
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
++        router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
+         router_scores = torch.sigmoid(router_scores.float()).to(
+             hidden_states.dtype)
+         return (router_scores, router_indices.to(torch.int32))
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index f197434f3..ae8637f06 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -703,3 +703,39 @@ def cast_overflow_tensors(
+         clamp_value = torch.finfo(tensors.dtype).max - offset
+         tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+     return tensors
++
++
++def fast_topk(
++    input: torch.Tensor,
++    k: int,
++    dim: int = -1,
++    largest: bool = True,
++    sorted: bool = True,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Optimized topk implementation for k=1 case.
++    
++    For k=1, we can use argmax/argmin which is faster than the general topk.
++    For k>1, falls back to torch.topk.
++    
++    Args:
++        input: Input tensor
++        k: Number of top elements to return
++        dim: Dimension along which to find topk
++        largest: If True, return largest k elements, else smallest k
++        sorted: If True, return sorted results (only relevant for k>1)
++    
++    Returns:
++        Tuple of (values, indices) matching torch.topk output
++    """
++    if k == 1:
++        # Optimized path for k=1
++        if largest:
++            indices = torch.argmax(input, dim=dim, keepdim=True)
++        else:
++            indices = torch.argmin(input, dim=dim, keepdim=True)
++        values = torch.gather(input, dim, indices)
++        return values, indices
++    else:
++        # Fall back to standard topk for k>1
++        return torch.topk(input, k, dim=dim, largest=largest, sorted=sorted)

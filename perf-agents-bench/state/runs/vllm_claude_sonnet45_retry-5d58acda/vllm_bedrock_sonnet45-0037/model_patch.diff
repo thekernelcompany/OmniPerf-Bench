@@ -1,0 +1,108 @@
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index ef3d28c80..733c3b2f7 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -259,6 +259,8 @@ class Qwen2_5_VisionAttention(nn.Module):
+         x: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         rotary_pos_emb: torch.Tensor,
++        max_seqlen: Optional[int] = None,  # Only used for Flash Attention
++        seqlens: Optional[List[int]] = None,  # Only used for xFormers
+     ) -> torch.Tensor:
+         # [s, b, c] --> [s, b, head * 3 * head_dim]
+         x, _ = self.qkv(x)
+@@ -285,7 +287,8 @@ class Qwen2_5_VisionAttention(nn.Module):
+ 
+             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+ 
+-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
++            if max_seqlen is None:
++                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+             output = flash_attn_varlen_func(q,
+                                             k,
+                                             v,
+@@ -321,7 +324,8 @@ class Qwen2_5_VisionAttention(nn.Module):
+             from xformers import ops as xops
+             from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+ 
+-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
++            if seqlens is None:
++                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+             attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens,
+                                                        kv_seqlen=None,
+                                                        device=q.device)
+@@ -364,11 +368,17 @@ class Qwen2_5_VisionBlock(nn.Module):
+                                      quant_config=quant_config,
+                                      prefix=f"{prefix}.mlp")
+ 
+-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
+-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
++    def forward(self,
++                x: torch.Tensor,
++                cu_seqlens: torch.Tensor,
++                rotary_pos_emb: torch.Tensor,
++                max_seqlen: Optional[int] = None,
++                seqlens: Optional[List[int]] = None) -> torch.Tensor:
+         x = x + self.attn(self.norm1(x),
+                           cu_seqlens=cu_seqlens,
+-                          rotary_pos_emb=rotary_pos_emb)
++                          rotary_pos_emb=rotary_pos_emb,
++                          max_seqlen=max_seqlen,
++                          seqlens=seqlens)
+         x = x + self.mlp(self.norm2(x))
+         return x
+ 
+diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
+index ac3d154dd..64ad6efe6 100644
+--- a/vllm/model_executor/models/qwen2_vl.py
++++ b/vllm/model_executor/models/qwen2_vl.py
+@@ -307,6 +307,8 @@ class Qwen2VisionAttention(nn.Module):
+         x: torch.Tensor,
+         cu_seqlens: torch.Tensor,
+         rotary_pos_emb: torch.Tensor,
++        max_seqlen: Optional[int] = None,  # Only used for Flash Attention
++        seqlens: Optional[List[int]] = None,  # Only used for xFormers
+     ) -> torch.Tensor:
+ 
+         # [s, b, c] --> [s, b, 3 * head * head_dim]
+@@ -329,7 +331,8 @@ class Qwen2VisionAttention(nn.Module):
+ 
+             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+ 
+-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
++            if max_seqlen is None:
++                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+             output = flash_attn_varlen_func(q,
+                                             k,
+                                             v,
+@@ -365,7 +368,8 @@ class Qwen2VisionAttention(nn.Module):
+             from xformers import ops as xops
+             from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+ 
+-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
++            if seqlens is None:
++                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+             attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens,
+                                                        kv_seqlen=None,
+                                                        device=q.device)
+@@ -409,11 +413,17 @@ class Qwen2VisionBlock(nn.Module):
+                                   quant_config=quant_config,
+                                   prefix=f"{prefix}.mlp")
+ 
+-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
+-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
++    def forward(self,
++                x: torch.Tensor,
++                cu_seqlens: torch.Tensor,
++                rotary_pos_emb: torch.Tensor,
++                max_seqlen: Optional[int] = None,
++                seqlens: Optional[List[int]] = None) -> torch.Tensor:
+         x = x + self.attn(self.norm1(x),
+                           cu_seqlens=cu_seqlens,
+-                          rotary_pos_emb=rotary_pos_emb)
++                          rotary_pos_emb=rotary_pos_emb,
++                          max_seqlen=max_seqlen,
++                          seqlens=seqlens)
+         x = x + self.mlp(self.norm2(x))
+         return x
+ 

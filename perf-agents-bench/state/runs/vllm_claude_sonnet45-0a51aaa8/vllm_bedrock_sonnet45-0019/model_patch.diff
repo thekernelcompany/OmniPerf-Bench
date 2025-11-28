@@ -1,0 +1,148 @@
+diff --git a/tests/v1/sample/test_topk_topp_sampler.py b/tests/v1/sample/test_topk_topp_sampler.py
+new file mode 100644
+index 000000000..243ec6903
+--- /dev/null
++++ b/tests/v1/sample/test_topk_topp_sampler.py
+@@ -0,0 +1,39 @@
++# SPDX-License-Identifier: Apache-2.0
++import torch
++from torch import Generator
++import pytest
++
++from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
++
++DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
++
++BATCH_SIZE = 1024
++VOCAB_SIZE = 128 * 1024
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), 
++                    reason="CUDA not available")
++def test_topk_impl_equivalance():
++
++    with torch.device(DEVICE):
++        generator = Generator(device=DEVICE).manual_seed(33)
++
++        logits = torch.rand((BATCH_SIZE, VOCAB_SIZE), generator=generator)
++
++        # Random top-k values between 1 and 9.
++        k = torch.randint(1, 10, (BATCH_SIZE, ), generator=generator)
++
++        # Set k=vocab_size for ~50% of requests in the batch (top-k disabled).
++        k.masked_fill_(
++            torch.rand((BATCH_SIZE, ), generator=generator) < 0.5, VOCAB_SIZE)
++
++        # Apply top-k using the optimized implementation.
++        logits_topk = apply_top_k_top_p(logits.clone(), k, None)
++
++        # Apply top-k using the reference implementation (via top-k + top-p).
++        # When p=1.0, top-p is effectively disabled.
++        p = torch.ones((BATCH_SIZE, ), device=DEVICE)
++        logits_ref = apply_top_k_top_p(logits.clone(), k, p)
++
++        # Check that the results are equivalent.
++        assert torch.allclose(logits_topk, logits_ref, atol=1e-5)
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 1dea71187..e47319974 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -140,6 +140,85 @@ def apply_top_k_top_p(
+     """
+     if k is None and p is None:
+         return logits
++    
++    # Fast path for top-k only (no top-p).
++    # This avoids sorting the entire vocabulary and is much faster.
++    if k is not None and p is None:
++        # Use topk to get the k-th largest values efficiently.
++        # We need to handle variable k values across the batch.
++        vocab_size = logits.shape[-1]
++        
++        # For requests where k >= vocab_size, no masking is needed.
++        # We'll process them separately to avoid unnecessary work.
++        k_long = k.to(torch.long)
++        needs_masking = k_long < vocab_size
++        
++        if not needs_masking.any():
++            # No masking needed for any request.
++            return logits
++        
++        if needs_masking.all():
++            # All requests need masking. Use the efficient path.
++            # Get the maximum k to determine how many values to retrieve.
++            max_k = k_long.max().item()
++            
++            # Use topk to get the top max_k values for all requests.
++            # This is much faster than sorting the entire vocabulary.
++            topk_values, topk_indices = torch.topk(logits, 
++                                                     min(max_k, vocab_size), 
++                                                     dim=-1, 
++                                                     largest=True, 
++                                                     sorted=False)
++            
++            # Create a mask for values to keep.
++            # We'll use scatter to efficiently mark which indices to keep.
++            mask = torch.ones_like(logits, dtype=torch.bool)
++            
++            # Create a range tensor for indexing.
++            # This allows us to vectorize the masking operation.
++            batch_size = logits.shape[0]
++            range_tensor = torch.arange(max_k, device=logits.device).unsqueeze(0).expand(batch_size, -1)
++            k_expanded = k_long.unsqueeze(1)
++            
++            # Create a mask for which topk indices to keep (those < k for each row).
++            keep_mask = range_tensor < k_expanded
++            
++            # Scatter the keep_mask into the full mask.
++            # We need to flatten for scatter, then reshape.
++            batch_indices = torch.arange(batch_size, device=logits.device).unsqueeze(1).expand(-1, max_k)
++            mask[batch_indices[keep_mask], topk_indices[keep_mask]] = False
++            
++            # Mask out (set to -inf) all values not in top-k.
++            logits.masked_fill_(mask, -float("inf"))
++            return logits
++        else:
++            # Mixed case: some requests need masking, some don't.
++            # Only process the ones that need masking.
++            logits_masked = logits[needs_masking]
++            k_masked = k_long[needs_masking]
++            
++            max_k = k_masked.max().item()
++            topk_values, topk_indices = torch.topk(logits_masked, 
++                                                     min(max_k, vocab_size), 
++                                                     dim=-1, 
++                                                     largest=True, 
++                                                     sorted=False)
++            
++            mask = torch.ones_like(logits_masked, dtype=torch.bool)
++            
++            batch_size_masked = logits_masked.shape[0]
++            range_tensor = torch.arange(max_k, device=logits.device).unsqueeze(0).expand(batch_size_masked, -1)
++            k_expanded = k_masked.unsqueeze(1)
++            keep_mask = range_tensor < k_expanded
++            
++            batch_indices = torch.arange(batch_size_masked, device=logits.device).unsqueeze(1).expand(-1, max_k)
++            mask[batch_indices[keep_mask], topk_indices[keep_mask]] = False
++            
++            logits_masked.masked_fill_(mask, -float("inf"))
++            logits[needs_masking] = logits_masked
++            return logits
++    
++    # Original path for top-p or combined top-k + top-p.
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     if k is not None:
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 397a049dc..d69372374 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -106,6 +106,8 @@ class Sampler(nn.Module):
+             logits = self.apply_min_p(logits, sampling_metadata.min_p)
+ 
+         # Apply top_k and/or top_p.
++        # The topk_topp_sampler has an optimized fast path for top-k only
++        # that avoids sorting the entire vocabulary.
+         random_sampled = self.topk_topp_sampler(
+             logits,
+             sampling_metadata.generators,

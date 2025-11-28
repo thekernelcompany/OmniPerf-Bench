@@ -1,0 +1,40 @@
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 5f8535eaa..b4f7f6529 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -135,6 +135,13 @@ class FlashAttentionImpl(AttentionImpl):
+         assert k_scale == 1.0 and v_scale == 1.0, (
+             "key/v_scale is not supported in FlashAttention.")
+ 
++        # Reshape the query, key, and value tensors.
++        # NOTE(woosuk): We do this outside the custom op to minimize the CPU
++        # overheads from the non-CUDA-graph regions.
++        query = query.view(-1, self.num_heads, self.head_size)
++        key = key.view(-1, self.num_kv_heads, self.head_size)
++        value = value.view(-1, self.num_kv_heads, self.head_size)
++
+         output = torch.empty_like(query)
+         torch.ops.vllm.unified_v1_flash_attention(
+             output,
+@@ -153,7 +160,7 @@ class FlashAttentionImpl(AttentionImpl):
+             self.alibi_slopes,
+             self.logits_soft_cap,
+         )
+-        return output
++        return output.view(-1, self.num_heads * self.head_size)
+ 
+ 
+ def unified_v1_flash_attention(
+@@ -184,10 +191,8 @@ def unified_v1_flash_attention(
+     attn_metadata: FlashAttentionMetadata = current_metadata
+     num_actual_tokens = attn_metadata.num_actual_tokens
+ 
+-    # Reshape the query, key, and value tensors.
+-    query = query.view(-1, num_heads, head_size)
+-    key = key.view(-1, num_kv_heads, head_size)
+-    value = value.view(-1, num_kv_heads, head_size)
++    # NOTE(woosuk): The query, key, and value tensors are already reshaped
++    # in the forward method to minimize the CPU overheads.
+ 
+     # Reshape the input keys and values and store them in the cache.
+     key_cache = kv_cache[0]

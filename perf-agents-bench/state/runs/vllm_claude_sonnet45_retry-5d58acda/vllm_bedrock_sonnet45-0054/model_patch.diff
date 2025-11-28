@@ -1,0 +1,267 @@
+diff --git a/tests/v1/sample/test_rejection_sampler.py b/tests/v1/sample/test_rejection_sampler.py
+index 84139a40b..329371041 100644
+--- a/tests/v1/sample/test_rejection_sampler.py
++++ b/tests/v1/sample/test_rejection_sampler.py
+@@ -8,18 +8,19 @@ import torch.nn.functional as F
+ from vllm.v1.sample.metadata import SamplingMetadata
+ from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID, RejectionSampler
+ 
+-DEVICE = "cpu"
++DEVICE = "cuda"
+ 
+ 
+ @pytest.fixture
+-def sampler():
++def rejection_sampler():
+     return RejectionSampler()
+ 
+ 
+-def create_logits_tensor(token_ids: list[list[int]],
++def create_logits_tensor(output_token_ids: list[list[int]],
+                          vocab_size: int = 100) -> torch.Tensor:
+     """Helper function to create logits tensor that 
+        will produce desired token ids on argmax"""
++    token_ids = [tokens[:-1] for tokens in output_token_ids]
+     num_total_tokens = sum(len(tokens) for tokens in token_ids)
+     logits = torch.full((num_total_tokens, vocab_size), -100.0, device=DEVICE)
+     start_loc = 0
+@@ -61,7 +62,7 @@ def create_sampling_metadata(
+ 
+ 
+ ########################### Tests for Greedy Sampling ###################
+-def test_perfect_match(sampler):
++def test_perfect_match(rejection_sampler):
+     """Test when output tokens perfectly match speculated tokens"""
+     spec_tokens = [[1, 2, 3]]
+     output_tokens = [[1, 2, 3, 4]]  # 4 is the bonus token
+@@ -71,14 +72,14 @@ def test_perfect_match(sampler):
+     bonus_token_tensor = torch.tensor([output_tokens[0][-1]],
+                                       device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[1, 2, 3, 4]],
+                             dtype=torch.int,
+                             device=logits.device)
+     assert torch.equal(output, expected)
+ 
+ 
+-def test_early_mismatch(sampler):
++def test_early_mismatch(rejection_sampler):
+     """Test when there's an early mismatch in tokens"""
+     spec_tokens = [[1, 2, 3]]
+     output_tokens = [[1, 5, 3, 4]]  # Mismatch at position 1
+@@ -88,14 +89,14 @@ def test_early_mismatch(sampler):
+     bonus_token_tensor = torch.tensor([output_tokens[0][-1]],
+                                       device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[1, 5, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+                             dtype=torch.int,
+                             device=logits.device)
+     assert torch.equal(output, expected)
+ 
+ 
+-def test_multiple_sequences(sampler):
++def test_multiple_sequences(rejection_sampler):
+     """Test handling multiple sequences of speculated tokens"""
+     spec_tokens = [[1, 2], [3]]
+     output_tokens = [[1, 2, 5], [3,
+@@ -106,14 +107,14 @@ def test_multiple_sequences(sampler):
+     bonus_token_tensor = torch.tensor(
+         [output_tokens[0][-1], output_tokens[1][-1]], device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[1, 2, 5], [3, 4, INVALID_TOKEN_ID]],
+                             dtype=torch.int,
+                             device=logits.device)
+     assert torch.equal(output, expected)
+ 
+ 
+-def test_single_token_sequence(sampler):
++def test_single_token_sequence(rejection_sampler):
+     """Test handling sequences with single token"""
+     spec_tokens = [[1]]
+     output_tokens = [[1, 2]]  # Single token with bonus token 2
+@@ -123,12 +124,12 @@ def test_single_token_sequence(sampler):
+     bonus_token_tensor = torch.tensor([output_tokens[0][-1]],
+                                       device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[1, 2]], dtype=torch.int, device=logits.device)
+     assert torch.equal(output, expected)
+ 
+ 
+-def test_empty_sequence(sampler):
++def test_empty_sequence(rejection_sampler):
+     """Test handling empty sequence of speculated tokens"""
+     spec_tokens: list[list[int]] = [[]]
+     output_tokens = [[5]]  # Just the bonus token
+@@ -138,12 +139,12 @@ def test_empty_sequence(sampler):
+     bonus_token_tensor = torch.tensor([output_tokens[0][-1]],
+                                       device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[5]], dtype=torch.int, device=logits.device)
+     assert torch.equal(output, expected)
+ 
+ 
+-def test_multiple_mismatches(sampler):
++def test_multiple_mismatches(rejection_sampler):
+     """Test handling multiple sequences with mismatches"""
+     spec_tokens = [[1, 2, 3], [4, 5, 6]]
+     output_tokens = [[1, 2, 7, 6], [4, 8, 6,
+@@ -154,7 +155,7 @@ def test_multiple_mismatches(sampler):
+     bonus_token_tensor = torch.tensor(
+         [output_tokens[0][-1], output_tokens[1][-1]], device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected = torch.tensor([[1, 2, 7, INVALID_TOKEN_ID],
+                              [4, 8, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+                             dtype=torch.int,
+@@ -170,14 +171,14 @@ def test_multiple_mismatches(sampler):
+         ([[1, 2], [3, 4]], [[1, 5, 6], [3, 4, 7]],
+          [[1, 5, INVALID_TOKEN_ID], [3, 4, 7]]),  # Mixed matches
+     ])
+-def test_parametrized_cases(sampler, spec_tokens, output_tokens, expected):
++def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expected):
+     """Parametrized test for various matching scenarios"""
+     metadata = create_sampling_metadata(all_greedy=True)
+     logits = create_logits_tensor(output_tokens)
+     bonus_token_tensor = torch.tensor([tokens[-1] for tokens in output_tokens],
+                                       device=logits.device)
+ 
+-    output = sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
++    output = rejection_sampler(spec_tokens, None, bonus_token_tensor, logits, metadata)
+     expected_tensor = torch.tensor(expected,
+                                    dtype=torch.int,
+                                    device=logits.device)
+@@ -190,7 +191,7 @@ def test_parametrized_cases(sampler, spec_tokens, output_tokens, expected):
+ @pytest.mark.parametrize("batch_size", [1, 4, 8])
+ @pytest.mark.parametrize("frac_seeded", [0.0, 0.5])
+ @pytest.mark.parametrize("n_rep", [20])
+-def test_deterministic_when_seeded(sampler, k: int, vocab_size: int,
++def test_deterministic_when_seeded(rejection_sampler, k: int, vocab_size: int,
+                                    batch_size: int, frac_seeded: float,
+                                    n_rep: int):
+     draft_probs = torch.rand(batch_size, k, vocab_size, dtype=torch.float32)
+@@ -217,7 +218,7 @@ def test_deterministic_when_seeded(sampler, k: int, vocab_size: int,
+ 
+         sampling_metadata = create_sampling_metadata(all_greedy=False,
+                                                      generators=seeded_seqs)
+-        rep_result = sampler(draft_token_ids.tolist(), draft_probs,
++        rep_result = rejection_sampler(draft_token_ids.tolist(), draft_probs,
+                              bonus_token_ids, target_probs, sampling_metadata)
+ 
+         results.append(rep_result)
+@@ -329,7 +330,7 @@ def estimate_rejection_sampling_pdf(
+     Returns:
+         Estimated probability distribution of the output tokens.
+     """
+-    sampler = RejectionSampler()
++    rejection_sampler = RejectionSampler()
+     # Repeat draft probs num_samples times.
+     draft_probs = draft_probs.reshape(1, 1,
+                                       vocab_size).repeat(num_samples, k, 1)
+@@ -345,11 +346,11 @@ def estimate_rejection_sampling_pdf(
+                                             num_samples, k)
+ 
+     # Bonus tokens not used but required.
+-    bonus_token_ids = torch.zeros((1, 1), dtype=torch.int64,
+-                                  device=DEVICE).repeat(num_samples, 1)
++    bonus_token_ids = torch.empty((num_samples, 1), dtype=torch.int64,
++                                  device=DEVICE)
+ 
+     sampling_metadata = create_sampling_metadata(all_greedy=False)
+-    output_token_ids = sampler(draft_token_ids.tolist(), draft_probs,
++    output_token_ids = rejection_sampler(draft_token_ids.tolist(), draft_probs,
+                                bonus_token_ids, target_probs,
+                                sampling_metadata)
+     output_token_ids = output_token_ids[:, :-1].flatten()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index bf214f314..b2937462a 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -35,7 +35,6 @@ if TYPE_CHECKING:
+     VLLM_TRACE_FUNCTION: int = 0
+     VLLM_ATTENTION_BACKEND: Optional[str] = None
+     VLLM_USE_FLASHINFER_SAMPLER: Optional[bool] = None
+-    VLLM_USE_FLASHINFER_REJECTION_SAMPLER: bool = False
+     VLLM_FLASHINFER_FORCE_TENSOR_CORES: bool = False
+     VLLM_PP_LAYER_PARTITION: Optional[str] = None
+     VLLM_CPU_KVCACHE_SPACE: int = 0
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 66015382b..b00f6988d 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -191,10 +191,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+         # None in the first PP rank. The rest are set after load_model.
+@@ -212,16 +212,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # identical position IDs, making M-RoPE functionally equivalent to
+             # 1D-RoPE.
+             # See page 5 of https://arxiv.org/abs/2409.12191
+-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
++            self.mrope_positions = torch.empty((3, self.max_num_tokens + 1),
+                                                dtype=torch.int64,
+                                                device=self.device)
+-            self.mrope_positions_cpu = torch.zeros(
++            self.mrope_positions_cpu = torch.empty(
+                 (3, self.max_num_tokens + 1),
+                 dtype=torch.int64,
+                 device="cpu",
+                 pin_memory=self.pin_memory)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -234,27 +234,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)

@@ -1,0 +1,76 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e79145300..594a43c20 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -66,8 +66,9 @@ class InputBatch:
+             pin_memory=False,
+         )
+         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+-        self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
++        self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
++        self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+         self.block_table = torch.zeros(
+@@ -189,6 +190,7 @@ class InputBatch:
+         end_idx = start_idx + len(request.output_token_ids)
+         self.token_ids_cpu[req_index,
+                            start_idx:end_idx] = request.output_token_ids
++        self.num_tokens[req_index] = request.num_tokens
+ 
+         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+         num_blocks = len(request.block_ids)
+@@ -290,10 +292,11 @@ class InputBatch:
+             self.req_ids[last_req_index] = None
+             self.req_id_to_index[req_id] = empty_index
+ 
+-            # TODO(woosuk): Optimize the copy of token_ids_cpu and
+-            # block_table_cpu.
+-            self.token_ids_cpu[empty_index] = self.token_ids_cpu[
+-                last_req_index]
++            # Optimize the copy of token_ids_cpu by only copying the used tokens.
++            num_tokens = self.num_tokens[last_req_index]
++            self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
++                last_req_index, :num_tokens]
++            self.num_tokens[empty_index] = num_tokens
+             self.num_prompt_tokens[empty_index] = \
+                 self.num_prompt_tokens[last_req_index]
+             self.num_computed_tokens_cpu[
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54e8..eb83c9a86 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -143,27 +143,27 @@ class GPUModelRunner:
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.seq_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device="cpu",
+                                              pin_memory=self.pin_memory)

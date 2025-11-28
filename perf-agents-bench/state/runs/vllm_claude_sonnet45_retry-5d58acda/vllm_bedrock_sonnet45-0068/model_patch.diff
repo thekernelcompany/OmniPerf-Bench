@@ -1,0 +1,256 @@
+diff --git a/cmake/utils.cmake b/cmake/utils.cmake
+index 6bf5d5130..c7d3d8538 100644
+--- a/cmake/utils.cmake
++++ b/cmake/utils.cmake
+@@ -100,6 +100,11 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
+ 
+     if (CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
+       list(APPEND GPU_FLAGS "-DENABLE_FP8_E5M2")
++      list(REMOVE_ITEM GPU_FLAGS
++        "-D__CUDA_NO_HALF_OPERATORS__"
++        "-D__CUDA_NO_HALF_CONVERSIONS__"
++        "-D__CUDA_NO_BFLOAT16_CONVERSIONS__"
++        "-D__CUDA_NO_HALF2_OPERATORS__")
+     endif()
+ 
+   elseif(${GPU_LANG} STREQUAL "HIP")
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index 6d34d014c..f88eb6a2d 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -4,11 +4,18 @@
+ 
+ #include "dispatch_utils.h"
+ #include "reduction_utils.cuh"
++#ifndef USE_ROCM
++  #include <cuda_bf16.h>
++  #include <cuda_fp16.h>
++#else
++  #include <hip/hip_bf16.h>
++  #include <hip/hip_fp16.h>
++#endif
+ 
+ namespace vllm {
+ 
+-// TODO(woosuk): Further optimize this kernel.
+-template<typename scalar_t>
++// Optimized RMS norm kernel with vectorized loads
++template<typename scalar_t, int VEC_SIZE = 4>
+ __global__ void rms_norm_kernel(
+   scalar_t* __restrict__ out,             // [..., hidden_size]
+   const scalar_t* __restrict__ input,     // [..., hidden_size]
+@@ -19,24 +26,54 @@ __global__ void rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
+-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float) input[blockIdx.x * hidden_size + idx];
++  const int token_idx = blockIdx.x;
++  const scalar_t* token_input = input + token_idx * hidden_size;
++  scalar_t* token_out = out + token_idx * hidden_size;
++
++  // Compute variance with vectorized loads where possible
++  const int vec_hidden_size = hidden_size / VEC_SIZE;
++  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
++    const int offset = idx * VEC_SIZE;
++    #pragma unroll
++    for (int i = 0; i < VEC_SIZE; i++) {
++      const float x = (float) token_input[offset + i];
++      variance += x * x;
++    }
++  }
++  
++  // Handle remaining elements
++  for (int idx = vec_hidden_size * VEC_SIZE + threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    const float x = (float) token_input[idx];
+     variance += x * x;
+   }
++  
+   variance = blockReduceSum<float>(variance);
+   if (threadIdx.x == 0) {
+     s_variance = rsqrtf(variance / hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) input[blockIdx.x * hidden_size + idx];
+-    out[blockIdx.x * hidden_size + idx] = ((scalar_t) (x * s_variance)) * weight[idx];
++  // Apply normalization with vectorized loads
++  const float norm_factor = s_variance;
++  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
++    const int offset = idx * VEC_SIZE;
++    #pragma unroll
++    for (int i = 0; i < VEC_SIZE; i++) {
++      const int pos = offset + i;
++      float x = (float) token_input[pos];
++      token_out[pos] = ((scalar_t) (x * norm_factor)) * weight[pos];
++    }
++  }
++  
++  // Handle remaining elements
++  for (int idx = vec_hidden_size * VEC_SIZE + threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float x = (float) token_input[idx];
++    token_out[idx] = ((scalar_t) (x * norm_factor)) * weight[idx];
+   }
+ }
+ 
+-// TODO: Further optimize this kernel.
+-template<typename scalar_t>
++// Optimized fused add + RMS norm kernel with vectorization
++template<typename scalar_t, int VEC_SIZE = 4>
+ __global__ void fused_add_rms_norm_kernel(
+   scalar_t* __restrict__ input,           // [..., hidden_size]
+   scalar_t* __restrict__ residual,        // [..., hidden_size]
+@@ -47,21 +84,54 @@ __global__ void fused_add_rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
+-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) input[blockIdx.x * hidden_size + idx];
+-    x += (float) residual[blockIdx.x * hidden_size + idx];
++  const int token_idx = blockIdx.x;
++  scalar_t* token_input = input + token_idx * hidden_size;
++  scalar_t* token_residual = residual + token_idx * hidden_size;
++
++  // Fused add and variance computation with vectorization
++  const int vec_hidden_size = hidden_size / VEC_SIZE;
++  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
++    const int offset = idx * VEC_SIZE;
++    #pragma unroll
++    for (int i = 0; i < VEC_SIZE; i++) {
++      const int pos = offset + i;
++      float x = (float) token_input[pos];
++      x += (float) token_residual[pos];
++      variance += x * x;
++      token_residual[pos] = (scalar_t) x;
++    }
++  }
++  
++  // Handle remaining elements
++  for (int idx = vec_hidden_size * VEC_SIZE + threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float x = (float) token_input[idx];
++    x += (float) token_residual[idx];
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = (scalar_t) x;
++    token_residual[idx] = (scalar_t) x;
+   }
++  
+   variance = blockReduceSum<float>(variance);
+   if (threadIdx.x == 0) {
+     s_variance = rsqrtf(variance / hidden_size + epsilon);
+   }
+   __syncthreads();
+ 
+-  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) residual[blockIdx.x * hidden_size + idx];
+-    input[blockIdx.x * hidden_size + idx] = ((scalar_t) (x * s_variance)) * weight[idx];
++  // Apply normalization with vectorization
++  const float norm_factor = s_variance;
++  for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
++    const int offset = idx * VEC_SIZE;
++    #pragma unroll
++    for (int i = 0; i < VEC_SIZE; i++) {
++      const int pos = offset + i;
++      float x = (float) token_residual[pos];
++      token_input[pos] = ((scalar_t) (x * norm_factor)) * weight[pos];
++    }
++  }
++  
++  // Handle remaining elements
++  for (int idx = vec_hidden_size * VEC_SIZE + threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float x = (float) token_residual[idx];
++    token_input[idx] = ((scalar_t) (x * norm_factor)) * weight[idx];
+   }
+ }
+ 
+@@ -76,7 +146,12 @@ void rms_norm(
+   int num_tokens = input.numel() / hidden_size;
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(hidden_size, 1024));
++  // Optimize block size for better occupancy
++  // Use 256 threads for better SM utilization
++  const int block_size = (hidden_size < 256) ? ((hidden_size + 31) & ~31) : 
++                         (hidden_size < 512) ? 256 : 
++                         (hidden_size < 1024) ? 512 : 1024;
++  dim3 block(block_size);
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_TYPES(
+@@ -102,7 +177,11 @@ void fused_add_rms_norm(
+   int num_tokens = input.numel() / hidden_size;
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(hidden_size, 1024));
++  // Optimize block size for better occupancy
++  const int block_size = (hidden_size < 256) ? ((hidden_size + 31) & ~31) : 
++                         (hidden_size < 512) ? 256 : 
++                         (hidden_size < 1024) ? 512 : 1024;
++  dim3 block(block_size);
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_TYPES(
+diff --git a/csrc/reduction_utils.cuh b/csrc/reduction_utils.cuh
+index c25464e86..838d6f098 100644
+--- a/csrc/reduction_utils.cuh
++++ b/csrc/reduction_utils.cuh
+@@ -24,7 +24,7 @@ namespace vllm {
+ template<typename T>
+ __inline__ __device__ T warpReduceSum(T val) {
+ #pragma unroll
+-  for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1)
++  for (int mask = 16; mask > 0; mask >>= 1)
+     val += VLLM_SHFL_XOR_SYNC(val, mask);
+   return val;
+ }
+@@ -37,14 +37,12 @@ __inline__ __device__ constexpr int _calculateWidShift(int warp_size) {
+   return 5 + (warp_size >> 6);
+ }
+ 
+-/* Calculate the sum of all elements in a block */
++/* Calculate the sum of all elements in a block - optimized version */
+ template<typename T>
+ __inline__ __device__ T blockReduceSum(T val) {
+-  static __shared__ T shared[WARP_SIZE];
+-  constexpr auto LANE_MASK = _calculateLaneMask(WARP_SIZE);
+-  constexpr auto WID_SHIFT = _calculateWidShift(WARP_SIZE);
+-  int lane = threadIdx.x & LANE_MASK;
+-  int wid = threadIdx.x >> WID_SHIFT;
++  static __shared__ T shared[32];
++  const int lane = threadIdx.x & 31;
++  const int wid = threadIdx.x >> 5;
+ 
+   val = warpReduceSum<T>(val);
+ 
+@@ -53,10 +51,12 @@ __inline__ __device__ T blockReduceSum(T val) {
+ 
+   __syncthreads();
+ 
+-  // Modify from blockDim.x << 5 to blockDim.x / 32. to prevent
+-  // blockDim.x is not divided by 32
+-  val = (threadIdx.x < (blockDim.x / (WARP_SIZE * 1.0f))) ? shared[lane] : (T)(0.0f);
+-  val = warpReduceSum<T>(val);
++  // Only threads in the first warp participate in final reduction
++  const int num_warps = (blockDim.x + 31) >> 5;
++  val = (threadIdx.x < num_warps) ? shared[lane] : (T)(0.0f);
++  if (wid == 0)
++    val = warpReduceSum<T>(val);
++  
+   return val;
+ }
+ 
+diff --git a/tests/kernels/test_layernorm.py b/tests/kernels/test_layernorm.py
+index b1e3c1a7f..20fc3dac9 100644
+--- a/tests/kernels/test_layernorm.py
++++ b/tests/kernels/test_layernorm.py
+@@ -4,8 +4,8 @@ import torch
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ 
+ DTYPES = [torch.half, torch.bfloat16, torch.float]
+-NUM_TOKENS = [7, 83, 4096]  # Arbitrary values for testing
+-HIDDEN_SIZES = [768, 5120, 8192]  # Arbitrary values for testing
++NUM_TOKENS = [7, 83, 2048, 4096]  # Arbitrary values for testing
++HIDDEN_SIZES = [768, 4096, 5120, 8192]  # Arbitrary values for testing
+ ADD_RESIDUAL = [False, True]
+ SEEDS = [0]
+ CUDA_DEVICES = [

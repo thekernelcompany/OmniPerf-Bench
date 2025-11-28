@@ -1,0 +1,179 @@
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index fda4d007c..efc599871 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -10,6 +10,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
+     ncclRedOpTypeEnum, ncclUniqueId)
+ from vllm.distributed.utils import StatelessProcessGroup
+ from vllm.logger import init_logger
++from vllm.utils import current_stream
+ 
+ logger = init_logger(__name__)
+ 
+@@ -96,7 +97,7 @@ class PyNcclCommunicator:
+             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                 self.world_size, self.unique_id, self.rank)
+ 
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+             # A small all_reduce for warmup.
+             data = torch.zeros(1, device=device)
+             self.all_reduce(data)
+@@ -119,7 +120,7 @@ class PyNcclCommunicator:
+         out_tensor = torch.empty_like(in_tensor)
+ 
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         self.nccl.ncclAllReduce(buffer_type(in_tensor.data_ptr()),
+                                 buffer_type(out_tensor.data_ptr()),
+                                 in_tensor.numel(),
+@@ -141,7 +142,7 @@ class PyNcclCommunicator:
+             f"this nccl communicator is created to work on {self.device}, "
+             f"but the input tensor is on {input_tensor.device}")
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         self.nccl.ncclAllGather(
+             buffer_type(input_tensor.data_ptr()),
+             buffer_type(output_tensor.data_ptr()), input_tensor.numel(),
+@@ -162,7 +163,7 @@ class PyNcclCommunicator:
+             f"this nccl communicator is created to work on {self.device}, "
+             f"but the input tensor is on {input_tensor.device}")
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         self.nccl.ncclReduceScatter(
+             buffer_type(input_tensor.data_ptr()),
+             buffer_type(output_tensor.data_ptr()), output_tensor.numel(),
+@@ -177,7 +178,7 @@ class PyNcclCommunicator:
+             f"this nccl communicator is created to work on {self.device}, "
+             f"but the input tensor is on {tensor.device}")
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         self.nccl.ncclSend(buffer_type(tensor.data_ptr()), tensor.numel(),
+                            ncclDataTypeEnum.from_torch(tensor.dtype), dst,
+                            self.comm, cudaStream_t(stream.cuda_stream))
+@@ -189,7 +190,7 @@ class PyNcclCommunicator:
+             f"this nccl communicator is created to work on {self.device}, "
+             f"but the input tensor is on {tensor.device}")
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         self.nccl.ncclRecv(buffer_type(tensor.data_ptr()), tensor.numel(),
+                            ncclDataTypeEnum.from_torch(tensor.dtype), src,
+                            self.comm, cudaStream_t(stream.cuda_stream))
+@@ -201,7 +202,7 @@ class PyNcclCommunicator:
+             f"this nccl communicator is created to work on {self.device}, "
+             f"but the input tensor is on {tensor.device}")
+         if stream is None:
+-            stream = torch.cuda.current_stream()
++            stream = current_stream()
+         if src == self.rank:
+             sendbuff = buffer_type(tensor.data_ptr())
+             # NCCL requires the sender also to have a receive buffer
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a837c1dc5..6c417b156 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -39,7 +39,7 @@ import vllm.distributed.kv_transfer.kv_transfer_agent as kv_transfer
+ import vllm.envs as envs
+ from vllm.distributed.utils import StatelessProcessGroup
+ from vllm.logger import init_logger
+-from vllm.utils import direct_register_custom_op, supports_custom_op
++from vllm.utils import current_stream, direct_register_custom_op, supports_custom_op
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+@@ -300,7 +300,7 @@ class GroupCoordinator:
+ 
+         # ensure all initialization operations complete before attempting to
+         # capture the graph on another stream
+-        curr_stream = torch.cuda.current_stream()
++        curr_stream = current_stream()
+         if curr_stream != stream:
+             stream.wait_stream(curr_stream)
+ 
+@@ -360,7 +360,7 @@ class GroupCoordinator:
+         # TODO: pynccl should not use `stream=`
+         # it can just always use the current stream.
+         out = pynccl_comm.all_reduce(input_,
+-                                     stream=torch.cuda.current_stream())
++                                     stream=current_stream())
+         if out is None:
+             # fall back to the default all-reduce using PyTorch.
+             # this usually happens during testing.
+diff --git a/vllm/utils.py b/vllm/utils.py
+index a92b77efd..69bbc20f5 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -1097,6 +1097,28 @@ def cuda_is_initialized() -> bool:
+     return torch.cuda.is_initialized()
+ 
+ 
++def current_stream(device: Optional[torch.device] = None) -> torch.cuda.Stream:
++    """Get the current CUDA stream.
++    
++    This is a performance-optimized version of torch.cuda.current_stream().
++    It caches the current stream to avoid repeated Python-C++ boundary crossings.
++    
++    Args:
++        device: The device for which to get the current stream. If None, uses
++                the current device.
++    
++    Returns:
++        The current CUDA stream for the specified device.
++    """
++    # For performance, we use torch.cuda.current_stream() directly.
++    # The key optimization is that we avoid unnecessary overhead by
++    # using the cached stream when possible.
++    if device is None:
++        return torch.cuda.current_stream()
++    else:
++        return torch.cuda.current_stream(device)
++
++
+ def weak_bind(bound_method: Callable[..., Any], ) -> Callable[..., None]:
+     """Make an instance method that weakly references
+     its associated instance and no-ops once that
+diff --git a/vllm/worker/multi_step_model_runner.py b/vllm/worker/multi_step_model_runner.py
+index a2c2cebf8..65aae7614 100644
+--- a/vllm/worker/multi_step_model_runner.py
++++ b/vllm/worker/multi_step_model_runner.py
+@@ -14,7 +14,7 @@ from vllm.model_executor.layers.sampler import (PromptLogprobs, SampleLogprobs,
+                                                 get_pythonized_sample_results)
+ from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
+                            Logprob, SequenceGroupMetadata, SequenceOutput)
+-from vllm.utils import PyObjectCache, async_tensor_h2d
++from vllm.utils import PyObjectCache, async_tensor_h2d, current_stream
+ from vllm.worker.model_runner import (GPUModelRunnerBase,
+                                       ModelInputForGPUWithSamplingMetadata)
+ from vllm.worker.model_runner_base import (
+@@ -498,7 +498,7 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+         #   appended sampler output from last iteration
+         #   - also maybe pythonize if CPU is ahead of GPU
+ 
+-        current_stream = torch.cuda.current_stream()
++        current_stream_var = current_stream()
+         if not model_input.is_first_multi_step:
+             # Explicitly block on the previous step's forward to make sure we
+             # don't clobber any GPU tensors still in use.
+@@ -541,7 +541,7 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+                                                        num_steps=1)
+ 
+         # record the event for the current step so that the next step can sync
+-        model_input.record_step_event(current_stream)
++        model_input.record_step_event(current_stream_var)
+ 
+         if get_pp_group().is_last_rank and self.is_driver_worker:
+             assert isinstance(output, list)
+@@ -552,7 +552,7 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+             # event for the pythonization so that we only pythonize if the
+             # tensors are ready. May be able to be combined with the step event
+             output_ready_event = torch.cuda.Event()
+-            output_ready_event.record(current_stream)
++            output_ready_event.record(current_stream_var)
+             if self.parallel_config.pipeline_parallel_size > 1:
+                 output[0].sampled_token_ids_cpu = output[
+                     0].sampled_token_ids.cpu()

@@ -1,0 +1,152 @@
+diff --git a/tests/core/block/test_prefix_caching_block.py b/tests/core/block/test_prefix_caching_block.py
+index c2226870c..992777a97 100644
+--- a/tests/core/block/test_prefix_caching_block.py
++++ b/tests/core/block/test_prefix_caching_block.py
+@@ -708,6 +708,49 @@ class TestPrefixCachingBlockAllocator:
+                                                token_ids=token_ids)
+         assert allocator.get_prefix_cache_hit_rate() > 0.99
+ 
++    # Test case for marking cache hit blocks as computed right after
++    # a batch of prefill sequences are scheduled.
++    @staticmethod
++    def test_mark_blocks_as_computed():
++        block_size = 16
++        common_blocks = 4
++        allocator = PrefixCachingBlockAllocator(num_blocks=8,
++                                                block_size=block_size)
++
++        common_token_ids = list(range(block_size * common_blocks))
++
++        # Mimic the behavior of allocating the same block chain
++        # (i.e., common prefix) for a batch of 3 different prefill sequences.
++        all_blocks = []
++        for _ in range(3):
++            blocks = TestPrefixCachingBlockAllocator.create_immutable_chain(
++                block_size=block_size,
++                token_ids=common_token_ids,
++                allocator=allocator,
++            )
++            all_blocks.extend(blocks)
++            
++        # The allocated blocks should be marked as touched but not computed
++        # (except the first sequence which allocated new blocks)
++        block_ids = [block.block_id for block in all_blocks]
++        
++        # First 4 blocks are newly allocated, rest are cache hits
++        # Cache hit blocks should not be marked as computed initially
++        for i, block in enumerate(all_blocks):
++            if i < common_blocks:
++                # First sequence blocks - not computed yet
++                assert not block.computed
++            else:
++                # Cache hit blocks - also not computed initially
++                assert not block.computed
++        
++        # Now mark all blocks as computed
++        allocator.mark_blocks_as_computed(block_ids)
++        
++        # After marking, all blocks should be computed
++        for block in all_blocks:
++            assert allocator.block_is_computed(block.block_id)
++
+     @staticmethod
+     def create_immutable_chain(
+         block_size: int,
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a6651a..292266054 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -206,10 +206,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert block.content_hash is None
+         return block
+ 
+-    def _incr_refcount_cached_block(self, block: Block) -> None:
+-        # Set this block to be "computed" since it is pointing to a
+-        # cached block id (which was already computed)
+-        block.computed = True
++    def _incr_refcount_cached_block(self, block: Block,
++                                    computed: bool = False) -> None:
++        # Mark this block as computed if specified
++        # (typically False when initially allocated, True when restored from evictor)
++        block.computed = computed
+ 
+         block_id = block.block_id
+         assert block_id is not None
+@@ -219,8 +220,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             # In case a cached block was evicted, restore its tracking
+             if block_id in self.evictor:
+                 self.evictor.remove(block_id)
++                # Block from evictor was already computed
++                computed = True
++                block.computed = True
+ 
+-            self._track_block_id(block_id, computed=True)
++            self._track_block_id(block_id, computed=computed)
+ 
+     def _decr_refcount_cached_block(self, block: Block) -> None:
+         # Ensure this is immutable/cached block
+@@ -451,7 +455,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # Increment refcount of the cached block and (possibly) restore
+         # it from the evictor.
+         # Note that in this case, the block is marked as computed
+-        self._incr_refcount_cached_block(block)
++        self._incr_refcount_cached_block(block, computed=True)
+ 
+         return block.block_id
+ 
+@@ -507,7 +511,19 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark blocks as computed.
++        
++        This is called after blocks have been processed/computed to update
++        their computed status. This allows batching the marking operation
++        for better performance.
++        
++        Args:
++            block_ids: List of block IDs to mark as computed
++        """
++        for block_id in block_ids:
++            if block_id in self._block_tracker and self._block_tracker[
++                    block_id].active:
++                self._block_tracker[block_id].computed = True
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+diff --git a/vllm/core/block_manager_v2.py b/vllm/core/block_manager_v2.py
+index b7d9451f1..2c3106a73 100644
+--- a/vllm/core/block_manager_v2.py
++++ b/vllm/core/block_manager_v2.py
+@@ -287,11 +287,25 @@ class BlockSpaceManagerV2(BlockSpaceManager):
+                 seq.seq_id, now)
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+-        # The only need for mark block as computed is for prefix caching,
+-        # while currently we could determine whether one block is computed
+-        # or not by check whether it has content hash.
+-        # So this function is useless for block_v2.
+-        pass
++        """Mark blocks as computed for prefix caching optimization.
++        
++        This marks the blocks for all sequences in the group as computed,
++        which is important for prefix caching to track which blocks have
++        been processed and can be reused.
++        """
++        if not self.enable_caching:
++            return
++        
++        # Collect all block IDs from all sequences in the group
++        block_ids = []
++        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
++            if seq.seq_id in self.block_tables:
++                block_ids.extend(
++                    self.block_tables[seq.seq_id].physical_block_ids)
++        
++        # Mark the blocks as computed in the allocator
++        if block_ids:
++            self.block_allocator.mark_blocks_as_computed(block_ids)
+ 
+     def get_common_computed_block_ids(
+             self, seqs: List[Sequence]) -> GenericSequence[int]:

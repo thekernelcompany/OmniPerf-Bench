@@ -1,0 +1,59 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 79787303a..3fc22790d 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -287,13 +287,17 @@ class LRUCache(Generic[_K, _V]):
+             return
+ 
+         if not remove_pinned:
+-            # pop the oldest item in the cache that is not pinned
+-            lru_key = next(
+-                (key for key in self.cache if key not in self.pinned_items),
+-                ALL_PINNED_SENTINEL)
+-            if lru_key is ALL_PINNED_SENTINEL:
+-                raise RuntimeError("All items are pinned, "
+-                                   "cannot remove oldest from the cache.")
++            # Fast path: if no items are pinned, just get the first item
++            if not self.pinned_items:
++                lru_key = next(iter(self.cache))
++            else:
++                # pop the oldest item in the cache that is not pinned
++                lru_key = next(
++                    (key for key in self.cache if key not in self.pinned_items),
++                    ALL_PINNED_SENTINEL)
++                if lru_key is ALL_PINNED_SENTINEL:
++                    raise RuntimeError("All items are pinned, "
++                                       "cannot remove oldest from the cache.")
+         else:
+             lru_key = next(iter(self.cache))
+         self.pop(lru_key)  # type: ignore
+@@ -327,15 +331,12 @@ class PyObjectCache:
+         self._obj_builder = obj_builder
+         self._index = 0
+ 
+-        self._obj_cache = []
+-        for _ in range(128):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache = [self._obj_builder() for _ in range(128)]
+ 
+     def _grow_cache(self):
+         # Double the size of the cache
+         num_objs = len(self._obj_cache)
+-        for _ in range(num_objs):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache.extend(self._obj_builder() for _ in range(num_objs))
+ 
+     def get_object(self):
+         """Returns a pre-allocated cached object. If there is not enough
+@@ -411,6 +412,11 @@ async def merge_async_iterators(
+     When it yields, it yields a tuple (i, item) where i is the index of the
+     iterator that yields the item.
+     """
++    if len(iterators) == 1:
++        # Fast-path single iterator case.
++        async for item in iterators[0]:
++            yield 0, item
++        return
+ 
+     loop = asyncio.get_running_loop()
+ 

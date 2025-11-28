@@ -1,0 +1,131 @@
+diff --git a/Dockerfile b/Dockerfile
+index f41753aeb..6ef03b843 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -41,14 +41,6 @@ ENV NVCC_THREADS=$nvcc_threads
+ 
+ RUN python3 setup.py build_ext --inplace
+ 
+-# Build the megablocks library as wheel because it doesn't publish pre-built wheels.
+-# https://github.com/stanford-futuredata/megablocks/commit/5897cd6f254b7b3edf7a708a3a3314ecb54b6f78
+-RUN apt-get install -y git && \
+-    git clone https://github.com/stanford-futuredata/megablocks.git && \
+-    cd megablocks && \
+-    git checkout 5897cd6f254b7b3edf7a708a3a3314ecb54b6f78 && \
+-    MAX_JOBS=8 NVCC_THREADS=8 python3 setup.py bdist_wheel
+-
+ # image to run unit testing suite
+ FROM dev AS test
+ 
+@@ -85,12 +77,8 @@ FROM vllm-base AS vllm-openai
+ RUN --mount=type=cache,target=/root/.cache/pip \
+     pip install accelerate
+ 
+-COPY vllm vllm
+ COPY --from=build /workspace/vllm/*.so /workspace/vllm/
+-COPY --from=build /workspace/megablocks/dist/*.whl /tmp/
+-RUN --mount=type=cache,target=/root/.cache/pip \
+-    pip install /tmp/megablocks-0.5.0-cp310-cp310-linux_x86_64.whl && \
+-    rm /tmp/megablocks-0.5.0-cp310-cp310-linux_x86_64.whl
++COPY vllm vllm
+ 
+ ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+ 
+diff --git a/README.md b/README.md
+index 84cadee48..e4b3b5026 100644
+--- a/README.md
++++ b/README.md
+@@ -72,10 +72,6 @@ Install vLLM with pip or [from source](https://vllm.readthedocs.io/en/latest/get
+ ```bash
+ pip install vllm
+ ```
+-**NOTE:** The Mixtral model additionally requires `megablocks` which can be installed with pip or [from source](https://github.com/stanford-futuredata/megablocks):
+-```bash
+-pip install megablocks
+-```
+ 
+ ## Getting Started
+ 
+diff --git a/docs/source/models/supported_models.rst b/docs/source/models/supported_models.rst
+index e21cdd65d..3d768e1be 100644
+--- a/docs/source/models/supported_models.rst
++++ b/docs/source/models/supported_models.rst
+@@ -74,8 +74,7 @@ Otherwise, please refer to :ref:`Adding a New Model <adding_a_new_model>` for in
+ Alternatively, you can raise an issue on our `GitHub <https://github.com/vllm-project/vllm/issues>`_ project.
+ 
+ .. note::
+-    Currently, the ROCm version of vLLM does not support Mixtral.
+-    Additionally, it only supports Mistral for context lengths up to 4096.
++    Currently, the ROCm version of vLLM only supports Mistral for context lengths up to 4096.
+ 
+ .. tip::
+     The easiest way to check if your model is supported is to run the program below:
+diff --git a/vllm/config.py b/vllm/config.py
+index 6bafa73c7..d14f7b2c6 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -120,15 +120,6 @@ class ModelConfig:
+             if load_format == "auto":
+                 load_format = "pt"
+ 
+-        # FIXME(woosuk): This is a temporary hack. Support safetensor weights.
+-        architectures = getattr(self.hf_config, "architectures", [])
+-        if "MixtralForCausalLM" in architectures and load_format != "pt":
+-            logger.info(
+-                "Currently, only 'pt' format is supported for Mixtral. "
+-                "Changing the format to 'pt'. This may re-download the "
+-                "weights if you have downloaded the safetensor weights.")
+-            load_format = "pt"
+-
+         self.load_format = load_format
+ 
+     def _verify_tokenizer_mode(self) -> None:
+@@ -315,6 +306,7 @@ class ParallelConfig:
+         worker_use_ray: Whether to use Ray for model workers. Will be set to
+             True if either pipeline_parallel_size or tensor_parallel_size is
+             greater than 1.
++        expert_parallel_size: Number of expert parallel groups for MoE models.
+     """
+ 
+     def __init__(
+@@ -323,9 +315,11 @@ class ParallelConfig:
+         tensor_parallel_size: int,
+         worker_use_ray: bool,
+         max_parallel_loading_workers: Optional[int] = None,
++        expert_parallel_size: int = 1,
+     ) -> None:
+         self.pipeline_parallel_size = pipeline_parallel_size
+         self.tensor_parallel_size = tensor_parallel_size
++        self.expert_parallel_size = expert_parallel_size
+         self.worker_use_ray = worker_use_ray
+         self.max_parallel_loading_workers = max_parallel_loading_workers
+ 
+diff --git a/vllm/model_executor/models/__init__.py b/vllm/model_executor/models/__init__.py
+index 5596884f3..5477b5ab1 100644
+--- a/vllm/model_executor/models/__init__.py
++++ b/vllm/model_executor/models/__init__.py
+@@ -39,7 +39,7 @@ _MODELS = {
+ }
+ 
+ # Models not supported by ROCm.
+-_ROCM_UNSUPPORTED_MODELS = ["MixtralForCausalLM"]
++_ROCM_UNSUPPORTED_MODELS = []
+ 
+ # Models partially supported by ROCm.
+ # Architecture -> Reason.
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 8e0a094c7..5b126a8f1 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -243,10 +243,9 @@ class BlockSparseMoE(nn.Module):
+         column_indices_t = row_indices.gather(0, gather_indices.long())
+         block_offsets_t = gather_indices.int()
+ 
+-        zero = torch.zeros((1, ), dtype=torch.int32, device=row_indices.device)
+         nnz_per_column = ops.histogram(column_indices, block_columns)
+         nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
+-        offsets_t = torch.cat([zero, nnz_per_column])
++        offsets_t = F.pad(nnz_per_column, (1, 0), value=0)
+         return column_indices_t, offsets_t, block_offsets_t
+ 
+     def topology(self, x: torch.Tensor,

@@ -1,0 +1,201 @@
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index d2787d696..21165591e 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -38,24 +38,17 @@ class RefCounter(RefCounterProtocol):
+ 
+     def incr(self, block_id: BlockId) -> RefCount:
+         assert block_id in self._refcounts
+-        pre_incr_refcount = self._refcounts[block_id]
+-
+-        assert pre_incr_refcount >= 0
+-
+-        post_incr_refcount = pre_incr_refcount + 1
+-        self._refcounts[block_id] = post_incr_refcount
+-        return post_incr_refcount
++        # Optimize: single dictionary access and update
++        self._refcounts[block_id] += 1
++        assert self._refcounts[block_id] > 0
++        return self._refcounts[block_id]
+ 
+     def decr(self, block_id: BlockId) -> RefCount:
+         assert block_id in self._refcounts
+-        refcount = self._refcounts[block_id]
+-
+-        assert refcount > 0
+-        refcount -= 1
+-
+-        self._refcounts[block_id] = refcount
+-
+-        return refcount
++        # Optimize: single dictionary access and update
++        assert self._refcounts[block_id] > 0
++        self._refcounts[block_id] -= 1
++        return self._refcounts[block_id]
+ 
+     def get(self, block_id: BlockId) -> RefCount:
+         assert block_id in self._refcounts
+@@ -186,12 +179,16 @@ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
+         List[Block]: A list of all the blocks in the sequence, in the order they
+             appear.
+     """
+-
+-    def recurse(block: Block, lst: List[Block]) -> None:
+-        if block.prev_block is not None:
+-            recurse(block.prev_block, lst)
+-        lst.append(block)
+-
++    # Optimize: use iterative approach instead of recursion to avoid function call overhead
+     all_blocks: List[Block] = []
+-    recurse(last_block, all_blocks)
++    current_block: Optional[Block] = last_block
++    
++    # First, traverse backwards to collect all blocks
++    temp_blocks: List[Block] = []
++    while current_block is not None:
++        temp_blocks.append(current_block)
++        current_block = current_block.prev_block
++    
++    # Reverse to get correct order
++    all_blocks = temp_blocks[::-1]
+     return all_blocks
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74e4..c6d0301f8 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -111,6 +111,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
++        # Optimize: create block once and reuse
+         block = self._create_block(
+             prev_block=prev_block,
+             token_ids=token_ids,
+@@ -119,12 +120,14 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         )
+         assert block.content_hash is not None
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        # Optimize: single dictionary lookup
++        cached_block_id = self._cached_blocks.get(block.content_hash)
+         if cached_block_id is not None:
+             block.block_id = cached_block_id
+-            self._incr_refcount_cached_block(block, block.block_id)
++            self._incr_refcount_cached_block(block, cached_block_id)
+             return block
+ 
++        # Cache miss: allocate new mutable block
+         block = self.allocate_mutable(prev_block)
+         block.append_token_ids(token_ids)
+         assert block.content_hash is not None
+@@ -384,10 +387,15 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
++        # Optimize: early exit for empty list
++        if not block_ids:
++            return
+ 
+         for block_id in block_ids:
+-            if block_id in self._blocks:
+-                self._blocks[block_id].last_accessed = now
++            # Optimize: use dict.get() to avoid double lookup
++            block = self._blocks.get(block_id)
++            if block is not None:
++                block.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -396,21 +404,27 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         """Mark blocks as computed, used in prefix caching."""
++        # Optimize: early exit for empty list
++        if not block_ids:
++            return
+ 
+         for block_id in block_ids:
+-            if block_id in self._blocks:
++            # Optimize: use dict.get() to avoid double lookup
++            block = self._blocks.get(block_id)
++            if block is not None:
+                 # only those full block is valid for prefix caching
+-                if self._blocks[block_id].is_full:
+-                    self._blocks[block_id].computed = True
++                if block.is_full:
++                    block.computed = True
+             elif block_id not in self.evictor:
+                 raise ValueError(f"Mark {block_id=} as computed which "
+                                  "is not belonged to GPU")
+ 
+     def block_is_computed(self, block_id: int) -> bool:
+-        if block_id in self._blocks:
+-            return self._blocks[block_id].computed
+-        else:
+-            return block_id in self.evictor
++        # Optimize: use dict.get() to avoid double lookup
++        block = self._blocks.get(block_id)
++        if block is not None:
++            return block.computed
++        return block_id in self.evictor
+ 
+     def get_common_computed_block_ids(
+             self, seq_block_ids: List[List[int]]) -> List[int]:
+@@ -424,16 +438,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.
+ 
++        # Optimize: filter empty sequences early
++        non_empty_seqs = [seq[:-1] for seq in seq_block_ids if len(seq) > 1]
++        if not non_empty_seqs:
++            return []
++
+         ids_list = [
+             list(
+                 takewhile(lambda block_id: self.block_is_computed(block_id),
+-                          seq[:-1])) for seq in seq_block_ids
++                          seq)) for seq in non_empty_seqs
+         ]
+         # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
+-            ids for ids in ids_list  # type: ignore
+-            if ids != []
+-        ])
++        # Optimize: filter empty lists before commonprefix
++        non_empty_ids = [ids for ids in ids_list if ids]
++        if not non_empty_ids:
++            return []
++        return commonprefix(non_empty_ids)  # type: ignore
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],
+@@ -607,11 +627,17 @@ class PrefixCachingBlock(Block):
+         if self._cached_num_tokens_total is not None:
+             return self._cached_num_tokens_total
+ 
++        # Optimize: compute incrementally from previous block's cached value
++        if self._prev_block is not None and hasattr(self._prev_block, '_cached_num_tokens_total'):
++            prev_total = self._prev_block._cached_num_tokens_total
++            if prev_total is not None:
++                self._cached_num_tokens_total = prev_total + len(self.token_ids)
++                return self._cached_num_tokens_total
++
++        # Fallback to full traversal if previous block doesn't have cached value
+         _block: Optional[Block] = self
+         self._cached_num_tokens_total = 0
+ 
+-        # TODO: current implement here take O(N^2), we expect future
+-        # we have O(1) here
+         while _block is not None:
+             self._cached_num_tokens_total += len(_block.token_ids)
+             _block = _block.prev_block
+@@ -685,7 +711,8 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        # Optimize: use tuple() instead of unpacking with * for better performance
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ def assert_prefix_caching_block_or_none(block: Optional[Block]):

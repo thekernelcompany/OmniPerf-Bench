@@ -1,0 +1,62 @@
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index 2ef8d3115..b50d44b08 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -29,7 +29,7 @@ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.activation import ReLUSquaredActivation
+ from vllm.model_executor.layers.layernorm import RMSNorm
+-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
++from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                                QKVParallelLinear,
+                                                RowParallelLinear)
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -63,11 +63,12 @@ class NemotronHMLP(nn.Module):
+         config: NemotronHConfig,
+         quant_config: Optional[QuantizationConfig] = None,
+         bias: bool = False,
++        prefix: str = "",
+     ) -> None:
+         super().__init__()
+-        self.up_proj = MergedColumnParallelLinear(
++        self.up_proj = ColumnParallelLinear(
+             input_size=config.hidden_size,
+-            output_sizes=[config.intermediate_size],
++            output_size=config.intermediate_size,
+             bias=bias,
+             quant_config=quant_config,
+         )
+@@ -99,9 +100,12 @@ class NemotronHMLPDecoderLayer(nn.Module):
+         super().__init__()
+         self.config = config
+ 
+-        self.mixer = NemotronHMLP(config,
+-                                  quant_config=quant_config,
+-                                  bias=config.mlp_bias)
++        self.mixer = NemotronHMLP(
++            config,
++            quant_config=quant_config,
++            bias=config.mlp_bias,
++            prefix=f"{prefix}.mixer",
++        )
+ 
+         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+@@ -355,15 +359,13 @@ class NemotronHModel(nn.Module):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        residual = None
+         num_non_mamba_layers = 0
+-        for i in range(len(self.layers)):
+-            layer = self.layers[i]
+-            layer_mamba_cache_params = None
++        for i, layer in enumerate(self.layers):
+             if isinstance(layer, NemotronHMambaDecoderLayer):
+                 layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
+                     i - num_non_mamba_layers)
+             else:
++                layer_mamba_cache_params = None
+                 num_non_mamba_layers += 1
+ 
+             hidden_states, residual = layer(
