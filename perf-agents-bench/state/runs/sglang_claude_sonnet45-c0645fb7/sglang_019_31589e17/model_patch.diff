@@ -1,0 +1,98 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 29f18f0ef..b4fc4d7a7 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -454,6 +454,7 @@ class DeepseekV2MoE(nn.Module):
+                 num_expert_group=self.num_expert_group,
+                 correction_bias=self.correction_bias,
+                 routed_scaling_factor=self.routed_scaling_factor,
++                num_token_non_padded=state.forward_batch.num_token_non_padded,
+                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                     layer_id=self.layer_id,
+                 ),
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f40..7cdc88837 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -110,7 +110,8 @@ def compute_split_indices_for_cuda_graph_replay(
+ 
+ class TboCudaGraphRunnerPlugin:
+     def __init__(self):
+-        pass  # TODO add logic here
++        # Buffer to hold non-padded token counts for TBO children [A, B]
++        self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
+ 
+     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
+         if not global_server_args_dict["enable_two_batch_overlap"]:
+@@ -126,13 +127,48 @@ class TboCudaGraphRunnerPlugin:
+ 
+         TboForwardBatchPreparer.prepare(batch)
+ 
++        # Initialize children's num_token_non_padded for graph capture path
++        # Use token split computed from sequence split for decode; extend uses token computation from lens.
++        tbo_split_token_index = compute_split_token_index(
++            split_seq_index=batch.tbo_split_seq_index,
++            forward_mode=batch.forward_mode,
++            extend_seq_lens=None,
++        )
++        a_tokens = int(tbo_split_token_index)
++        b_tokens = int(num_tokens - a_tokens)
++        # Keep buffer device consistent with parent's num_token_non_padded when available
++        parent_device = (
++            batch.num_token_non_padded.device
++            if isinstance(batch.num_token_non_padded, torch.Tensor)
++            else self._tbo_children_num_token_non_padded.device
++        )
++        if self._tbo_children_num_token_non_padded.device != parent_device:
++            self._tbo_children_num_token_non_padded = self._tbo_children_num_token_non_padded.to(parent_device)
++        self._tbo_children_num_token_non_padded[0] = a_tokens
++        self._tbo_children_num_token_non_padded[1] = b_tokens
++        # Assign scalars to children for masking padded regions in grouped_topk
++        if batch.tbo_children is not None:
++            batch.tbo_children[0].num_token_non_padded = self._tbo_children_num_token_non_padded[0]
++            batch.tbo_children[1].num_token_non_padded = self._tbo_children_num_token_non_padded[1]
++
+     def replay_prepare(
+         self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
+     ):
+         if not global_server_args_dict["enable_two_batch_overlap"]:
+             return
+ 
+-        pass  # TODO add logic here
++        # Compute split indices for the current bs used by CUDA Graph replay
++        tbo_split_seq_index, tbo_split_token_index = compute_split_indices_for_cuda_graph_replay(
++            forward_mode=forward_mode, cuda_graph_num_tokens=bs
++        )
++        # Compute children's non-padded token counts for this replay
++        a_tokens = min(int(num_token_non_padded), int(tbo_split_token_index))
++        b_tokens = max(int(num_token_non_padded) - int(tbo_split_token_index), 0)
++        # Ensure the buffer is on default (CPU) device for CUDA graph runner usage
++        if self._tbo_children_num_token_non_padded.device != torch.tensor(0).device:
++            self._tbo_children_num_token_non_padded = self._tbo_children_num_token_non_padded.cpu()
++        self._tbo_children_num_token_non_padded[0] = a_tokens
++        self._tbo_children_num_token_non_padded[1] = b_tokens
+ 
+ 
+ class TboDPAttentionPreparer:
+@@ -324,7 +360,7 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,
+@@ -357,7 +393,11 @@ class TboForwardBatchPreparer:
+                 top_p_normalized_logprobs=False,
+                 top_p=None,
+                 mm_inputs=None,
+-                num_token_non_padded=None,
++                num_token_non_padded=torch.tensor(
++                    end_token_index - start_token_index,
++                    dtype=torch.int32,
++                    device=output_dict["input_ids"].device,
++                ),
+             )
+         )
+ 

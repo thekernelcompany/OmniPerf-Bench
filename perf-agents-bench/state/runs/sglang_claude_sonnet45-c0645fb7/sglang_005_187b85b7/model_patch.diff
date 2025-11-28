@@ -1,0 +1,169 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/memory_pool.py b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+deleted file mode 100644
+index 6e8edaf92..000000000
+--- a/python/sglang/srt/disaggregation/mooncake/memory_pool.py
++++ /dev/null
+@@ -1,47 +0,0 @@
+-import os
+-import threading
+-from importlib import resources
+-from typing import Dict, Final, Optional
+-
+-import torch
+-from torch.cuda.memory import CUDAPluggableAllocator
+-
+-
+-# TODO(shangming): move this class into mooncake's package for more general use cases
+-class MooncakeNVLinkAllocator:
+-    _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+-    _lock: Final = threading.Lock()
+-
+-    @classmethod
+-    def _get_so_path(cls) -> str:
+-        """Dynamically locate hook.so in the mooncake package installation"""
+-        try:
+-            # Attempt to locate package resource
+-            with resources.path("mooncake", "hook.so") as so_path:
+-                if so_path.exists():
+-                    return str(so_path)
+-        except (ImportError, FileNotFoundError, TypeError):
+-            pass
+-
+-        # Fallback strategy: check in package location via import metadata
+-        try:
+-            import mooncake
+-
+-            base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
+-            so_path = os.path.join(base_path, "hook.so")
+-            if os.path.exists(so_path):
+-                return so_path
+-        except (ImportError, FileNotFoundError, TypeError):
+-            raise ImportError(
+-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+-            )
+-
+-    @classmethod
+-    def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
+-        with cls._lock:
+-            if device not in cls._instances:
+-                so_path = cls._get_so_path()
+-                cls._instances[device] = CUDAPluggableAllocator(
+-                    so_path, "mc_nvlink_malloc", "mc_nvlink_free"
+-                )
+-            return cls._instances[device]
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f1b..f2ae9efee 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -64,7 +64,7 @@ class ReqToTokenPool:
+         self.max_context_len = max_context_len
+         self.device = device
+         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+-            self.req_to_token = torch.zeros(
++            self.req_to_token = torch.empty(
+                 (size, max_context_len), dtype=torch.int32, device=device
+             )
+         self.free_slots = list(range(size))
+@@ -270,12 +270,13 @@ class MHATokenToKVPool(KVCache):
+             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+         )
+         if self.enable_custom_mem_pool:
+-            from sglang.srt.disaggregation.mooncake.memory_pool import (
+-                MooncakeNVLinkAllocator,
+-            )
++            from torch.cuda.memory import CUDAPluggableAllocator
+ 
+-            # TODO(shangming): abstract custom allocator class for more backends
+-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
++            allocator = CUDAPluggableAllocator(
++                "libmooncake_transfer_engine.so",
++                "mc_malloc",
++                "mc_free",
++            )
+             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+         else:
+             self.custom_mem_pool = None
+@@ -303,7 +304,7 @@ class MHATokenToKVPool(KVCache):
+                 # [size, head_num, head_dim] for each layer
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.k_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -311,7 +312,7 @@ class MHATokenToKVPool(KVCache):
+                     for _ in range(self.layer_num)
+                 ]
+                 self.v_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -602,12 +603,13 @@ class MLATokenToKVPool(KVCache):
+             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+         )
+         if self.enable_custom_mem_pool:
+-            from sglang.srt.disaggregation.mooncake.memory_pool import (
+-                MooncakeNVLinkAllocator,
+-            )
++            from torch.cuda.memory import CUDAPluggableAllocator
+ 
+-            # TODO(shangming): abstract custom allocator class for more backends
+-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
++            allocator = CUDAPluggableAllocator(
++                "libmooncake_transfer_engine.so",
++                "mc_malloc",
++                "mc_free",
++            )
+             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+         else:
+             self.custom_mem_pool = None
+@@ -620,7 +622,7 @@ class MLATokenToKVPool(KVCache):
+             ):
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.kv_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                         dtype=self.store_dtype,
+                         device=device,
+@@ -758,13 +760,13 @@ class DoubleSparseTokenToKVPool(KVCache):
+         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+             # [size, head_num, head_dim] for each layer
+             self.k_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+             ]
+             self.v_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+@@ -772,7 +774,7 @@ class DoubleSparseTokenToKVPool(KVCache):
+ 
+             # [size, head_num, heavy_channel_num] for each layer
+             self.label_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+diff --git a/scripts/ci_install_dependency.sh b/scripts/ci_install_dependency.sh
+index 922c886c4..a1808019e 100755
+--- a/scripts/ci_install_dependency.sh
++++ b/scripts/ci_install_dependency.sh
+@@ -23,7 +23,7 @@ pip install -e "python[dev]"
+ pip list
+ 
+ # Install additional dependencies
+-pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
++pip install mooncake-transfer-engine==0.3.4 nvidia-cuda-nvrtc-cu12
+ 
+ # For lmms_evals evaluating MMMU
+ git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

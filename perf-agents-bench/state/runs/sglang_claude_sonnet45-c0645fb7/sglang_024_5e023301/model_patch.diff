@@ -1,0 +1,238 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index aeab9d48d..dde9fd560 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -146,7 +146,7 @@ def apply_w8a8_block_fp8_linear(
+         q_input, x_scale = per_token_group_quant_fp8(
+             input_2d, block_size[1], column_major_scales=False
+         )
+-        output = torch.zeros(
++        output = torch.empty(
+             [q_input.shape[0], weight.shape[0]],
+             dtype=input.dtype,
+             device=q_input.device,
+@@ -210,22 +210,11 @@ def block_quant_to_tensor_quant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = x_q_block.to(torch.float32)
+-
+-    x_dq_block_tiles = [
+-        [
+-            x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            for i in range(k_tiles)
+-        ]
+-        for j in range(n_tiles)
+-    ]
+-
+-    for i in range(k_tiles):
+-        for j in range(n_tiles):
+-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
++    # Vectorized blockwise dequantization via Kronecker product to avoid Python loops
++    tile = torch.ones(block_n, block_k, dtype=torch.float32, device=x_s.device)
++    scale_full = torch.kron(x_s.to(torch.float32), tile)
++    scale_full = scale_full[:n, :k]
++    x_dq_block = x_q_block.to(torch.float32) * scale_full
+ 
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_block)
+@@ -248,6 +237,41 @@ def channel_quant_to_tensor_quant(
+     return x_q_tensor, scale
+ 
+ 
++def block_quant_dequant(
++    x_q_block: torch.Tensor,
++    x_s: torch.Tensor,
++    block_size: List[int],
++    dtype: torch.dtype,
++) -> torch.Tensor:
++    """Convert block-wise quantized tensor to dequantized tensor with target dtype.
++    
++    This function uses a loop-based approach for better memory efficiency
++    compared to the Kronecker product method.
++    """
++    block_n, block_k = block_size[0], block_size[1]
++    n, k = x_q_block.shape
++    n_tiles = (n + block_n - 1) // block_n
++    k_tiles = (k + block_k - 1) // block_k
++    assert n_tiles == x_s.shape[0]
++    assert k_tiles == x_s.shape[1]
++
++    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
++
++    for j in range(n_tiles):
++        for i in range(k_tiles):
++            n_start = j * block_n
++            n_end = min(n_start + block_n, n)
++            k_start = i * block_k
++            k_end = min(k_start + block_k, k)
++            
++            scale = x_s[j, i].to(torch.float32)
++            x_dq_block[n_start:n_end, k_start:k_end] = (
++                x_q_block[n_start:n_end, k_start:k_end].to(torch.float32) * scale
++            ).to(dtype)
++
++    return x_dq_block
++
++
+ def _process_scaled_mm_output(output, input_2d_shape, output_shape):
+     if type(output) is tuple and len(output) == 2:
+         output = output[0]
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 339aaad6b..b93e088df 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
+     per_token_group_quant_mla_deep_gemm_masked_fp8,
+ )
+ from sglang.srt.layers.quantization.fp8_utils import (
++    block_quant_dequant,
+     block_quant_to_tensor_quant,
+     channel_quant_to_tensor_quant,
+     normalize_e4m3fn_to_e4m3fnuz,
+@@ -113,6 +114,14 @@ expert_distribution_recorder = ExpertDistributionRecorder()
+ logger = logging.getLogger(__name__)
+ 
+ 
++
++
++def _use_bmm_bf16_fallback() -> bool:
++    try:
++        return os.getenv("SGLANG_DSV3_BMM_FALLBACK_BF16", "1") == "1"
++    except Exception:
++        return True
++
+ class AttnForwardMethod(IntEnum):
+     # Use multi-head attention
+     MHA = auto()
+@@ -763,13 +772,19 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 self.w_kc.to(torch.bfloat16) * self.w_scale,
+             )
+         elif self.w_kc.dtype == torch.float8_e4m3fn:
+-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+-                q_nope.transpose(0, 1),
+-                zero_allocator.allocate(1),
+-            )
+-            q_nope_out = bmm_fp8(
+-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+-            )
++            if _use_bmm_bf16_fallback():
++                q_nope_out = torch.bmm(
++                    q_nope.to(torch.bfloat16).transpose(0, 1),
++                    self.w_kc.to(torch.bfloat16) * self.w_scale,
++                )
++            else:
++                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
++                    q_nope.transpose(0, 1),
++                    zero_allocator.allocate(1),
++                )
++                q_nope_out = bmm_fp8(
++                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
++                )
+         else:
+             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+ 
+@@ -810,17 +825,23 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 self.w_vc.to(torch.bfloat16) * self.w_scale,
+             )
+         elif self.w_vc.dtype == torch.float8_e4m3fn:
+-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+-                attn_output.transpose(0, 1),
+-                zero_allocator.allocate(1),
+-            )
+-            attn_bmm_output = bmm_fp8(
+-                attn_output_val,
+-                self.w_vc,
+-                attn_output_scale,
+-                self.w_scale,
+-                torch.bfloat16,
+-            )
++            if _use_bmm_bf16_fallback():
++                attn_bmm_output = torch.bmm(
++                    attn_output.to(torch.bfloat16).transpose(0, 1),
++                    self.w_vc.to(torch.bfloat16) * self.w_scale,
++                )
++            else:
++                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
++                    attn_output.transpose(0, 1),
++                    zero_allocator.allocate(1),
++                )
++                attn_bmm_output = bmm_fp8(
++                    attn_output_val,
++                    self.w_vc,
++                    attn_output_scale,
++                    self.w_scale,
++                    torch.bfloat16,
++                )
+         else:
+             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+@@ -862,14 +883,20 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 self.w_kc.to(torch.bfloat16) * self.w_scale,
+             )
+         elif self.w_kc.dtype == torch.float8_e4m3fn:
+-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+-                q_nope.transpose(0, 1),
+-                zero_allocator.allocate(1),
+-                dtype=torch.float8_e4m3fn,
+-            )
+-            q_nope_out = bmm_fp8(
+-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+-            )
++            if _use_bmm_bf16_fallback():
++                q_nope_out = torch.bmm(
++                    q_nope.to(torch.bfloat16).transpose(0, 1),
++                    self.w_kc.to(torch.bfloat16) * self.w_scale,
++                )
++            else:
++                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
++                    q_nope.transpose(0, 1),
++                    zero_allocator.allocate(1),
++                    dtype=torch.float8_e4m3fn,
++                )
++                q_nope_out = bmm_fp8(
++                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
++                )
+         else:
+             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+@@ -958,18 +985,24 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 self.w_vc.to(torch.bfloat16) * self.w_scale,
+             )
+         elif self.w_vc.dtype == torch.float8_e4m3fn:
+-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+-                attn_output.transpose(0, 1),
+-                zero_allocator.allocate(1),
+-                dtype=torch.float8_e4m3fn,
+-            )
+-            attn_bmm_output = bmm_fp8(
+-                attn_output_val,
+-                self.w_vc,
+-                attn_output_scale,
+-                self.w_scale,
+-                torch.bfloat16,
+-            )
++            if _use_bmm_bf16_fallback():
++                attn_bmm_output = torch.bmm(
++                    attn_output.to(torch.bfloat16).transpose(0, 1),
++                    self.w_vc.to(torch.bfloat16) * self.w_scale,
++                )
++            else:
++                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
++                    attn_output.transpose(0, 1),
++                    zero_allocator.allocate(1),
++                    dtype=torch.float8_e4m3fn,
++                )
++                attn_bmm_output = bmm_fp8(
++                    attn_output_val,
++                    self.w_vc,
++                    attn_output_scale,
++                    self.w_scale,
++                    torch.bfloat16,
++                )
+         else:
+             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)

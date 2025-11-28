@@ -1,0 +1,158 @@
+diff --git a/docs/test_process.md b/docs/test_process.md
+index d22570b4e..18f91c6d4 100644
+--- a/docs/test_process.md
++++ b/docs/test_process.md
+@@ -1,6 +1,7 @@
+ ## SRT Unit Tests
+ 
+ ### Latency Alignment
++Make sure your changes do not slow down the following benchmarks
+ ```
+ # single gpu
+ python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 32 --input-len 512 --output-len 256
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/bench_latency.py b/python/sglang/bench_latency.py
+index a163cbd30..b349c9971 100644
+--- a/python/sglang/bench_latency.py
++++ b/python/sglang/bench_latency.py
+@@ -222,8 +222,8 @@ def latency_test(
+     @torch.inference_mode()
+     def run_once(output_len):
+         # Prefill
+-        torch.cuda.synchronize()
+         tot_latency = 0
++        torch.cuda.synchronize()
+         tic = time.time()
+         next_token_ids, _, batch = extend(reqs, model_runner)
+         torch.cuda.synchronize()
+diff --git a/python/sglang/global_config.py b/python/sglang/global_config.py
+index 0cc0f747f..74655268d 100644
+--- a/python/sglang/global_config.py
++++ b/python/sglang/global_config.py
+@@ -19,6 +19,7 @@ class GlobalConfig:
+         self.enable_precache_with_tracing = True
+         self.enable_parallel_encoding = True
+         self.enable_parallel_decoding = True
++        self.enable_dp_attention = False
+ 
+         # Choices: ["no_adjust", "adjust_cache"]
+         # no_adjust: Do not adjust the position embedding of KV cache.
+diff --git a/python/sglang/srt/layers/radix_attention.py b/python/sglang/srt/layers/radix_attention.py
+index 66d206082..af5821d7b 100644
+--- a/python/sglang/srt/layers/radix_attention.py
++++ b/python/sglang/srt/layers/radix_attention.py
+@@ -103,11 +103,20 @@ class RadixAttention(nn.Module):
+     def prefill_forward_flashinfer(self, q, k, v, input_metadata: InputMetadata):
+         self.store_kv_cache(k, v, input_metadata)
+ 
+-        o = input_metadata.flashinfer_prefill_wrapper.forward(
+-            q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
+-            input_metadata.token_to_kv_pool.kv_data[self.layer_id],
+-            logits_soft_cap=self.logit_cap,
+-        )
++        from sglang.global_config import global_config
++        if global_config.enable_dp_attention:
++            o = input_metadata.flashinfer_prefill_wrapper.forward(
++                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
++                input_metadata.token_to_kv_pool.kv_data[self.layer_id],
++                logits_soft_cap=self.logit_cap,
++                sm_scale=1.0 / (self.head_dim ** 0.5),
++            )
++        else:
++            o = input_metadata.flashinfer_prefill_wrapper.forward(
++                q.contiguous().view(-1, self.tp_q_head_num, self.head_dim),
++                input_metadata.token_to_kv_pool.kv_data[self.layer_id],
++                logits_soft_cap=self.logit_cap,
++            )
+ 
+         return o.view(-1, self.tp_q_head_num * self.head_dim)
+ 
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index c2fe5c6e3..edcaaf7e2 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -69,10 +69,9 @@ class InputMetadata:
+     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+ 
+     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
+-        self.kv_indptr = torch.empty(
++        self.kv_indptr = torch.zeros(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
+-        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_last_page_len = torch.ones(
+             (self.batch_size,), dtype=torch.int32, device="cuda"
+@@ -93,10 +92,9 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.empty(
++            self.qo_indptr = torch.zeros(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
+-            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+ 
+             self.flashinfer_prefill_wrapper.end_forward()
+@@ -126,8 +124,7 @@ class InputMetadata:
+ 
+     def init_extend_args(self):
+         self.extend_seq_lens = self.seq_lens - self.prefix_lens
+-        self.extend_start_loc = torch.empty_like(self.seq_lens)
+-        self.extend_start_loc[0] = 0
++        self.extend_start_loc = torch.zeros_like(self.seq_lens)
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.max_extend_len = int(torch.max(self.extend_seq_lens))
+ 
+@@ -150,8 +147,7 @@ class InputMetadata:
+         flashinfer_decode_wrapper=None,
+     ):
+         batch_size = len(req_pool_indices)
+-        start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
+-        start_loc[0] = 0
++        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+         start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+         total_num_tokens = int(torch.sum(seq_lens))
+         max_seq_len = int(torch.max(seq_lens))
+@@ -377,14 +373,17 @@ class ModelRunner:
+             else:
+                 use_tensor_cores = False
+ 
+-            workspace_buffer = torch.empty(
++            workspace_buffer_prefill = torch.empty(
++                128 * 1024 * 1024, dtype=torch.int8, device="cuda"
++            )
++            workspace_buffer_decode = torch.empty(
+                 128 * 1024 * 1024, dtype=torch.int8, device="cuda"
+             )
+             self.flashinfer_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+-                workspace_buffer, "NHD"
++                workspace_buffer_prefill, "NHD"
+             )
+             self.flashinfer_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+-                workspace_buffer, "NHD", use_tensor_cores=use_tensor_cores
++                workspace_buffer_decode, "NHD", use_tensor_cores=use_tensor_cores
+             )
+         else:
+             self.flashinfer_prefill_wrapper = self.flashinfer_decode_wrapper = None
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index e28530889..43d93aac3 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -203,10 +203,10 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
+     pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
+     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
+ 
+-    if server_args.dp_size == 1:
+-        start_process = start_controller_process_single
+-    else:
++    if server_args.dp_size > 1:
+         start_process = start_controller_process_multi
++    else:
++        start_process = start_controller_process_single
+     proc_router = mp.Process(
+         target=start_process,
+         args=(server_args, port_args, pipe_router_writer, model_overide_args),

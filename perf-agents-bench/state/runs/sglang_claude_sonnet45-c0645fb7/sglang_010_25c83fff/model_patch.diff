@@ -1,0 +1,102 @@
+diff --git a/docs/backend/server_arguments.md b/docs/backend/server_arguments.md
+index 36c44b57e..50b888cbf 100644
+--- a/docs/backend/server_arguments.md
++++ b/docs/backend/server_arguments.md
+@@ -221,3 +221,4 @@ Please consult the documentation below and [server_args.py](https://github.com/s
+ | `triton_attention_num_kv_splits` | Use to adjust the number of KV splits in triton kernels. | `8` |
+ | `flashinfer_mla_disable_ragged` | Disable the use of the [ragged prefill](https://github.com/flashinfer-ai/flashinfer/blob/5751fc68f109877f6e0fc54f674cdcdef361af56/docs/tutorials/kv_layout.rst#L26) wrapper for the FlashInfer MLA attention backend. Ragged prefill increases throughput by computing MHA instead of paged MLA when there is no prefix match. Only use it when FlashInfer is being used as the MLA backend. | `False` |
+ | `disable_chunked_prefix_cache` | Disable the use of chunked prefix cache for DeepSeek models. Only use it when FA3 is attention backend. | `False` |
++| `enable_dp_lm_head` | Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention. | `False` |
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 4958c6d04..9e7cabba0 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -177,7 +177,7 @@ class LogitsMetadata:
+         else:
+             dp_local_start_pos = cumtokens[dp_rank - 1]
+         dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+-        gathered_buffer = torch.zeros(
++        gathered_buffer = torch.empty(
+             (
+                 sum(self.global_num_tokens_for_logprob_cpu),
+                 hidden_states.shape[1],
+@@ -424,11 +424,10 @@ class LogitsProcessor(nn.Module):
+         """
+         if self.do_tensor_parallel_all_gather_dp_attn:
+             logits_metadata.compute_dp_attention_metadata(hidden_states)
+-            hidden_states, local_hidden_states = (
+-                logits_metadata.gathered_buffer,
+-                hidden_states.clone(),
+-            )
+-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
++            local_seq_len = hidden_states.shape[0]
++            src_hidden_states = hidden_states
++            hidden_states = logits_metadata.gathered_buffer
++            dp_gather_replicate(hidden_states, src_hidden_states, logits_metadata)
+ 
+         if hasattr(lm_head, "weight"):
+             logits = torch.matmul(
+@@ -447,7 +446,7 @@ class LogitsProcessor(nn.Module):
+         if self.do_tensor_parallel_all_gather_dp_attn:
+             logits, global_logits = (
+                 torch.empty(
+-                    (local_hidden_states.shape[0], logits.shape[1]),
++                    (local_seq_len, logits.shape[1]),
+                     device=logits.device,
+                     dtype=logits.dtype,
+                 ),
+diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
+index ebc148feb..c97c6505f 100644
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -463,7 +463,8 @@ class VocabParallelEmbedding(torch.nn.Module):
+         if not self.use_presharded_weights:
+             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+-        param[loaded_weight.shape[0] :].data.fill_(0)
++        if param.shape[0] > loaded_weight.shape[0]:
++            param[loaded_weight.shape[0] :].data.zero_()
+ 
+     def forward(self, input_):
+         if self.tp_size > 1:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index a797a7f3a..ae9933c50 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -75,6 +75,7 @@ global_server_args_dict = {
+     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
+     "enable_dp_attention": ServerArgs.enable_dp_attention,
+     "enable_ep_moe": ServerArgs.enable_ep_moe,
++    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
+     "enable_nan_detection": ServerArgs.enable_nan_detection,
+     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
+     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
+@@ -1024,14 +1025,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2e3b6c4df..9c604776a 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -159,6 +159,7 @@ class ServerArgs:
+     disable_overlap_schedule: bool = False
+     enable_mixed_chunk: bool = False
+     enable_dp_attention: bool = False
++    enable_dp_lm_head: bool = False
+     enable_ep_moe: bool = False
+     enable_deepep_moe: bool = False
+     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"

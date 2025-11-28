@@ -1,0 +1,215 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/managers/policy_scheduler.py b/python/sglang/srt/managers/policy_scheduler.py
+index 30a009c2e..5b00db1ac 100644
+--- a/python/sglang/srt/managers/policy_scheduler.py
++++ b/python/sglang/srt/managers/policy_scheduler.py
+@@ -18,27 +18,18 @@ limitations under the License.
+ import random
+ from collections import defaultdict
+ from contextlib import contextmanager
++from typing import List
+ 
+ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+ 
+ 
+ class PolicyScheduler:
+-    def __init__(
+-        self,
+-        policy,
+-        max_running_seqs,
+-        max_prefill_num_tokens,
+-        max_total_num_tokens,
+-        tree_cache,
+-    ):
+-        if tree_cache.disable and policy == "lpm":
+-            # LMP is meaningless when the tree cache is disabled.
++    def __init__(self, policy, tree_cache):
++        if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
++            # LPM and DFS-weight are meaningless when the tree cache is disabled.
+             policy = "fcfs"
+ 
+         self.policy = policy
+-        self.max_running_seqs = max_running_seqs
+-        self.max_prefill_num_tokens = max_prefill_num_tokens
+-        self.max_total_num_tokens = max_total_num_tokens
+         self.tree_cache = tree_cache
+ 
+     def get_priority_queue(self, waiting_queue):
+@@ -157,6 +148,9 @@ class PrefillAdder:
+ 
+     @contextmanager
+     def _lock_node(self, last_node):
++        if self.tree_cache.disable:
++            yield None
++            return
+         try:
+             delta = self.tree_cache.inc_lock_ref(last_node)
+             self.rem_total_tokens += delta
+@@ -187,7 +181,8 @@ class PrefillAdder:
+             ):
+                 # Non-chunked prefill
+                 self.can_run_list.append(req)
+-                self.tree_cache.inc_lock_ref(req.last_node)
++                if not self.tree_cache.disable:
++                    self.tree_cache.inc_lock_ref(req.last_node)
+                 self._prefill_one_req(
+                     prefix_len, input_tokens, req.sampling_params.max_new_tokens
+                 )
+@@ -201,7 +196,8 @@ class PrefillAdder:
+                 req.input_ids = req.input_ids[: len(req.prefix_indices) + trunc_len]
+                 self.can_run_list.append(req)
+                 self.new_inflight_req = req
+-                self.tree_cache.inc_lock_ref(req.last_node)
++                if not self.tree_cache.disable:
++                    self.tree_cache.inc_lock_ref(req.last_node)
+                 self._prefill_one_req(prefix_len, trunc_len, 0)
+ 
+         return True
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2489abd5d..3c6e9008d 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -363,13 +363,14 @@ class ScheduleBatch:
+         out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+ 
+         if out_cache_loc is None:
+-            if self.tree_cache is not None:
++            cache_enabled = self.tree_cache is not None and not getattr(self.tree_cache, "disable", False)
++            if cache_enabled:
+                 self.tree_cache.evict(num_tokens, self.token_to_kv_pool.free)
+                 out_cache_loc = self.token_to_kv_pool.alloc(num_tokens)
+ 
+             if out_cache_loc is None:
+                 logger.error("Prefill out of memory. Try to lower your batch size.")
+-                if self.tree_cache is not None:
++                if cache_enabled:
+                     self.tree_cache.pretty_print()
+                 exit(1)
+ 
+@@ -519,15 +520,16 @@ class ScheduleBatch:
+                 self.req_to_token_pool.free(req.req_pool_idx)
+ 
+                 # release the last node
+-                self.tree_cache.dec_lock_ref(req.last_node)
++                if not getattr(self.tree_cache, "disable", False):
++                    self.tree_cache.dec_lock_ref(req.last_node)
+ 
+-                # NOTE(lsyin): we should use the newly evictable memory instantly.
+-                residual_size = (
+-                    len(sorted_indices) * global_config.retract_decode_steps
+-                    - self.token_to_kv_pool.available_size()
+-                )
+-                residual_size = max(0, residual_size)
+-                self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
++                    # NOTE(lsyin): we should use the newly evictable memory instantly.
++                    residual_size = (
++                        len(sorted_indices) * global_config.retract_decode_steps
++                        - self.token_to_kv_pool.available_size()
++                    )
++                    residual_size = max(0, residual_size)
++                    self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+ 
+             req.prefix_indices = None
+             req.last_node = None
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 0228073c7..fc16af585 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -167,9 +167,6 @@ class ModelTpServer:
+         self.tree_cache_metrics = {"total": 0, "hit": 0}
+         self.scheduler = PolicyScheduler(
+             self.schedule_policy,
+-            self.max_running_requests,
+-            self.max_prefill_tokens,
+-            self.max_total_num_tokens,
+             self.tree_cache,
+         )
+         self.req_to_token_pool = self.model_runner.req_to_token_pool
+@@ -270,8 +267,10 @@ class ModelTpServer:
+                 self.new_token_ratio = global_config.init_new_token_ratio
+ 
+     def print_stats(self):
++        cache_disabled = getattr(self.tree_cache, "disable", False)
+         num_used = self.max_total_num_tokens - (
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
++            self.token_to_kv_pool.available_size()
++            + (0 if cache_disabled else self.tree_cache.evictable_size())
+         )
+         throughput = self.num_generated_tokens / (time.time() - self.last_stats_tic)
+         self.num_generated_tokens = 0
+@@ -287,8 +286,10 @@ class ModelTpServer:
+ 
+     def check_memory(self):
+         crash = os.getenv("CI", "false") == "true"
++        cache_disabled = getattr(self.tree_cache, "disable", False)
+         available_size = (
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
++            self.token_to_kv_pool.available_size()
++            + (0 if cache_disabled else self.tree_cache.evictable_size())
+         )
+         if available_size != self.max_total_num_tokens:
+             warnings.warn(
+@@ -385,9 +386,11 @@ class ModelTpServer:
+         # Get priority queue
+         self.waiting_queue = self.scheduler.get_priority_queue(self.waiting_queue)
+ 
++        cache_disabled = getattr(self.tree_cache, "disable", False)
+         adder = PrefillAdder(
+             self.tree_cache,
+-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size(),
++            self.token_to_kv_pool.available_size()
++            + (0 if cache_disabled else self.tree_cache.evictable_size()),
+             self.max_prefill_tokens,
+             self.chunked_prefill_size,
+         )
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index c23812049..8b72aa84b 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -91,17 +91,21 @@ class RadixCache(BasePrefixCache):
+ 
+     def cache_finished_req(self, req: "Req", token_ids=None):
+         """Cache request when it finishes."""
++        if self.disable:
++            # Early return to avoid unnecessary computation
++            kv_indices = self.req_to_token_pool.req_to_token[
++                req.req_pool_idx, : len(req.input_ids + req.output_ids) - 1
++            ]
++            self.token_to_kv_pool.free(kv_indices)
++            self.req_to_token_pool.free(req.req_pool_idx)
++            return
++        
+         if token_ids is None:
+             token_ids = (req.input_ids + req.output_ids)[:-1]
+         kv_indices = self.req_to_token_pool.req_to_token[
+             req.req_pool_idx, : len(token_ids)
+         ]
+ 
+-        if self.disable:
+-            self.token_to_kv_pool.free(kv_indices)
+-            self.req_to_token_pool.free(req.req_pool_idx)
+-            return
+-
+         # Radix Cache takes one ref in memory pool
+         new_prefix_len = self.insert(token_ids, kv_indices.clone())
+         self.token_to_kv_pool.free(kv_indices[len(req.prefix_indices) : new_prefix_len])
+@@ -169,6 +173,8 @@ class RadixCache(BasePrefixCache):
+                 heapq.heappush(leaves, x.parent)
+ 
+     def inc_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 0:
+@@ -179,6 +185,8 @@ class RadixCache(BasePrefixCache):
+         return delta
+ 
+     def dec_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 1:
