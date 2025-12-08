@@ -26,117 +26,61 @@ vllm_data = load_dataset('Inferencebench/vllm_dataset_with_test', split='test')
 
 ```
 OmniPerf-Bench/
-├── README.md                    # Main project documentation
-├── LICENSE                      # Project license
-├── pyproject.toml              # Python project configuration (gso package)
-├── uv.lock                     # Lock file for uv package manager
-├── requirements.txt            # Python dependencies
+├── README.md                      # Main documentation
+├── CLAUDE.md                      # AI assistant guidance
+├── requirements.txt               # Python dependencies
 │
-├── 🚀 commit_to_dataset.py     # 🔥 Main entry point: Single-commit dataset pipeline
-├── experiments.yaml            # Example experiment configuration
-├── 8d75fe48_test_case_generator_v2.py  # Example test generator script
-├── eg_test_generator.txt       # Example prompt template
+├── commit_to_dataset.py           # 🔥 Main entry: dataset generation
+├── run_commit_optimization.py     # Single commit runner
+├── batch_commit_optimization.py   # Batch processing
 │
-├── src/                        # Main OmniPerf-Bench source code
-│   ├── collect/                # Collection framework for dataset generation
-│   │   ├── analysis/           # Commit and API analysis modules
-│   │   │   ├── commits.py      # Performance commit extraction
-│   │   │   ├── apis.py         # API identification and mapping
-│   │   │   ├── parser.py       # Code parsing utilities
-│   │   │   └── retriever.py    # RAG-based code retrieval
-│   │   ├── execute/            # Test execution and evaluation
-│   │   │   ├── execute.py      # SkyPilot-based distributed execution
-│   │   │   ├── evaluate.py     # Performance evaluation and metrics
-│   │   │   └── skymgr.py       # Sky cluster management
-│   │   ├── generate/           # Performance test generation
-│   │   │   ├── generate.py     # Main test generation pipeline
-│   │   │   ├── context.py      # Context extraction for tests
-│   │   │   └── prompt.py       # LLM prompts for test generation
-│   │   ├── scripts/            # Collection utility scripts
-│   │   └── build_dataset.py    # Main dataset building script
-│   ├── data/                   # Data models and parsing utilities
-│   │   ├── commit.py           # Commit data structures
-│   │   ├── dataset.py          # Dataset handling and validation
-│   │   ├── problem.py          # Problem instance definitions
-│   │   └── perf.py             # Performance measurement utilities
-│   ├── harness/                # Evaluation harness for performance testing
-│   │   ├── environment/        # Docker environment management
-│   │   │   ├── docker_build.py # Docker image building
-│   │   │   └── patches.py      # Environment patches
-│   │   ├── grading/            # Grading and metrics evaluation
-│   │   │   ├── grade.py        # Performance grading logic
-│   │   │   └── metrics.py      # Evaluation metrics
-│   │   ├── plot/               # Visualization and plotting tools
-│   │   │   ├── plot_opt_k.py   # Opt@K performance plots
-│   │   │   └── plot_speedups.py # Speedup visualization
-│   │   ├── opt_at_k.py         # Main evaluation runner (Opt@K)
-│   │   ├── prepare_images.py   # Docker image preparation
-│   │   └── run_evaluation.py   # Evaluation orchestration
-│   ├── test_scripts/           # Test generation and analysis scripts
-│   │   ├── generate_test_generators.py # LLM test generator creation
-│   │   ├── performance_analyzer.py     # Performance analysis tools
-│   │   └── commit_analyzer.py          # Commit analysis utilities
-│   ├── utils/                  # General utility functions
-│   │   ├── io.py               # I/O utilities
-│   │   ├── multiprocess.py     # Multiprocessing helpers
-│   │   └── patch_parser.py     # Patch parsing utilities
-│   ├── constants.py            # Project constants
-│   └── logger.py              # Logging configuration
+├── src/                           # Core framework
+│   ├── collect/                   # Dataset generation pipeline
+│   ├── harness/                   # Docker-based Opt@K evaluation
+│   └── test_scripts/              # LLM test generation
 │
-├── data/                       # Generated datasets
-│   ├── Inferencebench.jsonl    # Inference benchmark dataset
-│   └── vllm_dataset_with_test.jsonl # vLLM performance dataset (282 problems)
+├── perf-agents-bench/             # Agent evaluation framework
+│   ├── bench/                     # CLI (plan/prepare/report)
+│   ├── tasks/                     # Task configs (vllm.yaml, sglang.yaml)
+│   ├── state/                     # Plans and run journals
+│   ├── docs/                      # Framework-specific guides
+│   └── tests/                     # Test files
 │
-├── docs/                       # Documentation
-│   └── dataset_schema.md       # Canonical dataset schema specification
+├── agents/                        # Agent configurations
+│   └── codex/                     # Codex CLI wrapper & config
 │
-├── third-party/               # External dependencies
-│   └── effibench/             # Original EffiBench repository integration
-│       ├── src/               # EffiBench source code
-│       ├── data/              # EffiBench datasets
-│       ├── prompts/           # LLM prompts for EffiBench
-│       └── requirements.txt   # EffiBench dependencies
+├── data/                          # Final datasets only
+│   ├── vllm_dataset_with_test.jsonl
+│   └── Inferencebench.jsonl
 │
-├── tools/                     # Utility scripts and patches
-│   ├── manual_review.py       # Manual dataset review utilities
-│   └── openrouter_patch.py    # OpenRouter API patches
+├── inputs/                        # Input data for pipelines
+│   └── experiments/               # Commit extractions & test generators
 │
-└── misc/                      # Experimental data and results
-    ├── experiments/           # Experimental data and configurations
-    │   ├── commit_extractions/ # Extracted commit data (64 JSON files)
-    │   ├── commit_extractions_with_apis/ # Commit data with API mappings
-    │   ├── generated_test_generators_v4/ # Latest LLM test generators
-    │   ├── vllm/              # vLLM experiment data and results
-    │   │   ├── data/          # vLLM training data (parquet files)
-    │   │   ├── divided/       # Split result files for parallel processing
-    │   │   └── *.json         # vLLM experiment configurations and results
-    │   ├── sglang.yaml        # SGLang experiment configuration
-    │   └── vllm.yaml          # vLLM experiment configuration
-    └── results/               # Analysis results, logs, and reviews
-        ├── logs/              # Execution and system logs
-        └── reviews/           # Manual review files (CSV format)
+├── configs/                       # Pipeline configurations
+├── scripts/                       # Runnable scripts
+│   ├── analysis/                  # Analysis scripts
+│   └── runners/                   # Shell scripts
+│
+├── docs/                          # Documentation & results
+│   ├── analysis/                  # Run analysis & visualizations
+│   ├── results/                   # Experiment results
+│   └── plans/                     # Implementation plans
+│
+├── tools/                         # Utility scripts
+├── third-party/                   # External dependencies
+│   ├── effibench/                 # EffiBench integration
+│   └── trae-agent/                # TRAE agent (auto-cloned)
+│
+└── paper/                         # ICML paper
 ```
 
-**🎯 Repository Organization Philosophy:**
-
-This repository follows a **"no duplicates, clear entry points"** structure:
-
-- **Root level** - Main entry points and configuration files
-- **`commit_to_dataset.py`** - 🔥 **PRIMARY ENTRY POINT** for single-commit dataset creation
-- **`src/`** - Organized source code by functionality (collect, harness, data, utils)  
-- **`misc/`** - Experimental data and working files (preserved as-is for research)
-- **`data/`** - Generated datasets ready for consumption
-- **`docs/`** - Documentation and schemas
-
 **Key Components:**
-- **`commit_to_dataset.py`** - 🚀 **Main script**: Streamlined single-commit to dataset conversion  
-- **`src/collect/`** - Multi-stage dataset generation pipeline (commit extraction → API mapping → test generation → execution)
-- **`src/harness/`** - Docker-based evaluation system with Opt@K metrics and visualization
-- **`src/data/`** - Core data models and schema validation
-- **`experiments.yaml`** - Example configuration that works out-of-the-box
-- **`data/`** - Generated benchmark datasets ready for use
-- **`docs/dataset_schema.md`** - Canonical schema supporting GSO/SWE-Perf export views
-- **`misc/experiments/`** - Real experimental data including 64 extracted commits and vLLM dataset (282 problems)
+- **`commit_to_dataset.py`** - Dataset generation from commit extractions
+- **`perf-agents-bench/`** - Agent evaluation (OpenHands, TRAE, Codex)
+- **`src/harness/`** - Docker-based Opt@K evaluation
+- **`agents/`** - Agent configurations
+- **`inputs/`** - Commit extractions and test generators
+- **`docs/analysis/`** - Experiment results and visualizations
 
 ## 🚀 setup
 
@@ -148,22 +92,12 @@ This repository follows a **"no duplicates, clear entry points"** structure:
 
 ### Cloning the Repository
 
-This repository uses Git submodules for external dependencies. You must clone with the `--recursive` flag to get all required components:
-
 ```bash
-# Clone repository with submodules (REQUIRED)
-git clone --recursive git@github.com:thekernelcompany/OmniPerf-Bench.git
+git clone git@github.com:thekernelcompany/OmniPerf-Bench.git
 cd OmniPerf-Bench
 ```
 
-**Important:** If you already cloned without `--recursive`, initialize submodules with:
-```bash
-git submodule update --init --recursive
-```
-
-**Submodules included:**
-- `vllm/` - Modified vLLM fork with OmniPerf-Bench integration
-- `third-party/trae-agent/` - TRAE agent integration for automated optimization
+**Note:** Target repositories (vLLM, SGLang) are cloned on-demand when running agents - no submodules required for them.
 
 ### Option 1: Using uv (recommended)
 ```bash
@@ -649,18 +583,13 @@ python -m bench.cli prepare \
 
 **Before running, ensure TRAE is properly configured:**
 
-1. **Initialize TRAE submodule:**
+1. **Install TRAE agent (auto-clones if needed):**
    ```bash
-   git submodule update --init --recursive third-party/trae-agent
+   ./scripts/install_trae_integration.sh
    ```
+   This script automatically clones `trae-agent` if not present and installs all dependencies.
 
-2. **Install TRAE agent:**
-   ```bash
-   source bench-env/bin/activate
-   uv pip install -e third-party/trae-agent
-   ```
-
-3. **Configure TRAE for OpenAI:**
+2. **Configure TRAE for OpenAI:**
    
    Edit `third-party/trae-agent/trae_config.yaml`:
    ```yaml
@@ -690,7 +619,7 @@ python -m bench.cli prepare \
            parallel_tool_calls: true
    ```
 
-4. **Update bench.yaml paths:**
+3. **Update bench.yaml paths:**
    
    Edit `perf-agents-bench/bench.yaml`:
    ```yaml

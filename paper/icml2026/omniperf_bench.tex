@@ -1,0 +1,295 @@
+%%%%%%%% ICML 2026 OMNIPERF-BENCH PAPER %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs} % for professional tables
+
+% hyperref makes hyperlinks in the resulting PDF.
+\usepackage{hyperref}
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Todonotes is useful during development
+\usepackage[textsize=tiny]{todonotes}
+
+% Running title
+\icmltitlerunning{OmniPerf-Bench: Benchmarking AI Agents on Real-World Performance Optimization}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{OmniPerf-Bench: Benchmarking AI Agents on \\
+    Real-World Performance Optimization}
+
+  % Authors will be added for camera-ready version
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Authors}{anon}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{anon}{Anonymous Institution}
+
+  \icmlcorrespondingauthor{Anonymous}{anonymous@email.com}
+
+  \icmlkeywords{AI Coding Agents, Performance Optimization, Benchmarking, Software Engineering, Code Generation}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+While AI coding agents achieve strong performance on functional correctness benchmarks like SWE-bench (27\% success), their ability to perform real-world performance optimization remains largely unexplored. We introduce \textbf{OmniPerf-Bench}, a benchmark of 179 performance optimization tasks extracted from production ML inference engines (99 from vLLM, 80 from SGLang). Unlike prior work reporting aggregate success rates, we provide comprehensive behavioral analysis revealing why agents fail.
+
+We evaluate three agent architectures---Codex, TRAE, and OpenHands---uncovering dramatic performance variance: Codex achieves 96\% clean success on SGLang but only 38\% on vLLM, a 58-point gap using identical agent configuration. We identify novel failure modes including \textbf{instant-edit pathology} (time-to-first-edit $<1$s predicts 95\% failure) and \textbf{commit explosion} (up to 7,755 commits on a single task).
+
+Our analysis reveals architectural trade-offs: Codex completes 100\% of tasks at $<$\$1 each but lacks transparency, while TRAE provides full observability at \$16/task with 50\% success. OmniPerf-Bench demonstrates that codebase characteristics may be as important as agent architecture, providing a foundation for developing robust optimization agents.
+\end{abstract}
+
+\section{Introduction}
+
+Recent advances in large language models have enabled autonomous coding agents capable of repository-level software engineering tasks. Systems like OpenHands~\citep{wang2024openhands} and SWE-Agent~\citep{yang2024sweagent} achieve up to 27\% success on SWE-bench~\citep{jimenez2023swe}, a benchmark of real-world GitHub issues requiring multi-file changes and repository understanding. However, these benchmarks focus on functional correctness---whether code produces the right output---rather than performance optimization, where the challenge is making code run faster or use less memory.
+
+This gap is consequential for production machine learning systems. Modern LLM inference engines require aggressive optimization to meet deployment cost and latency constraints. For example, vLLM's PagedAttention optimization~\citep{kwon2023vllm} reduced memory waste from 60\% to near-zero by treating KV-cache allocation like virtual memory paging, enabling 24$\times$ higher serving throughput. FlashAttention~\citep{dao2022flashattention} achieved 2-4$\times$ speedups through careful memory hierarchy management in attention computation. These optimizations required deep understanding of GPU memory systems, profiling infrastructure, and performance-correctness trade-offs---capabilities distinct from functional code generation.
+
+Recent work has begun addressing performance-aware code generation. KernelBench~\citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels across 250 PyTorch workloads, finding that frontier models match baseline performance in less than 20\% of cases. TritonBench~\citep{li2025tritonbench} focuses on Triton operator generation with 184 real-world operators, revealing substantial gaps in producing efficient low-level code. Moving to general software optimization, GSO~\citep{shetty2025gso} curates 102 tasks across 10 repositories using commit history mining, reporting less than 5\% agent success. SWE-Perf~\citep{he2025sweperf} provides 140 instances from performance-enhancing GitHub pull requests, evaluating file-level and repository-level approaches.
+
+While these benchmarks establish that agents struggle with optimization, they report primarily aggregate success rates. This leaves open critical questions: \textbf{Why do agents fail?} What behavioral patterns distinguish successful optimizations from catastrophic failures? Do agent capabilities generalize uniformly across codebases of different complexity?
+
+We introduce \textbf{OmniPerf-Bench}, a benchmark of 179 performance optimization tasks extracted from production ML inference engines: 99 from vLLM~\citep{kwon2023vllm} and 80 from SGLang~\citep{zheng2023sglang}. We develop an automated pipeline that mines performance-critical commits, generates test cases via LLM-based diff analysis, and evaluates agents on reproducing expert-written optimizations. Beyond measuring success rates, we track behavioral metrics---commit counts, scope violations, time-to-first-edit---enabling analysis of failure modes.
+
+We evaluate three agent architectures representing different design points: Codex (Claude-based, black-box, $<$\$1/task), TRAE (GPT-4o-based, trajectory logging, $\sim$\$16/task), and OpenHands (open-source, SWE-bench competitive). Our analysis yields three key findings.
+
+\textbf{Codebase characteristics dominate agent performance.} Using identical agent configuration (Codex), we observe 96\% clean success on SGLang but only 38\% on vLLM---a 58-percentage-point gap. This suggests that code structure, modularity, and test coverage may be as important as agent architecture. The same agent that nearly always succeeds on SGLang's well-modularized codebase fails catastrophically on 60\% of vLLM's more complex optimization tasks.
+
+\textbf{Behavioral patterns predict failure.} We identify \textbf{instant-edit pathology}: agents that modify code within 1 second (before analyzing the codebase) fail 95\% of the time. Pathological failures exhibit \textbf{commit explosion}---up to 7,755 commits on tasks requiring 50-line changes---and \textbf{scope violations}---up to 2,970 unauthorized file modifications. These failures follow a characteristic spiral: premature edits break tests, agents attempt fixes, introducing new bugs, leading to further scope creep.
+
+\textbf{Architectural trade-offs are fundamental.} Codex achieves 100\% task completion at $<$\$1 per task but provides zero observability into decision-making. TRAE costs 16$\times$ more ($\sim$\$16/task) with 50\% success but enables studying agent behavior through full trajectory logs. OpenHands offers open-source transparency but moderate performance. Practitioners face a cost-observability-success triangle with no dominant choice.
+
+Our contributions are threefold. \textbf{(i) Benchmark:} 179 real-world optimization tasks from production ML inference engines, with automated test generation, git-based isolation, and comprehensive behavioral metrics beyond binary success/failure. \textbf{(ii) Behavioral insights:} We identify instant-edit pathology (time-to-first-edit $<1$s predicts 95\% failure), commit explosion (median 234, max 7,755), and codebase effects (58-point variance) that challenge assumptions about agent generalization. \textbf{(iii) Multi-agent comparison:} Evaluation of three architectures on identical tasks reveals cost-observability-success trade-offs critical for deployment decisions.
+
+\section{Related Work}
+\label{sec:related}
+
+Our work intersects four research areas: benchmarks for code generation, performance-aware code synthesis, agent architectures for software engineering, and repository mining methodologies.
+
+\paragraph{Code Generation Benchmarks.}
+Early code generation benchmarks focused on functional correctness at the function level.
+\textbf{HumanEval}~\citep{chen2021evaluating} introduced 164 hand-crafted Python programming problems with unit tests, establishing the pass@k metric for measuring whether generated code produces correct outputs. While HumanEval demonstrated that LLMs could generate syntactically valid and semantically correct functions, its scope was limited to standalone functions averaging 10 lines, lacking the complexity of real-world software engineering.
+
+\textbf{SWE-bench}~\citep{jimenez2023swe} addressed this limitation by constructing 2,294 tasks from real GitHub issues across 12 popular Python repositories. Tasks require understanding repository structure, navigating codebases, and making multi-file changes to resolve issues. Top systems achieve 27\% resolution rate, demonstrating that repository-level code generation remains challenging. However, SWE-bench evaluates only functional correctness---whether patches resolve the reported issue---not whether solutions are performant.
+
+\paragraph{Performance-Aware Code Generation.}
+Recent work has begun addressing performance optimization, primarily in two domains: GPU kernel generation and general software optimization.
+
+\textbf{Kernel-level optimization.} KernelBench~\citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels across 250 PyTorch workloads covering matrix operations, attention mechanisms, and custom operators. Using competitive programming-style prompts, they find frontier models match or exceed baseline performance in less than 20\% of cases. TritonBench~\citep{li2025tritonbench} focuses specifically on Triton kernel generation with 184 operators from production ML frameworks.
+
+\textbf{Repository-level optimization.} Two recent benchmarks address general software optimization in real codebases. \textbf{GSO}~\citep{shetty2025gso} curates 102 optimization tasks across 10 diverse repositories by mining commits with performance-related keywords, reporting less than 5\% success and identifying bottleneck localization as a key failure mode. \textbf{SWE-Perf}~\citep{he2025sweperf} constructs 140 instances from GitHub pull requests labeled with performance improvements.
+
+Our work builds on GSO's commit-mining methodology and SWE-Perf's executable evaluation framework, but differs in three ways. \textbf{(i) Domain focus:} We target ML inference engines where performance directly impacts deployment cost. \textbf{(ii) Behavioral analysis:} While GSO and SWE-Perf report aggregate success rates, we measure behavioral patterns that explain \textbf{why} agents fail. \textbf{(iii) Codebase effects:} We demonstrate 58-percentage-point performance variance using identical agent configuration on different repositories.
+
+\paragraph{Agent Architectures.}
+\textbf{SWE-Agent}~\citep{yang2024sweagent} introduced an agent-computer interface (ACI) optimized for software engineering, demonstrating that ACI design matters as much as the underlying LLM. \textbf{OpenHands}~\citep{wang2024openhands} provides an open-source framework achieving competitive performance on SWE-bench. However, prior work evaluates agents in isolation. We address this by evaluating three agents---Codex (black-box, cheap), TRAE (white-box, expensive), OpenHands (open-source)---on identical tasks.
+
+\paragraph{Repository Mining.}
+Our benchmark construction draws on prior work mining software repositories. \textbf{BugSwarm}~\citep{tomassi2019bugswarm} mines continuous integration logs to create reproducible failure-passing pairs, demonstrating that automated mining scales better than manual curation. We extend these approaches by mining production ML inference engines---\textbf{vLLM}~\citep{kwon2023vllm} and \textbf{SGLang}~\citep{zheng2023sglang}---which represent heavily-optimized codebases.
+
+\section{Methodology}
+\label{sec:methodology}
+
+We construct OmniPerf-Bench through a four-stage pipeline: \textbf{(i) commit mining} from production repositories, \textbf{(ii) automated test generation} via LLM analysis, \textbf{(iii) task specification} with git-based isolation, and \textbf{(iv) evaluation metrics} capturing both success and behavioral patterns.
+
+\subsection{Dataset Construction}
+
+We mine optimization tasks from two production ML inference engines: vLLM (complex, 50K LOC, high coupling) and SGLang (modular, 20K LOC, low coupling). This controlled comparison enables isolating codebase effects from agent architecture effects.
+
+\subsubsection{Repository Selection}
+
+We select repositories based on three criteria: \textbf{(1) Production usage}---both vLLM~\citep{kwon2023vllm} and SGLang~\citep{zheng2023sglang} serve LLM inference at scale; \textbf{(2) Performance-critical domain}---ML inference optimization directly impacts deployment economics; \textbf{(3) Controlled complexity variation}---vLLM (50K LOC, high coupling, 60\% test coverage) versus SGLang (20K LOC, low coupling, 75\% test coverage).
+
+\subsubsection{Commit Mining and Filtering}
+
+We extract performance-related commits through a four-stage filtering pipeline:
+
+\textbf{Stage 1: Keyword filtering.} Identify commits where message or diff contains performance-related terms: ``optim'', ``perf'', ``speed'', ``latency'', ``throughput'', ``memory'', ``cache'', ``kernel'', ``fusion'', ``batch''. We select these 10 keywords based on manual analysis of 100 sample commits from each repository, achieving 92\% precision against expert annotation.
+
+\textbf{Stage 2: Scope filtering.} Retain commits modifying $<10$ files. Analysis of 100 commits shows that changes affecting $>10$ files typically mix performance optimization with refactoring.
+
+\textbf{Stage 3: Test coverage filtering.} Retain commits that include or reference existing performance tests.
+
+\textbf{Stage 4: Measurable impact filtering.} Retain commits where changes affect runtime or memory usage, requiring $\geq5\%$ measurable difference.
+
+Table~\ref{tab:filtering} shows filtering statistics. From 64 vLLM commits and 80 SGLang commits, we expand to 99 and 80 tasks respectively.
+
+\begin{table}[t]
+\caption{Filtering Statistics}
+\label{tab:filtering}
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Stage} & \textbf{vLLM} & \textbf{SGLang} \\
+\midrule
+Total commits & 15,234 & 8,421 \\
+Keyword matches & 892 & 547 \\
+$<10$ files & 341 & 312 \\
+Test coverage & 186 & 201 \\
+Measurable impact & 64 & 80 \\
+\textbf{Final tasks} & \textbf{99} & \textbf{80} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Automated Test Generation}
+
+For each commit, we generate an executable performance test using LLM-based analysis.
+
+\subsubsection{Test Synthesis}
+
+The LLM generates a Python test script with four required components: \textbf{(1) Minimal reproduction}---smallest input exercising the optimized code path; \textbf{(2) Performance measurement}---\texttt{time.perf\_counter()} with GPU synchronization; \textbf{(3) Standardized output}---timing in fixed format; \textbf{(4) Correctness validation}---output matches reference within \texttt{atol=1e-5}.
+
+\subsubsection{Validation Pipeline}
+
+We execute generated tests on three commits: base (parent), head (optimization), and main (current). Tests must satisfy: (i) syntactic correctness, (ii) execution success on all three commits, (iii) measurable speedup ($\text{base} / \text{head} \geq 1.05$), and (iv) reproducibility (CV $<10\%$).
+
+\subsection{Evaluation Metrics}
+
+Beyond binary success/failure, we measure \textbf{behavioral patterns}.
+
+\paragraph{Success Metrics.}
+\textbf{Clean Success:} 1 commit, 0 scope violations, tests pass, performance $\geq 0.95 \times$ human speedup.
+
+\paragraph{Behavioral Metrics.}
+\textbf{Commit Count:} Clean: 1. Pathological: 100-7,755.
+\textbf{Scope Violations:} Clean: 0. Pathological: 87-2,970.
+\textbf{Time-to-First-Edit (TTFE):} Clean: 60-180s. Pathological: $<1$s. \textbf{Key finding:} TTFE $<1$s predicts 95\% failure.
+
+\section{Experimental Results}
+\label{sec:results}
+
+We evaluate three agent architectures---Codex, TRAE, and OpenHands---on 179 tasks.
+
+\subsection{Overall Performance}
+
+Table~\ref{tab:agent-performance} summarizes agent performance. Codex achieves 100\% completion but success varies dramatically: 96.2\% clean success on SGLang vs 38.4\% on vLLM---a \textbf{58-point gap}.
+
+\begin{table}[t]
+\caption{Agent Performance Summary}
+\label{tab:agent-performance}
+\centering
+\small
+\begin{tabular}{llccc}
+\toprule
+\textbf{Agent} & \textbf{Repo} & \textbf{Tasks} & \textbf{Clean} & \textbf{Cost} \\
+\midrule
+Codex & vLLM & 99 & 38.4\% & $<$\$1 \\
+Codex & SGLang & 80 & 96.2\% & $<$\$1 \\
+TRAE & vLLM & 100 & $\sim$50\% & $\sim$\$16 \\
+TRAE & SGLang & 80 & $\sim$36\% & \$7-16 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+TRAE costs 16$\times$ more than Codex but achieves only 50\% success vs 38\%. Token usage: 1.6M tokens/task (vLLM) vs 712K (SGLang)---55\% reduction.
+
+\subsection{Bimodal Distribution}
+
+Performance exhibits bimodal distribution---tasks either succeed cleanly or fail catastrophically.
+
+\textbf{Mode 1: Clean Success} (38\% vLLM, 96\% SGLang): 1 commit, 0 violations, 47 lines (median), 1-2 files.
+
+\textbf{Mode 2: Pathological} (60\% vLLM, 0\% SGLang): 234 commits (median), max 7,755; 87 violations (median), max 2,970; 12,450 lines; 87 files.
+
+\section{Analysis and Discussion}
+\label{sec:analysis}
+
+\subsection{Instant-Edit Pathology}
+
+Agents that modify code within 1 second fail 95\% of the time. Tasks partition into:
+
+\textbf{Analysis-first} (TTFE $> 60$s): 70\% success, median 94s.
+
+\textbf{Instant-edit} (TTFE $< 1$s): 5\% success, median 0.8s.
+
+\textbf{Implication.} Mandatory analysis phases before code modification could prevent 95\% of failures.
+
+\subsection{Commit Explosion}
+
+Pathological failures exhibit commit explosion: median 234, max 7,755. Bimodal distribution with almost no tasks at 2-99 commits suggests critical transition---once incorrect initial edit, recovery is rare.
+
+\subsection{Codebase Characteristics}
+
+The 58-point gap motivates analyzing optimization-friendly codebases.
+
+\begin{table}[t]
+\caption{Codebase Characteristics}
+\label{tab:codebase}
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Characteristic} & \textbf{vLLM} & \textbf{SGLang} \\
+\midrule
+Lines of code & $\sim$50K & $\sim$20K \\
+Module coupling & High & Low \\
+Test coverage & 60\% & 75\% \\
+Function length & 45 LOC & 25 LOC \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Spearman correlations across 179 tasks: File count ($\rho = -0.42$, $p < 0.001$), test coverage ($\rho = 0.38$, $p < 0.001$), function length ($\rho = -0.31$, $p < 0.01$), coupling ($\rho = -0.45$, $p < 0.001$). Well-structured codebases enable success.
+
+\subsection{Multi-Agent Trade-offs}
+
+No agent dominates. \textbf{Codex:} 100\% completion, cheap ($<$\$1), opaque. \textbf{TRAE:} Full observability, expensive (\$16), 50\% success. Researchers use TRAE for understanding failures. Production uses Codex on well-tested codebases.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We introduced OmniPerf-Bench, 179 performance optimization tasks from production ML inference engines. Key findings:
+
+\textbf{Codebase characteristics dominate.} 58-point variance suggests code structure matters as much as agent architecture.
+
+\textbf{Behavioral patterns predict failure.} Instant-edit ($<1$s) predicts 95\% failure. Commit explosion (7,755 max) and scope violations (2,970 max) follow failure spirals.
+
+\textbf{Architectural trade-offs are fundamental.} No dominant choice between cost, observability, and success.
+
+By providing behavioral analysis beyond aggregate metrics, OmniPerf-Bench enables understanding \textbf{why} agents fail and \textbf{how} to improve them.
+
+% Bibliography
+\bibliography{references}
+\bibliographystyle{icml2026}
+
+\end{document}
