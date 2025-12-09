@@ -1,4 +1,13 @@
 """
+DEPRECATED: Use run_omniperf.py instead.
+
+    python run_omniperf.py configs/omniperf.yaml
+
+See configs/omniperf.yaml for the new configuration format.
+This script is kept for backwards compatibility but will be removed in a future version.
+
+---
+
 Create canonical OmniPerf-Bench dataset records for all commits in the extractions directory
 and (optionally) export SWE-Perf/GSO compatible views, with optional push to Hugging Face.
 
@@ -38,6 +47,14 @@ Requires:
 """
 
 from __future__ import annotations
+
+import warnings
+warnings.warn(
+    "commit_to_dataset.py is deprecated. Use: python run_omniperf.py config.yaml\n"
+    "See configs/omniperf.yaml for the new configuration format.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import json
 import logging

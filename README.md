@@ -22,6 +22,51 @@ gso = load_dataset('gso-bench/gso', split='test')
 vllm_data = load_dataset('Inferencebench/vllm_dataset_with_test', split='test')
 ```
 
+## 🆕 New Modular Architecture (v0.2.0)
+
+OmniPerf-Bench now has a clean, modular architecture:
+
+```
+src/omniperf/
+├── data/       # Data models (CommitExtraction, DatasetRecord)
+├── input/      # Loaders (JSON files, HuggingFace)
+├── generate/   # LLM test generation (OpenAI/Anthropic/Bedrock)
+├── execute/    # Pluggable executors (local, Modal, cloud)
+├── build/      # Dataset building
+├── pipeline.py # Main orchestrator
+└── cli.py      # Command-line interface
+```
+
+### Quick Start (New)
+
+```bash
+# Edit config with your paths
+cp configs/omniperf.yaml my_config.yaml
+# Edit my_config.yaml
+
+# Run pipeline
+python run_omniperf.py my_config.yaml
+
+# Dry run (validate config)
+python run_omniperf.py my_config.yaml --dry-run
+```
+
+### Configuration
+
+See `configs/omniperf.yaml` for all options:
+
+```yaml
+input_source: "inputs/experiments/commit_extractions_with_apis"  # or hf://repo/name
+repo_path: "/path/to/repo"
+llm_provider: "openai"  # openai, anthropic, bedrock
+llm_model: "gpt-4o-mini"
+executor: "local"  # local, modal (future), skypilot (future)
+output_dir: "data"
+dataset_name: "my_dataset"
+```
+
+---
+
 ## 📁 repository structure
 
 ```
@@ -30,11 +75,20 @@ OmniPerf-Bench/
 ├── CLAUDE.md                      # AI assistant guidance
 ├── requirements.txt               # Python dependencies
 │
-├── commit_to_dataset.py           # 🔥 Main entry: dataset generation
+├── run_omniperf.py                # 🔥 NEW: Main entry point
+├── commit_to_dataset.py           # (deprecated) Old entry point
 ├── run_commit_optimization.py     # Single commit runner
 ├── batch_commit_optimization.py   # Batch processing
 │
 ├── src/                           # Core framework
+│   ├── omniperf/                  # 🆕 NEW: Modular package
+│   │   ├── data/                  # Data models
+│   │   ├── input/                 # Input loaders
+│   │   ├── generate/              # Test generation
+│   │   ├── execute/               # Execution backends
+│   │   ├── build/                 # Dataset building
+│   │   ├── pipeline.py            # Orchestrator
+│   │   └── cli.py                 # CLI
 │   ├── collect/                   # Dataset generation pipeline
 │   ├── harness/                   # Docker-based Opt@K evaluation
 │   └── test_scripts/              # LLM test generation
@@ -75,7 +129,8 @@ OmniPerf-Bench/
 ```
 
 **Key Components:**
-- **`commit_to_dataset.py`** - Dataset generation from commit extractions
+- **`run_omniperf.py`** - 🆕 NEW main entry point for dataset generation
+- **`src/omniperf/`** - 🆕 NEW modular package (data, input, generate, execute, build)
 - **`perf-agents-bench/`** - Agent evaluation (OpenHands, TRAE, Codex)
 - **`src/harness/`** - Docker-based Opt@K evaluation
 - **`agents/`** - Agent configurations
