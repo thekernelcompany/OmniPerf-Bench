@@ -17,9 +17,21 @@ OmniPerf-Bench is a **performance optimization benchmark framework** with two pi
 
 ## Essential Commands
 
-### Dataset Generation
+### Dataset Generation (NEW - v0.2.0)
 ```bash
-# Main entry point - processes all commits in extractions_dir
+# NEW: Main entry point using modular architecture
+python run_omniperf.py configs/omniperf.yaml
+
+# Dry run (validate config)
+python run_omniperf.py configs/omniperf.yaml --dry-run
+
+# Verbose mode
+python run_omniperf.py configs/omniperf.yaml -v
+```
+
+### Dataset Generation (Legacy - deprecated)
+```bash
+# DEPRECATED: Old entry point (still works but shows warning)
 python commit_to_dataset.py configs/experiments.yaml
 
 # Single commit (for debugging)
@@ -86,13 +98,22 @@ export TRAE_CONFIG=/path/to/trae_config.yaml
 
 ```
 OmniPerf-Bench/
-├── commit_to_dataset.py          # Main dataset generation entry
+├── run_omniperf.py               # NEW: Main entry point (v0.2.0)
+├── commit_to_dataset.py          # DEPRECATED: Old entry point
 ├── run_commit_optimization.py    # Single commit runner
 │
 ├── src/                          # Core framework
-│   ├── collect/                  # Dataset generation pipeline
+│   ├── omniperf/                 # NEW: Modular package (v0.2.0)
+│   │   ├── data/                 # Data models (CommitExtraction, DatasetRecord)
+│   │   ├── input/                # Loaders (JSON, HuggingFace)
+│   │   ├── generate/             # LLM test generation
+│   │   ├── execute/              # Pluggable executors (local, modal, cloud)
+│   │   ├── build/                # Dataset building
+│   │   ├── pipeline.py           # Main orchestrator
+│   │   └── cli.py                # CLI
+│   ├── collect/                  # Dataset generation pipeline (legacy)
 │   ├── harness/                  # Docker-based Opt@K evaluation
-│   └── test_scripts/             # LLM test generation
+│   └── test_scripts/             # LLM test generation (legacy)
 │
 ├── perf-agents-bench/            # Agent evaluation framework
 │   ├── bench/                    # CLI (plan/prepare/report)
