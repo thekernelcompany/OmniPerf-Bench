@@ -305,5 +305,116 @@ def build(task: str, bench_cfg: str = "bench.yaml", include_agent: bool = False)
         typer.echo(f"Build error: {e}")
         raise typer.Exit(1)
 
+
+@app.command()
+def evaluate(
+    repo_path: str = typer.Option(..., "--repo", "-r", help="Path to repository (vllm or sglang)"),
+    run_ids: Optional[str] = typer.Option(None, "--run-ids", help="Comma-separated run IDs to evaluate (default: all)"),
+    test_dataset: str = typer.Option("Inferencebench/test-generation-scripts", "--test-dataset", help="HuggingFace dataset ID for test scripts"),
+    output_dir: str = typer.Option("eval_results", "--output-dir", "-o", help="Output directory for results"),
+    timeout: int = typer.Option(600, "--timeout", "-t", help="Timeout per test in seconds"),
+    download_only: bool = typer.Option(False, "--download-only", help="Only download and index test scripts"),
+    report_only: bool = typer.Option(False, "--report-only", help="Only generate report from existing results"),
+):
+    """
+    Evaluate agent patches against HuggingFace test scripts.
+
+    Downloads test scripts from HuggingFace, matches them to agent runs by commit hash,
+    runs tests on both baseline and patched code, and reports performance metrics.
+
+    Example:
+        python -m bench.cli evaluate --repo /path/to/vllm --output-dir eval_results/
+    """
+    import sys
+    # Add src to path for eval module imports
+    src_path = Path(__file__).resolve().parents[2] / "src"
+    if str(src_path) not in sys.path:
+        sys.path.insert(0, str(src_path))
+
+    try:
+        from eval.download_tests import download_and_index_tests, load_test_index
+        from eval.run_tests_on_patches import TestRunner
+        from eval.aggregate_results import aggregate_results, generate_report, print_summary
+    except ImportError as e:
+        typer.echo(f"Error importing eval module: {e}")
+        typer.echo("Make sure src/eval/ exists and huggingface_hub is installed.")
+        raise typer.Exit(1)
+
+    output_path = Path(output_dir)
+    repo = Path(repo_path)
+    state_root = Path(__file__).resolve().parents[1] / "state"
+
+    # Report only mode
+    if report_only:
+        if not output_path.exists():
+            typer.echo(f"Output directory not found: {output_path}")
+            raise typer.Exit(1)
+
+        typer.echo("Generating report from existing results...")
+        summaries = aggregate_results(output_path)
+        print_summary(summaries)
+        report = generate_report(summaries, output_path / "evaluation_report.json")
+        typer.echo(f"\n✓ Report saved to {output_path / 'evaluation_report.json'}")
+        raise typer.Exit(0)
+
+    # Download and index test scripts
+    typer.echo(f"Downloading test scripts from {test_dataset}...")
+    try:
+        test_index = download_and_index_tests()
+        typer.echo(f"✓ Indexed {len(test_index)} test scripts")
+    except Exception as e:
+        typer.echo(f"Error downloading test scripts: {e}")
+        raise typer.Exit(1)
+
+    if download_only:
+        typer.echo("Download complete (--download-only specified)")
+        raise typer.Exit(0)
+
+    # Validate repo path
+    if not repo.exists():
+        typer.echo(f"Repository not found: {repo}")
+        raise typer.Exit(1)
+
+    # Parse run IDs
+    run_id_list = None
+    if run_ids:
+        run_id_list = [r.strip() for r in run_ids.split(",")]
+
+    # Create test runner
+    runner = TestRunner(
+        repo_path=repo,
+        state_root=state_root,
+        output_dir=output_path,
+        test_index=test_index,
+        timeout=timeout,
+    )
+
+    # Discover runs
+    runs = runner.discover_runs(run_id_list)
+    if not runs:
+        typer.echo("No runs found to evaluate")
+        raise typer.Exit(1)
+
+    typer.echo(f"Found {len(runs)} commits to evaluate")
+
+    # Count how many have tests
+    with_tests = sum(1 for r in runs if r.test_script_path)
+    typer.echo(f"  - With matching tests: {with_tests}")
+    typer.echo(f"  - Without tests: {len(runs) - with_tests}")
+
+    # Run evaluation
+    typer.echo("\nStarting evaluation...")
+    results = runner.run_all(run_id_list)
+
+    # Generate report
+    typer.echo("\nGenerating report...")
+    summaries = aggregate_results(output_path)
+    print_summary(summaries)
+    report = generate_report(summaries, output_path / "evaluation_report.json")
+
+    typer.echo(f"\n✓ Evaluation complete. Results in {output_path}")
+    typer.echo(f"✓ Report saved to {output_path / 'evaluation_report.json'}")
+
+
 if __name__ == "__main__":
     app()
