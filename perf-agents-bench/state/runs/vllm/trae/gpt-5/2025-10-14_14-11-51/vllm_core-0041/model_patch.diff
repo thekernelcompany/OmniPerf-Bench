@@ -1,0 +1,107 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c376797a..121458f81 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -220,7 +220,7 @@ def _apply_min_tokens_penalty(
+             seqs_to_penalize: List[int] = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+-                if len(seq_data.output_token_ids) < min_tokens:
++                if len(seq_data.output_token_ids_array) < min_tokens:
+                     seqs_to_penalize.append(j)
+ 
+             if seqs_to_penalize:
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d173..8b97d81f9 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -1,4 +1,6 @@
+ import random
++from array import array
++
+ from dataclasses import dataclass
+ from typing import Dict, List, Optional, Tuple
+ 
+@@ -329,8 +331,8 @@ class SamplingTensors:
+             user-defined seed for each sequence.
+         extra_entropy: extra entropy to use when generating seeds.
+         """
+-        prompt_tokens: List[List[int]] = []
+-        output_tokens: List[List[int]] = []
++        prompt_tokens: List[array] = []
++        output_tokens: List[array] = []
+         top_ks: List[int] = []
+         temperatures: List[float] = []
+         top_ps: List[float] = []
+@@ -437,8 +439,8 @@ class SamplingTensors:
+                 if seq_group.do_sample:
+                     for seq_id in seq_ids:
+                         seq_data = seq_group.seq_data[seq_id]
+-                        prompt_tokens.append(list(seq_data.prompt_token_ids))
+-                        output_tokens.append(list(seq_data.output_token_ids))
++                        prompt_tokens.append(seq_data.prompt_token_ids_array)
++                        output_tokens.append(seq_data.output_token_ids_array)
+ 
+         sampling_tensors = SamplingTensors.from_lists(
+             temperatures, top_ps, top_ks, min_ps, presence_penalties,
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 0cd4c7e71..d1eddcff5 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -9,6 +9,7 @@ from typing import (TYPE_CHECKING, Dict, List, Mapping, Optional, Set, Tuple,
+                     Union)
+ 
+ import torch
++from array import array
+ 
+ from vllm.lora.request import LoRARequest
+ from vllm.pooling_params import PoolingParams
+@@ -119,11 +120,16 @@ class SequenceData:
+         prompt_token_ids: List[int],
+         output_token_ids: Optional[List[int]] = None,
+     ) -> None:
++        # Maintain list/tuple for API compatibility
+         self._prompt_token_ids: List[int] = list(prompt_token_ids)
+         self._prompt_token_ids_tuple: Tuple[int, ...] = tuple(prompt_token_ids)
+         self._output_token_ids: List[int] = (
+             list(output_token_ids) if output_token_ids is not None else [])
+ 
++        # Fast path arrays for internal performance-sensitive operations
++        self._prompt_token_ids_array: array = array('I', self._prompt_token_ids)
++        self._output_token_ids_array: array = array('I', self._output_token_ids)
++
+         self.cumulative_logprob = 0.0
+         # The number of tokens that are computed (that run against the model).
+         self._num_computed_tokens = 0
+@@ -143,6 +149,8 @@ class SequenceData:
+     def prompt_token_ids(self, new_prompt_token_ids) -> None:
+         self._prompt_token_ids = list(new_prompt_token_ids)
+         self._prompt_token_ids_tuple = tuple(new_prompt_token_ids)
++        # keep array in sync
++        self._prompt_token_ids_array = array('I', self._prompt_token_ids)
+         self._update_cached_all_tokens()
+ 
+     @property
+@@ -152,10 +160,22 @@ class SequenceData:
+     @output_token_ids.setter
+     def output_token_ids(self, new_output_token_ids) -> None:
+         self._output_token_ids = list(new_output_token_ids)
++        # keep array in sync
++        self._output_token_ids_array = array('I', self._output_token_ids)
+         self._update_cached_all_tokens()
+ 
++    # Optimized accessors (no tuple/list allocations)
++    @property
++    def prompt_token_ids_array(self) -> array:
++        return self._prompt_token_ids_array
++
++    @property
++    def output_token_ids_array(self) -> array:
++        return self._output_token_ids_array
++
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self._output_token_ids.append(token_id)
++        self._output_token_ids_array.append(token_id)
+         self._cached_all_token_ids.append(token_id)
+         self.cumulative_logprob += logprob
+ 

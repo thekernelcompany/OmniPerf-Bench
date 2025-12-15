@@ -1,0 +1,90 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/worker/neuron_worker.py b/vllm/worker/neuron_worker.py
+index 5f0eb0019..6c59bd409 100644
+--- a/vllm/worker/neuron_worker.py
++++ b/vllm/worker/neuron_worker.py
+@@ -42,6 +42,12 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+             vllm_config=vllm_config)
+         self.is_driver_worker = is_driver_worker
+ 
++        # Internal flags for idempotent initialization
++        self._device_initialized = False
++        self._dist_env_initialized = False
++        self._cached_available_blocks = None
++
++    @torch.inference_mode()
+     def execute_model(
+         self,
+         execute_model_req: Optional[ExecuteModelRequest] = None,
+@@ -53,15 +59,17 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+                     "Cache operations are not supported for Neuron backend.")
+         assert execute_model_req.num_lookahead_slots == 0, (
+             "lookahead not supported for Neuron backend.")
+-        output = LocalOrDistributedWorkerBase.execute_model(
++        return LocalOrDistributedWorkerBase.execute_model(
+             self, execute_model_req)
+-        return output
+ 
+     def init_device(self) -> None:
++        if getattr(self, "_device_initialized", False):
++            return
+         self.init_distributed_environment()
+ 
+         # Set random seed.
+         set_random_seed(self.model_config.seed)
++        self._device_initialized = True
+ 
+     def load_model(self):
+         self.model_runner.load_model()
+@@ -73,15 +81,21 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+ 
+         We configure num_gpu_blocks to be equal to max_num_seqs.
+         """
++        cached = getattr(self, "_cached_available_blocks", None)
++        if cached is not None:
++            return cached
++
+         # Set the number of GPU blocks to be the same as the maximum number of
+         # sequences that can be processed in a single batch. This is equivalent
+         # to schedule without PagedAttention.
+-        num_gpu_blocks = self.scheduler_config.max_num_seqs
++        num_gpu_blocks = self.scheduler_config.max_num_seqs + 1
+ 
+         # Swap not yet supported with Neuron backend.
+         num_cpu_blocks = 0
+ 
+-        return num_gpu_blocks, num_cpu_blocks
++        result = (num_gpu_blocks, num_cpu_blocks)
++        self._cached_available_blocks = result
++        return result
+ 
+     def initialize_cache(self, num_gpu_blocks: int,
+                          num_cpu_blocks: int) -> None:
+@@ -90,7 +104,7 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+ 
+         # Different values are not tested.
+         assert num_cpu_blocks == 0
+-        assert num_gpu_blocks == self.scheduler_config.max_num_seqs
++        assert num_gpu_blocks == self.scheduler_config.max_num_seqs + 1
+ 
+         self.cache_config.num_gpu_blocks = num_gpu_blocks
+         self.cache_config.num_cpu_blocks = num_cpu_blocks
+@@ -125,6 +139,11 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+         vLLM still needs the environment initialized when TP/PP > 1,
+         so we initialize a distributed environment with one process.
+         """
++        # Fast path: avoid redundant initialization
++        if getattr(self, "_dist_env_initialized", False) or \
++                torch.distributed.is_available() and \
++                torch.distributed.is_initialized():
++            return
+         init_distributed_environment(
+             world_size=1,
+             rank=0,
+@@ -136,3 +155,4 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+             1,
+             1,
+         )
++        self._dist_env_initialized = True
