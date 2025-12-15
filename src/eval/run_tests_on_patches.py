@@ -80,6 +80,11 @@ class RunMetadata:
     agent_status: str
     patch_path: Optional[str] = None
     test_script_path: Optional[str] = None
+    # Hierarchical path components (optional, for new structure)
+    repo: Optional[str] = None
+    agent: Optional[str] = None
+    model: Optional[str] = None
+    timestamp: Optional[str] = None
 
 
 class TestRunner:
@@ -152,6 +157,10 @@ class TestRunner:
         """
         Discover agent runs from state directory.
 
+        Supports both flat and hierarchical directory structures:
+        - Flat: state/runs/{run_id}/{item_id}/
+        - Hierarchical: state/runs/{repo}/{agent}/{model}/{timestamp}/{item_id}/
+
         Args:
             run_ids: Optional list of specific run IDs to process
 
@@ -163,6 +172,24 @@ class TestRunner:
             logger.error(f"Runs directory not found: {runs_dir}")
             return []
 
+        discovered = []
+
+        # Detect structure type by checking first-level directories
+        first_level = [d for d in runs_dir.iterdir() if d.is_dir()]
+        is_hierarchical = any(d.name in ("vllm", "sglang") for d in first_level)
+
+        if is_hierarchical:
+            # Hierarchical structure: {repo}/{agent}/{model}/{timestamp}/{item_id}/
+            discovered = self._discover_hierarchical(runs_dir, run_ids)
+        else:
+            # Flat structure: {run_id}/{item_id}/
+            discovered = self._discover_flat(runs_dir, run_ids)
+
+        logger.info(f"Discovered {len(discovered)} runs")
+        return discovered
+
+    def _discover_flat(self, runs_dir: Path, run_ids: Optional[List[str]] = None) -> List[RunMetadata]:
+        """Discover runs from flat directory structure."""
         discovered = []
 
         # Get run directories to process
@@ -178,54 +205,124 @@ class TestRunner:
                 if not item_dir.is_dir():
                     continue
 
-                journal_path = item_dir / "journal.json"
-                if not journal_path.exists():
-                    continue
+                metadata = self._parse_item_dir(item_dir, run_id)
+                if metadata:
+                    discovered.append(metadata)
 
-                try:
-                    journal = json.loads(journal_path.read_text())
-                except Exception as e:
-                    logger.error(f"Error reading {journal_path}: {e}")
-                    continue
-
-                commits = journal.get("commits", {})
-                human_commit = commits.get("human")
-                pre_commit = commits.get("pre")
-
-                if not human_commit or not pre_commit:
-                    logger.warning(f"Missing commits in {journal_path}")
-                    continue
-
-                # Check for patch file
-                patch_path = item_dir / "model_patch.diff"
-                patch_exists = patch_path.exists() and patch_path.stat().st_size > 0
-
-                # Find matching test script
-                test_script = find_test_script(human_commit, self.test_index)
-
-                metadata = RunMetadata(
-                    run_id=run_id,
-                    item_id=item_dir.name,
-                    task_id=journal.get("task_id", "unknown"),
-                    human_commit=human_commit,
-                    pre_commit=pre_commit,
-                    agent_status=journal.get("status", "unknown"),
-                    patch_path=str(patch_path) if patch_exists else None,
-                    test_script_path=test_script,
-                )
-                discovered.append(metadata)
-
-        logger.info(f"Discovered {len(discovered)} runs")
         return discovered
 
-    def _get_repo_for_run(self, run_id: str) -> Optional[Path]:
-        """Determine which repo to use based on run_id."""
-        run_lower = run_id.lower()
-        if run_lower.startswith("sglang"):
+    def _discover_hierarchical(self, runs_dir: Path, run_ids: Optional[List[str]] = None) -> List[RunMetadata]:
+        """Discover runs from hierarchical directory structure: {repo}/{agent}/{model}/{timestamp}/{item_id}/"""
+        discovered = []
+
+        for repo_dir in runs_dir.iterdir():
+            if not repo_dir.is_dir():
+                continue
+            repo = repo_dir.name
+
+            for agent_dir in repo_dir.iterdir():
+                if not agent_dir.is_dir():
+                    continue
+                agent = agent_dir.name
+
+                for model_dir in agent_dir.iterdir():
+                    if not model_dir.is_dir():
+                        continue
+                    model = model_dir.name
+
+                    for timestamp_dir in model_dir.iterdir():
+                        if not timestamp_dir.is_dir():
+                            continue
+                        timestamp = timestamp_dir.name
+
+                        # Build run_id for filtering
+                        run_id = f"{repo}/{agent}/{model}/{timestamp}"
+
+                        # Filter by run_ids if specified
+                        if run_ids and not any(rid in run_id for rid in run_ids):
+                            continue
+
+                        for item_dir in timestamp_dir.iterdir():
+                            if not item_dir.is_dir():
+                                continue
+
+                            metadata = self._parse_item_dir(
+                                item_dir, run_id,
+                                repo=repo, agent=agent, model=model, timestamp=timestamp
+                            )
+                            if metadata:
+                                discovered.append(metadata)
+
+        return discovered
+
+    def _parse_item_dir(
+        self,
+        item_dir: Path,
+        run_id: str,
+        repo: Optional[str] = None,
+        agent: Optional[str] = None,
+        model: Optional[str] = None,
+        timestamp: Optional[str] = None,
+    ) -> Optional[RunMetadata]:
+        """Parse an item directory and return RunMetadata if valid."""
+        journal_path = item_dir / "journal.json"
+        if not journal_path.exists():
+            return None
+
+        try:
+            journal = json.loads(journal_path.read_text())
+        except Exception as e:
+            logger.error(f"Error reading {journal_path}: {e}")
+            return None
+
+        commits = journal.get("commits", {})
+        human_commit = commits.get("human")
+        pre_commit = commits.get("pre")
+
+        if not human_commit or not pre_commit:
+            logger.warning(f"Missing commits in {journal_path}")
+            return None
+
+        # Check for patch file
+        patch_path = item_dir / "model_patch.diff"
+        patch_exists = patch_path.exists() and patch_path.stat().st_size > 0
+
+        # Find matching test script
+        test_script = find_test_script(human_commit, self.test_index)
+
+        return RunMetadata(
+            run_id=run_id,
+            item_id=item_dir.name,
+            task_id=journal.get("task_id", "unknown"),
+            human_commit=human_commit,
+            pre_commit=pre_commit,
+            agent_status=journal.get("status", "unknown"),
+            patch_path=str(patch_path) if patch_exists else None,
+            test_script_path=test_script,
+            repo=repo,
+            agent=agent,
+            model=model,
+            timestamp=timestamp,
+        )
+
+    def _get_repo_for_run(self, metadata: RunMetadata) -> Optional[Path]:
+        """Determine which repo to use based on run metadata.
+
+        Uses metadata.repo if available (hierarchical structure),
+        otherwise falls back to parsing run_id (flat structure).
+        """
+        # Use repo field directly if available (hierarchical structure)
+        if metadata.repo:
+            repo_name = metadata.repo.lower()
+        else:
+            # Fall back to parsing run_id (flat structure)
+            repo_name = metadata.run_id.lower()
+
+        if repo_name.startswith("sglang"):
             if self.sglang_repo_path:
                 return self.sglang_repo_path
             else:
-                logger.warning(f"sglang repo not configured for run {run_id}")
+                logger.warning(f"sglang repo not configured for run {metadata.run_id}")
                 return None
         # Default to vllm repo for vllm_*, prefix_caching_opt, moe_align_opt, etc.
         return self.repo_path
@@ -253,7 +350,7 @@ class TestRunner:
             )
 
         # Determine which repo to use
-        repo_path = self._get_repo_for_run(metadata.run_id)
+        repo_path = self._get_repo_for_run(metadata)
         if not repo_path:
             return TestResult(
                 status="error",
@@ -278,7 +375,8 @@ class TestRunner:
                 self._create_worktree(worktree_path, metadata.pre_commit, repo_path)
 
                 # Determine if we can use a wheel (vLLM only)
-                is_vllm = not metadata.run_id.lower().startswith("sglang")
+                repo_name = metadata.repo.lower() if metadata.repo else metadata.run_id.lower()
+                is_vllm = not repo_name.startswith("sglang")
                 wheel_installed = False
 
                 if is_vllm and self._check_wheel_exists(metadata.pre_commit):
@@ -670,8 +768,25 @@ class TestRunner:
         )
 
     def _save_result(self, metadata: RunMetadata, result: TestResult) -> None:
-        """Save test result to output directory."""
-        result_dir = self.output_dir / metadata.run_id / metadata.item_id
+        """Save test result to output directory.
+
+        Uses hierarchical structure when metadata has repo/agent/model/timestamp:
+        - Hierarchical: {repo}/{agent}/{model}/{timestamp}/{item_id}/
+        - Flat fallback: {run_id}/{item_id}/
+        """
+        if metadata.repo and metadata.agent and metadata.model and metadata.timestamp:
+            # Hierarchical output: {repo}/{agent}/{model}/{timestamp}/{item_id}/
+            result_dir = (
+                self.output_dir
+                / metadata.repo
+                / metadata.agent
+                / metadata.model
+                / metadata.timestamp
+                / metadata.item_id
+            )
+        else:
+            # Flat output fallback: {run_id}/{item_id}/
+            result_dir = self.output_dir / metadata.run_id / metadata.item_id
         result_dir.mkdir(parents=True, exist_ok=True)
 
         # Save result JSON
