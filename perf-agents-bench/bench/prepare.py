@@ -27,10 +27,24 @@ logger = logging.getLogger(__name__)
 class PrepareExecutor:
     def __init__(self, bench_cfg: Dict[str, Any], run_id: str):
         self.cfg = bench_cfg
-        self.run_id = run_id
+        self.run_id = run_id  # Now supports hierarchical paths like "vllm/trae/gpt-4o/2024-01-15_14-30-00"
         self.state_root = Path(self.cfg["paths"]["state_root"]).resolve()
         self.work_root = Path(self.cfg["paths"]["work_root"]).resolve()
         (self.state_root / "runs" / self.run_id).mkdir(parents=True, exist_ok=True)
+
+        # Extract run metadata from hierarchical path
+        run_parts = self.run_id.split("/")
+        if len(run_parts) >= 4:
+            self.repo_name = run_parts[0]
+            self.agent_name = run_parts[1]
+            self.model_name = run_parts[2]
+            self.run_timestamp = run_parts[3]
+        else:
+            # Legacy flat structure fallback
+            self.repo_name = "unknown"
+            self.agent_name = str(self.cfg.get("agents", {}).get("default", "unknown"))
+            self.model_name = "default"
+            self.run_timestamp = run_id
 
     def execute(self, task_cfg: Dict[str, Any], plan_path: Path, max_workers: int = 4, resume: bool = True):
         plan = json.loads(Path(plan_path).read_text()) if plan_path.suffix == ".json" else None
@@ -1252,6 +1266,13 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     "commits": {"pre": pre, "human": human},
                     "agent_branch": branch,
                     "status": status,
+                    "run_metadata": {
+                        "repo": self.repo_name,
+                        "agent": self.agent_name,
+                        "model": self.model_name,
+                        "run_timestamp": self.run_timestamp,
+                        "run_path": self.run_id,
+                    },
                     "experiment": {
                         "hints_enabled": hints_enabled,
                         "preflight_enabled": preflight_enabled,
@@ -1281,6 +1302,13 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     "commits": {"pre": pre, "human": human},
                     "agent_branch": branch,
                     "status": "error",
+                    "run_metadata": {
+                        "repo": self.repo_name,
+                        "agent": self.agent_name,
+                        "model": self.model_name,
+                        "run_timestamp": self.run_timestamp,
+                        "run_path": self.run_id,
+                    },
                     "error": str(e),
                     "error_type": type(e).__name__,
                 })

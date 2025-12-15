@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -13,10 +14,81 @@ from .pipeline import run_task
 from .pipeline import smoke_task
 from .planner import MatrixPlanner
 from .prepare import PrepareExecutor
-from .report import summarize_stage_a
+from .report import summarize_stage_a, summarize_all_runs
 from .build_cmd import build_images
 # Ensure metrics registry is populated by importing builtins
 from . import metrics as _metrics_autoload  # noqa: F401
+
+
+def _extract_repo_name(repo_url: str) -> str:
+    """Extract repository name from URL or path."""
+    if not repo_url:
+        return "unknown"
+    # Handle GitHub URLs
+    if "github.com" in repo_url:
+        # https://github.com/vllm-project/vllm.git -> vllm
+        parts = repo_url.rstrip("/").rstrip(".git").split("/")
+        return parts[-1] if parts else "unknown"
+    # Handle local paths
+    return Path(repo_url).name or "unknown"
+
+
+def _get_model_name(bench_cfg: Dict[str, Any], agent_name: str) -> str:
+    """Extract model name from bench config or environment."""
+    # Check environment first
+    model_env = os.environ.get("LLM_MODEL")
+    if model_env:
+        return _sanitize_path_component(model_env)
+
+    # Try to read from agent's config file
+    agent_cfg = bench_cfg.get("agents", {}).get(agent_name, {})
+    config_file = agent_cfg.get("config_file")
+
+    if config_file:
+        config_path = Path(config_file)
+        # Expand environment variables in path
+        config_path_str = os.path.expandvars(str(config_path))
+        config_path = Path(config_path_str)
+
+        if config_path.exists():
+            try:
+                cfg_data = yaml.safe_load(config_path.read_text())
+                # Try common model config patterns
+                if "models" in cfg_data:
+                    for model_key, model_cfg in cfg_data["models"].items():
+                        if "model" in model_cfg:
+                            return _sanitize_path_component(model_cfg["model"])
+                if "llm" in cfg_data and "model" in cfg_data["llm"]:
+                    return _sanitize_path_component(cfg_data["llm"]["model"])
+            except Exception:
+                pass
+
+    return "default"
+
+
+def _sanitize_path_component(name: str) -> str:
+    """Sanitize a string for use in directory path."""
+    if not name:
+        return "unknown"
+    # Replace special characters with dashes
+    sanitized = re.sub(r'[^\w\-]', '-', name.lower())
+    # Remove consecutive dashes
+    sanitized = re.sub(r'-+', '-', sanitized)
+    # Remove leading/trailing dashes
+    return sanitized.strip('-') or "unknown"
+
+
+def _build_hierarchical_run_path(
+    repo_name: str,
+    agent_name: str,
+    model_name: str,
+    timestamp: Optional[str] = None
+) -> str:
+    """Build hierarchical run path: repo/agent/model/timestamp."""
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    return f"{repo_name}/{agent_name}/{model_name}/{timestamp}"
 
 
 app = typer.Typer(add_completion=False)
@@ -180,10 +252,23 @@ def prepare(task: str, from_plan: str = typer.Option("state/plan.json", "--from-
     try:
         task_cfg = _load_task_cfg(task_p)
         cfg = _load_bench_cfg(bench_cfg_path)
-        run_id = f"{task_cfg['id']}-{uuid.uuid4().hex[:8]}"
-        executor = PrepareExecutor(cfg, run_id=run_id)
+
+        # Build hierarchical run path: repo/agent/model/timestamp
+        repo_url = task_cfg.get("repo", {}).get("url", "")
+        repo_name = _extract_repo_name(repo_url)
+        agent_name = str(cfg.get("agents", {}).get("default", "unknown"))
+        model_name = _get_model_name(cfg, agent_name)
+
+        run_path = _build_hierarchical_run_path(repo_name, agent_name, model_name)
+
+        typer.echo(f"Run path: {run_path}")
+        typer.echo(f"  Repo:   {repo_name}")
+        typer.echo(f"  Agent:  {agent_name}")
+        typer.echo(f"  Model:  {model_name}")
+
+        executor = PrepareExecutor(cfg, run_id=run_path)
         executor.execute(task_cfg, plan_p, max_workers=max_workers, resume=resume)
-        typer.echo(f"✓ Prepare completed: state/runs/{run_id}")
+        typer.echo(f"✓ Prepare completed: state/runs/{run_path}")
     except Exception as e:
         typer.echo(f"Prepare error: {e}")
         raise typer.Exit(1)
@@ -283,6 +368,61 @@ def report(run_dir: str = typer.Argument(..., help="Path to state/runs/<run_id>"
     except Exception as e:
         typer.echo(f"Report error: {e}")
         raise typer.Exit(1)
+
+
+@app.command(name="report-all")
+def report_all(state_root: str = typer.Option("./state", help="Path to state directory")):
+    """Summarize all runs organized by repo/agent/model hierarchy."""
+    try:
+        out = summarize_all_runs(Path(state_root))
+        typer.echo(json.dumps(out, indent=2))
+    except Exception as e:
+        typer.echo(f"Report error: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def migrate(
+    state_root: str = typer.Option("./state", help="Path to state directory"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Preview changes without moving files"),
+):
+    """Migrate runs from flat to hierarchical structure (repo/agent/model/timestamp).
+
+    Use --execute to actually perform the migration.
+    """
+    import sys
+    # Import migration module
+    migrate_script = Path(__file__).parent.parent / "migrate_runs.py"
+    if not migrate_script.exists():
+        typer.echo(f"Migration script not found: {migrate_script}")
+        raise typer.Exit(1)
+
+    # Import the migration module dynamically
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("migrate_runs", migrate_script)
+    if spec is None or spec.loader is None:
+        typer.echo("Failed to load migration module")
+        raise typer.Exit(1)
+
+    migrate_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migrate_module)
+
+    # Run migration
+    typer.echo(f"State root: {Path(state_root).resolve()}")
+    typer.echo(f"Mode: {'DRY-RUN (preview only)' if dry_run else 'EXECUTE (will move files)'}")
+    typer.echo()
+
+    if not dry_run:
+        if not typer.confirm("This will reorganize all run directories. Continue?"):
+            typer.echo("Aborted.")
+            raise typer.Exit(0)
+
+    results = migrate_module.migrate_runs(Path(state_root).resolve(), dry_run=dry_run)
+    migrate_module.print_summary(results)
+
+    if dry_run:
+        typer.echo("\nTo execute the migration, run with --execute flag:")
+        typer.echo(f"  python -m bench.cli migrate --state-root {state_root} --execute")
 
 
 @app.command()
