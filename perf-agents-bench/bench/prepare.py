@@ -15,6 +15,15 @@ from .repo_manager import RepoManager
 from .git_utils import get_changed_files, resolve_precommit
 from .agents.openhands import OpenHandsAgent
 
+# Import run summary generation (Stage 1: after agent run)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+try:
+    from eval.run_summary import generate_summary_from_state, save_summary
+except ImportError:
+    generate_summary_from_state = None
+    save_summary = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1286,6 +1295,23 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         "duration_s": dur,
                     },
                 })
+
+                # Generate run_summary.json (Stage 1: after agent run)
+                if generate_summary_from_state and save_summary:
+                    try:
+                        summary = generate_summary_from_state(
+                            item_dir=jw.dir,
+                            repo=self.repo_name,
+                            agent=self.agent_name,
+                            model_hint=self.model_name,
+                            timestamp=self.run_timestamp,
+                        )
+                        if summary:
+                            save_summary(summary, jw.dir / "run_summary.json")
+                            logger.info(f"Generated run_summary.json for {item_id}")
+                    except Exception as summary_err:
+                        logger.warning(f"Failed to generate run_summary.json: {summary_err}")
+
                 logger.info(f"Task completed successfully: {status}:{item_id}")
                 return f"{status}:{item_id}"
             except Exception as e:
@@ -1312,6 +1338,22 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     "error": str(e),
                     "error_type": type(e).__name__,
                 })
+
+                # Generate run_summary.json even for error cases (Stage 1)
+                if generate_summary_from_state and save_summary:
+                    try:
+                        summary = generate_summary_from_state(
+                            item_dir=jw.dir,
+                            repo=self.repo_name,
+                            agent=self.agent_name,
+                            model_hint=self.model_name,
+                            timestamp=self.run_timestamp,
+                        )
+                        if summary:
+                            save_summary(summary, jw.dir / "run_summary.json")
+                    except Exception:
+                        pass  # Don't fail on summary generation errors
+
                 logger.error(f"Task failed with exception: error:{item_id}")
                 return f"error:{item_id}"
 

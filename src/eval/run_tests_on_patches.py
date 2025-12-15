@@ -19,6 +19,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .download_tests import find_test_script, load_test_index
+from .run_summary import (
+    RunSummary,
+    load_summary,
+    save_summary,
+    add_evaluation_to_summary,
+    generate_summary_from_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +92,8 @@ class RunMetadata:
     agent: Optional[str] = None
     model: Optional[str] = None
     timestamp: Optional[str] = None
+    # Source directory path (for loading run_summary.json)
+    source_dir: Optional[str] = None
 
 
 class TestRunner:
@@ -303,6 +312,7 @@ class TestRunner:
             agent=agent,
             model=model,
             timestamp=timestamp,
+            source_dir=str(item_dir),
         )
 
     def _get_repo_for_run(self, metadata: RunMetadata) -> Optional[Path]:
@@ -773,6 +783,9 @@ class TestRunner:
         Uses hierarchical structure when metadata has repo/agent/model/timestamp:
         - Hierarchical: {repo}/{agent}/{model}/{timestamp}/{item_id}/
         - Flat fallback: {run_id}/{item_id}/
+
+        Also handles run_summary.json:
+        - Stage 2: Load from source dir, add evaluation, save to output
         """
         if metadata.repo and metadata.agent and metadata.model and metadata.timestamp:
             # Hierarchical output: {repo}/{agent}/{model}/{timestamp}/{item_id}/
@@ -789,7 +802,7 @@ class TestRunner:
             result_dir = self.output_dir / metadata.run_id / metadata.item_id
         result_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save result JSON
+        # Save result JSON (legacy format for backward compatibility)
         result_path = result_dir / "test_results.json"
         with open(result_path, "w") as f:
             json.dump(
@@ -801,6 +814,48 @@ class TestRunner:
                 indent=2,
                 default=str,
             )
+
+        # Handle run_summary.json (Stage 2: load from source, add eval, save)
+        summary = None
+        if metadata.source_dir:
+            source_summary_path = Path(metadata.source_dir) / "run_summary.json"
+            summary = load_summary(source_summary_path)
+
+        if summary:
+            # Add evaluation results to existing summary
+            add_evaluation_to_summary(
+                summary,
+                status=result.status,
+                baseline_ms=result.baseline_ms,
+                patched_ms=result.patched_ms,
+                speedup=result.speedup,
+                improvement=result.improvement,
+                error=result.error_message,
+            )
+        else:
+            # Generate summary from scratch (backward compatibility)
+            if metadata.source_dir:
+                summary = generate_summary_from_state(
+                    item_dir=Path(metadata.source_dir),
+                    repo=metadata.repo or "unknown",
+                    agent=metadata.agent or "unknown",
+                    model_hint=metadata.model or "unknown",
+                    timestamp=metadata.timestamp or "unknown",
+                )
+                if summary:
+                    add_evaluation_to_summary(
+                        summary,
+                        status=result.status,
+                        baseline_ms=result.baseline_ms,
+                        patched_ms=result.patched_ms,
+                        speedup=result.speedup,
+                        improvement=result.improvement,
+                        error=result.error_message,
+                    )
+
+        # Save run_summary.json to output directory
+        if summary:
+            save_summary(summary, result_dir / "run_summary.json")
 
         # Save stdout/stderr
         if result.stdout:
