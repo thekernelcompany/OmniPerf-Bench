@@ -10,6 +10,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+try:
+    from dotenv import load_dotenv
+    _HAS_DOTENV = True
+    # Load .env at import time so environment variables are available for typer
+    _env_path = Path(".env")
+    if not _env_path.exists():
+        _env_path = Path(__file__).parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    _HAS_DOTENV = False
+
 from .pipeline import run_task
 from .pipeline import smoke_task
 from .planner import MatrixPlanner
@@ -554,6 +566,171 @@ def evaluate(
 
     typer.echo(f"\n✓ Evaluation complete. Results in {output_path}")
     typer.echo(f"✓ Report saved to {output_path / 'evaluation_report.json'}")
+
+
+@app.command()
+def analyze(
+    state_root: str = typer.Option("./state", "--state-root", "-s", help="Path to state directory containing runs/"),
+    output_dir: str = typer.Option("./state/analysis", "--output-dir", "-o", help="Output directory for analysis results"),
+    run_dir: Optional[str] = typer.Option(None, "--run-dir", "-d", help="Analyze a single run directory directly"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", envvar="OPENROUTER_API_KEY", help="OpenRouter API key"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Filter by repo (vllm, sglang)"),
+    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Filter by agent (trae, codex, openhands)"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Filter by model name"),
+    skip_llm: bool = typer.Option(False, "--skip-llm", help="Skip LLM analysis (quantitative only)"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Cache directory for LLM responses"),
+    max_concurrent: int = typer.Option(3, "--max-concurrent", help="Maximum concurrent analyses"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Discover runs without analyzing"),
+):
+    """
+    Analyze agent runs and extract soft metrics using Gemini 3 Pro.
+
+    Uses OpenRouter to call Gemini 3 Pro for qualitative analysis of agent
+    benchmark runs. Extracts academic-grade metrics including:
+    - Code understanding, task alignment, approach quality scores (0-10)
+    - Tool usage patterns, failure categories
+    - Key decisions, optimization techniques, missed opportunities
+
+    Results are written to a hierarchical directory structure:
+        state/analysis/{repo}/{agent}/{model}/{timestamp}/{item_id}/
+
+    Examples:
+        # Analyze all runs with filters
+        python -m bench.cli analyze --state-root state/ --repo vllm --agent trae
+
+        # Analyze a single run directory
+        python -m bench.cli analyze --run-dir state/runs/vllm/codex/gpt-5/2025-11-20/item-0001
+
+    Set OPENROUTER_API_KEY environment variable, .env file, or use --api-key option.
+    """
+    import asyncio
+
+    # Import analysis module
+    try:
+        from .analysis import SoftMetricsAnalyzer, OutputWriter
+    except ImportError as e:
+        typer.echo(f"Error importing analysis module: {e}")
+        typer.echo("Make sure bench/analysis/ module exists.")
+        raise typer.Exit(1)
+
+    # Check API key (not needed for dry-run or skip-llm)
+    if not skip_llm and not api_key and not dry_run:
+        typer.echo("Error: OpenRouter API key required for LLM analysis.")
+        typer.echo("Set OPENROUTER_API_KEY environment variable or use --api-key option.")
+        typer.echo("Use --skip-llm to only extract quantitative metrics.")
+        raise typer.Exit(1)
+
+    # Initialize analyzer
+    try:
+        analyzer = SoftMetricsAnalyzer(
+            api_key=api_key or "",
+            cache_dir=Path(cache_dir) if cache_dir else None,
+        )
+    except Exception as e:
+        typer.echo(f"Error initializing analyzer: {e}")
+        raise typer.Exit(1)
+
+    # Handle single run directory vs discovery
+    if run_dir:
+        # Analyze a single directory directly
+        run_path = Path(run_dir)
+        if not run_path.exists():
+            typer.echo(f"Run directory not found: {run_path}")
+            raise typer.Exit(1)
+        if not (run_path / "journal.json").exists():
+            typer.echo(f"Not a valid run directory (no journal.json): {run_path}")
+            raise typer.Exit(1)
+
+        item_dirs = [run_path]
+        typer.echo(f"Analyzing single run: {run_path.name}")
+
+        if dry_run:
+            typer.echo("Dry run complete. Use without --dry-run to analyze.")
+            raise typer.Exit(0)
+    else:
+        # Discover runs from state directory
+        state_path = Path(state_root)
+        if not state_path.exists():
+            typer.echo(f"State directory not found: {state_path}")
+            raise typer.Exit(1)
+
+        typer.echo(f"Discovering runs in {state_path}...")
+        item_dirs = analyzer.discover_runs(
+            state_path,
+            repo_filter=repo,
+            agent_filter=agent,
+            model_filter=model,
+        )
+
+        if not item_dirs:
+            typer.echo("No runs found matching filters.")
+            raise typer.Exit(0)
+
+        typer.echo(f"Found {len(item_dirs)} runs to analyze")
+
+        # Group by hierarchy for display
+        groups: Dict[str, int] = {}
+        for item_dir in item_dirs:
+            parts = item_dir.parts
+            try:
+                runs_idx = [i for i, p in enumerate(parts) if p == "runs"][0]
+                key = f"{parts[runs_idx+1]}/{parts[runs_idx+2]}/{parts[runs_idx+3]}"
+                groups[key] = groups.get(key, 0) + 1
+            except (IndexError, ValueError):
+                groups["other"] = groups.get("other", 0) + 1
+
+        typer.echo("\nRuns by category:")
+        for key, count in sorted(groups.items()):
+            typer.echo(f"  {key}: {count}")
+
+        if dry_run:
+            typer.echo("\nDry run complete. Use without --dry-run to analyze.")
+            raise typer.Exit(0)
+
+    # Run analysis
+    typer.echo(f"\nAnalyzing with {'quantitative metrics only' if skip_llm else 'Gemini 3 Pro'}...")
+
+    def progress(current: int, total: int, item: str):
+        print(f"\r  [{current}/{total}] {item[:50]:<50}", end="", flush=True)
+
+    async def run_analysis():
+        results = await analyzer.analyze_batch(
+            item_dirs,
+            progress_callback=progress,
+            skip_llm=skip_llm,
+            max_concurrent=max_concurrent,
+        )
+        return results
+
+    results = asyncio.run(run_analysis())
+    print()  # Newline after progress
+
+    if not results:
+        typer.echo("No analyses completed successfully.")
+        raise typer.Exit(1)
+
+    typer.echo(f"\nCompleted {len(results)} analyses")
+
+    # Write results
+    output_path = Path(output_dir)
+    writer = OutputWriter(output_path)
+
+    typer.echo(f"Writing results to {output_path}...")
+    writer.write_batch(results)
+
+    # Generate aggregate report
+    report_path = writer.write_aggregate_report(results)
+    typer.echo(f"\n✓ Aggregate report: {report_path}")
+
+    # Summary statistics
+    success_count = sum(1 for r in results if r.quantitative.status == "success")
+    avg_score = sum(r.qualitative.overall_score for r in results) / len(results) if results else 0
+
+    typer.echo(f"\nSummary:")
+    typer.echo(f"  Total analyzed: {len(results)}")
+    typer.echo(f"  Success rate: {success_count}/{len(results)} ({100*success_count/len(results):.1f}%)")
+    if not skip_llm:
+        typer.echo(f"  Avg overall score: {avg_score:.2f}/10")
 
 
 if __name__ == "__main__":
