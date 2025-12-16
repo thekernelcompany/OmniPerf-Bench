@@ -1,0 +1,43 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index b2aaeb33c..97a423d86 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -313,7 +313,10 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+ 
+         # Compute a new hash for the block so that it can be shared by other
+         # Sequences
+-        new_hash = seq.hash_of_block(len(seq.logical_token_blocks) - 1)
++        # Avoid touching the (potentially large) logical block list; compute
++        # the last full block index directly from sequence length.
++        last_full_idx = seq.data.get_len() // seq.block_size - 1
++        new_hash = seq.hash_of_block(last_full_idx)
+ 
+         # if new_hash is already in the cached table, then free last_block
+         # and return the cached version
+@@ -328,7 +331,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         self,
+         seq: Sequence,
+     ) -> bool:
+-        token_ids_len = len(seq.data.get_token_ids())
++        # Avoid constructing token lists; use O(1) length query.
++        token_ids_len = seq.data.get_len()
+         return token_ids_len > 0 and token_ids_len % seq.block_size == 0
+ 
+     def _maybe_promote_last_block(
+@@ -353,10 +357,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         if not self.enable_caching:
+             return self.gpu_allocator.allocate()
+         block_hash: Optional[int] = None
++        num_hashed_tokens: int = 0
+         if (self._is_last_block_full(seq)):
+-            block_hash = seq.hash_of_block(len(seq.logical_token_blocks) - 1)
+-        num_hashed_tokens = seq.num_hashed_tokens_of_block(
+-            len(seq.logical_token_blocks) - 1)
++            # Compute last full block index without scanning logical blocks.
++            last_full_idx = seq.data.get_len() // seq.block_size - 1
++            block_hash = seq.hash_of_block(last_full_idx)
++            # Each full block contributes exactly `block_size` hashed tokens.
++            num_hashed_tokens = (last_full_idx + 1) * seq.block_size
+ 
+         # num_hashed_tokens is used to compute future hashes
+         # (e.g. in the hashing function, it is used to ask the sequence for

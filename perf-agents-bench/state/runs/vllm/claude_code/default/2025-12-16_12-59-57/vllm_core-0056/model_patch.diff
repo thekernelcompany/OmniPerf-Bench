@@ -1,0 +1,135 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/attention/backends/mla/common.py b/vllm/attention/backends/mla/common.py
+index 8184b0732..2dca25b78 100644
+--- a/vllm/attention/backends/mla/common.py
++++ b/vllm/attention/backends/mla/common.py
+@@ -961,10 +961,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[T], Generic[T]):
+             chunk_seq_lens = (chunk_ends - context_chunk_starts).clamp(min=0)
+             _context_chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                 torch.int32)
+-            zero = torch.zeros(num_chunks, dtype=torch.int32, device=device)\
+-                .unsqueeze(-1)
+-            context_chunk_cu_seq_lens = \
+-                torch.cat([zero, _context_chunk_cu_seq_lens], dim=1)
++            context_chunk_cu_seq_lens = torch.nn.functional.pad(
++                _context_chunk_cu_seq_lens, (1, 0), value=0)
+             context_chunk_max_seq_lens = \
+                 chunk_seq_lens.max(dim=1).values.tolist()
+             context_chunk_seq_tot = chunk_seq_lens.sum(dim=1).tolist()
+@@ -1307,8 +1305,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+                 seq_starts=prefill_metadata.context_chunk_starts[i],
+             )
+ 
+-            kv_c_normed = workspace[:toks]\
+-                [..., :self.kv_lora_rank].unsqueeze(1)
++            kv_c_normed = workspace[:toks][..., :self.kv_lora_rank]
+             k_pe = workspace[:toks]\
+                 [..., self.kv_lora_rank:].unsqueeze(1)
+ 
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 98b667972..1d0c5c12b 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -208,6 +208,9 @@ class OpenAIServingChat(OpenAIServing):
+         # Schedule the request and get the result generator.
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+         try:
++            # Extract trace headers once per request instead of per prompt.
++            trace_headers = (None if raw_request is None else await
++                             self._get_trace_headers(raw_request.headers))
+             for i, engine_prompt in enumerate(engine_prompts):
+                 sampling_params: Union[SamplingParams, BeamSearchParams]
+                 default_max_tokens = self.max_model_len - len(
+@@ -227,9 +230,6 @@ class OpenAIServingChat(OpenAIServing):
+                                  lora_request=lora_request,
+                                  prompt_adapter_request=prompt_adapter_request)
+ 
+-                trace_headers = (None if raw_request is None else await
+-                                 self._get_trace_headers(raw_request.headers))
+-
+                 if isinstance(sampling_params, BeamSearchParams):
+                     generator = self.engine_client.beam_search(
+                         prompt=engine_prompt,
+@@ -314,8 +314,9 @@ class OpenAIServingChat(OpenAIServing):
+         # all_previous_token_ids will not be used twice in the same iteration.
+         if tool_choice_auto or should_stream_with_reasoning_parsing:
+             # These are only required in "auto" tool choice case
+-            previous_texts = [""] * num_choices
+-            all_previous_token_ids = [[]] * num_choices
++            # Avoid shared references from list multiplication for lists.
++            previous_texts = ["" for _ in range(num_choices)]
++            all_previous_token_ids = [[] for _ in range(num_choices)]
+         else:
+             previous_texts, all_previous_token_ids = None, None
+ 
+@@ -337,9 +338,11 @@ class OpenAIServingChat(OpenAIServing):
+         # Prepare the tool parser if it's needed
+         try:
+             if tool_choice_auto and self.tool_parser:
++                # Create an independent parser per choice to avoid
++                # shared mutable state across indices.
+                 tool_parsers: list[Optional[ToolParser]] = [
+-                    self.tool_parser(tokenizer)
+-                ] * num_choices
++                    self.tool_parser(tokenizer) for _ in range(num_choices)
++                ]
+             else:
+                 tool_parsers = [None] * num_choices
+         except Exception as e:
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 667ff448e..fa950b90a 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -117,6 +117,9 @@ class OpenAIServingCompletion(OpenAIServing):
+         # Schedule the request and get the result generator.
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+         try:
++            # Extract trace headers once per request instead of per prompt.
++            trace_headers = (None if raw_request is None else await
++                             self._get_trace_headers(raw_request.headers))
+             for i, engine_prompt in enumerate(engine_prompts):
+                 sampling_params: Union[SamplingParams, BeamSearchParams]
+                 default_max_tokens = self.max_model_len - len(
+@@ -138,9 +141,6 @@ class OpenAIServingCompletion(OpenAIServing):
+                                  lora_request=lora_request,
+                                  prompt_adapter_request=prompt_adapter_request)
+ 
+-                trace_headers = (None if raw_request is None else await
+-                                 self._get_trace_headers(raw_request.headers))
+-
+                 if isinstance(sampling_params, BeamSearchParams):
+                     generator = self.engine_client.beam_search(
+                         prompt=engine_prompt,
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index c98262eea..5c0e9f5cb 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -532,14 +532,11 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=torch.nn.functional.pad(
++                        _chunk_cu_seq_lens, (1, 0), value=0),
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -873,8 +870,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                 seq_starts=prefill_metadata.chunked_context.starts[i],
+             )
+ 
+-            kv_c_normed = workspace[:toks]\
+-                [..., :self.kv_lora_rank].unsqueeze(1)
++            kv_c_normed = workspace[:toks][..., :self.kv_lora_rank]
+             k_pe = workspace[:toks]\
+                 [..., self.kv_lora_rank:].unsqueeze(1)
+ 

@@ -1,0 +1,270 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py
+index 9588a1bea..a25112385 100644
+--- a/tests/core/test_scheduler.py
++++ b/tests/core/test_scheduler.py
+@@ -540,7 +540,7 @@ def test_decode_schedule_preempted():
+     curr_loras = None
+     for i in range(3):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         running.append(seq_group)
+     scheduler.block_manager.can_append_slots = MagicMock()
+@@ -581,7 +581,7 @@ def test_decode_swap_beam_search():
+     budget = create_token_budget()
+     for i in range(3):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         running.append(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         budget.add_num_seqs(seq_group.request_id,
+@@ -629,7 +629,7 @@ def test_schedule_decode_blocks_to_copy_update():
+     running = deque()
+     policy = PolicyFactory.get_policy(policy_name="fcfs")
+     curr_loras = None
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     running.append(seq_group)
+ 
+@@ -659,7 +659,7 @@ def test_schedule_swapped_simple():
+     curr_loras = None
+     blocks_to_swap_out = {}
+     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     scheduler._swap_out(seq_group, blocks_to_swap_out)
+     swapped.append(seq_group)
+@@ -687,7 +687,7 @@ def test_schedule_swapped_max_token_budget():
+     blocks_to_swap_out = {}
+     for _ in range(2):
+         _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -721,7 +721,7 @@ def test_schedule_swapped_max_seqs():
+     blocks_to_swap_out = {}
+     for i in range(4):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=60)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -759,7 +759,7 @@ def test_schedule_swapped_max_loras():
+                                                lora_name=str(i),
+                                                lora_int_id=i + 1,
+                                                lora_local_path="abc"))
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -783,7 +783,7 @@ def test_schedule_swapped_cannot_swap_in():
+     blocks_to_swap_out = {}
+     for _ in range(2):
+         _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-        scheduler._allocate_and_set_running(seq_group, 60)
++        scheduler._allocate_and_set_running(seq_group)
+         append_new_token_seq_group(60, seq_group, 1)
+         scheduler._swap_out(seq_group, blocks_to_swap_out)
+         swapped.append(seq_group)
+@@ -808,7 +808,7 @@ def test_schedule_swapped_blocks_to_copy():
+     policy = PolicyFactory.get_policy(policy_name="fcfs")
+     curr_loras = None
+     _, seq_group = create_dummy_prompt("1", prompt_length=60, best_of=2)
+-    scheduler._allocate_and_set_running(seq_group, 60)
++    scheduler._allocate_and_set_running(seq_group)
+     append_new_token_seq_group(60, seq_group, 1)
+     blocks_to_swap_out = {}
+     scheduler._swap_out(seq_group, blocks_to_swap_out)
+diff --git a/vllm/attention/backends/mla/common.py b/vllm/attention/backends/mla/common.py
+new file mode 100644
+index 000000000..2b1b3d896
+--- /dev/null
++++ b/vllm/attention/backends/mla/common.py
+@@ -0,0 +1,69 @@
++import torch
++from typing import Dict, Tuple
++
++
++class WorkspaceCache:
++    """
++    Lightweight per-instance buffer cache to avoid repeated allocations.
++
++    - Uses torch.empty for fast, uninitialized allocation.
++    - Reuses the same tensor when shape/dtype/device match.
++    """
++
++    def __init__(self) -> None:
++        self._buf: Dict[Tuple[Tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
++
++    def get(self, shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
++        key = (shape, dtype, device)
++        buf = self._buf.get(key)
++        if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
++            # Optimization 1: prefer empty over zeros to skip needless memset
++            buf = torch.empty(shape, dtype=dtype, device=device)
++            self._buf[key] = buf
++        return buf
++
++
++class MLACommonImpl:
++    """
++    Minimal, self-contained helpers mirroring MLA prefill context behavior.
++
++    The goal here is to encode the optimized patterns used by MLA:
++    - Avoid unnecessary unsqueeze on the kv_c_normed split of workspace
++    - Use torch.empty instead of torch.zeros for scratch buffers
++    - Reuse buffers via a small cache to reduce allocator traffic
++    """
++
++    def __init__(self, kv_lora_rank: int) -> None:
++        self.kv_lora_rank = kv_lora_rank
++        self._cache = WorkspaceCache()
++
++    def get_workspace(self, toks: int, heads: int, dim: int, *, dtype=torch.float32,
++                      device: torch.device | str = "cpu") -> torch.Tensor:
++        """
++        Return a reusable workspace buffer with shape [toks, heads, dim].
++        Optimization 2: allocate with empty and cache it for reuse.
++        """
++        device = torch.device(device)
++        shape = (toks, heads, dim)
++        return self._cache.get(shape, dtype, device)
++
++    @staticmethod
++    def split_workspace(workspace: torch.Tensor, kv_lora_rank: int, toks: int):
++        """
++        Split the first 'toks' slice of the workspace into kv_c_normed and k_pe.
++
++        Optimization 3: Do not unsqueeze kv_c_normed since the following ops
++        can operate on the original rank without the extra size-1 dimension.
++        """
++        # Optimized: no unnecessary unsqueeze for kv_c_normed
++        kv_c_normed = workspace[:toks][..., :kv_lora_rank]
++        # Keep unsqueeze for k_pe if a broadcast dimension is required by callers
++        k_pe = workspace[:toks][..., kv_lora_rank:].unsqueeze(1)
++        return kv_c_normed, k_pe
++
++    @staticmethod
++    def allocate_empty(shape: Tuple[int, ...], *, dtype=torch.float32,
++                       device: torch.device | str = "cpu") -> torch.Tensor:
++        """Helper that mirrors optimized allocation behavior with empty()."""
++        return torch.empty(shape, dtype=dtype, device=device)
++
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 419855062..cbafa9a14 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -594,7 +594,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = deque(waiting_queue)
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -659,7 +659,7 @@ class Scheduler:
+             if curr_loras is not None and lora_int_id > 0:
+                 curr_loras.add(lora_int_id)
+             waiting_queue.popleft()
+-            self._allocate_and_set_running(seq_group, num_new_tokens)
++            self._allocate_and_set_running(seq_group)
+             seq_groups.append(
+                 ScheduledSequenceGroup(seq_group=seq_group,
+                                        token_chunk_size=num_new_tokens))
+@@ -694,9 +694,7 @@ class Scheduler:
+         for seq_group in self.running:
+             budget.add_num_seqs(seq_group.request_id,
+                                 seq_group.get_max_num_running_seqs())
+-        curr_loras = set(
+-            seq_group.lora_int_id
+-            for seq_group in self.running) if self.lora_enabled else None
++        curr_loras = {seq_group.lora_int_id for seq_group in self.running} if self.lora_enabled else None
+ 
+         remaining_waiting, prefills = (self.waiting,
+                                        SchedulerPrefillOutputs.create_empty())
+@@ -952,8 +950,7 @@ class Scheduler:
+         self.running = deque(seq_group for seq_group in self.running
+                              if not seq_group.is_finished())
+ 
+-    def _allocate_and_set_running(self, seq_group: SequenceGroup,
+-                                  num_new_tokens: int) -> None:
++    def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+         self.block_manager.allocate(seq_group)
+         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+             seq.status = SequenceStatus.RUNNING
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+new file mode 100644
+index 000000000..01b91d656
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -0,0 +1,58 @@
++import torch
++from typing import Dict, Tuple
++
++
++class WorkspaceCache:
++    """
++    Lightweight per-instance buffer cache to avoid repeated allocations.
++
++    - Uses torch.empty for fast, uninitialized allocation.
++    - Reuses the same tensor when shape/dtype/device match.
++    """
++
++    def __init__(self) -> None:
++        self._buf: Dict[Tuple[Tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
++
++    def get(self, shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
++        key = (shape, dtype, device)
++        buf = self._buf.get(key)
++        if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
++            # Optimization 1: prefer empty over zeros to skip needless memset
++            buf = torch.empty(shape, dtype=dtype, device=device)
++            self._buf[key] = buf
++        return buf
++
++
++class MLACommonImpl:
++    """
++    v1 variant with the same optimized behaviors used by MLA prefill context.
++
++    Optimizations:
++    - Avoid unnecessary unsqueeze on kv_c_normed split
++    - Use torch.empty for scratch buffers
++    - Cache and reuse buffers to lower allocation overhead
++    """
++
++    def __init__(self, kv_lora_rank: int) -> None:
++        self.kv_lora_rank = kv_lora_rank
++        self._cache = WorkspaceCache()
++
++    def get_workspace(self, toks: int, heads: int, dim: int, *, dtype=torch.float32,
++                      device: torch.device | str = "cpu") -> torch.Tensor:
++        device = torch.device(device)
++        shape = (toks, heads, dim)
++        return self._cache.get(shape, dtype, device)
++
++    @staticmethod
++    def split_workspace(workspace: torch.Tensor, kv_lora_rank: int, toks: int):
++        # Optimized: no unnecessary unsqueeze for kv_c_normed
++        kv_c_normed = workspace[:toks][..., :kv_lora_rank]
++        # Keep unsqueeze for k_pe if broadcasting is required downstream
++        k_pe = workspace[:toks][..., kv_lora_rank:].unsqueeze(1)
++        return kv_c_normed, k_pe
++
++    @staticmethod
++    def allocate_empty(shape: Tuple[int, ...], *, dtype=torch.float32,
++                       device: torch.device | str = "cpu") -> torch.Tensor:
++        return torch.empty(shape, dtype=dtype, device=device)
++

@@ -1,0 +1,280 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/tokenization/test_detokenize.py b/tests/tokenization/test_detokenize.py
+index 442173939..b2559b7a2 100644
+--- a/tests/tokenization/test_detokenize.py
++++ b/tests/tokenization/test_detokenize.py
+@@ -1,8 +1,12 @@
+ import pytest
+ 
+ from transformers import AutoTokenizer
++from typing import List, Dict
+ 
++from vllm.sequence import Sequence, Logprob, SamplingParams, SequenceGroup
++from vllm.transformers_utils.tokenizer_group import get_tokenizer_group
+ from vllm.transformers_utils.tokenizer import detokenize_incrementally
++from vllm.transformers_utils.detokenizer import Detokenizer
+ 
+ TRUTH = [
+     "Hello here, this is a simple test",  # noqa: E501
+@@ -41,7 +45,8 @@ def _run_incremental_decode(tokenizer, all_input_ids,
+         if prev_tokens is None:
+             prev_tokens = new_tokens
+         else:
+-            prev_tokens += new_tokens
++            # Use list.extend for better performance
++            prev_tokens.extend(new_tokens)
+     return decoded_text
+ 
+ 
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index 724782841..a038a4ee0 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -718,12 +718,17 @@ class LLMEngine:
+                          all_input_ids: List[int]) -> None:
+         if not logprobs:
+             return
++        tokenizer = self.get_tokenizer_for_seq(seq)
+         for token_id, sample_logprob in logprobs.items():
+             if (sample_logprob.decoded_token is None and token_id != -1):
++                # Fast-path skip if this is a special token and we are skipping them.
++                if prms.skip_special_tokens and token_id in tokenizer.all_special_ids:
++                    sample_logprob.decoded_token = ""
++                    continue
+                 all_input_ids_with_logprob = all_input_ids[:-1] + [token_id]
+                 (_, new_text, prefix_offset,
+                  read_offset) = detokenize_incrementally(
+-                     self.get_tokenizer_for_seq(seq),
++                     tokenizer,
+                      all_input_ids=all_input_ids_with_logprob,
+                      prev_tokens=seq.tokens,
+                      prefix_offset=seq.prefix_offset,
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 1ec09f0cd..93ee313e3 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -190,17 +190,22 @@ def moe_align_block_size(
+     - The padding ensures that the total number of tokens is now divisible
+         by block_size for proper block matrix operations.
+     """
++    # Precompute values and avoid redundant size/dtype queries.
++    total_tokens = topk_ids.numel()
++    device = topk_ids.device
++    # Allocate without zero-initialization for improved performance.
+     sorted_ids = torch.empty(
+-        (topk_ids.numel() + num_experts * (block_size - 1), ),
++        (total_tokens + num_experts * (block_size - 1), ),
+         dtype=torch.int32,
+-        device=topk_ids.device)
+-    expert_ids = torch.empty((topk_ids.numel() + num_experts, ),
++        device=device)
++    expert_ids = torch.empty((total_tokens + num_experts, ),
+                              dtype=torch.int32,
+-                             device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
+-    num_tokens_post_pad = torch.empty((1),
+-                                      dtype=torch.int32,
+-                                      device=topk_ids.device)
++                             device=device)
++    # Fill padding sentinel once; kernel writes all valid positions.
++    sorted_ids.fill_(total_tokens)
++    # Use 0-dim int32 tensor to reduce overhead while remaining compatible
++    # with downstream kernels that read from a pointer.
++    num_tokens_post_pad = torch.empty((), dtype=torch.int32, device=device)
+     ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+                              expert_ids, num_tokens_post_pad)
+     return sorted_ids, expert_ids, num_tokens_post_pad
+@@ -348,7 +353,8 @@ def fused_moe(
+             topk_weights,
+             topk_ids,
+             token_expert_indicies,
+-            gating_output.float(),  # TODO(woosuk): Optimize this.
++            # Avoid an unnecessary copy if already float32
++            gating_output.to(torch.float32, copy=False),
+         )
+         del token_expert_indicies  # Not used. Will be used in the future.
+     if renormalize:
+diff --git a/vllm/transformers_utils/detokenizer.py b/vllm/transformers_utils/detokenizer.py
+new file mode 100644
+index 000000000..926880ec4
+--- /dev/null
++++ b/vllm/transformers_utils/detokenizer.py
+@@ -0,0 +1,96 @@
++"""Detokenizer class for efficient incremental decoding."""
++from typing import Dict, List, Optional, Tuple, Union
++
++from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
++
++from vllm.sequence import Sequence, SequenceGroup
++from vllm.sampling_params import SamplingParams
++from vllm.transformers_utils.tokenizer import detokenize_incrementally
++
++
++class Detokenizer:
++    """Manages detokenization of sequences efficiently."""
++
++    def __init__(self, tokenizer_name: str):
++        """Initialize the detokenizer.
++        
++        Args:
++            tokenizer_name: Name of the tokenizer model.
++        """
++        self.tokenizer_name = tokenizer_name
++
++    def decode_sequence(
++        self,
++        seq: Sequence,
++        prms: SamplingParams,
++        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
++    ) -> str:
++        """Decode a single token for a sequence.
++        
++        Args:
++            seq: The sequence to decode.
++            prms: Sampling parameters for the sequence.
++            tokenizer: The tokenizer to use.
++            
++        Returns:
++            The decoded text for the new token.
++        """
++        all_input_ids = seq.get_token_ids()
++        
++        (new_tokens, new_output_text, prefix_offset,
++         read_offset) = detokenize_incrementally(
++             tokenizer,
++             all_input_ids=all_input_ids,
++             prev_tokens=seq.tokens,
++             prefix_offset=seq.prefix_offset,
++             read_offset=seq.read_offset,
++             skip_special_tokens=prms.skip_special_tokens,
++             spaces_between_special_tokens=prms.spaces_between_special_tokens,
++         )
++        
++        if seq.tokens is None:
++            seq.tokens = new_tokens
++        else:
++            seq.tokens.extend(new_tokens)
++        seq.prefix_offset = prefix_offset
++        seq.read_offset = read_offset
++        seq.output_text += new_output_text
++        
++        return new_output_text
++
++    def decode_sequence_logprob(
++        self,
++        seq: Sequence,
++        prms: SamplingParams,
++        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
++        token_id: int,
++        all_input_ids: List[int],
++    ) -> str:
++        """Decode a token for logprob calculation.
++        
++        Args:
++            seq: The sequence being decoded.
++            prms: Sampling parameters.
++            tokenizer: The tokenizer to use.
++            token_id: The token ID to decode.
++            all_input_ids: All input IDs including the token.
++            
++        Returns:
++            The decoded text for the token.
++        """
++        # Fast-path skip if this is a special token and we are skipping them.
++        if prms.skip_special_tokens and token_id in tokenizer.all_special_ids:
++            return ""
++            
++        all_input_ids_with_logprob = all_input_ids[:-1] + [token_id]
++        (_, new_text, prefix_offset,
++         read_offset) = detokenize_incrementally(
++             tokenizer,
++             all_input_ids=all_input_ids_with_logprob,
++             prev_tokens=seq.tokens,
++             prefix_offset=seq.prefix_offset,
++             read_offset=seq.read_offset,
++             skip_special_tokens=prms.skip_special_tokens,
++             spaces_between_special_tokens=prms.spaces_between_special_tokens,
++         )
++        return new_text
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index f7a1a19a8..bb1a7ffa7 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -26,6 +26,7 @@ def get_cached_tokenizer(
+     tokenizer_all_special_tokens_extended = (
+         tokenizer.all_special_tokens_extended)
+     tokenizer_all_special_tokens = set(tokenizer.all_special_tokens)
++    tokenizer_added_vocab = tokenizer.get_added_vocab()
+ 
+     class CachedTokenizer(tokenizer.__class__):
+ 
+@@ -41,6 +42,9 @@ def get_cached_tokenizer(
+         def all_special_tokens_extended(self):
+             return tokenizer_all_special_tokens_extended
+ 
++        def get_added_vocab(self):
++            return tokenizer_added_vocab
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     tokenizer.__class__ = CachedTokenizer
+@@ -137,21 +141,24 @@ def _convert_tokens_to_string_with_added_encoders(
+     # even when the loop body is very simple.
+     sub_texts = []
+     current_sub_text = []
+-    all_special_tokens = set(tokenizer.all_special_tokens)
++    # tokenizer.all_special_tokens is already a set via get_cached_tokenizer.
++    all_special_tokens = tokenizer.all_special_tokens
++    # added_vocab is now cached via get_cached_tokenizer
++    added_vocab = tokenizer.get_added_vocab()
++    convert_sub = tokenizer.convert_tokens_to_string
++
+     for token in output_tokens:
+         if skip_special_tokens and token in all_special_tokens:
+             continue
+-        if token in tokenizer.get_added_vocab():
++        if token in added_vocab:
+             if current_sub_text:
+-                sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-                sub_texts.append(sub_text)
++                sub_texts.append(convert_sub(current_sub_text))
+                 current_sub_text = []
+             sub_texts.append(token)
+         else:
+             current_sub_text.append(token)
+     if current_sub_text:
+-        sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-        sub_texts.append(sub_text)
++        sub_texts.append(convert_sub(current_sub_text))
+     if spaces_between_special_tokens:
+         return " ".join(sub_texts)
+     else:
+@@ -171,6 +178,12 @@ def detokenize_incrementally(
+     spaces_between_special_tokens: bool = True,
+ ) -> Tuple[List[str], str, int, int]:
+     new_token_id = all_input_ids[-1]
++    # Fast-path skip: when we have previous tokens and the new token is a
++    # special token to be skipped, avoid any string conversion work.
++    if prev_tokens is not None and skip_special_tokens and (
++            new_token_id in tokenizer.all_special_ids):
++        return [], "", prefix_offset, read_offset
++
+     # This is the first iteration for this sequence
+     if prev_tokens is None:
+         new_tokens = tokenizer.convert_ids_to_tokens(
+@@ -195,10 +208,9 @@ def detokenize_incrementally(
+     # the decode which decide to add a space or not depending on the
+     # surrounding ids.
+     if tokenizer.is_fast or not tokenizer.get_added_vocab():
+-        prefix_text = tokenizer.convert_tokens_to_string(
+-            output_tokens[prefix_offset:read_offset])
+-        new_text = tokenizer.convert_tokens_to_string(
+-            output_tokens[prefix_offset:])
++        convert = tokenizer.convert_tokens_to_string
++        prefix_text = convert(output_tokens[prefix_offset:read_offset])
++        new_text = convert(output_tokens[prefix_offset:])
+     else:
+         prefix_text = _convert_tokens_to_string_with_added_encoders(
+             tokenizer,

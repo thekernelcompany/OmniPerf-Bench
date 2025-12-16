@@ -1,0 +1,130 @@
+diff --git a/.buildkite/test-pipeline.yaml b/.buildkite/test-pipeline.yaml
+index 398fdc5f0..cadb03c25 100644
+--- a/.buildkite/test-pipeline.yaml
++++ b/.buildkite/test-pipeline.yaml
+@@ -77,8 +77,8 @@ steps:
+   - vllm/
+   - tests/basic_correctness/test_chunked_prefill
+   commands:
+-  - VLLM_ATTENTION_BACKEND=XFORMERS VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1 pytest -v -s basic_correctness/test_chunked_prefill.py
+-  - VLLM_ATTENTION_BACKEND=FLASH_ATTN VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1 pytest -v -s basic_correctness/test_chunked_prefill.py
++  - VLLM_ATTENTION_BACKEND=XFORMERS pytest -v -s basic_correctness/test_chunked_prefill.py
++  - VLLM_ATTENTION_BACKEND=FLASH_ATTN pytest -v -s basic_correctness/test_chunked_prefill.py
+ 
+ - label: Core Test # 10min
+   mirror_hardwares: [amd]
+@@ -88,10 +88,10 @@ steps:
+   - vllm/distributed
+   - tests/core
+   commands:
+-  - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1  pytest -v -s core/test_scheduler.py
+-  - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1  pytest -v -s core core/test_chunked_prefill_scheduler.py
+-  - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1  pytest -v -s core core/block/e2e/test_correctness.py
+-  - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1  pytest -v -s core core/block/e2e/test_correctness_sliding_window.py
++  - pytest -v -s core/test_scheduler.py
++  - pytest -v -s core core/test_chunked_prefill_scheduler.py
++  - pytest -v -s core core/block/e2e/test_correctness.py
++  - pytest -v -s core core/block/e2e/test_correctness_sliding_window.py
+   - pytest -v -s core --ignore=core/block/e2e/test_correctness.py --ignore=core/test_scheduler.py --ignore=core/test_chunked_prefill_scheduler.py --ignore=core/block/e2e/test_correctness.py --ignore=core/block/e2e/test_correctness_sliding_window.py
+ 
+ - label: Entrypoints Test # 40min
+@@ -192,7 +192,7 @@ steps:
+   - vllm/
+   - tests/prefix_caching
+   commands:
+-    - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1 pytest -v -s prefix_caching/test_prefix_caching.py
++    - pytest -v -s prefix_caching/test_prefix_caching.py
+     - pytest -v -s prefix_caching --ignore=prefix_caching/test_prefix_caching.py
+ 
+ - label: Samplers Test # 36min
+@@ -217,7 +217,7 @@ steps:
+   - tests/spec_decode
+   commands:
+     - pytest -v -s spec_decode/e2e/test_multistep_correctness.py
+-    - VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1 pytest -v -s spec_decode/e2e/test_compatibility.py
++    - pytest -v -s spec_decode/e2e/test_compatibility.py
+     - VLLM_ATTENTION_BACKEND=FLASH_ATTN pytest -v -s spec_decode --ignore=spec_decode/e2e/test_multistep_correctness.py --ignore=spec_decode/e2e/test_compatibility.py
+ 
+ - label: LoRA Test %N # 15min each
+diff --git a/vllm/attention/backends/flash_attn.py b/vllm/attention/backends/flash_attn.py
+index 8457bde06..b24284afc 100644
+--- a/vllm/attention/backends/flash_attn.py
++++ b/vllm/attention/backends/flash_attn.py
+@@ -444,12 +444,15 @@ class FlashAttentionMetadataBuilder(
+                                              self.runner.pin_memory)
+         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
+                                                device, self.runner.pin_memory)
+-        query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
++        # Use empty + explicit first-element init; cumsum writes the rest.
++        query_start_loc = torch.empty(query_lens_tensor.shape[0] + 1,
+                                       dtype=torch.int32,
+                                       device=device)
+-        seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
++        query_start_loc[0] = 0
++        seq_start_loc = torch.empty(seq_lens_tensor.shape[0] + 1,
+                                     dtype=torch.int32,
+                                     device=device)
++        seq_start_loc[0] = 0
+         torch.cumsum(seq_lens_tensor,
+                      dim=0,
+                      dtype=seq_start_loc.dtype,
+diff --git a/vllm/attention/backends/flashinfer.py b/vllm/attention/backends/flashinfer.py
+index ba9b2d043..31817ffdf 100644
+--- a/vllm/attention/backends/flashinfer.py
++++ b/vllm/attention/backends/flashinfer.py
+@@ -642,12 +642,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                                              self.runner.pin_memory)
+         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
+                                                device, self.runner.pin_memory)
+-        query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
++        # Avoid full zero-fill; cumsum populates [1:], set index 0 explicitly.
++        query_start_loc = torch.empty(query_lens_tensor.shape[0] + 1,
+                                       dtype=torch.int32,
+                                       device=device)
+-        seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
++        query_start_loc[0] = 0
++        seq_start_loc = torch.empty(seq_lens_tensor.shape[0] + 1,
+                                     dtype=torch.int32,
+                                     device=device)
++        seq_start_loc[0] = 0
+         torch.cumsum(seq_lens_tensor,
+                      dim=0,
+                      dtype=seq_start_loc.dtype,
+@@ -670,10 +673,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                                                   dtype=torch.int)
+             paged_kv_last_page_len_tensor = torch.tensor(
+                 self.paged_kv_last_page_len, device="cpu", dtype=torch.int)
+-            block_table_bound_tensor = torch.zeros(len(self.paged_kv_indptr) -
+-                                                   1,
+-                                                   device="cpu",
+-                                                   dtype=torch.int)
++            # Bound tensor is written by downstream kernels; init first val.
++            block_table_bound_tensor = torch.empty(
++                len(self.paged_kv_indptr) - 1, device="cpu", dtype=torch.int)
++            if block_table_bound_tensor.numel() > 0:
++                block_table_bound_tensor[0] = 0
+         else:
+             paged_kv_indices_tensor = None
+             paged_kv_indptr_tensor = None
+diff --git a/vllm/attention/backends/utils.py b/vllm/attention/backends/utils.py
+index 53e3a53ba..1e679edde 100644
+--- a/vllm/attention/backends/utils.py
++++ b/vllm/attention/backends/utils.py
+@@ -241,12 +241,15 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
+                                              self.runner.pin_memory)
+         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
+                                                device, self.runner.pin_memory)
+-        query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
++        # Avoid zero-fill; cumsum populates indices [1:], set [0] explicitly.
++        query_start_loc = torch.empty(query_lens_tensor.shape[0] + 1,
+                                       dtype=torch.int32,
+                                       device=device)
+-        seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
++        query_start_loc[0] = 0
++        seq_start_loc = torch.empty(seq_lens_tensor.shape[0] + 1,
+                                     dtype=torch.int32,
+                                     device=device)
++        seq_start_loc[0] = 0
+         torch.cumsum(seq_lens_tensor,
+                      dim=0,
+                      dtype=seq_start_loc.dtype,

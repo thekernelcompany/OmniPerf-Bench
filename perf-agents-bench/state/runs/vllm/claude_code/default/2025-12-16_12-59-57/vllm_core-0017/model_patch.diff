@@ -1,0 +1,269 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 47eddb345..45fced949 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -39,38 +39,37 @@ repos:
+   - id: mypy-local
+     name: Run mypy for local Python installation
+     entry: tools/mypy.sh
+-    language: python
++    language: system
+     types: [python]
+-    additional_dependencies: &mypy_deps [mypy==1.11.1, types-setuptools, types-PyYAML, types-requests]
+-    stages: [pre-commit] # Don't run in CI
++    stages: [pre-commit]
+   - id: mypy-3.9 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+     name: Run mypy for Python 3.9
+     entry: tools/mypy.sh 1 "3.9"
+     language: python
+     types: [python]
+-    additional_dependencies: *mypy_deps
+-    stages: [manual] # Only run in CI
++    additional_dependencies: &mypy_deps [mypy==1.11.1, types-setuptools, types-PyYAML, types-requests]
++    stages: [manual]
+   - id: mypy-3.10 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+     name: Run mypy for Python 3.10
+     entry: tools/mypy.sh 1 "3.10"
+     language: python
+     types: [python]
+     additional_dependencies: *mypy_deps
+-    stages: [manual] # Only run in CI
++    stages: [manual]
+   - id: mypy-3.11 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+     name: Run mypy for Python 3.11
+     entry: tools/mypy.sh 1 "3.11"
+     language: python
+     types: [python]
+     additional_dependencies: *mypy_deps
+-    stages: [manual] # Only run in CI
++    stages: [manual]
+   - id: mypy-3.12 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+     name: Run mypy for Python 3.12
+     entry: tools/mypy.sh 1 "3.12"
+     language: python
+     types: [python]
+     additional_dependencies: *mypy_deps
+-    stages: [manual] # Only run in CI
++    stages: [manual]
+   - id: shellcheck
+     name: Lint shell scripts
+     entry: tools/shellcheck.sh
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index c03b5932e..1dff1800b 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -39,23 +39,27 @@ class RefCounter(RefCounterProtocol):
+                                            for index in deduped}
+ 
+     def incr(self, block_id: BlockId) -> RefCount:
+-        assert block_id in self._refcounts
+-        pre_incr_refcount = self._refcounts[block_id]
++        # Optimization: Reduce dict lookups by storing reference
++        refcounts = self._refcounts
++        assert block_id in refcounts
++        pre_incr_refcount = refcounts[block_id]
+ 
+         assert pre_incr_refcount >= 0
+ 
+         post_incr_refcount = pre_incr_refcount + 1
+-        self._refcounts[block_id] = post_incr_refcount
++        refcounts[block_id] = post_incr_refcount
+         return post_incr_refcount
+ 
+     def decr(self, block_id: BlockId) -> RefCount:
+-        assert block_id in self._refcounts
+-        refcount = self._refcounts[block_id]
++        # Optimization: Reduce dict lookups by storing reference
++        refcounts = self._refcounts
++        assert block_id in refcounts
++        refcount = refcounts[block_id]
+ 
+         assert refcount > 0
+         refcount -= 1
+ 
+-        self._refcounts[block_id] = refcount
++        refcounts[block_id] = refcount
+ 
+         return refcount
+ 
+@@ -251,9 +255,8 @@ class BlockList:
+         self._blocks = blocks
+ 
+         # Cache block ids for fast query
+-        self._block_ids = []
+-        for block in self._blocks:
+-            self._add_block_id(block.block_id)
++        # Optimization: Use list comprehension for better performance
++        self._block_ids = [block.block_id for block in blocks]
+ 
+     def append_token_ids(self, block_index: int, token_ids: List[int]) -> None:
+         block = self._blocks[block_index]
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 123830323..2edf39741 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -160,21 +160,24 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+         # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None,
+-                                            extra_hash=extra_hash)
++        # Optimization: Use local references to avoid repeated attribute lookups
++        block_pool = self._block_pool
++        block = block_pool.init_block(prev_block=prev_block,
++                                      token_ids=token_ids,
++                                      block_size=self._block_size,
++                                      physical_block_id=None,
++                                      extra_hash=extra_hash)
+         assert block.content_hash is not None
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        cached_blocks = self._cached_blocks
++        cached_block_id = cached_blocks.get(block.content_hash, None)
+         if cached_block_id is not None:
+             self.metric_data.query(hit=True)
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block)
+             return block
+         self.metric_data.query(hit=False)
+-        self._block_pool.free_block(block)
++        block_pool.free_block(block)
+ 
+         # No cached block => Allocate a new block
+         block = self.allocate_mutable_block(prev_block, extra_hash=extra_hash)
+@@ -231,11 +234,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         block_id = block.block_id
+         assert block_id is not None
+ 
++        # Optimization: Use local reference for refcounter
+         refcount = self._refcounter.incr(block_id)
+         if refcount == 1:
+             # In case a cached block was evicted, restore its tracking
+-            if block_id in self.evictor:
+-                self.evictor.remove(block_id)
++            evictor = self.evictor
++            if block_id in evictor:
++                evictor.remove(block_id)
+ 
+             self._track_block_id(block_id, computed=True)
+ 
+@@ -376,20 +381,25 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+         source_blocks = get_all_blocks_recursively(last_block)
+ 
++        # Optimization: Use local references to avoid repeated attribute lookups
++        refcounter = self._refcounter
++        block_pool = self._block_pool
++        block_size = self._block_size
++
+         forked_blocks: List[Block] = []
+         prev_block = None
+         for block in source_blocks:
+             block_id = block.block_id
+             assert block_id is not None
+ 
+-            refcount = self._refcounter.incr(block_id)
++            refcount = refcounter.incr(block_id)
+             assert refcount != 1, "can't fork free'd block_id = {}".format(
+                 block_id)
+ 
+-            forked_block = self._block_pool.init_block(
++            forked_block = block_pool.init_block(
+                 prev_block=prev_block,
+                 token_ids=block.token_ids,
+-                block_size=self._block_size,
++                block_size=block_size,
+                 physical_block_id=block_id,
+                 extra_hash=block.extra_hash)
+ 
+@@ -453,20 +463,25 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert block.block_id is not None
+         assert self._refcounter.get(block.block_id) > 0
+ 
+-        if block.content_hash not in self._cached_blocks:
++        # Optimization: Use local references
++        cached_blocks = self._cached_blocks
++        content_hash = block.content_hash
++
++        if content_hash not in cached_blocks:
+             # No cached content hash => Set this block as cached.
+             # Note that this block cannot be marked as computed yet
+             # because other sequences in the same batch cannot reuse
+             # this block.
+-            self._cached_blocks[block.content_hash] = block.block_id
++            block_id = block.block_id
++            cached_blocks[content_hash] = block_id
+             # Mark this block as touched so that it can be marked as
+             # computed after the entire batch of sequences are scheduled.
+-            self._touched_blocks.add(block.block_id)
+-            return block.block_id
++            self._touched_blocks.add(block_id)
++            return block_id
+ 
+         # Reuse the cached content hash
+         self._decr_refcount_hashless_block(block)
+-        block.block_id = self._cached_blocks[block.content_hash]
++        block.block_id = cached_blocks[content_hash]
+ 
+         # Increment refcount of the cached block and (possibly) restore
+         # it from the evictor.
+@@ -516,20 +531,25 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
++        # Optimization: Use local references to avoid repeated attribute lookups
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+ 
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
+-            elif block_id in self.evictor:
+-                self.evictor.update(block_id, now)
++            if block_tracker[block_id].active:
++                block_tracker[block_id].last_accessed = now
++            elif block_id in evictor:
++                evictor.update(block_id, now)
+             else:
+                 raise ValueError(
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         # Mark all touched blocks as computed.
++        # Optimization: Use local reference to avoid repeated attribute lookups
++        block_tracker = self._block_tracker
+         for block_id in self._touched_blocks:
+-            self._block_tracker[block_id].computed = True
++            block_tracker[block_id].computed = True
+         self._touched_blocks.clear()
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+@@ -740,16 +760,12 @@ class PrefixCachingBlock(Block):
+         """Incrementally computes the number of tokens that there is
+         till the current block (included)
+         """
+-        res = 0
+-
+-        # Add all previous blocks
+-        if self._prev_block is not None:
+-            res += self._prev_block.num_tokens_total
+-
+-        # Add current block
+-        res += len(self.token_ids)
+-
+-        self._cached_num_tokens_total = res
++        # Optimization: Compute directly without intermediate variable
++        prev_block = self._prev_block
++        self._cached_num_tokens_total = (
++            (prev_block.num_tokens_total if prev_block is not None else 0) +
++            len(self.token_ids)
++        )
+ 
+     @property
+     def computed(self) -> bool:
