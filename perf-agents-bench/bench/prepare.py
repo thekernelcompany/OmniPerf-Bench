@@ -559,9 +559,9 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 iterations = args_cfg.get("iterations", 50)
                 max_budget = args_cfg.get("max_budget_per_task", 10.0)
                 use_python_api = bool(args_cfg.get("use_python_api", True))
-            elif default_agent in {"trae", "codex", "codex_cli"}:
+            elif default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
                 agent_cfg = self.cfg["agents"].get(default_agent, {})
-                cli = agent_cfg.get("cli", "python")
+                cli = agent_cfg.get("cli", "claude" if default_agent == "claude_code" else "python")
                 time_budget = int(agent_cfg.get("time_budget_minutes", 60))
                 args_cfg = agent_cfg.get("args", {})
                 iterations = int(args_cfg.get("max_steps", 50))
@@ -629,8 +629,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         "-b", str(max_budget)
                     ]
 
-            elif default_agent in {"trae", "codex", "codex_cli"}:
-                # Run Trae/Codex (module) or Codex CLI
+            elif default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
+                # Run Trae/Codex (module), Codex CLI, or Claude Code
                 if default_agent == "trae":
                     cmd = [
                         cli, "-m", "trae_agent.cli", "run",
@@ -655,7 +655,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     ]
                     if trae_config_file:
                         cmd.extend(["--config-file", str(trae_config_file)])
-                else:  # codex_cli
+                elif default_agent == "codex_cli":
                     # Invoke the locally installed Codex CLI directly using non-interactive exec
                     # Read task prompt content to pass as a single PROMPT argument
                     try:
@@ -671,7 +671,39 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     if profile:
                         cmd += ["-p", str(profile)]
                     cmd += [prompt_text]
-                logger.info(f"{default_agent} agent command: {' '.join(map(str, cmd))}")
+                else:  # claude_code
+                    # Invoke Claude Code CLI with stream-json output for structured logging
+                    try:
+                        prompt_text = Path(task_file).read_text()
+                    except Exception:
+                        prompt_text = ""
+
+                    # Build Claude Code command
+                    cmd = [
+                        cli,  # 'claude' CLI
+                        "--output-format", "stream-json",  # JSON output for parsing
+                        "--verbose",
+                        "--max-turns", str(iterations),
+                        "--dangerously-skip-permissions",  # Non-interactive mode
+                    ]
+
+                    # Add model if specified
+                    model = args_cfg.get("model")
+                    if model:
+                        cmd += ["--model", model]
+
+                    # Add allowed tools if specified
+                    allowed_tools = args_cfg.get("allowed_tools")
+                    if allowed_tools:
+                        cmd += ["--allowedTools", allowed_tools]
+
+                    # Add the prompt as positional argument
+                    cmd += ["-p", prompt_text]
+
+                    # Set working directory via environment (Claude Code uses cwd)
+                    # We'll handle this in the Popen call
+
+                logger.info(f"{default_agent} agent command: {' '.join(map(str, cmd[:5]))}...")  # Truncate for readability
                 logger.info(f"{default_agent} config file: {trae_config_file}")
 
             logger.info(f"Initializing {default_agent} execution")
@@ -1030,8 +1062,10 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     try:
                         if default_agent == "trae":
                             jw.write_trae_logs(stdout_content, stderr_content)
-                        elif default_agent == "codex":
+                        elif default_agent == "codex" or default_agent == "codex_cli":
                             jw.write_codex_logs(stdout_content, stderr_content)
+                        elif default_agent == "claude_code":
+                            jw.write_claude_code_logs(stdout_content, stderr_content)
                         else:
                             jw.write_openhands_logs(stdout_content, stderr_content)
                     except Exception:
@@ -1060,8 +1094,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         logger.error(f"Stderr: {stderr_content}")
                 
                 # Determine status based on actual task completion, not just return code
-                if default_agent in {"trae", "codex"}:
-                    # For Trae/Codex, check if commits were made or files changed
+                if default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
+                    # For Trae/Codex/Claude Code, check if commits were made or files changed
                     status = "success" if task_completed else "error"
                 else:
                     # For OpenHands, use return code
@@ -1144,8 +1178,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
                 if len(changed) == 0:
                     logger.warning("No file changes detected.")
-                    # For Trae/Codex agent, check if this is due to detection bug vs actual no changes
-                    if default_agent in {"trae", "codex"}:
+                    # For Trae/Codex/Claude Code agent, check if this is due to detection bug vs actual no changes
+                    if default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
                         # Check if there are any commits made by agent
                         try:
                             commits = subprocess.check_output([
