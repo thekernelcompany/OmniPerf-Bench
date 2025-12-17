@@ -1,0 +1,328 @@
+diff --git a/cmake/utils.cmake b/cmake/utils.cmake
+index c9cd099b8..21a2d0bc1 100644
+--- a/cmake/utils.cmake
++++ b/cmake/utils.cmake
+@@ -99,9 +99,9 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
+       "Failed to determine torch nvcc compiler flags")
+ 
+     if (CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
++      # Enable FP8 paths and allow half/bfloat intrinsics for better kernels
+       list(APPEND GPU_FLAGS "-DENABLE_FP8")
+-    endif()
+-    if (CUDA_VERSION VERSION_GREATER_EQUAL 12.0)
++      list(APPEND GPU_FLAGS "-DENABLE_FP8_E5M2")
+       list(REMOVE_ITEM GPU_FLAGS
+         "-D__CUDA_NO_HALF_OPERATORS__"
+         "-D__CUDA_NO_HALF_CONVERSIONS__"
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index fb6882f3e..52330f54c 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -1,13 +1,20 @@
++// Optimized layernorm kernels with lighter-weight reductions and better
++// occupancy tuning.
+ #include "type_convert.cuh"
+ #include "dispatch_utils.h"
++#include "reduction_utils.cuh"
+ 
+ #include <torch/cuda.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
+ #ifndef USE_ROCM
+   #include <cub/cub.cuh>
++  #include <cuda_bf16.h>
++  #include <cuda_fp16.h>
+ #else
+   #include <hipcub/hipcub.hpp>
++  #include <hip/hip_bf16.h>
++  #include <hip/hip_fp16.h>
+ #endif
+ 
+ namespace vllm {
+@@ -27,9 +34,8 @@ __global__ void rms_norm_kernel(
+     variance += x * x;
+   }
+ 
+-  using BlockReduce = cub::BlockReduce<float, 1024>;
+-  __shared__ typename BlockReduce::TempStorage reduceStore;
+-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
++  // Reduce across the entire block and make the sum available to all threads.
++  variance = vllm::block_reduce_sum_all<1024>(variance);
+ 
+   if (threadIdx.x == 0) {
+     s_variance = rsqrtf(variance / hidden_size + epsilon);
+@@ -79,9 +85,7 @@ fused_add_rms_norm_kernel(
+     residual_v[id] = temp;
+   }
+ 
+-  using BlockReduce = cub::BlockReduce<float, 1024>;
+-  __shared__ typename BlockReduce::TempStorage reduceStore;
+-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
++  variance = vllm::block_reduce_sum_all<1024>(variance);
+ 
+   if (threadIdx.x == 0) {
+     s_variance = rsqrtf(variance / hidden_size + epsilon);
+@@ -118,9 +122,7 @@ fused_add_rms_norm_kernel(
+     residual[blockIdx.x * hidden_size + idx] = z;
+   }
+ 
+-  using BlockReduce = cub::BlockReduce<float, 1024>;
+-  __shared__ typename BlockReduce::TempStorage reduceStore;
+-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
++  variance = vllm::block_reduce_sum_all<1024>(variance);
+ 
+   if (threadIdx.x == 0) {
+     s_variance = rsqrtf(variance / hidden_size + epsilon);
+@@ -144,7 +146,9 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
+   int num_tokens = input.numel() / hidden_size;
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(hidden_size, 1024));
++  // Tune block size for better occupancy in memory-bound regimes.
++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
++  dim3 block(std::min(hidden_size, max_block_size));
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&] {
+diff --git a/csrc/reduction_utils.cuh b/csrc/reduction_utils.cuh
+new file mode 100644
+index 000000000..36e170884
+--- /dev/null
++++ b/csrc/reduction_utils.cuh
+@@ -0,0 +1,47 @@
++// Lightweight warp/block reduction utilities shared across kernels.
++#pragma once
++
++#include <cuda.h>
++
++namespace vllm {
++
++// Warp-level sum using shuffles.
++__device__ __forceinline__ float warp_reduce_sum(float val) {
++#ifndef USE_ROCM
++  unsigned mask = 0xffffffffu;
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    val += __shfl_down_sync(mask, val, offset);
++  }
++#else
++  // HIP does not require an explicit mask argument.
++  for (int offset = 16; offset > 0; offset >>= 1) {
++    val += __shfl_down(val, offset);
++  }
++#endif
++  return val;
++}
++
++// Block-level sum reduction that returns the block-wide sum to all threads.
++template <int MaxBlockSize>
++__device__ __forceinline__ float block_reduce_sum_all(float val) {
++  // Enough for up to 1024 threads (32 warps)
++  __shared__ float shared[MaxBlockSize / 32];
++  int lane = threadIdx.x & 31;
++  int wid = threadIdx.x >> 5;
++
++  float sum = warp_reduce_sum(val);
++  if (lane == 0) shared[wid] = sum;
++  __syncthreads();
++
++  // Number of active warps in the block
++  int nwarps = (blockDim.x + 31) >> 5;
++  sum = (threadIdx.x < nwarps) ? shared[lane] : 0.0f;
++  if (wid == 0) sum = warp_reduce_sum(sum);
++
++  if (wid == 0 && lane == 0) shared[0] = sum;
++  __syncthreads();
++  return shared[0];
++}
++
++}  // namespace vllm
++
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..9a2f46fb9
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,116 @@
++diff --git a/cmake/utils.cmake b/cmake/utils.cmake
++index c9cd099b8..21a2d0bc1 100644
++--- a/cmake/utils.cmake
+++++ b/cmake/utils.cmake
++@@ -99,9 +99,9 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
++       "Failed to determine torch nvcc compiler flags")
++ 
++     if (CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
+++      # Enable FP8 paths and allow half/bfloat intrinsics for better kernels
++       list(APPEND GPU_FLAGS "-DENABLE_FP8")
++-    endif()
++-    if (CUDA_VERSION VERSION_GREATER_EQUAL 12.0)
+++      list(APPEND GPU_FLAGS "-DENABLE_FP8_E5M2")
++       list(REMOVE_ITEM GPU_FLAGS
++         "-D__CUDA_NO_HALF_OPERATORS__"
++         "-D__CUDA_NO_HALF_CONVERSIONS__"
++diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
++index fb6882f3e..52330f54c 100644
++--- a/csrc/layernorm_kernels.cu
+++++ b/csrc/layernorm_kernels.cu
++@@ -1,13 +1,20 @@
+++// Optimized layernorm kernels with lighter-weight reductions and better
+++// occupancy tuning.
++ #include "type_convert.cuh"
++ #include "dispatch_utils.h"
+++#include "reduction_utils.cuh"
++ 
++ #include <torch/cuda.h>
++ #include <c10/cuda/CUDAGuard.h>
++ 
++ #ifndef USE_ROCM
++   #include <cub/cub.cuh>
+++  #include <cuda_bf16.h>
+++  #include <cuda_fp16.h>
++ #else
++   #include <hipcub/hipcub.hpp>
+++  #include <hip/hip_bf16.h>
+++  #include <hip/hip_fp16.h>
++ #endif
++ 
++ namespace vllm {
++@@ -27,9 +34,8 @@ __global__ void rms_norm_kernel(
++     variance += x * x;
++   }
++ 
++-  using BlockReduce = cub::BlockReduce<float, 1024>;
++-  __shared__ typename BlockReduce::TempStorage reduceStore;
++-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+++  // Reduce across the entire block and make the sum available to all threads.
+++  variance = vllm::block_reduce_sum_all<1024>(variance);
++ 
++   if (threadIdx.x == 0) {
++     s_variance = rsqrtf(variance / hidden_size + epsilon);
++@@ -79,9 +85,7 @@ fused_add_rms_norm_kernel(
++     residual_v[id] = temp;
++   }
++ 
++-  using BlockReduce = cub::BlockReduce<float, 1024>;
++-  __shared__ typename BlockReduce::TempStorage reduceStore;
++-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+++  variance = vllm::block_reduce_sum_all<1024>(variance);
++ 
++   if (threadIdx.x == 0) {
++     s_variance = rsqrtf(variance / hidden_size + epsilon);
++@@ -118,9 +122,7 @@ fused_add_rms_norm_kernel(
++     residual[blockIdx.x * hidden_size + idx] = z;
++   }
++ 
++-  using BlockReduce = cub::BlockReduce<float, 1024>;
++-  __shared__ typename BlockReduce::TempStorage reduceStore;
++-  variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+++  variance = vllm::block_reduce_sum_all<1024>(variance);
++ 
++   if (threadIdx.x == 0) {
++     s_variance = rsqrtf(variance / hidden_size + epsilon);
++@@ -144,7 +146,9 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
++   int num_tokens = input.numel() / hidden_size;
++ 
++   dim3 grid(num_tokens);
++-  dim3 block(std::min(hidden_size, 1024));
+++  // Tune block size for better occupancy in memory-bound regimes.
+++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+++  dim3 block(std::min(hidden_size, max_block_size));
++   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
++   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&] {
++diff --git a/csrc/reduction_utils.cuh b/csrc/reduction_utils.cuh
++new file mode 100644
++index 000000000..36e170884
++--- /dev/null
+++++ b/csrc/reduction_utils.cuh
++@@ -0,0 +1,47 @@
+++// Lightweight warp/block reduction utilities shared across kernels.
+++#pragma once
+++
+++#include <cuda.h>
+++
+++namespace vllm {
+++
+++// Warp-level sum using shuffles.
+++__device__ __forceinline__ float warp_reduce_sum(float val) {
+++#ifndef USE_ROCM
+++  unsigned mask = 0xffffffffu;
+++  for (int offset = 16; offset > 0; offset >>= 1) {
+++    val += __shfl_down_sync(mask, val, offset);
+++  }
+++#else
+++  // HIP does not require an explicit mask argument.
+++  for (int offset = 16; offset > 0; offset >>= 1) {
+++    val += __shfl_down(val, offset);
+++  }
+++#endif
+++  return val;
+++}
+++
+++// Block-level sum reduction that returns the block-w
+\ No newline at end of file
+diff --git a/tests/kernels/test_layernorm.py b/tests/kernels/test_layernorm.py
+index fa4bbe458..c4eb66371 100644
+--- a/tests/kernels/test_layernorm.py
++++ b/tests/kernels/test_layernorm.py
+@@ -71,6 +71,7 @@ def test_rms_norm(
+ @pytest.mark.parametrize("quant_scale", [1.0, 0.01, 10.0])
+ @pytest.mark.parametrize("seed", SEEDS)
+ @pytest.mark.parametrize("device", CUDA_DEVICES)
++@torch.inference_mode()
+ def test_fused_rms_norm_quant(
+     num_tokens: int,
+     hidden_size: int,
+diff --git a/vllm/model_executor/models/llama4.py b/vllm/model_executor/models/llama4.py
+index 8785e9dcf..51efbfe20 100644
+--- a/vllm/model_executor/models/llama4.py
++++ b/vllm/model_executor/models/llama4.py
+@@ -37,7 +37,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ 
+ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+-from .utils import (AutoWeightsLoader, extract_layer_index,
++from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
+                     is_pp_missing_parameter)
+ 
+ 
+@@ -50,7 +50,7 @@ class Llama4MoE(nn.Module):
+         topk: int,
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
++        router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
+         router_scores = torch.sigmoid(router_scores.float()).to(
+             hidden_states.dtype)
+         return (router_scores, router_indices.to(torch.int32))
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index f197434f3..8893f00db 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -654,7 +654,7 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
+     ) -> IntermediateTensors:
+         return IntermediateTensors({
+             key:
+-            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
++            torch.empty((batch_size, hidden_size), dtype=dtype, device=device)
+             for key in keys
+         })
+ 
+@@ -695,6 +695,18 @@ def extract_layer_index(layer_name: str) -> int:
+     return int_vals[0]
+ 
+ 
++
++def fast_topk(x: torch.Tensor, k: int, dim: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Optimized top-k for the common k==1 case used by some MoE routers.
++    Falls back to torch.topk for k>1.
++    """
++    if k == 1:
++        values, indices = torch.max(x, dim=dim, keepdim=True)
++        return values, indices
++    return torch.topk(x, k, dim=dim)
++
++
+ def cast_overflow_tensors(
+     tensors: torch.Tensor,
+     offset: float = 1000,

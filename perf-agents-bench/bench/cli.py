@@ -581,6 +581,7 @@ def analyze(
     cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Cache directory for LLM responses"),
     max_concurrent: int = typer.Option(3, "--max-concurrent", help="Maximum concurrent analyses"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Discover runs without analyzing"),
+    data_dir: Optional[str] = typer.Option(None, "--data-dir", "-D", help="Path to data/ directory containing benchmark datasets (for patch comparison)"),
 ):
     """
     Analyze agent runs and extract soft metrics using Gemini 3 Pro.
@@ -699,6 +700,7 @@ def analyze(
             progress_callback=progress,
             skip_llm=skip_llm,
             max_concurrent=max_concurrent,
+            data_dir=Path(data_dir) if data_dir else None,
         )
         return results
 

@@ -611,12 +611,14 @@ class SoftMetricsAnalyzer:
         self,
         item_dir: Path,
         skip_llm: bool = False,
+        data_dir: Optional[Path] = None,
     ) -> RunAnalysis:
         """Analyze a single run directory.
 
         Args:
             item_dir: Path to the run item directory
             skip_llm: If True, only extract quantitative metrics (no LLM call)
+            data_dir: Path to data/ directory containing benchmark datasets
 
         Returns:
             Complete RunAnalysis object
@@ -654,7 +656,18 @@ class SoftMetricsAnalyzer:
         trajectory_metrics = self._parse_trajectory_metrics(data.get("trajectory", {}))
 
         # V3: Compare patches against human reference
-        data_dir = item_dir.parent.parent.parent.parent.parent / "data"
+        # Use provided data_dir, or try to find it relative to item_dir
+        if data_dir is None:
+            # Try common relative paths
+            for levels in [8, 7, 6, 5]:  # Try different parent levels
+                candidate = item_dir
+                for _ in range(levels):
+                    candidate = candidate.parent
+                candidate = candidate / "data"
+                if candidate.exists():
+                    data_dir = candidate
+                    break
+        
         patch_similarity = self._compare_patches(
             agent_patch=data.get("patch", ""),
             repo=meta.repo,
@@ -749,6 +762,7 @@ class SoftMetricsAnalyzer:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         skip_llm: bool = False,
         max_concurrent: int = 3,
+        data_dir: Optional[Path] = None,
     ) -> List[RunAnalysis]:
         """Analyze multiple runs with progress tracking.
 
@@ -757,6 +771,7 @@ class SoftMetricsAnalyzer:
             progress_callback: Callback(current, total, item_id) for progress
             skip_llm: If True, skip LLM analysis
             max_concurrent: Maximum concurrent analyses
+            data_dir: Path to data/ directory containing benchmark datasets
 
         Returns:
             List of RunAnalysis objects
@@ -767,7 +782,7 @@ class SoftMetricsAnalyzer:
         async def analyze_with_semaphore(item_dir: Path, index: int) -> Optional[RunAnalysis]:
             async with semaphore:
                 try:
-                    result = await self.analyze_run(item_dir, skip_llm=skip_llm)
+                    result = await self.analyze_run(item_dir, skip_llm=skip_llm, data_dir=data_dir)
                     if progress_callback:
                         progress_callback(index + 1, len(item_dirs), item_dir.name)
                     return result

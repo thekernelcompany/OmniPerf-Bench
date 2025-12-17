@@ -424,28 +424,55 @@ def find_dataset_for_repo(repo: str, data_dir: Path) -> Optional[Path]:
     Returns:
         Path to dataset file or None
     """
-    # Try various naming patterns
-    patterns = [
+    # Priority patterns - final dataset first since it contains complete data
+    priority_patterns = [
         f"{repo}_final_dataset.jsonl",
+    ]
+    
+    # Fallback patterns
+    fallback_patterns = [
         f"{repo}_dataset.jsonl",
         f"{repo}_dataset_with_test.jsonl",
         f"{repo}.jsonl",
     ]
 
-    # Search in data directory and common subdirectories
-    search_dirs = [
-        data_dir,
+    # Priority search directories - final/ first since it contains curated data
+    priority_dirs = [
         data_dir / "final",
-        data_dir / "datasets",
-        data_dir.parent / "data",
         data_dir.parent / "data" / "final",
     ]
+    
+    # Fallback directories
+    fallback_dirs = [
+        data_dir,
+        data_dir / "datasets",
+        data_dir.parent / "data",
+    ]
 
-    for search_dir in search_dirs:
+    # First pass: look for priority patterns in priority directories
+    for search_dir in priority_dirs:
         if not search_dir.exists():
             continue
+        for pattern in priority_patterns:
+            candidate = search_dir / pattern
+            if candidate.exists():
+                return candidate
 
-        for pattern in patterns:
+    # Second pass: look for priority patterns in fallback directories
+    for search_dir in fallback_dirs:
+        if not search_dir.exists():
+            continue
+        for pattern in priority_patterns:
+            candidate = search_dir / pattern
+            if candidate.exists():
+                return candidate
+
+    # Third pass: look for fallback patterns in all directories
+    all_dirs = priority_dirs + fallback_dirs
+    for search_dir in all_dirs:
+        if not search_dir.exists():
+            continue
+        for pattern in fallback_patterns:
             candidate = search_dir / pattern
             if candidate.exists():
                 return candidate

@@ -1,0 +1,192 @@
+diff --git a/csrc/moe/moe_permute_unpermute_op.cu b/csrc/moe/moe_permute_unpermute_op.cu
+index 13aecd800..e827d9b11 100644
+--- a/csrc/moe/moe_permute_unpermute_op.cu
++++ b/csrc/moe/moe_permute_unpermute_op.cu
+@@ -49,7 +49,7 @@ void moe_permute(
+   auto permuted_experts_id = torch::empty_like(topk_ids);
+   auto dst_row_id2src_row_id_map = torch::empty_like(src_row_id2dst_row_id_map);
+   auto align_expert_first_token_offset =
+-      torch::zeros_like(expert_first_token_offset);
++      torch::empty_like(expert_first_token_offset);
+ 
+   CubKeyValueSorter sorter{};
+   int64_t* valid_num_ptr = nullptr;
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index bdd3a1a9c..72d683508 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -35,6 +35,10 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++# Precompile EBNF escape regex to avoid recompilation overhead
++_EBNF_ESCAPE_RE = re.compile(r'(["\\])')
++
++
+ def get_local_xgrammar_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer: PreTrainedTokenizer,
+@@ -271,7 +275,8 @@ class GrammarConfig:
+     def escape_ebnf_string(s: str) -> str:
+         """Escape special characters in a EBNF string."""
+         # Escape double quotes and backslashes
+-        return re.sub(r'(["\\])', r'\\\1', s)
++        # Use precompiled regex to avoid per-call compile cost
++        return _EBNF_ESCAPE_RE.sub(r'\\\1', s)
+ 
+     @staticmethod
+     def choice_as_grammar(choice: list[str] | None) -> str:
+@@ -301,6 +306,9 @@ class XGrammarLogitsProcessor:
+     matchers: list[xgr.GrammarMatcher] = field(default_factory=list)
+     batch_size: int = field(default=1)
+     prefilled: bool = field(default=False)
++    # Cache device-specific token bitmask to avoid repeated transfers
++    _token_bitmask_cached: torch.Tensor | None = None
++    _token_bitmask_cached_device: torch.device | None = None
+ 
+     def __post_init__(self):
+         if self.tokenizer_info is None:
+@@ -321,6 +329,8 @@ class XGrammarLogitsProcessor:
+         self.batch_size = 1
+         self.token_bitmask = None  # type: ignore[assignment]
+         self.prefilled = False
++        self._token_bitmask_cached = None
++        self._token_bitmask_cached_device = None
+ 
+     def _ensure_ctx(self):
+         """Lazily initialize the processor in the worker process"""
+@@ -381,21 +391,37 @@ class XGrammarLogitsProcessor:
+                 matcher.fill_next_token_bitmask(self.token_bitmask, i)
+ 
+         # token_bitmask is a CPU tensor for use with accept_token and
+-        # fill_next_token_bitmask so we move it to the device of scores
+-        device_type = scores.device.type
+-        dtype = scores.dtype
+-        if device_type != "cuda":
+-            # xgrammar on cpu only supports float32 scores
+-            # see: https://github.com/mlc-ai/xgrammar/blob/c1b64920cad24f44f235778c1c00bb52d57da01a/python/xgrammar/kernels/apply_token_bitmask_inplace_cpu.py#L22
+-            scores = scores.to("cpu").float().unsqueeze(0)
+-
+-        # Note: In this method, if the tensors have different dimensions
+-        # on CPU device fails, but on GPU it runs without error. Hence the
+-        # unsqueeze above for scores, to match the token bitmask shape
+-        xgr.apply_token_bitmask_inplace(
+-            scores, self.token_bitmask.to(scores.device, non_blocking=True))
+-        if device_type != "cuda":
+-            scores = scores.to(dtype).to(device_type).squeeze()
++        # fill_next_token_bitmask. For GPU we cache a device copy to
++        # avoid per-call transfers.
++        orig_device = scores.device
++        orig_dtype = scores.dtype
++
++        if orig_device.type != "cuda":
++            # Ensure scores are on CPU and float32 for CPU kernels.
++            if orig_device.type != "cpu":
++                scores = scores.to("cpu")
++            if scores.dtype is not torch.float32:
++                scores = scores.float()
++            # Match expected shape
++            scores = scores.unsqueeze(0)
++            xgr.apply_token_bitmask_inplace(scores, self.token_bitmask)
++            # Restore original dtype/device and shape
++            if orig_device.type != "cpu":
++                scores = scores.to(orig_device)
++            if orig_dtype is not torch.float32:
++                scores = scores.to(orig_dtype)
++            scores = scores.squeeze(0)
++        else:
++            # GPU path: cache device-specific token bitmask
++            if (self._token_bitmask_cached_device != orig_device
++                    or self._token_bitmask_cached is None
++                    or self._token_bitmask_cached.shape !=
++                    self.token_bitmask.shape):
++                self._token_bitmask_cached = self.token_bitmask.to(
++                    orig_device, non_blocking=True)
++                self._token_bitmask_cached_device = orig_device
++            xgr.apply_token_bitmask_inplace(scores,
++                                            self._token_bitmask_cached)
+ 
+         return scores
+ 
+@@ -414,9 +440,10 @@ class XGrammarLogitsProcessor:
+                 xgr.GrammarMatcher(self.ctx) for _ in range(self.batch_size)
+             ]
+ 
+-        # Create a new token bitmask with the same size
+-        if hasattr(self, 'token_bitmask') and self.token_bitmask is not None:
+-            new_processor.token_bitmask = self.token_bitmask
++        # Do not share mutable token bitmask buffers; allocate lazily on use
++        new_processor.token_bitmask = None  # type: ignore[assignment]
++        new_processor._token_bitmask_cached = None
++        new_processor._token_bitmask_cached_device = None
+ 
+         # Copy simple attributes
+         new_processor.batch_size = self.batch_size
+diff --git a/vllm/model_executor/layers/fused_moe/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+index ff49d7bb7..9f4b0cf12 100644
+--- a/vllm/model_executor/layers/fused_moe/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+@@ -136,18 +136,10 @@ def run_cutlass_moe_fp8(
+                                      dtype=torch.int32,
+                                      device=device)
+ 
+-        # With expert_map each Rank processes only a subset of experts. As
+-        # a result not all of a_map and c2 tensors are filled. We fill it
+-        # zeros for correctness.
+-        if expert_map is not None:
+-            a_map = torch.zeros((local_topk_ids.numel()),
+-                                dtype=torch.int32,
+-                                device=device)
+-        else:
+-            a_map = torch.empty((local_topk_ids.numel()),
+-                                dtype=torch.int32,
+-                                device=device)
+-
++        # Always allocate without initialization; fill only where needed.
++        a_map = torch.empty((local_topk_ids.numel()),
++                            dtype=torch.int32,
++                            device=device)
+         c_map = torch.empty((local_topk_ids.numel()),
+                             dtype=torch.int32,
+                             device=device)
+@@ -156,6 +148,12 @@ def run_cutlass_moe_fp8(
+                                     problem_sizes1, problem_sizes2, a_map,
+                                     c_map, global_num_experts, N, K)
+ 
++        # Zero only invalid entries to avoid reading garbage during shuffle.
++        if expert_map is not None:
++            invalid_mask = (local_topk_ids.reshape(-1) < 0)
++            if invalid_mask.any().item():
++                a_map.masked_fill_(invalid_mask, 0)
++
+         a1q = ops.shuffle_rows(a1q, a_map)
+         a1q_scale = (ops.shuffle_rows(a1q_scale, a_map)
+                      if per_act_token else a1q_scale)
+@@ -186,7 +184,10 @@ def run_cutlass_moe_fp8(
+         c2, a2_scale, use_per_token_if_dynamic=per_act_token)
+ 
+     if expert_map is not None:
+-        c3.fill_(0)
++        # Zero only rows corresponding to invalid tokens to avoid stale data.
++        invalid_rows = (local_topk_ids.reshape(-1) < 0).nonzero(as_tuple=False).reshape(-1).to(dtype=torch.int64, device=c3.device)
++        if invalid_rows.numel() > 0:
++            c3.index_fill_(0, invalid_rows, 0)
+ 
+     ops.cutlass_moe_mm(c3, a2q, w2, a2q_scale, w2_scale, expert_offsets,
+                        problem_sizes2, ab_strides2, ab_strides2, c_strides2,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+index 1a31410c3..2c68ccd3e 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+@@ -203,7 +203,7 @@ class CompressedTensorsW4A4MoeMethod(CompressedTensorsMoEMethod):
+         round_up_multiple = lambda x, m: (x + m - 1) // m * m
+         M_padded = round_up_multiple(M, 128)
+         K_padded = round_up_multiple(K, 4)
+-        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
++        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype, device=scale.device)
+         padded_scale[:B, :M, :K] = scale
+         batches, rows, cols = padded_scale.shape
+         assert rows % 128 == 0

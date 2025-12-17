@@ -1,0 +1,232 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/weight_loading/test_weight_loading.py b/tests/weight_loading/test_weight_loading.py
+index e456bfab8..fd6539d06 100644
+--- a/tests/weight_loading/test_weight_loading.py
++++ b/tests/weight_loading/test_weight_loading.py
+@@ -12,7 +12,9 @@ MODEL_NAME = os.environ.get("MODEL_NAME",
+                             "robertgshaw2/zephyr-7b-beta-channelwise-gptq")
+ REVISION = os.environ.get("REVISION", "main")
+ QUANTIZATION = os.environ.get("QUANTIZATION", "gptq_marlin")
+-MIN_CAPABILITY = os.environ.get("MIN_CAPABILITY", "89")
++# Lower the default minimum capability to broaden GPU support and avoid
++# unnecessarily skipping tests on capable devices.
++MIN_CAPABILITY = os.environ.get("MIN_CAPABILITY", "80")
+ 
+ 
+ @pytest.mark.skipif(
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 0e363eddc..a86f99bce 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -1,9 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import enum
+-import heapq
+ from abc import ABC, abstractmethod
+-from typing import Dict, List, Tuple
++from collections import OrderedDict
++from typing import Tuple
+ 
+ 
+ class EvictionPolicy(enum.Enum):
+@@ -78,14 +78,8 @@ class LRUEvictor(Evictor):
+     highest num_hashed_tokens value, then one will be chose arbitrarily
+     """
+ 
+-    # CLEANUP_THRESHOLD determines the maximum allowable size of the priority
+-    # queue relative to the free table size. When this threshold is exceeded,
+-    # a cleanup operation is triggered to reduce memory usage.
+-    CLEANUP_THRESHOLD = 50
+-
+     def __init__(self):
+-        self.free_table: Dict[int, BlockMetaData] = {}
+-        self.priority_queue = []
++        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()
+ 
+     def __contains__(self, block_id: int) -> bool:
+         return block_id in self.free_table
+@@ -94,49 +88,38 @@ class LRUEvictor(Evictor):
+         if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        while self.priority_queue:
+-            # We do not remove outdated entries from the priority queue at the
+-            # time of updating the last_accessed timestamp. Instead, outdated
+-            # entries are filtered out here during eviction. Outdated entries
+-            # would either not in the free table, or have older last accessed
+-            # time.
+-            last_accessed, _, block_id, content_hash = heapq.heappop(
+-                self.priority_queue)
+-            if (block_id in self.free_table and
+-                    self.free_table[block_id].last_accessed == last_accessed):
+-                self.free_table.pop(block_id)
+-                return block_id, content_hash
+-
+-        raise ValueError("No usable cache memory left")
++        # Evict the first block (least recently used) with the most hashed tokens
++        # OrderedDict maintains insertion order, and we move to end on update,
++        # so the first items are the least recently used
++        evicted_block_id = next(iter(self.free_table))
++        evicted_block = self.free_table[evicted_block_id]
++
++        # Iterate through blocks at the start of OrderedDict to find the one
++        # with maximum number of hashed tokens among blocks with the same
++        # last_accessed time. Use early break optimization.
++        for _id, block in self.free_table.items():
++            if evicted_block.last_accessed < block.last_accessed:
++                # Since OrderedDict is ordered by access time (via move_to_end),
++                # we can break early when we see a more recently accessed block
++                break
++            if (evicted_block.last_accessed == block.last_accessed and
++                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):
++                evicted_block = block
++                evicted_block_id = _id
++
++        self.free_table.pop(evicted_block_id)
++        return evicted_block_id, evicted_block.content_hash
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+             last_accessed: float):
+         self.free_table[block_id] = BlockMetaData(content_hash,
+                                                   num_hashed_tokens,
+                                                   last_accessed)
+-        heapq.heappush(
+-            self.priority_queue,
+-            (last_accessed, -num_hashed_tokens, block_id, content_hash))
+-        self._cleanup_if_necessary()
+ 
+     def update(self, block_id: int, last_accessed: float):
+         self.free_table[block_id].last_accessed = last_accessed
+-
+-    def _cleanup_if_necessary(self):
+-        if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
+-                self.free_table):
+-            self._cleanup()
+-
+-    def _cleanup(self):
+-        new_priority_queue: List[Tuple[float, int, int, int]] = []
+-
+-        for block_id, block in self.free_table.items():
+-            new_priority_queue.append(
+-                (block.last_accessed, -block.num_hashed_tokens, block_id,
+-                 block.content_hash))
+-        heapq.heapify(new_priority_queue)
+-
+-        self.priority_queue = new_priority_queue
++        # Move to end to maintain LRU order
++        self.free_table.move_to_end(block_id)
+ 
+     def remove(self, block_id: int):
+         if block_id not in self.free_table:
+diff --git a/vllm/model_executor/layers/quantization/awq_marlin.py b/vllm/model_executor/layers/quantization/awq_marlin.py
+index a43b2e597..34892cd1a 100644
+--- a/vllm/model_executor/layers/quantization/awq_marlin.py
++++ b/vllm/model_executor/layers/quantization/awq_marlin.py
+@@ -134,6 +134,29 @@ class AWQMarlinConfig(QuantizationConfig):
+                     self.full_config).get_quant_method(layer, prefix)
+             return AWQMarlinLinearMethod(self)
+         elif isinstance(layer, FusedMoE):
++            # Prefer the WNA16 MoE kernel by default for large expert counts
++            # when compatible, which can reduce overhead and improve
++            # performance on many-expert MoEs.
++            try:
++                num_experts = getattr(layer, "num_experts", None)
++                if num_experts is not None and num_experts >= 64:
++                    # Local import to avoid circular import on module load.
++                    from vllm.model_executor.layers.quantization.moe_wna16 import (  # noqa: E501
++                        MoeWNA16Config)
++                    cfg = {
++                        "quant_method": "awq",
++                        "bits": self.weight_bits,
++                        "group_size": self.group_size,
++                        "zero_point": self.zero_point,
++                        "lm_head": self.lm_head_quantized,
++                        "modules_to_not_convert": self.modules_to_not_convert,
++                    }
++                    if MoeWNA16Config.is_moe_wna16_compatible(cfg):
++                        return MoeWNA16Config.from_config(cfg).get_quant_method(
++                            layer, prefix)
++            except Exception:
++                # Fall back to Marlin MoE if any issue occurs.
++                pass
+             return AWQMoEMethod(self)
+         return None
+ 
+diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
+index 0a9d86b00..035f0a621 100644
+--- a/vllm/model_executor/layers/quantization/gptq_marlin.py
++++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
+@@ -160,6 +160,28 @@ class GPTQMarlinConfig(QuantizationConfig):
+     ) -> Optional[Union["GPTQMarlinLinearMethod", "GPTQMarlinMoEMethod",
+                         UnquantizedLinearMethod, UnquantizedEmbeddingMethod]]:
+         if isinstance(layer, FusedMoE):
++            # For many-expert MoEs, prefer the WNA16 MoE kernel where
++            # compatible as it can reduce routing/memory overhead.
++            try:
++                num_experts = getattr(layer, "num_experts", None)
++                if num_experts is not None and num_experts >= 64:
++                    # Local import to avoid circular import on module load.
++                    from vllm.model_executor.layers.quantization.moe_wna16 import (  # noqa: E501
++                        MoeWNA16Config)
++                    cfg = {
++                        "quant_method": "gptq",
++                        "bits": self.weight_bits,
++                        "group_size": self.group_size,
++                        "desc_act": self.desc_act,
++                        "sym": self.is_sym,
++                        "lm_head": self.lm_head_quantized,
++                    }
++                    if MoeWNA16Config.is_moe_wna16_compatible(cfg):
++                        return MoeWNA16Config.from_config(cfg).get_quant_method(
++                            layer, prefix)
++            except Exception:
++                # If any issue arises, fall back to Marlin MoE.
++                pass
+             return GPTQMarlinMoEMethod(self)
+         return get_linear_quant_method(self, layer, prefix,
+                                        GPTQMarlinLinearMethod)
+diff --git a/vllm/model_executor/layers/quantization/moe_wna16.py b/vllm/model_executor/layers/quantization/moe_wna16.py
+index b9460e7d7..eca5cec3b 100644
+--- a/vllm/model_executor/layers/quantization/moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/moe_wna16.py
+@@ -217,7 +217,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         layer.register_parameter("w2_qweight", w2_qweight)
+         set_weight_attrs(w2_qweight, extra_weight_attrs)
+ 
+-        w13_scales = torch.nn.Parameter(torch.zeros(
++        # Scales and zero-points are immediately loaded from checkpoints; avoid
++        # the extra memset by using empty() instead of zeros().
++        w13_scales = torch.nn.Parameter(torch.empty(
+             num_experts,
+             2 * intermediate_size_per_partition,
+             hidden_size // group_size,
+@@ -226,7 +228,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         layer.register_parameter("w13_scales", w13_scales)
+         set_weight_attrs(w13_scales, extra_weight_attrs)
+ 
+-        w2_scales = torch.nn.Parameter(torch.zeros(
++        w2_scales = torch.nn.Parameter(torch.empty(
+             num_experts,
+             hidden_size,
+             intermediate_size_per_partition // group_size,
+@@ -236,7 +238,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+         set_weight_attrs(w2_scales, extra_weight_attrs)
+ 
+         if self.quant_config.has_zp:
+-            w13_qzeros = torch.nn.Parameter(torch.zeros(
++            w13_qzeros = torch.nn.Parameter(torch.empty(
+                 num_experts,
+                 2 * intermediate_size_per_partition // bit8_pack_factor,
+                 hidden_size // group_size,
+@@ -245,7 +247,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
+             layer.register_parameter("w13_qzeros", w13_qzeros)
+             set_weight_attrs(w13_qzeros, extra_weight_attrs)
+ 
+-            w2_qzeros = torch.nn.Parameter(torch.zeros(
++            w2_qzeros = torch.nn.Parameter(torch.empty(
+                 num_experts,
+                 hidden_size // bit8_pack_factor,
+                 intermediate_size_per_partition // group_size,
