@@ -372,6 +372,12 @@ class RunAnalysis(BaseModel):
         description="Raw LLM analysis output (verbatim)"
     )
 
+    # V4: Patch quality analysis (categories + discussion, no scores)
+    patch_quality: Optional[PatchQualityAnalysis] = Field(
+        default=None,
+        description="LLM-based patch quality assessment using categories and discussion"
+    )
+
     # Timestamps
     analyzed_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     analysis_duration_s: float = Field(default=0.0, ge=0)
@@ -454,6 +460,139 @@ class RunAnalysis(BaseModel):
             }
 
         return summary
+
+
+# =============================================================================
+# V4 Patch Quality Analysis (Categories + Discussion, NO SCORES)
+# Inspired by GSO Benchmark (arxiv:2505.23671v3)
+# =============================================================================
+
+
+class BottleneckTargetCategory(str, Enum):
+    """Categories for bottleneck targeting comparison."""
+    SAME_TARGET = "same_target"
+    RELATED_TARGET = "related_target"
+    DIFFERENT_TARGET = "different_target"
+    NO_OPTIMIZATION = "no_optimization"
+    OTHER = "other"
+
+
+class OptimizationTechnique(str, Enum):
+    """Optimization technique categories."""
+    ALGORITHMIC = "algorithmic"
+    MEMORY_OPTIMIZATION = "memory_optimization"
+    PARALLELIZATION = "parallelization"
+    API_LIBRARY = "api_library"
+    LAZY_COMPUTATION = "lazy_computation"
+    BATCHING = "batching"
+    LOW_LEVEL = "low_level"
+    OTHER = "other"
+
+
+class PatchApproachCategory(str, Enum):
+    """Categories for approach comparison (distinct from existing ApproachCategory)."""
+    SAME_APPROACH = "same_approach"
+    SIMILAR_APPROACH = "similar_approach"
+    VALID_ALTERNATIVE = "valid_alternative"
+    PARTIAL_SOLUTION = "partial_solution"
+    INEFFECTIVE = "ineffective"
+    HARMFUL = "harmful"
+    OTHER = "other"
+
+
+class SpeedupLikelihood(str, Enum):
+    """Categories for speedup likelihood opinion."""
+    LIKELY_SIMILAR = "likely_similar"
+    LIKELY_PARTIAL = "likely_partial"
+    UNCERTAIN = "uncertain"
+    LIKELY_INEFFECTIVE = "likely_ineffective"
+    LIKELY_REGRESSION = "likely_regression"
+    OTHER = "other"
+
+
+class PatchFailureMode(str, Enum):
+    """Failure mode categories based on GSO paper taxonomy."""
+    LOCALIZATION_FAILURE = "localization_failure"
+    TECHNIQUE_MISMATCH = "technique_mismatch"
+    INCOMPLETE_IMPLEMENTATION = "incomplete_implementation"
+    COMPLEXITY_AVOIDANCE = "complexity_avoidance"
+    OVERCOMPLICATED = "overcomplicated"
+    NOT_APPLICABLE = "not_applicable"
+    OTHER = "other"
+
+
+class BottleneckTargetAnalysis(BaseModel):
+    """Analysis of whether agent targets the same bottleneck as human."""
+    category: BottleneckTargetCategory
+    human_target: str = Field(description="What bottleneck the human patch targets")
+    agent_target: str = Field(description="What bottleneck the agent patch targets")
+    discussion: str = Field(description="Explanation of bottleneck comparison")
+
+    model_config = {"extra": "ignore"}
+
+
+class OptimizationTechniqueAnalysis(BaseModel):
+    """Analysis of optimization techniques used by human vs agent."""
+    human_techniques: List[OptimizationTechnique] = Field(default_factory=list)
+    agent_techniques: List[OptimizationTechnique] = Field(default_factory=list)
+    technique_overlap: bool = Field(default=False)
+    discussion: str = Field(default="", description="Comparison of techniques used")
+
+    model_config = {"extra": "ignore"}
+
+
+class ApproachComparisonAnalysis(BaseModel):
+    """Analysis of how agent's approach compares to human's."""
+    category: PatchApproachCategory
+    discussion: str = Field(description="Why this category, key differences")
+
+    model_config = {"extra": "ignore"}
+
+
+class SpeedupLikelihoodAnalysis(BaseModel):
+    """Opinion on likely speedup based on patch analysis."""
+    category: SpeedupLikelihood
+    discussion: str = Field(description="Reasoning, what would need benchmarking")
+
+    model_config = {"extra": "ignore"}
+
+
+class FailureModeAnalysis(BaseModel):
+    """Analysis of failure mode if agent didn't match human."""
+    category: PatchFailureMode
+    discussion: str = Field(description="What went wrong, if applicable")
+
+    model_config = {"extra": "ignore"}
+
+
+class PatchObservations(BaseModel):
+    """Free-form observations about patch comparison."""
+    key_differences: List[str] = Field(default_factory=list)
+    agent_strengths: List[str] = Field(default_factory=list)
+    agent_weaknesses: List[str] = Field(default_factory=list)
+    benchmark_needed: str = Field(default="", description="What benchmark would verify performance")
+
+    model_config = {"extra": "ignore"}
+
+
+class PatchQualityAnalysis(BaseModel):
+    """LLM-based patch quality analysis - categories and discussion only, no scores.
+
+    This complements the rule-based PatchSimilarityMetrics with LLM-driven
+    categorical assessment and expert discussion.
+    """
+    human_patch_available: bool = Field(default=False)
+    analysis_model: str = Field(default="")
+    analysis_tokens: int = Field(default=0, ge=0)
+
+    bottleneck_target: Optional[BottleneckTargetAnalysis] = Field(default=None)
+    optimization_techniques: Optional[OptimizationTechniqueAnalysis] = Field(default=None)
+    approach_comparison: Optional[ApproachComparisonAnalysis] = Field(default=None)
+    speedup_likelihood: Optional[SpeedupLikelihoodAnalysis] = Field(default=None)
+    failure_mode: Optional[FailureModeAnalysis] = Field(default=None)
+    observations: Optional[PatchObservations] = Field(default=None)
+
+    model_config = {"extra": "ignore"}
 
 
 # Legacy compatibility aliases

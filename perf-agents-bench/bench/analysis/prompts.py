@@ -400,3 +400,205 @@ Return as JSON with structure:
 """
 
     return prompt
+
+
+# =============================================================================
+# V4 Patch Quality Analysis Prompt (Categories + Discussion, NO SCORES)
+# Inspired by GSO Benchmark (arxiv:2505.23671v3)
+# =============================================================================
+
+PATCH_QUALITY_PROMPT_TEMPLATE = '''# Patch Quality Analysis: Agent vs Human Reference
+
+You are analyzing how an AI agent's optimization patch compares to a human expert's reference implementation. This is for academic research on AI agent capabilities in performance optimization tasks.
+
+## Task Description
+
+<task_description>
+{task_description}
+</task_description>
+
+## Human Reference Patch (Ground Truth)
+
+This is the human expert's solution that achieved verified performance improvement:
+
+```diff
+{human_patch}
+```
+
+## Agent's Patch
+
+This is what the AI agent produced:
+
+```diff
+{agent_patch}
+```
+
+## Rule-Based Metrics (Pre-computed)
+
+These metrics were calculated automatically without LLM:
+
+<rule_based_metrics>
+{rule_based_metrics}
+</rule_based_metrics>
+
+---
+
+## Analysis Instructions
+
+Analyze how the agent's patch compares to the human reference. Focus on categorical assessment and detailed discussion - **DO NOT provide numeric scores**.
+
+For each category, select the most appropriate option. If none fit well, select "other" and explain in the discussion field.
+
+### 1. Bottleneck Target
+
+Does the agent target the same performance bottleneck as the human?
+
+Categories:
+- `same_target`: Optimizes the exact same bottleneck/function
+- `related_target`: Optimizes related code that affects same performance path
+- `different_target`: Optimizes something else entirely
+- `no_optimization`: No meaningful optimization attempted
+- `other`: None of the above - explain in discussion
+
+### 2. Optimization Techniques
+
+What optimization technique(s) did each use? (Select all that apply for each)
+
+Techniques:
+- `algorithmic`: Better algorithm/data structure (O(n²) → O(n log n))
+- `memory_optimization`: Reduced allocations, better memory layout, caching
+- `parallelization`: Threading, vectorization, GPU offload
+- `api_library`: Using faster API calls or optimized libraries
+- `lazy_computation`: Deferred/avoided unnecessary computation
+- `batching`: Combined operations to reduce overhead
+- `low_level`: Assembly, CUDA kernels, intrinsics
+- `other`: Describe in discussion
+
+### 3. Approach Comparison
+
+How does the agent's approach compare to the human's?
+
+Categories:
+- `same_approach`: Essentially the same solution
+- `similar_approach`: Same strategy, different implementation details
+- `valid_alternative`: Different but potentially valid optimization
+- `partial_solution`: Addresses part of the optimization
+- `ineffective`: Changes unlikely to improve performance
+- `harmful`: Changes likely to hurt performance or correctness
+- `other`: None of the above - explain in discussion
+
+### 4. Speedup Likelihood
+
+Based on the patch analysis, what is the likely performance impact compared to human's verified speedup?
+
+Categories:
+- `likely_similar`: Probably achieves similar speedup to human
+- `likely_partial`: Probably achieves some but not full speedup
+- `uncertain`: Cannot determine without benchmarking
+- `likely_ineffective`: Probably no meaningful speedup
+- `likely_regression`: May cause performance regression
+- `other`: None of the above - explain in discussion
+
+### 5. Failure Mode
+
+If the agent's solution differs from human's, what went wrong?
+
+Categories:
+- `localization_failure`: Misidentified the bottleneck or wrong abstraction level
+- `technique_mismatch`: Right target, wrong optimization technique
+- `incomplete_implementation`: Right idea, incomplete execution
+- `complexity_avoidance`: Avoided necessary low-level optimizations
+- `overcomplicated`: Added unnecessary complexity
+- `not_applicable`: Agent solution is valid/successful
+- `other`: None of the above - explain in discussion
+
+---
+
+## Output Format
+
+Return your analysis as a JSON object. Every field with "discussion" is REQUIRED and must contain meaningful explanation.
+
+```json
+{{
+  "bottleneck_target": {{
+    "category": "same_target|related_target|different_target|no_optimization|other",
+    "human_target": "Brief description of what the human patch optimizes",
+    "agent_target": "Brief description of what the agent patch optimizes",
+    "discussion": "REQUIRED: Detailed explanation of bottleneck comparison"
+  }},
+  "optimization_techniques": {{
+    "human_techniques": ["technique1", "technique2"],
+    "agent_techniques": ["technique1"],
+    "technique_overlap": true,
+    "discussion": "REQUIRED: Explanation of techniques used and comparison"
+  }},
+  "approach_comparison": {{
+    "category": "same_approach|similar_approach|valid_alternative|partial_solution|ineffective|harmful|other",
+    "discussion": "REQUIRED: Why this category, key differences between approaches"
+  }},
+  "speedup_likelihood": {{
+    "category": "likely_similar|likely_partial|uncertain|likely_ineffective|likely_regression|other",
+    "discussion": "REQUIRED: Reasoning for this assessment, what would need benchmarking to verify"
+  }},
+  "failure_mode": {{
+    "category": "localization_failure|technique_mismatch|incomplete_implementation|complexity_avoidance|overcomplicated|not_applicable|other",
+    "discussion": "REQUIRED: What went wrong (if applicable), or why the solution is valid"
+  }},
+  "observations": {{
+    "key_differences": ["Specific difference 1", "Specific difference 2"],
+    "agent_strengths": ["Strength 1", "Strength 2"],
+    "agent_weaknesses": ["Weakness 1", "Weakness 2"],
+    "benchmark_needed": "What specific benchmark would verify performance claims"
+  }}
+}}
+```
+
+Be specific and evidence-based. Reference actual code changes from the patches in your discussion.
+'''
+
+
+def build_patch_quality_prompt(
+    task_description: str,
+    human_patch: str,
+    agent_patch: str,
+    rule_based_metrics: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build minimal prompt for patch quality assessment.
+
+    Creates a focused prompt comparing agent's patch to human reference,
+    requesting categorical assessment with mandatory discussion fields.
+
+    Args:
+        task_description: Brief description of the optimization task
+        human_patch: Human reference patch (unified diff)
+        agent_patch: Agent's generated patch (unified diff)
+        rule_based_metrics: Pre-computed metrics from PatchComparator
+
+    Returns:
+        Formatted prompt string (~2-5K tokens)
+    """
+    # Format rule-based metrics if provided
+    if rule_based_metrics:
+        metrics_str = "\n".join(
+            f"- {key}: {value}"
+            for key, value in rule_based_metrics.items()
+            if key not in ["human_patch_available", "human_patch_source"]  # Skip meta fields
+        )
+    else:
+        metrics_str = "No pre-computed metrics available."
+
+    # Truncate patches if extremely long (keep under 50KB each)
+    max_patch_len = 50000
+    if len(human_patch) > max_patch_len:
+        human_patch = human_patch[:max_patch_len] + "\n\n... [TRUNCATED - patch too long] ..."
+    if len(agent_patch) > max_patch_len:
+        agent_patch = agent_patch[:max_patch_len] + "\n\n... [TRUNCATED - patch too long] ..."
+
+    prompt = PATCH_QUALITY_PROMPT_TEMPLATE.format(
+        task_description=task_description or "No task description provided.",
+        human_patch=human_patch or "No human patch available.",
+        agent_patch=agent_patch or "No agent patch generated.",
+        rule_based_metrics=metrics_str,
+    )
+
+    return prompt

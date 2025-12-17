@@ -12,10 +12,24 @@ from .schemas import (
     FreeFormAnalysis,
     LLMAnalysisResult,
     RunAnalysis,
+    # V4 Patch Quality Analysis schemas
+    PatchQualityAnalysis,
+    BottleneckTargetCategory,
+    BottleneckTargetAnalysis,
+    OptimizationTechnique,
+    OptimizationTechniqueAnalysis,
+    PatchApproachCategory,
+    ApproachComparisonAnalysis,
+    SpeedupLikelihood,
+    SpeedupLikelihoodAnalysis,
+    PatchFailureMode,
+    FailureModeAnalysis,
+    PatchObservations,
 )
 from .analyzer import SoftMetricsAnalyzer
 from .run_loader import RunLoader
 from .output_writer import OutputWriter
+from .prompts import build_patch_quality_prompt
 
 __all__ = [
     "RunMetadata",
@@ -28,4 +42,18 @@ __all__ = [
     "SoftMetricsAnalyzer",
     "RunLoader",
     "OutputWriter",
+    # V4 exports
+    "PatchQualityAnalysis",
+    "BottleneckTargetCategory",
+    "BottleneckTargetAnalysis",
+    "OptimizationTechnique",
+    "OptimizationTechniqueAnalysis",
+    "PatchApproachCategory",
+    "ApproachComparisonAnalysis",
+    "SpeedupLikelihood",
+    "SpeedupLikelihoodAnalysis",
+    "PatchFailureMode",
+    "FailureModeAnalysis",
+    "PatchObservations",
+    "build_patch_quality_prompt",
 ]

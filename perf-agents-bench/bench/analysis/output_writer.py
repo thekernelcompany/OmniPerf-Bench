@@ -10,6 +10,7 @@ Writes analysis results to a hierarchical directory structure:
         - metrics_summary.json   # Quick-reference compact summary
         - trajectory_metrics.json # V3: Detailed per-step metrics
         - patch_similarity.json   # V3: Agent vs human patch comparison
+        - patch_quality.json      # V4: LLM categorical assessment (no scores)
 """
 
 from __future__ import annotations
@@ -155,6 +156,15 @@ class OutputWriter:
                 indent=2
             ))
             logger.debug(f"Wrote patch similarity to {similarity_path}")
+
+        # V4: Write patch quality analysis (categories + discussion)
+        if analysis.patch_quality:
+            quality_path = out_dir / "patch_quality.json"
+            quality_path.write_text(json.dumps(
+                analysis.patch_quality.model_dump(mode="json"),
+                indent=2
+            ))
+            logger.debug(f"Wrote patch quality to {quality_path}")
 
         logger.info(f"Wrote analysis for {analysis.meta.item_id} to {out_dir}")
         return out_dir

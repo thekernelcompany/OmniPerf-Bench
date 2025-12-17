@@ -36,6 +36,19 @@ from .schemas import (
     InteractionMetrics,
     PatchSimilarityMetrics,
     LLMRawScores,
+    # V4 Patch Quality Analysis (categories + discussion, no scores)
+    PatchQualityAnalysis,
+    BottleneckTargetAnalysis,
+    BottleneckTargetCategory,
+    OptimizationTechniqueAnalysis,
+    OptimizationTechnique,
+    ApproachComparisonAnalysis,
+    PatchApproachCategory,
+    SpeedupLikelihoodAnalysis,
+    SpeedupLikelihood,
+    FailureModeAnalysis,
+    PatchFailureMode,
+    PatchObservations,
 )
 from .openrouter_client import OpenRouterClient, OpenRouterConfig, create_client
 from .run_loader import (
@@ -45,7 +58,7 @@ from .run_loader import (
     count_tool_calls,
     TrajectoryParser,
 )
-from .prompts import build_analysis_prompt
+from .prompts import build_analysis_prompt, build_patch_quality_prompt
 from .patch_comparator import (
     PatchComparator,
     load_human_patch_from_dataset,
@@ -267,7 +280,9 @@ class SoftMetricsAnalyzer:
         Args:
             agent_patch: Agent's generated patch
             repo: Repository name
-            commits: Dict with 'pre', 'human' commit hashes
+            commits: Dict with 'pre', 'human' commit hashes from run metadata.
+                     The 'human' key contains the commit hash of the human's
+                     solution, which maps to 'commit_hash' in the dataset.
             data_dir: Data directory for finding datasets
 
         Returns:
@@ -276,8 +291,8 @@ class SoftMetricsAnalyzer:
         if not agent_patch:
             return None
 
-        # Try to find human patch
-        human_commit = commits.get("human", "") or commits.get("head", "")
+        # Get human commit hash from run metadata (maps to commit_hash in dataset)
+        human_commit = commits.get("human", "")
         if not human_commit:
             return PatchSimilarityMetrics(
                 human_patch_available=False,
@@ -351,6 +366,164 @@ class SoftMetricsAnalyzer:
             detailed_analysis=json_data.get("detailed_analysis", {}),
             recommendations=json_data.get("recommendations", {}),
         )
+
+    async def _analyze_patch_quality(
+        self,
+        human_patch: str,
+        agent_patch: str,
+        task_description: str,
+        rule_based_metrics: Optional[Dict[str, Any]] = None,
+    ) -> Optional[PatchQualityAnalysis]:
+        """Analyze patch quality using LLM categorical assessment.
+
+        Compares agent's patch to human reference using categories + discussion,
+        inspired by GSO Benchmark (arxiv:2505.23671v3).
+
+        Args:
+            human_patch: Human reference patch (unified diff)
+            agent_patch: Agent's generated patch (unified diff)
+            task_description: Brief description of the optimization task
+            rule_based_metrics: Pre-computed metrics from PatchComparator
+
+        Returns:
+            PatchQualityAnalysis or None if analysis fails
+        """
+        if not human_patch:
+            return PatchQualityAnalysis(
+                human_patch_available=False,
+                analysis_model=self.model,
+            )
+
+        # Build minimal prompt
+        prompt = build_patch_quality_prompt(
+            task_description=task_description,
+            human_patch=human_patch,
+            agent_patch=agent_patch,
+            rule_based_metrics=rule_based_metrics,
+        )
+
+        try:
+            # Call LLM
+            logger.info(f"Analyzing patch quality with {self.model}...")
+            response = await self.client.analyze(prompt)
+
+            # Extract JSON from response
+            json_data = self.client.extract_json(response)
+
+            if not json_data:
+                logger.warning("Could not extract JSON from patch quality LLM response")
+                return PatchQualityAnalysis(
+                    human_patch_available=True,
+                    analysis_model=self.model,
+                )
+
+            # Parse bottleneck target
+            bt_data = json_data.get("bottleneck_target", {})
+            bottleneck_target = None
+            if bt_data:
+                try:
+                    category = BottleneckTargetCategory(bt_data.get("category", "other"))
+                except ValueError:
+                    category = BottleneckTargetCategory.OTHER
+                bottleneck_target = BottleneckTargetAnalysis(
+                    category=category,
+                    human_target=bt_data.get("human_target", ""),
+                    agent_target=bt_data.get("agent_target", ""),
+                    discussion=bt_data.get("discussion", ""),
+                )
+
+            # Parse optimization techniques
+            ot_data = json_data.get("optimization_techniques", {})
+            optimization_techniques = None
+            if ot_data:
+                def parse_techniques(techniques: List[str]) -> List[OptimizationTechnique]:
+                    result = []
+                    for t in techniques:
+                        try:
+                            result.append(OptimizationTechnique(t))
+                        except ValueError:
+                            result.append(OptimizationTechnique.OTHER)
+                    return result
+
+                optimization_techniques = OptimizationTechniqueAnalysis(
+                    human_techniques=parse_techniques(ot_data.get("human_techniques", [])),
+                    agent_techniques=parse_techniques(ot_data.get("agent_techniques", [])),
+                    technique_overlap=ot_data.get("technique_overlap", False),
+                    discussion=ot_data.get("discussion", ""),
+                )
+
+            # Parse approach comparison
+            ac_data = json_data.get("approach_comparison", {})
+            approach_comparison = None
+            if ac_data:
+                try:
+                    category = PatchApproachCategory(ac_data.get("category", "other"))
+                except ValueError:
+                    category = PatchApproachCategory.OTHER
+                approach_comparison = ApproachComparisonAnalysis(
+                    category=category,
+                    discussion=ac_data.get("discussion", ""),
+                )
+
+            # Parse speedup likelihood
+            sl_data = json_data.get("speedup_likelihood", {})
+            speedup_likelihood = None
+            if sl_data:
+                try:
+                    category = SpeedupLikelihood(sl_data.get("category", "other"))
+                except ValueError:
+                    category = SpeedupLikelihood.OTHER
+                speedup_likelihood = SpeedupLikelihoodAnalysis(
+                    category=category,
+                    discussion=sl_data.get("discussion", ""),
+                )
+
+            # Parse failure mode
+            fm_data = json_data.get("failure_mode", {})
+            failure_mode = None
+            if fm_data:
+                try:
+                    category = PatchFailureMode(fm_data.get("category", "other"))
+                except ValueError:
+                    category = PatchFailureMode.OTHER
+                failure_mode = FailureModeAnalysis(
+                    category=category,
+                    discussion=fm_data.get("discussion", ""),
+                )
+
+            # Parse observations
+            obs_data = json_data.get("observations", {})
+            observations = None
+            if obs_data:
+                observations = PatchObservations(
+                    key_differences=obs_data.get("key_differences", []),
+                    agent_strengths=obs_data.get("agent_strengths", []),
+                    agent_weaknesses=obs_data.get("agent_weaknesses", []),
+                    benchmark_needed=obs_data.get("benchmark_needed", ""),
+                )
+
+            # Get token usage
+            usage = response.get("usage", {})
+            total_tokens = usage.get("total_tokens", 0)
+
+            return PatchQualityAnalysis(
+                human_patch_available=True,
+                analysis_model=self.model,
+                analysis_tokens=total_tokens,
+                bottleneck_target=bottleneck_target,
+                optimization_techniques=optimization_techniques,
+                approach_comparison=approach_comparison,
+                speedup_likelihood=speedup_likelihood,
+                failure_mode=failure_mode,
+                observations=observations,
+            )
+
+        except Exception as e:
+            logger.error(f"Patch quality analysis failed: {e}")
+            return PatchQualityAnalysis(
+                human_patch_available=True,
+                analysis_model=self.model,
+            )
 
     def _parse_llm_response(self, response: Dict[str, Any]) -> tuple[
         QualitativeScores, CategoricalMetrics, FreeFormAnalysis
@@ -481,15 +654,25 @@ class SoftMetricsAnalyzer:
         trajectory_metrics = self._parse_trajectory_metrics(data.get("trajectory", {}))
 
         # V3: Compare patches against human reference
+        data_dir = item_dir.parent.parent.parent.parent.parent / "data"
         patch_similarity = self._compare_patches(
             agent_patch=data.get("patch", ""),
             repo=meta.repo,
             commits=meta.commits,
-            data_dir=item_dir.parent.parent.parent.parent.parent / "data",
+            data_dir=data_dir,
         )
 
-        # Initialize raw LLM scores
+        # Load human patch for V4 patch quality analysis
+        human_patch = ""
+        human_commit = meta.commits.get("human", "")
+        if human_commit:
+            dataset_path = find_dataset_for_repo(meta.repo, data_dir)
+            if dataset_path:
+                human_patch, _ = load_human_patch_from_dataset(dataset_path, human_commit)
+
+        # Initialize raw LLM scores and patch quality
         llm_raw: Optional[LLMRawScores] = None
+        patch_quality: Optional[PatchQualityAnalysis] = None
 
         # Call LLM for qualitative analysis if not skipped
         if not skip_llm:
@@ -520,7 +703,28 @@ class SoftMetricsAnalyzer:
             except Exception as e:
                 logger.error(f"LLM analysis failed for {item_dir}: {e}")
 
-        # Build complete analysis with V3 fields
+            # V4: Patch quality analysis (separate LLM call with minimal context)
+            if human_patch:
+                try:
+                    # Get task description from prompt data
+                    prompt_data = data.get("prompt", {})
+                    task_description = data.get("task", prompt_data.get("description", ""))
+
+                    # Get rule-based metrics for context
+                    rule_based_metrics = None
+                    if patch_similarity:
+                        rule_based_metrics = patch_similarity.model_dump()
+
+                    patch_quality = await self._analyze_patch_quality(
+                        human_patch=human_patch,
+                        agent_patch=data.get("patch", ""),
+                        task_description=task_description,
+                        rule_based_metrics=rule_based_metrics,
+                    )
+                except Exception as e:
+                    logger.error(f"Patch quality analysis failed for {item_dir}: {e}")
+
+        # Build complete analysis with V3 and V4 fields
         analysis = RunAnalysis(
             meta=meta,
             quantitative=quant,
@@ -532,6 +736,8 @@ class SoftMetricsAnalyzer:
             trajectory=trajectory_metrics,
             patch_similarity=patch_similarity,
             llm_raw=llm_raw,
+            # V4 patch quality analysis (categories + discussion)
+            patch_quality=patch_quality,
             analysis_duration_s=time.time() - start_time,
         )
 

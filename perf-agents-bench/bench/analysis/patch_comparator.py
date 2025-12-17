@@ -401,7 +401,8 @@ def load_human_patch_from_dataset(
                     item_commit.startswith(commit_hash[:7])
                     or commit_hash.startswith(item_commit[:7])
                 ):
-                    patch = item.get("patch", "")
+                    # Check both 'patch' and 'diff_text' fields (datasets use different names)
+                    patch = item.get("patch", "") or item.get("diff_text", "")
                     if patch:
                         source = f"{dataset_path.name}:line{line_num}"
                         return patch, source
