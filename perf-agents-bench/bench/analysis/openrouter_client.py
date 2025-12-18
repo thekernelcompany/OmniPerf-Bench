@@ -29,9 +29,9 @@ class OpenRouterError(Exception):
 class OpenRouterConfig:
     """Configuration for OpenRouter client."""
     api_key: str
-    model: str = "google/gemini-3-pro-preview"
+    model: str = "google/gemini-3-flash-preview"
     base_url: str = "https://openrouter.ai/api/v1"
-    timeout: float = 300.0  # 5 minutes for long analyses
+    timeout: float = 7200.0  # 2 hours for massive patches
     max_retries: int = 3
     retry_delay: float = 5.0
     thinking_budget_tokens: int = 10000
@@ -280,7 +280,7 @@ class OpenRouterClient:
 
 def create_client(
     api_key: Optional[str] = None,
-    model: str = "google/gemini-3-pro-preview",
+    model: str = "google/gemini-3-flash-preview",
     cache_dir: Optional[Path] = None,
 ) -> OpenRouterClient:
     """Create OpenRouter client with sensible defaults.
