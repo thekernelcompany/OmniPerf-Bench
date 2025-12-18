@@ -202,7 +202,7 @@ class FreeFormAnalysis(BaseModel):
 
 class LLMAnalysisResult(BaseModel):
     """Result from LLM analysis call."""
-    model: str = Field(default="google/gemini-3-pro-preview", description="LLM model used")
+    model: str = Field(default="google/gemini-3-flash-preview", description="LLM model used")
     provider: str = Field(default="openrouter", description="API provider")
     thinking_enabled: bool = Field(default=True, description="Whether thinking mode was used")
 
