@@ -78,7 +78,7 @@ class SoftMetricsAnalyzer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "google/gemini-3-pro-preview",
+        model: str = "google/gemini-3-flash-preview",
         cache_dir: Optional[Path] = None,
     ):
         """Initialize the analyzer.
