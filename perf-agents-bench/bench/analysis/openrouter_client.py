@@ -70,14 +70,19 @@ class OpenRouterClient:
         enable_thinking: bool = True,
         temperature: float = 0.0,
         max_tokens: int = 8192,
+        json_mode: bool = False,
     ) -> Dict[str, Any]:
         """Build request payload."""
         payload: Dict[str, Any] = {
             "model": self.config.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
+            "temperature": temperature,
             "max_tokens": max_tokens,
         }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         # Enable thinking for Gemini models
         if enable_thinking and "gemini" in self.config.model.lower():
@@ -126,6 +131,7 @@ class OpenRouterClient:
         prompt: str,
         enable_thinking: bool = True,
         use_cache: bool = True,
+        json_mode: bool = False,
     ) -> Dict[str, Any]:
         """Send analysis request to OpenRouter.
 
@@ -148,7 +154,7 @@ class OpenRouterClient:
             if cached:
                 return cached
 
-        payload = self._build_payload(prompt, enable_thinking)
+        payload = self._build_payload(prompt, enable_thinking, json_mode=json_mode)
         endpoint = f"{self.base_url}/chat/completions"
 
         last_error = None

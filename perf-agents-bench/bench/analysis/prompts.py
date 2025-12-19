@@ -447,9 +447,18 @@ These metrics were calculated automatically without LLM:
 
 Analyze how the agent's patch compares to the human reference. Focus on categorical assessment and detailed discussion - **DO NOT provide numeric scores**.
 
-For each category, select the most appropriate option. If none fit well, select "other" and explain in the discussion field.
+**IMPORTANT**: If you select any "other" category, you MUST explain exactly what it is in the discussion field. "Other" without explanation is invalid.
 
-### 1. Bottleneck Target
+### 1. Task Analysis
+
+Analyze the nature of the optimization task itself.
+
+- What is the primary domain? (e.g. compute, memory, io, concurrency, algorithmic complication)
+- What is the task about? Like a short description of the task.
+- How complex is the task? (low, medium, high, extreme)
+- Provide a brief description of the task's technical challenges.
+
+### 2. Bottleneck Target
 
 Does the agent target the same performance bottleneck as the human?
 
@@ -460,7 +469,7 @@ Categories:
 - `no_optimization`: No meaningful optimization attempted
 - `other`: None of the above - explain in discussion
 
-### 2. Optimization Techniques
+### 4. Optimization Techniques
 
 What optimization technique(s) did each use? (Select all that apply for each)
 
@@ -469,12 +478,13 @@ Techniques:
 - `memory_optimization`: Reduced allocations, better memory layout, caching
 - `parallelization`: Threading, vectorization, GPU offload
 - `api_library`: Using faster API calls or optimized libraries
-- `lazy_computation`: Deferred/avoided unnecessary computation
+- `lazy_computation`: Deferred/avoided unnecessary computation (lazy loading, generator usage, etc.)
+- `compiler_optimization`: Torch.compile, JIT, fusion, etc.
 - `batching`: Combined operations to reduce overhead
 - `low_level`: Assembly, CUDA kernels, intrinsics
 - `other`: Describe in discussion
 
-### 3. Approach Comparison
+### 5. Approach Comparison
 
 How does the agent's approach compare to the human's?
 
@@ -487,7 +497,7 @@ Categories:
 - `harmful`: Changes likely to hurt performance or correctness
 - `other`: None of the above - explain in discussion
 
-### 4. Speedup Likelihood
+### 6. Speedup Likelihood
 
 Based on the patch analysis, what is the likely performance impact compared to human's verified speedup?
 
@@ -499,7 +509,7 @@ Categories:
 - `likely_regression`: May cause performance regression
 - `other`: None of the above - explain in discussion
 
-### 5. Failure Mode
+### 7. Failure Mode
 
 If the agent's solution differs from human's, what went wrong?
 
@@ -509,8 +519,14 @@ Categories:
 - `incomplete_implementation`: Right idea, incomplete execution
 - `complexity_avoidance`: Avoided necessary low-level optimizations
 - `overcomplicated`: Added unnecessary complexity
+- `library_misuse`: Incorrect usage of a specific library (e.g. torch, cuda)
 - `not_applicable`: Agent solution is valid/successful
 - `other`: None of the above - explain in discussion
+
+### 8. Library Responsibility (If Failure)
+
+If the agent failed or produced a failing patch, identify if a specific library was responsible or misused (e.g. "pytorch", "cuda", "triton").
+Provide the library name and the specific reason.
 
 ---
 
@@ -520,6 +536,11 @@ Return your analysis as a JSON object. Every field with "discussion" is REQUIRED
 
 ```json
 {{
+  "task_analysis": {{
+    "domain": "compute|memory|io|concurrency|other",
+    "complexity": "low|medium|high|extreme",
+    "description": "Brief description of task challenges"
+  }},
   "bottleneck_target": {{
     "category": "same_target|related_target|different_target|no_optimization|other",
     "human_target": "Brief description of what the human patch optimizes",
@@ -549,6 +570,10 @@ Return your analysis as a JSON object. Every field with "discussion" is REQUIRED
     "agent_strengths": ["Strength 1", "Strength 2"],
     "agent_weaknesses": ["Weakness 1", "Weakness 2"],
     "benchmark_needed": "What specific benchmark would verify performance claims"
+  }},
+  "library_failure": {{
+    "responsible_libraries": ["lib1", "lib2"],
+    "failure_reason": "Explanation of how the library was involved in the failure"
   }}
 }}
 ```

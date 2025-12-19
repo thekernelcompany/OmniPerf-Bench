@@ -49,6 +49,8 @@ from .schemas import (
     FailureModeAnalysis,
     PatchFailureMode,
     PatchObservations,
+    TaskAnalysis,
+    LibraryFailureAnalysis,
 )
 from .openrouter_client import OpenRouterClient, OpenRouterConfig, create_client
 from .run_loader import (
@@ -197,7 +199,9 @@ class SoftMetricsAnalyzer:
             editor=tool_dist.get("editor", 0),
             read=tool_dist.get("read", 0),
             search=tool_dist.get("grep", 0) + tool_dist.get("glob", 0),
-            other=sum(v for k, v in tool_dist.items() if k not in ["bash", "editor", "read", "grep", "glob"]),
+            web_search=tool_dist.get("web_search", 0),
+            other=sum(v for k, v in tool_dist.items() if k not in ["bash", "editor", "read", "grep", "glob", "web_search"]),
+            other_details={k: v for k, v in tool_dist.items() if k not in ["bash", "editor", "read", "grep", "glob", "web_search"]},
         )
 
         # Build patch metrics
@@ -405,7 +409,7 @@ class SoftMetricsAnalyzer:
         try:
             # Call LLM
             logger.info(f"Analyzing patch quality with {self.model}...")
-            response = await self.client.analyze(prompt)
+            response = await self.client.analyze(prompt, json_mode=True)
 
             # Extract JSON from response
             json_data = self.client.extract_json(response)
@@ -415,6 +419,16 @@ class SoftMetricsAnalyzer:
                 return PatchQualityAnalysis(
                     human_patch_available=True,
                     analysis_model=self.model,
+                )
+
+            # Parse task analysis
+            task_data = json_data.get("task_analysis", {})
+            task_analysis = None
+            if task_data:
+                task_analysis = TaskAnalysis(
+                    domain=task_data.get("domain", "unknown"),
+                    complexity=task_data.get("complexity", "unknown"),
+                    description=task_data.get("description", ""),
                 )
 
             # Parse bottleneck target
@@ -502,6 +516,15 @@ class SoftMetricsAnalyzer:
                     benchmark_needed=obs_data.get("benchmark_needed", ""),
                 )
 
+            # Parse library failure
+            lf_data = json_data.get("library_failure", {})
+            library_failure = None
+            if lf_data:
+                library_failure = LibraryFailureAnalysis(
+                    responsible_libraries=lf_data.get("responsible_libraries", []),
+                    failure_reason=lf_data.get("failure_reason", ""),
+                )
+
             # Get token usage
             usage = response.get("usage", {})
             total_tokens = usage.get("total_tokens", 0)
@@ -510,12 +533,14 @@ class SoftMetricsAnalyzer:
                 human_patch_available=True,
                 analysis_model=self.model,
                 analysis_tokens=total_tokens,
+                task_analysis=task_analysis,
                 bottleneck_target=bottleneck_target,
                 optimization_techniques=optimization_techniques,
                 approach_comparison=approach_comparison,
                 speedup_likelihood=speedup_likelihood,
                 failure_mode=failure_mode,
                 observations=observations,
+                library_failure=library_failure,
             )
 
         except Exception as e:
@@ -696,7 +721,7 @@ class SoftMetricsAnalyzer:
 
                 # Call LLM
                 logger.info(f"Analyzing {item_dir.name} with {self.model}...")
-                response = await self.client.analyze(prompt)
+                response = await self.client.analyze(prompt, json_mode=True)
 
                 # Parse response
                 qualitative, categorical, free_form = self._parse_llm_response(response)

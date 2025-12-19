@@ -64,14 +64,16 @@ class ToolDistribution(BaseModel):
     bash: int = Field(default=0, ge=0, description="Shell command executions")
     editor: int = Field(default=0, ge=0, description="File edit operations")
     read: int = Field(default=0, ge=0, description="File read operations")
-    search: int = Field(default=0, ge=0, description="Search/grep operations")
-    other: int = Field(default=0, ge=0, description="Other tool calls")
+    search: int = Field(default=0, ge=0, description="Code search grep/glob operations")
+    web_search: int = Field(default=0, ge=0, description="Web search operations")
+    other: int = Field(default=0, ge=0, description="Other tool calls (captured below)")
+    other_details: Dict[str, int] = Field(default_factory=dict, description="Breakdown of 'other' tool calls")
 
     @computed_field
     @property
     def total(self) -> int:
         """Total tool calls."""
-        return self.bash + self.editor + self.read + self.search + self.other
+        return self.bash + self.editor + self.read + self.search + self.web_search + self.other
 
     model_config = {"extra": "allow"}
 
@@ -461,6 +463,17 @@ class RunAnalysis(BaseModel):
 
         return summary
 
+    model_config = {"extra": "ignore"}
+
+
+class TaskAnalysis(BaseModel):
+    """Analysis of the task complexity and domain."""
+    domain: str = Field(description="Primary domain (e.g., 'compute', 'memory', 'io', 'concurrency')")
+    complexity: str = Field(description="Task complexity rating (low/medium/high/extreme)")
+    description: str = Field(description="Detailed description of what the task involves")
+
+    model_config = {"extra": "ignore"}
+
 
 # =============================================================================
 # V4 Patch Quality Analysis (Categories + Discussion, NO SCORES)
@@ -486,7 +499,8 @@ class OptimizationTechnique(str, Enum):
     LAZY_COMPUTATION = "lazy_computation"
     BATCHING = "batching"
     LOW_LEVEL = "low_level"
-    OTHER = "other"
+    COMPILER_OPTIMIZATION = "compiler_optimization"
+    OTHER = "other"  # Must explain in discussion
 
 
 class PatchApproachCategory(str, Enum):
@@ -575,6 +589,15 @@ class PatchObservations(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+
+class LibraryFailureAnalysis(BaseModel):
+    """Analysis of which libraries failed and why."""
+    responsible_libraries: List[str] = Field(default_factory=list, description="List of libraries that caused issues (e.g. 'pytorch', 'cuda', 'triton')")
+    failure_reason: str = Field(default="", description="Detailed reason for the library failure")
+
+    model_config = {"extra": "ignore"}
+
+
 class PatchQualityAnalysis(BaseModel):
     """LLM-based patch quality analysis - categories and discussion only, no scores.
 
@@ -585,6 +608,8 @@ class PatchQualityAnalysis(BaseModel):
     analysis_model: str = Field(default="")
     analysis_tokens: int = Field(default=0, ge=0)
 
+    task_analysis: Optional[TaskAnalysis] = Field(default=None)
+    library_failure: Optional[LibraryFailureAnalysis] = Field(default=None)
     bottleneck_target: Optional[BottleneckTargetAnalysis] = Field(default=None)
     optimization_techniques: Optional[OptimizationTechniqueAnalysis] = Field(default=None)
     approach_comparison: Optional[ApproachComparisonAnalysis] = Field(default=None)

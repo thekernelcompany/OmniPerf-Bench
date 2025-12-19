@@ -327,6 +327,7 @@ def extract_error_metrics(stderr_content: str) -> Dict[str, Any]:
     Returns:
         Dict with:
             - error_count: Number of errors found
+            - error_count: Number of errors found
             - warning_count: Number of warnings found
             - exception_types: List of exception types found
     """
@@ -340,7 +341,6 @@ def extract_error_metrics(stderr_content: str) -> Dict[str, Any]:
     error_count = 0
     warning_count = 0
     exception_types = set()
-
     lines = stderr_content.lower().split("\n")
     for line in lines:
         if "error" in line or "exception" in line:
@@ -379,7 +379,11 @@ def count_tool_calls(stdout_content: str, agent_type: str) -> Dict[str, int]:
             (r"Tool:\s*(\w+)", "general"),
             (r"bash\s*```", "bash"),
             (r"str_replace_based_edit_tool", "editor"),
+            (r"Tool:\s*(\w+)", "general"),
+            (r"bash\s*```", "bash"),
+            (r"str_replace_based_edit_tool", "editor"),
             (r"view_file|cat ", "read"),
+            (r"search_engine|web_search|google", "web_search"),
         ]
         for pattern, tool in patterns:
             matches = re.findall(pattern, stdout_content, re.IGNORECASE)
@@ -396,7 +400,11 @@ def count_tool_calls(stdout_content: str, agent_type: str) -> Dict[str, int]:
             (r'"action":\s*"(\w+)"', None),
             (r"CmdRunAction", "bash"),
             (r"FileWriteAction|FileEditAction", "editor"),
+            (r"CmdRunAction", "bash"),
+            (r"FileWriteAction|FileEditAction", "editor"),
             (r"FileReadAction", "read"),
+            (r"IPythonRunCellAction", "bash"),  # Often used like shell
+            (r"BrowseInteractiveAction|BrowseURLAction", "web_search"),
         ]
         for pattern, tool in patterns:
             matches = re.findall(pattern, stdout_content)
@@ -412,6 +420,7 @@ def count_tool_calls(stdout_content: str, agent_type: str) -> Dict[str, int]:
         patterns = [
             (r'"tool_use"', "tool_use"),
             (r'"name":\s*"(Bash|Read|Write|Edit|Grep|Glob)"', None),
+            (r'"name":\s*"(WebSearch|BraveSearch)"', "web_search"),
         ]
         for pattern, tool in patterns:
             matches = re.findall(pattern, stdout_content, re.IGNORECASE)
