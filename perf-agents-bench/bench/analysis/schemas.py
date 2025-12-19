@@ -302,7 +302,7 @@ class PatchSimilarityMetrics(BaseModel):
     common_files: List[str] = Field(default_factory=list, description="Files modified by both")
     agent_only_files: List[str] = Field(default_factory=list, description="Files only agent modified")
     human_only_files: List[str] = Field(default_factory=list, description="Files only human modified")
-    file_overlap_pct: float = Field(default=0.0, ge=0, le=100, description="% of human files also modified by agent")
+    file_overlap_pct: float = Field(default=0.0, ge=0, le=100, description="Jaccard similarity % of modified files")
 
     # Line-level statistics
     agent_lines_added: int = Field(default=0, ge=0, description="Lines added by agent")
@@ -313,7 +313,7 @@ class PatchSimilarityMetrics(BaseModel):
     # Overlap metrics
     matching_additions: int = Field(default=0, ge=0, description="Agent lines that match human additions")
     matching_removals: int = Field(default=0, ge=0, description="Agent lines that match human removals")
-    line_overlap_pct: float = Field(default=0.0, ge=0, le=100, description="% of human lines matched by agent")
+    line_overlap_pct: float = Field(default=0.0, ge=0, le=100, description="Jaccard similarity % of modified lines")
 
     # Semantic similarity
     approach_similarity_score: float = Field(default=0.0, ge=0, le=10, description="Similarity score (0-10)")

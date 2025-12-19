@@ -195,10 +195,11 @@ class PatchComparator:
         agent_only = agent_files - human_files
         human_only = human_files - agent_files
 
-        # File overlap percentage
+        # Jaccard Overlap for Files
+        file_union = len(agent_files | human_files)
         file_overlap_pct = 0.0
-        if human_files:
-            file_overlap_pct = (len(common_files) / len(human_files)) * 100
+        if file_union > 0:
+            file_overlap_pct = (len(common_files) / file_union) * 100
 
         # Line-level metrics
         agent_lines_added = self.agent.lines_added
@@ -214,15 +215,29 @@ class PatchComparator:
             self.agent.removals, self.human.removals
         )
 
-        # Line overlap percentage (based on human's changes)
-        line_overlap_pct = 0.0
+        # Jaccard Overlap for Lines
+        # Intersection = matching_additions + matching_removals
+        # Union = (agent_added + agent_removed) + (human_added + human_removed) - Intersection
+        total_matching = matching_additions + matching_removals
+        total_agent_changes = agent_lines_added + agent_lines_removed
         total_human_changes = human_lines_added + human_lines_removed
-        if total_human_changes > 0:
-            total_matching = matching_additions + matching_removals
-            line_overlap_pct = (total_matching / total_human_changes) * 100
+        
+        line_union = total_agent_changes + total_human_changes - total_matching
+        line_overlap_pct = 0.0
+        
+        if line_union > 0:
+            line_overlap_pct = (total_matching / line_union) * 100
 
         # Semantic similarity score
         approach_similarity = self._calculate_semantic_similarity()
+        
+        # Calculate extra precision/recall metrics (optional for schema but good for debugging)
+        line_precision = 0.0
+        line_recall = 0.0
+        if total_agent_changes > 0:
+            line_precision = (total_matching / total_agent_changes) * 100
+        if total_human_changes > 0:
+            line_recall = (total_matching / total_human_changes) * 100
 
         return {
             "human_patch_available": bool(self.human.content),
