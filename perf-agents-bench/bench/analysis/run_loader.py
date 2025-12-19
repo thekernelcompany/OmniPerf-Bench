@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -348,90 +347,24 @@ def extract_error_metrics(stderr_content: str) -> Dict[str, Any]:
         if "warning" in line:
             warning_count += 1
 
-    # Extract exception types
-    exception_pattern = r"(\w+(?:Error|Exception))"
-    for match in re.finditer(exception_pattern, stderr_content):
-        exception_types.add(match.group(1))
-
+    # Extract exception types (Simplified to avoid regex, relies on LLM for detail)
+    # detecting common python exception keywords if needed, or just leave empty
+    # as the LLM will provide `error_counts` and qualitative failure analysis.
+    
     return {
         "error_count": error_count,
         "warning_count": warning_count,
-        "exception_types": list(exception_types),
+        "exception_types": [],
     }
 
 
 def count_tool_calls(stdout_content: str, agent_type: str) -> Dict[str, int]:
     """Count tool calls from stdout content.
 
-    Different agents have different output formats.
-
-    Returns:
-        Dict mapping tool names to counts
+    DEPRECATED: Tool counting is now handled by the LLM analysis.
+    This function remains signature-compatible but returns empty dicts.
     """
-    tool_counts: Dict[str, int] = {}
-
-    if not stdout_content:
-        return tool_counts
-
-    if agent_type == "trae":
-        # TRAE uses specific tool markers
-        patterns = [
-            (r"Tool:\s*(\w+)", "general"),
-            (r"bash\s*```", "bash"),
-            (r"str_replace_based_edit_tool", "editor"),
-            (r"Tool:\s*(\w+)", "general"),
-            (r"bash\s*```", "bash"),
-            (r"str_replace_based_edit_tool", "editor"),
-            (r"view_file|cat ", "read"),
-            (r"search_engine|web_search|google", "web_search"),
-        ]
-        for pattern, tool in patterns:
-            matches = re.findall(pattern, stdout_content, re.IGNORECASE)
-            if isinstance(matches, list) and matches:
-                if tool == "general":
-                    for match in matches:
-                        tool_counts[match.lower()] = tool_counts.get(match.lower(), 0) + 1
-                else:
-                    tool_counts[tool] = tool_counts.get(tool, 0) + len(matches)
-
-    elif agent_type == "openhands":
-        # OpenHands uses action-based format
-        patterns = [
-            (r'"action":\s*"(\w+)"', None),
-            (r"CmdRunAction", "bash"),
-            (r"FileWriteAction|FileEditAction", "editor"),
-            (r"CmdRunAction", "bash"),
-            (r"FileWriteAction|FileEditAction", "editor"),
-            (r"FileReadAction", "read"),
-            (r"IPythonRunCellAction", "bash"),  # Often used like shell
-            (r"BrowseInteractiveAction|BrowseURLAction", "web_search"),
-        ]
-        for pattern, tool in patterns:
-            matches = re.findall(pattern, stdout_content)
-            if matches:
-                if tool is None:
-                    for match in matches:
-                        tool_counts[match.lower()] = tool_counts.get(match.lower(), 0) + 1
-                else:
-                    tool_counts[tool] = tool_counts.get(tool, 0) + len(matches)
-
-    elif agent_type == "claude_code":
-        # Claude Code uses stream JSON format
-        patterns = [
-            (r'"tool_use"', "tool_use"),
-            (r'"name":\s*"(Bash|Read|Write|Edit|Grep|Glob)"', None),
-            (r'"name":\s*"(WebSearch|BraveSearch)"', "web_search"),
-        ]
-        for pattern, tool in patterns:
-            matches = re.findall(pattern, stdout_content, re.IGNORECASE)
-            if matches:
-                if tool is None:
-                    for match in matches:
-                        tool_counts[match.lower()] = tool_counts.get(match.lower(), 0) + 1
-                else:
-                    tool_counts[tool] = tool_counts.get(tool, 0) + len(matches)
-
-    return tool_counts
+    return {}
 
 
 # =============================================================================

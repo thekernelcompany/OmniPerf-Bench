@@ -726,6 +726,28 @@ class SoftMetricsAnalyzer:
                 # Parse response
                 qualitative, categorical, free_form = self._parse_llm_response(response)
 
+                # Update tool calls from LLM response override
+                json_data = self.client.extract_json(response)
+                if json_data:
+                    tool_usage_data = json_data.get("tool_usage_analysis", {})
+                    if not tool_usage_data:
+                         # Fallback
+                         tool_usage_data = json_data.get("quantitative_assessment", {}).get("tool_calls", {})
+                    
+                    if tool_usage_data:
+                        try:
+                            quant.tool_calls = ToolDistribution(
+                                bash=int(tool_usage_data.get("bash", 0)),
+                                read=int(tool_usage_data.get("read", 0)),
+                                editor=int(tool_usage_data.get("editor", 0)),
+                                web_search=int(tool_usage_data.get("web_search", 0)),
+                                search=int(tool_usage_data.get("search", 0)),
+                                other=int(tool_usage_data.get("other", 0)),
+                                other_details=tool_usage_data.get("other_details", {}) if isinstance(tool_usage_data.get("other_details"), dict) else {},
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to update tool calls from LLM: {e}")
+
                 # V3: Extract raw LLM scores
                 llm_raw = self._extract_raw_scores(response)
 

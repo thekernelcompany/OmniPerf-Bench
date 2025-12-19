@@ -332,6 +332,9 @@ class LLMRawScores(BaseModel):
     # Quantitative assessment from LLM
     quantitative_assessment: Dict[str, Any] = Field(default_factory=dict, description="Tool counts, errors, etc.")
 
+    # Tool usage analysis
+    tool_usage_analysis: Dict[str, Any] = Field(default_factory=dict, description="Detailed tool usage breakdown")
+
     # Detailed analysis text
     detailed_analysis: Dict[str, Any] = Field(default_factory=dict, description="Summary, strengths, weaknesses")
 
