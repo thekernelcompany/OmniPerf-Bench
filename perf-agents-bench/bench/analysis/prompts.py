@@ -335,6 +335,12 @@ def build_analysis_prompt(data: Dict[str, Any]) -> str:
     if len(stderr) > max_stderr_len:
         stderr = stderr[:max_stderr_len] + "\n\n... [TRUNCATED] ..."
 
+    # Truncate patch if too long
+    patch_content = data.get("patch", "No patch generated.")
+    max_patch_len = 100000  # ~100KB
+    if len(patch_content) > max_patch_len:
+        patch_content = patch_content[:max_patch_len] + "\n\n... [TRUNCATED DUE TO SIZE] ..."
+
     # Build the prompt
     prompt = ANALYSIS_PROMPT_TEMPLATE.format(
         # Task context
@@ -356,7 +362,7 @@ def build_analysis_prompt(data: Dict[str, Any]) -> str:
         # Agent output
         stdout_content=stdout or "No stdout captured.",
         stderr_content=stderr or "No stderr captured.",
-        patch_content=data.get("patch", "No patch generated."),
+        patch_content=patch_content,
         diff_targets=diff_targets_str,
 
         # Status

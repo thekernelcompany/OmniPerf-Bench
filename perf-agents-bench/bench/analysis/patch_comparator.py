@@ -429,7 +429,7 @@ def load_human_patch_from_dataset(
         return "", ""
 
 
-def find_dataset_for_repo(repo: str, data_dir: Path) -> Optional[Path]:
+def find_dataset_for_repo(repo: str, data_dir: Optional[Path]) -> Optional[Path]:
     """Find the dataset file for a repository.
 
     Args:
@@ -439,6 +439,9 @@ def find_dataset_for_repo(repo: str, data_dir: Path) -> Optional[Path]:
     Returns:
         Path to dataset file or None
     """
+    if data_dir is None:
+        return None
+
     # Priority patterns - final dataset first since it contains complete data
     priority_patterns = [
         f"{repo}_final_dataset.jsonl",
