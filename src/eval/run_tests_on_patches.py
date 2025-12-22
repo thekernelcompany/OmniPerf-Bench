@@ -37,7 +37,7 @@ DEFAULT_WARMUP_RUNS = 3
 VLLM_WHEEL_URL = "https://vllm-wheels.s3.us-west-2.amazonaws.com/{commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
 
 # Ephemeral cache root for runtime caches (wheel downloads, Triton JIT, etc.)
-EPHEMERAL_CACHE_ROOT = Path("/ephemeral/cache")
+EPHEMERAL_CACHE_ROOT = Path("/tmp/ephemeral_cache")
 
 
 def _get_ephemeral_cache_env() -> dict:
@@ -693,7 +693,20 @@ class TestRunner:
         # Use ephemeral cache for Triton JIT, torch caches, etc.
         env = _get_ephemeral_cache_env()
         if use_pythonpath:
-            env["PYTHONPATH"] = str(worktree_path)
+            paths_to_add = []
+            # Check for python/ subdirectory (common in sglang)
+            python_sub = worktree_path / "python"
+            if python_sub.exists():
+                paths_to_add.append(str(python_sub))
+            
+            # Always add root worktree path
+            paths_to_add.append(str(worktree_path))
+            
+            current_path = os.environ.get("PYTHONPATH", "")
+            if current_path:
+                env["PYTHONPATH"] = f"{':'.join(paths_to_add)}:{current_path}"
+            else:
+                env["PYTHONPATH"] = ":".join(paths_to_add)
 
         result = subprocess.run(
             ["python3", str(test_script)],
