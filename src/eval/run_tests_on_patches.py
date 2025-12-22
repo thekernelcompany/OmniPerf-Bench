@@ -63,7 +63,7 @@ def _get_ephemeral_cache_env() -> dict:
 @dataclass
 class TestResult:
     """Result of running a test script."""
-    status: str  # "success", "error", "timeout", "no_test", "no_patch", "patch_failed"
+    status: str  # "success", "error", "timeout", "no_test", "no_patch", "patch_failed", "baseline_failed"
     baseline_ms: Optional[float] = None
     patched_ms: Optional[float] = None
     speedup: Optional[float] = None
@@ -750,6 +750,23 @@ class TestRunner:
 
         baseline_ms = baseline.get("avg_ms")
 
+        # Check if test ran but couldn't produce timing (e.g., import errors, opt path not hit)
+        if baseline_ms is None:
+            # Extract error info from test output
+            error_msg = baseline.get("error") or baseline.get("error_message")
+            error_name = baseline.get("error_name")
+            if error_name:
+                error_msg = f"{error_name}: {error_msg}"
+            if not error_msg:
+                error_msg = "Test did not produce timing data (avg_ms)"
+            return TestResult(
+                status="baseline_failed",
+                error_message=error_msg,
+                baseline_output=baseline,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
         if not patch_applied or metadata.patch_path is None:
             return TestResult(
                 status="no_patch",
@@ -771,10 +788,28 @@ class TestRunner:
 
         patched_ms = patched.get("avg_ms")
 
+        # Check if patched test ran but couldn't produce timing
+        if patched_ms is None:
+            error_msg = patched.get("error") or patched.get("error_message")
+            error_name = patched.get("error_name")
+            if error_name:
+                error_msg = f"{error_name}: {error_msg}"
+            if not error_msg:
+                error_msg = "Patched test did not produce timing data (avg_ms)"
+            return TestResult(
+                status="patch_failed",
+                baseline_ms=baseline_ms,
+                error_message=error_msg,
+                baseline_output=baseline,
+                patched_output=patched,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
         # Compute speedup
         speedup = None
         improvement = False
-        if baseline_ms and patched_ms and patched_ms > 0:
+        if baseline_ms > 0 and patched_ms > 0:
             speedup = baseline_ms / patched_ms
             improvement = speedup > 1.0
 

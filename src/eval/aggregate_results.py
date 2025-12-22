@@ -51,6 +51,9 @@ def aggregate_results(output_dir: Path) -> Dict[str, AgentSummary]:
     """
     Aggregate results from all runs in the output directory.
 
+    Supports both flat structure (run_id/item/) and hierarchical structure
+    (repo/agent/model/timestamp/item/).
+
     Args:
         output_dir: Directory containing evaluation results
 
@@ -62,6 +65,117 @@ def aggregate_results(output_dir: Path) -> Dict[str, AgentSummary]:
         logger.warning(f"Output directory not found: {output_dir}")
         return {}
 
+    summaries: Dict[str, AgentSummary] = {}
+
+    # Find all run_summary.json files (works for hierarchical structure)
+    run_summaries = list(output_dir.rglob("run_summary.json"))
+
+    if run_summaries:
+        # Hierarchical structure - group by agent/model
+        return _aggregate_from_run_summaries(run_summaries)
+
+    # Fall back to legacy flat structure
+    return _aggregate_from_flat_structure(output_dir)
+
+
+def _aggregate_from_run_summaries(run_summary_paths: List[Path]) -> Dict[str, AgentSummary]:
+    """Aggregate from run_summary.json files in hierarchical structure."""
+    # Group by agent/model
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+
+    for path in run_summary_paths:
+        try:
+            data = json.loads(path.read_text())
+            meta = data.get("meta", {})
+            agent = meta.get("agent", "unknown")
+            model = meta.get("model", "unknown")
+            key = f"{agent}/{model}"
+            grouped[key].append(data)
+        except Exception as e:
+            logger.error(f"Error reading {path}: {e}")
+            continue
+
+    summaries = {}
+    for key, items in grouped.items():
+        agent_name = key.split("/")[0]
+        summary = AgentSummary(agent_name=agent_name, run_id=key)
+        speedups = []
+
+        for data in items:
+            summary.total_commits += 1
+            ev = data.get("evaluation", {})
+            agent_info = data.get("agent", {})
+            status = ev.get("status", "unknown")
+            patch_generated = agent_info.get("patch_generated", False)
+
+            # Check for test availability based on error message
+            error_msg = ev.get("error", "") or ""
+            no_test = "No test script found" in error_msg
+
+            if no_test:
+                summary.no_test_available += 1
+            elif not patch_generated:
+                summary.no_patch += 1
+                summary.tests_available += 1
+            elif status == "success":
+                summary.tests_available += 1
+                summary.tests_run += 1
+
+                speedup = ev.get("speedup")
+                baseline_ms = ev.get("baseline_ms")
+                patched_ms = ev.get("patched_ms")
+
+                if speedup is not None:
+                    summary.tests_passed += 1
+                    speedups.append(speedup)
+                    if speedup > 1.05:  # >5% improvement
+                        summary.commits_with_improvement += 1
+                    elif speedup < 0.95:  # >5% regression
+                        summary.commits_with_regression += 1
+                    else:
+                        summary.commits_neutral += 1
+                elif baseline_ms is None:
+                    # Status "success" but no baseline timing - test didn't run properly
+                    # This happens with import errors, opt path not triggered, etc.
+                    summary.tests_failed += 1
+                elif patched_ms is None:
+                    # Baseline ran but patched didn't produce timing
+                    summary.tests_failed += 1
+                else:
+                    # Both timings exist but speedup is None (shouldn't happen)
+                    summary.tests_passed += 1
+
+            elif status == "patch_failed":
+                summary.patch_failed += 1
+                summary.tests_available += 1
+                summary.tests_run += 1
+                summary.tests_failed += 1
+
+            elif status == "timeout":
+                summary.timeouts += 1
+                summary.tests_available += 1
+
+            elif status == "error" or status == "baseline_failed":
+                summary.errors += 1
+                summary.tests_available += 1
+
+            elif status == "no_patch":
+                summary.no_patch += 1
+                summary.tests_available += 1
+
+        # Compute aggregate metrics
+        if speedups:
+            summary.speedups = sorted(speedups)
+            summary.avg_speedup = sum(speedups) / len(speedups)
+            summary.median_speedup = speedups[len(speedups) // 2]
+
+        summaries[key] = summary
+
+    return summaries
+
+
+def _aggregate_from_flat_structure(output_dir: Path) -> Dict[str, AgentSummary]:
+    """Aggregate from legacy flat directory structure."""
     summaries: Dict[str, AgentSummary] = {}
 
     for run_dir in output_dir.iterdir():
