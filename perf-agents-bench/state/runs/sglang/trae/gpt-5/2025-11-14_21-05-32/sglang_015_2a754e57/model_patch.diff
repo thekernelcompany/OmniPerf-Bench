@@ -1,0 +1,69 @@
+diff --git a/docs/test_process.md b/docs/test_process.md
+index e7aff5b5a..d22570b4e 100644
+--- a/docs/test_process.md
++++ b/docs/test_process.md
+@@ -2,7 +2,16 @@
+ 
+ ### Latency Alignment
+ ```
++# single gpu
+ python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 32 --input-len 512 --output-len 256
++python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 1 --input-len 512 --output-len 256
++
++# multiple gpu
++python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-70B --tp 8 --mem-fraction-static 0.6 --batch 32 --input-len 8192 --output-len 1
++python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-70B --tp 8 --mem-fraction-static 0.6 --batch 1 --input-len 8100 --output-len 32
++
++# moe model
++python -m sglang.bench_latency --model-path databricks/dbrx-base --tp 8 --mem-fraction-static 0.6 --batch 4 --input-len 1024 --output-len 32
+ ```
+ 
+ ### High-level API
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index e41514706..c2fe5c6e3 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -69,9 +69,10 @@ class InputMetadata:
+     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+ 
+     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
+-        self.kv_indptr = torch.zeros(
++        self.kv_indptr = torch.empty(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_last_page_len = torch.ones(
+             (self.batch_size,), dtype=torch.int32, device="cuda"
+@@ -92,9 +93,10 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.zeros(
++            self.qo_indptr = torch.empty(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
++            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+ 
+             self.flashinfer_prefill_wrapper.end_forward()
+@@ -124,7 +126,8 @@ class InputMetadata:
+ 
+     def init_extend_args(self):
+         self.extend_seq_lens = self.seq_lens - self.prefix_lens
+-        self.extend_start_loc = torch.zeros_like(self.seq_lens)
++        self.extend_start_loc = torch.empty_like(self.seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.max_extend_len = int(torch.max(self.extend_seq_lens))
+ 
+@@ -147,7 +150,8 @@ class InputMetadata:
+         flashinfer_decode_wrapper=None,
+     ):
+         batch_size = len(req_pool_indices)
+-        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc[0] = 0
+         start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+         total_num_tokens = int(torch.sum(seq_lens))
+         max_seq_len = int(torch.max(seq_lens))

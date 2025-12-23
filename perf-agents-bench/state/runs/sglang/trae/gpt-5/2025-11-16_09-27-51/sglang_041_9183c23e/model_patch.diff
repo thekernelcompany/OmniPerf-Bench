@@ -1,0 +1,116 @@
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 13eb233bd..1aae28b00 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -426,8 +426,7 @@ class UpdateWeightsFromDistributedReqOutput:
+ 
+ @dataclass
+ class UpdateWeightsFromTensorReqInput:
+-    name: str
+-    tensor: torch.Tensor
++    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+ 
+ 
+ @dataclass
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index c8e14a746..020abea9b 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.server_args import ServerArgs
+-from sglang.srt.utils import broadcast_pyobj, set_random_seed
++from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -197,7 +197,7 @@ class TpModelWorker:
+ 
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+         success, message = self.model_runner.update_weights_from_tensor(
+-            recv_req.name, recv_req.tensor
++            recv_req.serialized_named_tensors
+         )
+         return success, message
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 786f654de..a51d6d845 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -428,8 +428,11 @@ class ModelRunner:
+             logger.error(error_msg)
+             return False, error_msg
+ 
+-    def update_weights_from_tensor(self, name, tensor: torch.Tensor):
+-        self.model.load_weights([(name, tensor)])
++    def update_weights_from_tensor(self, serialized_named_tensors: bytes):
++        from sglang.srt.utils import MultiprocessingSerializer
++        named_tensors = MultiprocessingSerializer.loads(serialized_named_tensors)
++        # named_tensors: Dict[str, torch.Tensor]
++        self.model.load_weights(list(named_tensors.items()))
+         return True, "Success"  # TODO error handling
+ 
+     def get_weights_by_name(
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index d95ce5931..491f03d78 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -89,6 +89,7 @@ from sglang.srt.utils import (
+     prepare_model_and_tokenizer,
+     set_prometheus_multiproc_dir,
+     set_ulimit,
++    MultiprocessingSerializer,
+ )
+ from sglang.utils import get_exception_traceback
+ from sglang.version import __version__
+@@ -875,8 +876,15 @@ class Engine:
+         )
+ 
+     def update_weights_from_tensor(self, name, tensor):
+-        """Update weights from distributed source."""
+-        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
++        """Update weights from tensor(s).
++
++        This method preserves the public API by accepting (name, tensor),
++        but internally serializes a dict to bytes for efficient IPC.
++        """
++        payload = {name: tensor}
++        obj = UpdateWeightsFromTensorReqInput(
++            serialized_named_tensors=MultiprocessingSerializer.dumps(payload)
++        )
+         loop = asyncio.get_event_loop()
+         return loop.run_until_complete(
+             tokenizer_manager.update_weights_from_tensor(obj, None)
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 7c3efa9a2..e4d0e8e85 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -742,6 +742,27 @@ def broadcast_pyobj(
+         return data
+ 
+ 
++
++class MultiprocessingSerializer:
++    """Efficient serializer for transferring named tensors between processes.
++
++    Uses torch.save/torch.load to handle tensors efficiently and reduce Python
++    pickle overhead compared to generic pickle.dumps for large tensors.
++    """
++
++    @staticmethod
++    def dumps(named_tensors: Dict[str, torch.Tensor]) -> bytes:
++        buf = BytesIO()
++        # torch.save is generally faster and more tensor-aware than pickle.dumps
++        torch.save(named_tensors, buf)
++        return buf.getvalue()
++
++    @staticmethod
++    def loads(buf: bytes) -> Dict[str, torch.Tensor]:
++        bio = BytesIO(buf)
++        # Load to CPU by default; the consumer can move to appropriate device
++        return torch.load(bio, map_location="cpu")
++
+ step_counter = 0
+ 
+ 

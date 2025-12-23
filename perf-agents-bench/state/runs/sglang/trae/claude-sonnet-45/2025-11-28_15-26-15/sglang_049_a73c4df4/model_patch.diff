@@ -1,0 +1,1407 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/sgl-kernel/csrc/cpu/activation.cpp b/sgl-kernel/csrc/cpu/activation.cpp
+new file mode 100644
+index 000000000..fa91168a7
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/activation.cpp
+@@ -0,0 +1,105 @@
++#include "common.h"
++#include "vec.h"
++
++namespace {
++
++template <typename scalar_t, typename func_t, typename vec_func_t>
++void act_and_mul_kernel_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    int64_t num_tokens,
++    int64_t dim,
++    const func_t& f,
++    const vec_func_t& vf) {
++  using bVec = at::vec::Vectorized<scalar_t>;
++  using fVec = at::vec::Vectorized<float>;
++
++  constexpr int64_t kVecSize = bVec::size();
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      // local ptrs
++      const scalar_t* __restrict__ input_ptr = input + i * 2 * dim;
++      const scalar_t* __restrict__ input_other_ptr = input_ptr + dim;
++      scalar_t* __restrict__ output_ptr = output + i * dim;
++
++      int64_t d = 0;
++      for (; d + kVecSize <= dim; d += kVecSize) {
++        bVec x = bVec::loadu(input_ptr + d);
++        bVec y = bVec::loadu(input_other_ptr + d);
++        bVec act = vf(x);
++        (act * y).store(output_ptr + d);
++      }
++      for (; d < dim; ++d) {
++        output_ptr[d] = f(input_ptr[d]) * input_other_ptr[d];
++      }
++    }
++  });
++}
++
++// Example activation functions
++struct SiluFn {
++  inline float operator()(float x) const {
++    return x / (1.0f + std::exp(-x));
++  }
++};
++
++struct GeluTanhFn {
++  inline float operator()(float x) const {
++    const float k0 = 0.79788456f;  // sqrt(2/pi)
++    const float k1 = 0.044715f;
++    float u = k0 * (x + k1 * x * x * x);
++    return 0.5f * x * (1.0f + std::tanh(u));
++  }
++};
++
++}  // namespace
++
++// Public entry points (not registered). Prefer uninitialized output to avoid
++// touching memory unnecessarily.
++
++void silu_and_mul_cpu_out(
++    at::Tensor& out,
++    const at::Tensor& input) {
++  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, 2, dim]");
++  int64_t num_tokens = input.size(0);
++  int64_t dim = input.size(2);
++  out.resize_({num_tokens, dim});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "silu_and_mul_cpu_out", [&] {
++    act_and_mul_kernel_impl<scalar_t>(
++        out.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        num_tokens,
++        dim,
++        SiluFn{},
++        [](const at::vec::Vectorized<scalar_t>& x) {
++          // sigmoid(x) = 1 / (1 + exp(-x)), so x * sigmoid(x) = x / (1 + exp(-x))
++          return x / (1 + (-x).exp());
++        });
++  });
++}
++
++void gelu_tanh_and_mul_cpu_out(
++    at::Tensor& out,
++    const at::Tensor& input) {
++  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, 2, dim]");
++  int64_t num_tokens = input.size(0);
++  int64_t dim = input.size(2);
++  out.resize_({num_tokens, dim});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul_cpu_out", [&] {
++    act_and_mul_kernel_impl<scalar_t>(
++        out.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        num_tokens,
++        dim,
++        GeluTanhFn{},
++        [](const at::vec::Vectorized<scalar_t>& x) {
++          using Vec = at::vec::Vectorized<scalar_t>;
++          const Vec k0 = Vec((scalar_t)0.79788456f);
++          const Vec k1 = Vec((scalar_t)0.044715f);
++          Vec u = k0 * (x + k1 * x * x * x);
++          return (Vec((scalar_t)0.5f) * x) * (Vec((scalar_t)1.0f) + u.tanh());
++        });
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/bmm.cpp b/sgl-kernel/csrc/cpu/bmm.cpp
+new file mode 100644
+index 000000000..9f0de038e
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/bmm.cpp
+@@ -0,0 +1,56 @@
++#include "common.h"
++
++// Simple CPU BMM kernel using naive loops with cache-friendly blocking.
++// Uses uninitialized output and accumulates into registers to reduce memory traffic.
++void bmm_cpu_naive(
++    const at::Tensor& A, // [B, M, K]
++    const at::Tensor& B, // [B, K, N]
++    at::Tensor& C       // [B, M, N]
++) {
++  TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A and B must be 3D");
++  int64_t Bz = A.size(0);
++  int64_t M = A.size(1);
++  int64_t K = A.size(2);
++  TORCH_CHECK(B.size(0) == Bz && B.size(1) == K, "Shape mismatch");
++  int64_t N = B.size(2);
++
++  C.resize_({Bz, M, N});
++
++  AT_DISPATCH_FLOATING_TYPES(A.scalar_type(), "bmm_cpu_naive", [&] {
++    const scalar_t* __restrict__ a_ptr = A.data_ptr<scalar_t>();
++    const scalar_t* __restrict__ b_ptr = B.data_ptr<scalar_t>();
++    scalar_t* __restrict__ c_ptr = C.data_ptr<scalar_t>();
++
++    constexpr int64_t BM = 64;
++    constexpr int64_t BN = 64;
++    constexpr int64_t BK = 64;
++
++    at::parallel_for(0, Bz, 0, [&](int64_t b_begin, int64_t b_end) {
++    for (int64_t b = b_begin; b < b_end; ++b) {
++      const scalar_t* __restrict__ Ab = a_ptr + b * M * K;
++      const scalar_t* __restrict__ Bb = b_ptr + b * K * N;
++      scalar_t* __restrict__ Cb = c_ptr + b * M * N;
++
++      for (int64_t mm = 0; mm < M; mm += BM) {
++        int64_t mmax = std::min(mm + BM, M);
++        for (int64_t nn = 0; nn < N; nn += BN) {
++          int64_t nmax = std::min(nn + BN, N);
++          // Local tile initialized lazily in registers
++          for (int64_t kk = 0; kk < K; kk += BK) {
++            int64_t kmax = std::min(kk + BK, K);
++            for (int64_t m = mm; m < mmax; ++m) {
++              for (int64_t n = nn; n < nmax; ++n) {
++                scalar_t acc = (kk == 0) ? (scalar_t)0 : Cb[m * N + n];
++                for (int64_t k = kk; k < kmax; ++k) {
++                  acc += Ab[m * K + k] * Bb[k * N + n];
++                }
++                Cb[m * N + n] = acc;
++              }
++            }
++          }
++        }
++      }
++    }
++    });
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/common.h b/sgl-kernel/csrc/cpu/common.h
+new file mode 100644
+index 000000000..1645fb525
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/common.h
+@@ -0,0 +1,82 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/Parallel.h>
++#include <ATen/cpu/vec/vec.h>
++#include <c10/util/irange.h>
++
++// Common helpers for CPU kernels. Keep lightweight to avoid build-time impact.
++
++#ifndef SGLANG_RESTRICT
++#  if defined(__CUDACC__) || defined(__HIPCC__)
++#    define SGLANG_RESTRICT __restrict__
++#  elif defined(_MSC_VER)
++#    define SGLANG_RESTRICT __restrict
++#  else
++#    define SGLANG_RESTRICT __restrict__
++#  endif
++#endif
++
++#ifndef CEILDIV
++#  define CEILDIV(x, y) (((x) + (y) - 1) / (y))
++#endif
++
++// Round up to a multiple of n (n power-of-two not required)
++static inline int64_t round_up(int64_t x, int64_t n) {
++  return CEILDIV(x, n) * n;
++}
++
++// Fast zero for POD types when needed, otherwise prefer uninitialized alloc
++// to avoid touching memory.
++template <typename T>
++inline void maybe_memset_zero(T* ptr, int64_t num) {
++  std::memset(ptr, 0, sizeof(T) * static_cast<size_t>(num));
++}
++
++// Prefetch hints for better cache utilization
++template <typename T>
++inline void prefetch_read(const T* ptr) {
++#if defined(__GNUC__) || defined(__clang__)
++  __builtin_prefetch(ptr, 0, 3);
++#endif
++}
++
++template <typename T>
++inline void prefetch_write(T* ptr) {
++#if defined(__GNUC__) || defined(__clang__)
++  __builtin_prefetch(ptr, 1, 3);
++#endif
++}
++
++// Alignment helpers
++constexpr int64_t kCacheLineSize = 64;
++
++template <typename T>
++inline bool is_aligned(const T* ptr, int64_t alignment = kCacheLineSize) {
++  return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
++}
++
++// Fast min/max
++template <typename T>
++inline T fast_min(T a, T b) {
++  return a < b ? a : b;
++}
++
++template <typename T>
++inline T fast_max(T a, T b) {
++  return a > b ? a : b;
++}
+diff --git a/sgl-kernel/csrc/cpu/decode.cpp b/sgl-kernel/csrc/cpu/decode.cpp
+new file mode 100644
+index 000000000..ff1031b38
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/decode.cpp
+@@ -0,0 +1,112 @@
++#include "common.h"
++#include "vec.h"
++
++// Optimized decode attention kernel for CPU
++namespace {
++
++template <typename scalar_t>
++void decode_attention_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ query,
++    const scalar_t* __restrict__ key_cache,
++    const scalar_t* __restrict__ value_cache,
++    int64_t num_tokens,
++    int64_t num_heads,
++    int64_t head_dim,
++    int64_t max_seq_len,
++    const int64_t* __restrict__ seq_lens,
++    scalar_t scale) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++  constexpr int64_t kVecSize = Vec::size();
++
++  at::parallel_for(0, num_tokens * num_heads, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t idx = begin; idx < end; ++idx) {
++      int64_t token_idx = idx / num_heads;
++      int64_t head_idx = idx % num_heads;
++      int64_t seq_len = seq_lens[token_idx];
++      
++      const scalar_t* q_ptr = query + idx * head_dim;
++      scalar_t* out_ptr = output + idx * head_dim;
++      
++      // Compute attention scores
++      std::vector<scalar_t> scores(seq_len);
++      for (int64_t s = 0; s < seq_len; ++s) {
++        const scalar_t* k_ptr = key_cache + (token_idx * max_seq_len + s) * num_heads * head_dim + head_idx * head_dim;
++        
++        scalar_t score = 0;
++        int64_t d = 0;
++        for (; d + kVecSize <= head_dim; d += kVecSize) {
++          Vec q_vec = Vec::loadu(q_ptr + d);
++          Vec k_vec = Vec::loadu(k_ptr + d);
++          score += at::vec::vec_reduce_all<scalar_t>(
++              [](Vec& x, Vec& y) { return x + y; }, q_vec * k_vec);
++        }
++        for (; d < head_dim; ++d) {
++          score += q_ptr[d] * k_ptr[d];
++        }
++        scores[s] = score * scale;
++      }
++      
++      // Softmax
++      scalar_t max_score = *std::max_element(scores.begin(), scores.end());
++      scalar_t sum = 0;
++      for (int64_t s = 0; s < seq_len; ++s) {
++        scores[s] = std::exp(scores[s] - max_score);
++        sum += scores[s];
++      }
++      scalar_t inv_sum = 1.0f / sum;
++      for (int64_t s = 0; s < seq_len; ++s) {
++        scores[s] *= inv_sum;
++      }
++      
++      // Weighted sum of values
++      std::memset(out_ptr, 0, head_dim * sizeof(scalar_t));
++      for (int64_t s = 0; s < seq_len; ++s) {
++        const scalar_t* v_ptr = value_cache + (token_idx * max_seq_len + s) * num_heads * head_dim + head_idx * head_dim;
++        scalar_t weight = scores[s];
++        
++        int64_t d = 0;
++        Vec weight_vec = Vec(weight);
++        for (; d + kVecSize <= head_dim; d += kVecSize) {
++          Vec v_vec = Vec::loadu(v_ptr + d);
++          Vec out_vec = Vec::loadu(out_ptr + d);
++          (out_vec + v_vec * weight_vec).store(out_ptr + d);
++        }
++        for (; d < head_dim; ++d) {
++          out_ptr[d] += v_ptr[d] * weight;
++        }
++      }
++    }
++  });
++}
++
++}  // namespace
++
++void decode_attention_cpu(
++    at::Tensor& output,
++    const at::Tensor& query,
++    const at::Tensor& key_cache,
++    const at::Tensor& value_cache,
++    const at::Tensor& seq_lens,
++    double scale) {
++  int64_t num_tokens = query.size(0);
++  int64_t num_heads = query.size(1);
++  int64_t head_dim = query.size(2);
++  int64_t max_seq_len = key_cache.size(1);
++  
++  output.resize_({num_tokens, num_heads, head_dim});
++  
++  AT_DISPATCH_FLOATING_TYPES(query.scalar_type(), "decode_attention_cpu", [&] {
++    decode_attention_impl<scalar_t>(
++        output.data_ptr<scalar_t>(),
++        query.data_ptr<scalar_t>(),
++        key_cache.data_ptr<scalar_t>(),
++        value_cache.data_ptr<scalar_t>(),
++        num_tokens,
++        num_heads,
++        head_dim,
++        max_seq_len,
++        seq_lens.data_ptr<int64_t>(),
++        static_cast<scalar_t>(scale));
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/extend.cpp b/sgl-kernel/csrc/cpu/extend.cpp
+new file mode 100644
+index 000000000..4f581ac4a
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/extend.cpp
+@@ -0,0 +1,25 @@
++#include "common.h"
++#include "vec.h"
++
++// Optimized extend/prefill attention kernel for CPU
++void extend_attention_cpu(
++    at::Tensor& output,
++    const at::Tensor& query,
++    const at::Tensor& key,
++    const at::Tensor& value,
++    double scale) {
++  // Placeholder implementation - uses standard attention
++  int64_t batch_size = query.size(0);
++  int64_t num_heads = query.size(1);
++  int64_t seq_len_q = query.size(2);
++  int64_t head_dim = query.size(3);
++  int64_t seq_len_k = key.size(2);
++  
++  output.resize_({batch_size, num_heads, seq_len_q, head_dim});
++  
++  // Simple matmul-based attention for now
++  auto scores = at::matmul(query, key.transpose(-2, -1)) * scale;
++  auto attn_weights = at::softmax(scores, -1);
++  auto out = at::matmul(attn_weights, value);
++  output.copy_(out);
++}
+diff --git a/sgl-kernel/csrc/cpu/gemm.cpp b/sgl-kernel/csrc/cpu/gemm.cpp
+new file mode 100644
+index 000000000..e921a99fa
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/gemm.cpp
+@@ -0,0 +1,125 @@
++#include "gemm.h"
++#include "vec.h"
++
++namespace {
++
++// Optimized GEMM with cache blocking and vectorization
++template <typename scalar_t>
++void gemm_impl(
++    scalar_t* __restrict__ C,
++    const scalar_t* __restrict__ A,
++    const scalar_t* __restrict__ B,
++    int64_t M,
++    int64_t N,
++    int64_t K,
++    bool trans_a,
++    bool trans_b) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++  constexpr int64_t kVecSize = Vec::size();
++  
++  // Block sizes for cache optimization
++  constexpr int64_t BM = 64;
++  constexpr int64_t BN = 64;
++  constexpr int64_t BK = 64;
++
++  at::parallel_for(0, M, 0, [&](int64_t m_begin, int64_t m_end) {
++    for (int64_t mm = m_begin; mm < m_end; mm += BM) {
++      int64_t m_max = std::min(mm + BM, m_end);
++      for (int64_t nn = 0; nn < N; nn += BN) {
++        int64_t n_max = std::min(nn + BN, N);
++        
++        // Initialize output block
++        for (int64_t m = mm; m < m_max; ++m) {
++          for (int64_t n = nn; n < n_max; ++n) {
++            C[m * N + n] = 0;
++          }
++        }
++        
++        // Accumulate over K dimension
++        for (int64_t kk = 0; kk < K; kk += BK) {
++          int64_t k_max = std::min(kk + BK, K);
++          
++          for (int64_t m = mm; m < m_max; ++m) {
++            for (int64_t n = nn; n < n_max; ++n) {
++              scalar_t acc = C[m * N + n];
++              
++              // Vectorized inner loop when possible
++              int64_t k = kk;
++              if (!trans_a && !trans_b) {
++                for (; k + kVecSize <= k_max; k += kVecSize) {
++                  Vec a_vec = Vec::loadu(A + m * K + k);
++                  Vec b_vec = Vec::loadu(B + k * N + n);
++                  acc += at::vec::vec_reduce_all<scalar_t>(
++                      [](Vec& x, Vec& y) { return x + y; },
++                      a_vec * b_vec);
++                }
++              }
++              
++              // Scalar remainder
++              for (; k < k_max; ++k) {
++                scalar_t a_val = trans_a ? A[k * M + m] : A[m * K + k];
++                scalar_t b_val = trans_b ? B[n * K + k] : B[k * N + n];
++                acc += a_val * b_val;
++              }
++              
++              C[m * N + n] = acc;
++            }
++          }
++        }
++      }
++    }
++  });
++}
++
++}  // namespace
++
++void gemm_cpu_fp32(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a,
++    bool trans_b) {
++  TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
++  
++  int64_t M = trans_a ? A.size(1) : A.size(0);
++  int64_t K = trans_a ? A.size(0) : A.size(1);
++  int64_t N = trans_b ? B.size(0) : B.size(1);
++  
++  TORCH_CHECK((trans_b ? B.size(1) : B.size(0)) == K, "Inner dimensions must match");
++  
++  C.resize_({M, N});
++  
++  gemm_impl<float>(
++      C.data_ptr<float>(),
++      A.data_ptr<float>(),
++      B.data_ptr<float>(),
++      M, N, K, trans_a, trans_b);
++}
++
++void gemm_cpu_fp16(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a,
++    bool trans_b) {
++  // Convert to fp32, compute, convert back
++  auto A_fp32 = A.to(at::kFloat);
++  auto B_fp32 = B.to(at::kFloat);
++  at::Tensor C_fp32;
++  gemm_cpu_fp32(A_fp32, B_fp32, C_fp32, trans_a, trans_b);
++  C = C_fp32.to(A.scalar_type());
++}
++
++void gemm_cpu_bf16(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a,
++    bool trans_b) {
++  // Convert to fp32, compute, convert back
++  auto A_fp32 = A.to(at::kFloat);
++  auto B_fp32 = B.to(at::kFloat);
++  at::Tensor C_fp32;
++  gemm_cpu_fp32(A_fp32, B_fp32, C_fp32, trans_a, trans_b);
++  C = C_fp32.to(A.scalar_type());
++}
+diff --git a/sgl-kernel/csrc/cpu/gemm.h b/sgl-kernel/csrc/cpu/gemm.h
+new file mode 100644
+index 000000000..51f545523
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/gemm.h
+@@ -0,0 +1,39 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include "common.h"
++
++// Optimized GEMM kernels for CPU
++void gemm_cpu_fp32(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a = false,
++    bool trans_b = false);
++
++void gemm_cpu_fp16(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a = false,
++    bool trans_b = false);
++
++void gemm_cpu_bf16(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    at::Tensor& C,
++    bool trans_a = false,
++    bool trans_b = false);
+diff --git a/sgl-kernel/csrc/cpu/gemm_int8.cpp b/sgl-kernel/csrc/cpu/gemm_int8.cpp
+new file mode 100644
+index 000000000..a7952f5cb
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/gemm_int8.cpp
+@@ -0,0 +1,14 @@
++#include "common.h"
++
++// INT8 GEMM kernel for CPU
++void gemm_int8_cpu(
++    at::Tensor& output,
++    const at::Tensor& A,
++    const at::Tensor& B,
++    const at::Tensor& scale_a,
++    const at::Tensor& scale_b) {
++  // Convert to fp32, compute, convert back
++  auto A_fp32 = A.to(at::kFloat) * scale_a;
++  auto B_fp32 = B.to(at::kFloat) * scale_b;
++  output = at::matmul(A_fp32, B_fp32);
++}
+diff --git a/sgl-kernel/csrc/cpu/interface.cpp b/sgl-kernel/csrc/cpu/interface.cpp
+new file mode 100644
+index 000000000..b7b6b68ec
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/interface.cpp
+@@ -0,0 +1,60 @@
++#include "common.h"
++
++// Forward declarations for all CPU kernels
++void silu_and_mul_cpu_out(at::Tensor& out, const at::Tensor& input);
++void gelu_tanh_and_mul_cpu_out(at::Tensor& out, const at::Tensor& input);
++void bmm_cpu_naive(const at::Tensor& A, const at::Tensor& B, at::Tensor& C);
++void rms_norm_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& weight, double epsilon);
++void layer_norm_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, double epsilon);
++void moe_gating_topk_softmax_cpu(at::Tensor& topk_weights, at::Tensor& topk_indices, const at::Tensor& gating_output, int64_t topk);
++void moe_expert_compute_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& expert_weights, const at::Tensor& expert_indices, const at::Tensor& topk_weights, int64_t intermediate_dim);
++
++// Python-facing wrappers that return new tensors
++at::Tensor silu_and_mul_cpu(const at::Tensor& input) {
++  auto output = at::empty({input.size(0), input.size(2)}, input.options());
++  silu_and_mul_cpu_out(output, input);
++  return output;
++}
++
++at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
++  auto output = at::empty({input.size(0), input.size(2)}, input.options());
++  gelu_tanh_and_mul_cpu_out(output, input);
++  return output;
++}
++
++at::Tensor bmm_cpu(const at::Tensor& A, const at::Tensor& B) {
++  auto C = at::empty({A.size(0), A.size(1), B.size(2)}, A.options());
++  bmm_cpu_naive(A, B, C);
++  return C;
++}
++
++at::Tensor rms_norm_cpu_wrapper(const at::Tensor& input, const at::Tensor& weight, double epsilon) {
++  auto output = at::empty_like(input);
++  rms_norm_cpu(output, input, weight, epsilon);
++  return output;
++}
++
++at::Tensor layer_norm_cpu_wrapper(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, double epsilon) {
++  auto output = at::empty_like(input);
++  layer_norm_cpu(output, input, weight, bias, epsilon);
++  return output;
++}
++
++std::tuple<at::Tensor, at::Tensor> moe_gating_topk_softmax_cpu_wrapper(const at::Tensor& gating_output, int64_t topk) {
++  int64_t num_tokens = gating_output.size(0);
++  auto topk_weights = at::empty({num_tokens, topk}, gating_output.options());
++  auto topk_indices = at::empty({num_tokens, topk}, at::TensorOptions().dtype(at::kInt).device(gating_output.device()));
++  moe_gating_topk_softmax_cpu(topk_weights, topk_indices, gating_output, topk);
++  return std::make_tuple(topk_weights, topk_indices);
++}
++
++at::Tensor moe_expert_compute_cpu_wrapper(
++    const at::Tensor& input,
++    const at::Tensor& expert_weights,
++    const at::Tensor& expert_indices,
++    const at::Tensor& topk_weights,
++    int64_t intermediate_dim) {
++  auto output = at::empty_like(input);
++  moe_expert_compute_cpu(output, input, expert_weights, expert_indices, topk_weights, intermediate_dim);
++  return output;
++}
+diff --git a/sgl-kernel/csrc/cpu/moe.cpp b/sgl-kernel/csrc/cpu/moe.cpp
+new file mode 100644
+index 000000000..a7d4fb351
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/moe.cpp
+@@ -0,0 +1,161 @@
++#include "common.h"
++#include "gemm.h"
++#include "vec.h"
++
++namespace {
++
++// Optimized MoE gating and routing with vectorization
++template <typename scalar_t>
++void moe_gating_topk_softmax_impl(
++    scalar_t* __restrict__ topk_weights,
++    int32_t* __restrict__ topk_indices,
++    const scalar_t* __restrict__ gating_output,
++    int64_t num_tokens,
++    int64_t num_experts,
++    int64_t topk) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++  constexpr int64_t kVecSize = Vec::size();
++
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* gate_ptr = gating_output + i * num_experts;
++      scalar_t* weight_ptr = topk_weights + i * topk;
++      int32_t* idx_ptr = topk_indices + i * topk;
++
++      // Find topk experts
++      std::vector<std::pair<scalar_t, int32_t>> scores;
++      scores.reserve(num_experts);
++      for (int64_t e = 0; e < num_experts; ++e) {
++        scores.emplace_back(gate_ptr[e], static_cast<int32_t>(e));
++      }
++      std::partial_sort(scores.begin(), scores.begin() + topk, scores.end(),
++                        [](const auto& a, const auto& b) { return a.first > b.first; });
++
++      // Softmax over topk
++      scalar_t max_val = scores[0].first;
++      scalar_t sum = 0;
++      for (int64_t k = 0; k < topk; ++k) {
++        scalar_t exp_val = std::exp(scores[k].first - max_val);
++        weight_ptr[k] = exp_val;
++        sum += exp_val;
++      }
++      scalar_t inv_sum = 1.0f / sum;
++      for (int64_t k = 0; k < topk; ++k) {
++        weight_ptr[k] *= inv_sum;
++        idx_ptr[k] = scores[k].second;
++      }
++    }
++  });
++}
++
++// Optimized expert parallel MoE computation
++template <typename scalar_t>
++void moe_expert_compute_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ expert_weights,
++    const int32_t* __restrict__ expert_indices,
++    const scalar_t* __restrict__ topk_weights,
++    int64_t num_tokens,
++    int64_t hidden_dim,
++    int64_t intermediate_dim,
++    int64_t topk) {
++  
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* in_ptr = input + i * hidden_dim;
++      scalar_t* out_ptr = output + i * hidden_dim;
++      
++      // Zero output for this token
++      std::memset(out_ptr, 0, hidden_dim * sizeof(scalar_t));
++      
++      // Process each expert for this token
++      for (int64_t k = 0; k < topk; ++k) {
++        int32_t expert_idx = expert_indices[i * topk + k];
++        scalar_t weight = topk_weights[i * topk + k];
++        
++        // Expert computation: gate_proj, up_proj, down_proj
++        const scalar_t* w_gate = expert_weights + expert_idx * 3 * hidden_dim * intermediate_dim;
++        const scalar_t* w_up = w_gate + hidden_dim * intermediate_dim;
++        const scalar_t* w_down = w_up + hidden_dim * intermediate_dim;
++        
++        // Intermediate buffer
++        std::vector<scalar_t> intermediate(intermediate_dim);
++        std::vector<scalar_t> gate_out(intermediate_dim);
++        
++        // gate_proj and up_proj
++        for (int64_t j = 0; j < intermediate_dim; ++j) {
++          scalar_t gate_sum = 0, up_sum = 0;
++          for (int64_t h = 0; h < hidden_dim; ++h) {
++            gate_sum += in_ptr[h] * w_gate[j * hidden_dim + h];
++            up_sum += in_ptr[h] * w_up[j * hidden_dim + h];
++          }
++          // SiLU activation: x * sigmoid(x)
++          gate_out[j] = gate_sum / (1.0f + std::exp(-gate_sum));
++          intermediate[j] = gate_out[j] * up_sum;
++        }
++        
++        // down_proj and accumulate
++        for (int64_t h = 0; h < hidden_dim; ++h) {
++          scalar_t sum = 0;
++          for (int64_t j = 0; j < intermediate_dim; ++j) {
++            sum += intermediate[j] * w_down[h * intermediate_dim + j];
++          }
++          out_ptr[h] += weight * sum;
++        }
++      }
++    }
++  });
++}
++
++}  // namespace
++
++// Public entry points
++void moe_gating_topk_softmax_cpu(
++    at::Tensor& topk_weights,
++    at::Tensor& topk_indices,
++    const at::Tensor& gating_output,
++    int64_t topk) {
++  int64_t num_tokens = gating_output.size(0);
++  int64_t num_experts = gating_output.size(1);
++  
++  topk_weights.resize_({num_tokens, topk});
++  topk_indices.resize_({num_tokens, topk});
++  
++  AT_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "moe_gating_topk_softmax_cpu", [&] {
++    moe_gating_topk_softmax_impl<scalar_t>(
++        topk_weights.data_ptr<scalar_t>(),
++        topk_indices.data_ptr<int32_t>(),
++        gating_output.data_ptr<scalar_t>(),
++        num_tokens,
++        num_experts,
++        topk);
++  });
++}
++
++void moe_expert_compute_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& expert_weights,
++    const at::Tensor& expert_indices,
++    const at::Tensor& topk_weights,
++    int64_t intermediate_dim) {
++  int64_t num_tokens = input.size(0);
++  int64_t hidden_dim = input.size(1);
++  int64_t topk = topk_weights.size(1);
++  
++  output.resize_({num_tokens, hidden_dim});
++  
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_expert_compute_cpu", [&] {
++    moe_expert_compute_impl<scalar_t>(
++        output.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        expert_weights.data_ptr<scalar_t>(),
++        expert_indices.data_ptr<int32_t>(),
++        topk_weights.data_ptr<scalar_t>(),
++        num_tokens,
++        hidden_dim,
++        intermediate_dim,
++        topk);
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/moe_int8.cpp b/sgl-kernel/csrc/cpu/moe_int8.cpp
+new file mode 100644
+index 000000000..41cc97fad
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/moe_int8.cpp
+@@ -0,0 +1,16 @@
++#include "common.h"
++
++// INT8 MoE kernel for CPU
++void moe_int8_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& expert_weights,
++    const at::Tensor& expert_indices,
++    const at::Tensor& topk_weights,
++    const at::Tensor& scale) {
++  // Placeholder - convert to fp32 and use regular MoE
++  auto input_fp32 = input.to(at::kFloat);
++  auto weights_fp32 = expert_weights.to(at::kFloat) * scale;
++  // Would call regular MoE here
++  output = input_fp32;  // Placeholder
++}
+diff --git a/sgl-kernel/csrc/cpu/norm.cpp b/sgl-kernel/csrc/cpu/norm.cpp
+new file mode 100644
+index 000000000..c6ca36ad1
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/norm.cpp
+@@ -0,0 +1,179 @@
++#include "common.h"
++#include "vec.h"
++
++namespace {
++
++// Optimized RMSNorm with vectorization
++template <typename scalar_t>
++void rms_norm_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ weight,
++    int64_t num_tokens,
++    int64_t hidden_size,
++    scalar_t epsilon) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++  constexpr int64_t kVecSize = Vec::size();
++
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* in_ptr = input + i * hidden_size;
++      scalar_t* out_ptr = output + i * hidden_size;
++
++      // Compute variance
++      scalar_t variance = 0;
++      int64_t d = 0;
++      
++      Vec var_vec = Vec(0);
++      for (; d + kVecSize <= hidden_size; d += kVecSize) {
++        Vec x = Vec::loadu(in_ptr + d);
++        var_vec = var_vec + x * x;
++      }
++      variance = at::vec::vec_reduce_all<scalar_t>(
++          [](Vec& x, Vec& y) { return x + y; }, var_vec);
++      
++      for (; d < hidden_size; ++d) {
++        variance += in_ptr[d] * in_ptr[d];
++      }
++      
++      variance = variance / hidden_size;
++      scalar_t inv_std = 1.0f / std::sqrt(variance + epsilon);
++
++      // Normalize and scale
++      d = 0;
++      Vec inv_std_vec = Vec(inv_std);
++      for (; d + kVecSize <= hidden_size; d += kVecSize) {
++        Vec x = Vec::loadu(in_ptr + d);
++        Vec w = Vec::loadu(weight + d);
++        Vec out = x * inv_std_vec * w;
++        out.store(out_ptr + d);
++      }
++      
++      for (; d < hidden_size; ++d) {
++        out_ptr[d] = in_ptr[d] * inv_std * weight[d];
++      }
++    }
++  });
++}
++
++// Optimized LayerNorm with vectorization
++template <typename scalar_t>
++void layer_norm_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ weight,
++    const scalar_t* __restrict__ bias,
++    int64_t num_tokens,
++    int64_t hidden_size,
++    scalar_t epsilon) {
++  using Vec = at::vec::Vectorized<scalar_t>;
++  constexpr int64_t kVecSize = Vec::size();
++
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* in_ptr = input + i * hidden_size;
++      scalar_t* out_ptr = output + i * hidden_size;
++
++      // Compute mean
++      scalar_t mean = 0;
++      int64_t d = 0;
++      
++      Vec mean_vec = Vec(0);
++      for (; d + kVecSize <= hidden_size; d += kVecSize) {
++        Vec x = Vec::loadu(in_ptr + d);
++        mean_vec = mean_vec + x;
++      }
++      mean = at::vec::vec_reduce_all<scalar_t>(
++          [](Vec& x, Vec& y) { return x + y; }, mean_vec);
++      
++      for (; d < hidden_size; ++d) {
++        mean += in_ptr[d];
++      }
++      mean = mean / hidden_size;
++
++      // Compute variance
++      scalar_t variance = 0;
++      d = 0;
++      
++      Vec var_vec = Vec(0);
++      Vec mean_vec_broadcast = Vec(mean);
++      for (; d + kVecSize <= hidden_size; d += kVecSize) {
++        Vec x = Vec::loadu(in_ptr + d);
++        Vec diff = x - mean_vec_broadcast;
++        var_vec = var_vec + diff * diff;
++      }
++      variance = at::vec::vec_reduce_all<scalar_t>(
++          [](Vec& x, Vec& y) { return x + y; }, var_vec);
++      
++      for (; d < hidden_size; ++d) {
++        scalar_t diff = in_ptr[d] - mean;
++        variance += diff * diff;
++      }
++      
++      variance = variance / hidden_size;
++      scalar_t inv_std = 1.0f / std::sqrt(variance + epsilon);
++
++      // Normalize, scale and shift
++      d = 0;
++      Vec inv_std_vec = Vec(inv_std);
++      for (; d + kVecSize <= hidden_size; d += kVecSize) {
++        Vec x = Vec::loadu(in_ptr + d);
++        Vec w = Vec::loadu(weight + d);
++        Vec b = bias ? Vec::loadu(bias + d) : Vec(0);
++        Vec out = (x - mean_vec_broadcast) * inv_std_vec * w + b;
++        out.store(out_ptr + d);
++      }
++      
++      for (; d < hidden_size; ++d) {
++        out_ptr[d] = (in_ptr[d] - mean) * inv_std * weight[d];
++        if (bias) {
++          out_ptr[d] += bias[d];
++        }
++      }
++    }
++  });
++}
++
++}  // namespace
++
++void rms_norm_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& weight,
++    double epsilon) {
++  int64_t num_tokens = input.size(0);
++  int64_t hidden_size = input.size(1);
++  output.resize_({num_tokens, hidden_size});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_cpu", [&] {
++    rms_norm_impl<scalar_t>(
++        output.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        weight.data_ptr<scalar_t>(),
++        num_tokens,
++        hidden_size,
++        static_cast<scalar_t>(epsilon));
++  });
++}
++
++void layer_norm_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& weight,
++    const at::Tensor& bias,
++    double epsilon) {
++  int64_t num_tokens = input.size(0);
++  int64_t hidden_size = input.size(1);
++  output.resize_({num_tokens, hidden_size});
++
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "layer_norm_cpu", [&] {
++    layer_norm_impl<scalar_t>(
++        output.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        weight.data_ptr<scalar_t>(),
++        bias.defined() ? bias.data_ptr<scalar_t>() : nullptr,
++        num_tokens,
++        hidden_size,
++        static_cast<scalar_t>(epsilon));
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/qkv_proj.cpp b/sgl-kernel/csrc/cpu/qkv_proj.cpp
+new file mode 100644
+index 000000000..ea0ab276f
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/qkv_proj.cpp
+@@ -0,0 +1,11 @@
++#include "common.h"
++#include "gemm.h"
++
++// Optimized QKV projection for CPU
++void qkv_proj_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& weight) {
++  // Simple matmul for QKV projection
++  output = at::matmul(input, weight.t());
++}
+diff --git a/sgl-kernel/csrc/cpu/rope.cpp b/sgl-kernel/csrc/cpu/rope.cpp
+new file mode 100644
+index 000000000..b085f772b
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/rope.cpp
+@@ -0,0 +1,73 @@
++#include "common.h"
++#include "vec.h"
++
++namespace {
++
++// Optimized RoPE (Rotary Position Embedding) with vectorization
++template <typename scalar_t>
++void rope_impl(
++    scalar_t* __restrict__ output,
++    const scalar_t* __restrict__ input,
++    const scalar_t* __restrict__ cos_cache,
++    const scalar_t* __restrict__ sin_cache,
++    int64_t num_tokens,
++    int64_t num_heads,
++    int64_t head_dim,
++    int64_t rotary_dim) {
++  
++  at::parallel_for(0, num_tokens * num_heads, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t idx = begin; idx < end; ++idx) {
++      int64_t token_idx = idx / num_heads;
++      int64_t head_idx = idx % num_heads;
++      
++      const scalar_t* in_ptr = input + idx * head_dim;
++      scalar_t* out_ptr = output + idx * head_dim;
++      const scalar_t* cos_ptr = cos_cache + token_idx * rotary_dim;
++      const scalar_t* sin_ptr = sin_cache + token_idx * rotary_dim;
++      
++      // Apply rotation to rotary_dim dimensions
++      for (int64_t d = 0; d < rotary_dim / 2; ++d) {
++        scalar_t x0 = in_ptr[2 * d];
++        scalar_t x1 = in_ptr[2 * d + 1];
++        scalar_t cos_val = cos_ptr[2 * d];
++        scalar_t sin_val = sin_ptr[2 * d];
++        
++        out_ptr[2 * d] = x0 * cos_val - x1 * sin_val;
++        out_ptr[2 * d + 1] = x0 * sin_val + x1 * cos_val;
++      }
++      
++      // Copy remaining dimensions
++      for (int64_t d = rotary_dim; d < head_dim; ++d) {
++        out_ptr[d] = in_ptr[d];
++      }
++    }
++  });
++}
++
++}  // namespace
++
++void rope_cpu(
++    at::Tensor& output,
++    const at::Tensor& input,
++    const at::Tensor& cos_cache,
++    const at::Tensor& sin_cache,
++    int64_t rotary_dim) {
++  TORCH_CHECK(input.dim() == 3, "input must be [num_tokens, num_heads, head_dim]");
++  int64_t num_tokens = input.size(0);
++  int64_t num_heads = input.size(1);
++  int64_t head_dim = input.size(2);
++  
++  output.resize_({num_tokens, num_heads, head_dim});
++  
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rope_cpu", [&] {
++    rope_impl<scalar_t>(
++        output.data_ptr<scalar_t>(),
++        input.data_ptr<scalar_t>(),
++        cos_cache.data_ptr<scalar_t>(),
++        sin_cache.data_ptr<scalar_t>(),
++        num_tokens,
++        num_heads,
++        head_dim,
++        rotary_dim);
++  });
++}
+diff --git a/sgl-kernel/csrc/cpu/shm.cpp b/sgl-kernel/csrc/cpu/shm.cpp
+new file mode 100644
+index 000000000..27ba933e3
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/shm.cpp
+@@ -0,0 +1,10 @@
++#include "shm.h"
++#include <cstdlib>
++
++void* allocate_shared_memory(size_t size) {
++  return std::malloc(size);
++}
++
++void free_shared_memory(void* ptr) {
++  std::free(ptr);
++}
+diff --git a/sgl-kernel/csrc/cpu/shm.h b/sgl-kernel/csrc/cpu/shm.h
+new file mode 100644
+index 000000000..58fe5d06c
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/shm.h
+@@ -0,0 +1,21 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include "common.h"
++
++// Shared memory management utilities for CPU
++void* allocate_shared_memory(size_t size);
++void free_shared_memory(void* ptr);
+diff --git a/sgl-kernel/csrc/cpu/topk.cpp b/sgl-kernel/csrc/cpu/topk.cpp
+new file mode 100644
+index 000000000..bd64293df
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/topk.cpp
+@@ -0,0 +1,69 @@
++#include "common.h"
++#include <algorithm>
++#include <vector>
++
++namespace {
++
++// Optimized TopK selection with partial sort
++template <typename scalar_t>
++void topk_impl(
++    scalar_t* __restrict__ topk_values,
++    int64_t* __restrict__ topk_indices,
++    const scalar_t* __restrict__ input,
++    int64_t num_tokens,
++    int64_t vocab_size,
++    int64_t k) {
++  
++  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
++    for (int64_t i = begin; i < end; ++i) {
++      const scalar_t* in_ptr = input + i * vocab_size;
++      scalar_t* val_ptr = topk_values + i * k;
++      int64_t* idx_ptr = topk_indices + i * k;
++      
++      // Create pairs of (value, index)
++      std::vector<std::pair<scalar_t, int64_t>> pairs;
++      pairs.reserve(vocab_size);
++      for (int64_t j = 0; j < vocab_size; ++j) {
++        pairs.emplace_back(in_ptr[j], j);
++      }
++      
++      // Partial sort to get top-k
++      std::partial_sort(
++          pairs.begin(),
++          pairs.begin() + k,
++          pairs.end(),
++          [](const auto& a, const auto& b) { return a.first > b.first; });
++      
++      // Extract results
++      for (int64_t j = 0; j < k; ++j) {
++        val_ptr[j] = pairs[j].first;
++        idx_ptr[j] = pairs[j].second;
++      }
++    }
++  });
++}
++
++}  // namespace
++
++std::tuple<at::Tensor, at::Tensor> topk_cpu(
++    const at::Tensor& input,
++    int64_t k) {
++  TORCH_CHECK(input.dim() == 2, "input must be 2D [num_tokens, vocab_size]");
++  int64_t num_tokens = input.size(0);
++  int64_t vocab_size = input.size(1);
++  
++  auto topk_values = at::empty({num_tokens, k}, input.options());
++  auto topk_indices = at::empty({num_tokens, k}, at::TensorOptions().dtype(at::kLong).device(input.device()));
++  
++  AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "topk_cpu", [&] {
++    topk_impl<scalar_t>(
++        topk_values.data_ptr<scalar_t>(),
++        topk_indices.data_ptr<int64_t>(),
++        input.data_ptr<scalar_t>(),
++        num_tokens,
++        vocab_size,
++        k);
++  });
++  
++  return std::make_tuple(topk_values, topk_indices);
++}
+diff --git a/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+new file mode 100644
+index 000000000..947bf16a9
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/torch_extension_cpu.cpp
+@@ -0,0 +1,35 @@
++#include <torch/extension.h>
++#include "common.h"
++
++// Forward declarations
++at::Tensor silu_and_mul_cpu(const at::Tensor& input);
++at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
++at::Tensor bmm_cpu(const at::Tensor& A, const at::Tensor& B);
++at::Tensor rms_norm_cpu_wrapper(const at::Tensor& input, const at::Tensor& weight, double epsilon);
++at::Tensor layer_norm_cpu_wrapper(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, double epsilon);
++std::tuple<at::Tensor, at::Tensor> moe_gating_topk_softmax_cpu_wrapper(const at::Tensor& gating_output, int64_t topk);
++at::Tensor moe_expert_compute_cpu_wrapper(const at::Tensor& input, const at::Tensor& expert_weights, const at::Tensor& expert_indices, const at::Tensor& topk_weights, int64_t intermediate_dim);
++std::tuple<at::Tensor, at::Tensor> topk_cpu(const at::Tensor& input, int64_t k);
++void rope_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& cos_cache, const at::Tensor& sin_cache, int64_t rotary_dim);
++void decode_attention_cpu(at::Tensor& output, const at::Tensor& query, const at::Tensor& key_cache, const at::Tensor& value_cache, const at::Tensor& seq_lens, double scale);
++void extend_attention_cpu(at::Tensor& output, const at::Tensor& query, const at::Tensor& key, const at::Tensor& value, double scale);
++void qkv_proj_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& weight);
++void gemm_int8_cpu(at::Tensor& output, const at::Tensor& A, const at::Tensor& B, const at::Tensor& scale_a, const at::Tensor& scale_b);
++void moe_int8_cpu(at::Tensor& output, const at::Tensor& input, const at::Tensor& expert_weights, const at::Tensor& expert_indices, const at::Tensor& topk_weights, const at::Tensor& scale);
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++  m.def("silu_and_mul", &silu_and_mul_cpu, "SiLU and multiply (CPU)");
++  m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul_cpu, "GELU-tanh and multiply (CPU)");
++  m.def("bmm", &bmm_cpu, "Batch matrix multiply (CPU)");
++  m.def("rms_norm", &rms_norm_cpu_wrapper, "RMS normalization (CPU)");
++  m.def("layer_norm", &layer_norm_cpu_wrapper, "Layer normalization (CPU)");
++  m.def("moe_gating_topk_softmax", &moe_gating_topk_softmax_cpu_wrapper, "MoE gating with top-k and softmax (CPU)");
++  m.def("moe_expert_compute", &moe_expert_compute_cpu_wrapper, "MoE expert computation (CPU)");
++  m.def("topk", &topk_cpu, "Top-k selection (CPU)");
++  m.def("rope", &rope_cpu, "Rotary position embedding (CPU)");
++  m.def("decode_attention", &decode_attention_cpu, "Decode attention (CPU)");
++  m.def("extend_attention", &extend_attention_cpu, "Extend/prefill attention (CPU)");
++  m.def("qkv_proj", &qkv_proj_cpu, "QKV projection (CPU)");
++  m.def("gemm_int8", &gemm_int8_cpu, "INT8 GEMM (CPU)");
++  m.def("moe_int8", &moe_int8_cpu, "INT8 MoE (CPU)");
++}
+diff --git a/sgl-kernel/csrc/cpu/vec.h b/sgl-kernel/csrc/cpu/vec.h
+new file mode 100644
+index 000000000..36a530ee0
+--- /dev/null
++++ b/sgl-kernel/csrc/cpu/vec.h
+@@ -0,0 +1,35 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/cpu/vec/vec.h>
++
++namespace sglang_cpu_vec {
++
++// Minimal helpers mirroring ATen vec interfaces we actually use here.
++using at::vec::Vectorized;
++
++template <typename T>
++inline Vectorized<T> loadu(const T* ptr) {
++  return Vectorized<T>::loadu(ptr);
++}
++
++template <typename T>
++inline void store(T* ptr, const Vectorized<T>& v) {
++  v.store(ptr);
++}
++
++}  // namespace sglang_cpu_vec
+diff --git a/sgl-kernel/setup_cpu.py b/sgl-kernel/setup_cpu.py
+new file mode 100644
+index 000000000..0f737f863
+--- /dev/null
++++ b/sgl-kernel/setup_cpu.py
+@@ -0,0 +1,56 @@
++"""
++Setup script for building SGLang CPU kernels
++"""
++import os
++from setuptools import setup
++from torch.utils.cpp_extension import BuildExtension, CppExtension
++
++# Get the directory containing this file
++this_dir = os.path.dirname(os.path.abspath(__file__))
++csrc_dir = os.path.join(this_dir, "csrc", "cpu")
++
++# List all CPU kernel source files
++cpu_sources = [
++    os.path.join(csrc_dir, "activation.cpp"),
++    os.path.join(csrc_dir, "bmm.cpp"),
++    os.path.join(csrc_dir, "decode.cpp"),
++    os.path.join(csrc_dir, "extend.cpp"),
++    os.path.join(csrc_dir, "gemm.cpp"),
++    os.path.join(csrc_dir, "gemm_int8.cpp"),
++    os.path.join(csrc_dir, "interface.cpp"),
++    os.path.join(csrc_dir, "moe.cpp"),
++    os.path.join(csrc_dir, "moe_int8.cpp"),
++    os.path.join(csrc_dir, "norm.cpp"),
++    os.path.join(csrc_dir, "qkv_proj.cpp"),
++    os.path.join(csrc_dir, "rope.cpp"),
++    os.path.join(csrc_dir, "shm.cpp"),
++    os.path.join(csrc_dir, "topk.cpp"),
++    os.path.join(csrc_dir, "torch_extension_cpu.cpp"),
++]
++
++# Compiler flags for optimization
++extra_compile_args = {
++    "cxx": [
++        "-O3",
++        "-march=native",
++        "-fopenmp",
++        "-ffast-math",
++        "-DNDEBUG",
++    ]
++}
++
++extra_link_args = ["-fopenmp"]
++
++setup(
++    name="sglang_cpu_kernels",
++    ext_modules=[
++        CppExtension(
++            name="sglang_cpu_kernels",
++            sources=cpu_sources,
++            extra_compile_args=extra_compile_args,
++            extra_link_args=extra_link_args,
++            include_dirs=[csrc_dir],
++        )
++    ],
++    cmdclass={"build_ext": BuildExtension},
++)

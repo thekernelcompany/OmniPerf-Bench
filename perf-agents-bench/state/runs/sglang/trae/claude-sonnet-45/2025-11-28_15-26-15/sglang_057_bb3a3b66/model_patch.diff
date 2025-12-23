@@ -1,0 +1,113 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index 88f6031f7..046eca01f 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -2,11 +2,22 @@ from dataclasses import dataclass
+ from enum import Enum, auto
+ from typing import List
+ 
+-import numpy as np
+ import torch
+ from sglang.srt.managers.router.radix_cache import RadixCache
+ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+ 
++# Cache for frequently used arange tensors to reduce allocations in sampling
++_ARANGE_CACHE = {}
++
++def _get_cached_arange(length: int, device):
++    key = (str(device), int(length))
++    t = _ARANGE_CACHE.get(key)
++    if t is None or t.device != torch.device(device) or t.numel() != length:
++        t = torch.arange(0, length, device=device)
++        _ARANGE_CACHE[key] = t
++    return t
++
++
+ 
+ class ForwardMode(Enum):
+     PREFILL = auto()
+@@ -20,6 +31,7 @@ class FinishReason(Enum):
+     STOP_STR = auto()
+ 
+ 
++
+ class Req:
+     def __init__(self, rid, input_text, input_ids):
+         self.rid = rid
+@@ -31,6 +43,7 @@ class Req:
+         self.pixel_values = None
+         self.image_size = None
+         self.image_offset = 0
++        self.pad_value = None
+ 
+         self.sampling_params = None
+         self.return_logprob = False
+@@ -58,7 +71,7 @@ class Req:
+     def max_new_tokens(self):
+         return self.sampling_params.max_new_tokens
+ 
+-    def tokenize_fast_forward(self, fast_forward_str, next_state):
++    def fast_forward_and_retokenize(self, fast_forward_str, next_state):
+         old_output_str = self.tokenizer.decode(self.output_ids)
+         # FIXME: This logic does not really solve the problem of determining whether
+         # there should be a leading space.
+@@ -211,8 +224,7 @@ class Batch:
+         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+ 
+         # Alloc mem
+-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
++        extend_num_tokens = int(sum(seq_lens) - sum(prefix_lens))
+         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+         if out_cache_loc is None:
+             if not self.tree_cache.disable:
+@@ -233,9 +245,10 @@ class Batch:
+ 
+         # Handle logit bias
+         logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+-        for i in range(bs):
+-            if reqs[i].sampling_params.dtype == "int":
+-                logit_bias[i] = int_token_logit_bias
++        int_rows = [i for i, r in enumerate(reqs) if r.sampling_params.dtype == "int"]
++        if int_rows:
++            idx_tensor = torch.tensor(int_rows, dtype=torch.long, device=device)
++            logit_bias[idx_tensor] = int_token_logit_bias
+ 
+         # Set fields
+         self.input_ids = torch.tensor(
+@@ -351,7 +364,7 @@ class Batch:
+                     self.tree_cache.dec_ref_counter(req.last_node)
+ 
+                     # fast forward
+-                    req.tokenize_fast_forward(fast_forward_str, next_state)
++                    req.fast_forward_and_retokenize(fast_forward_str, next_state)
+ 
+                     fast_forward_reqs.append(req)
+                     filter_indices.remove(i)
+@@ -482,8 +495,7 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
+     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+     probs_sum = torch.cumsum(probs_sort, dim=-1)
+     probs_sort[(probs_sum - probs_sort) > top_ps] = 0.0
+-    probs_sort[
+-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks
+-    ] = 0.0
++    arange_row = _get_cached_arange(probs.shape[-1], probs.device).view(1, -1)
++    probs_sort[arange_row >= top_ks] = 0.0
+     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+     return probs_sort, probs_idx
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 8b7adf944..a752239cd 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -239,6 +239,8 @@ class ModelRpcServer(rpyc.Service):
+                 (recv_req.image_hash >> 32) % self.model_config.vocab_size,
+                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
+             ]
++            req.pad_value = pad_value
++
+             req.image_size = recv_req.image_size
+             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
+                 req.input_ids, pad_value, req.pixel_values.shape, req.image_size

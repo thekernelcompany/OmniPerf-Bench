@@ -1,0 +1,100 @@
+diff --git a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+index f1ee5d40e..6787c23dd 100644
+--- a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
++++ b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+@@ -183,7 +183,9 @@ __inline__ __device__ void block_barrier(
+     }
+   }
+ 
+-  __syncthreads();
++  if constexpr (start || need_fence) {
++    __syncthreads();
++  }
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>
+@@ -224,13 +226,14 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+ 
+   // The source pointers. Distributed round-robin for the different warps.
+   auto peer_comm_buffer_ptrs = params.peer_comm_buffer_ptrs->ptrs;
+-  T* local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
++  T* __restrict__ local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
+   // Start and end offsets of the thread
+   size_t chunk_start = bidx * params.elts_per_block + tidx * NUM_ELTS;
+-  size_t chunk_end = std::min((bidx + 1) * params.elts_per_block, params.elts_per_rank);
++  size_t chunk_end = min((bidx + 1) * params.elts_per_block, params.elts_per_rank);
++  T* __restrict__ local_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+ 
+   if constexpr (COPY_INPUT) {
+-    T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
++    T const* __restrict__ local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+     // Copy from local buffer to shareable buffer
+     for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+       *reinterpret_cast<int4*>(&local_shared_buffer[iter_offset]) =
+@@ -243,25 +246,22 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+ 
+   // Each block accumulates the values from the different GPUs on the same node.
+   for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+-    // Iterate over the different ranks/devices on the node to load the values.
+-    PackedStruct vals[RANKS_PER_NODE];
+-#pragma unroll
+-    for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+-      vals[ii].packed = *reinterpret_cast<int4 const*>(&((T*)peer_comm_buffer_ptrs[ii])[iter_offset]);
+-    }
+-
+-    // Sum the values from the different ranks.
++    // Sum the values from the different ranks in a fixed order to ensure determinism.
+     PackedStruct sums;
+-    sums.packed = {0, 0, 0, 0};
++    sums.packed = make_int4(0, 0, 0, 0);
+ #pragma unroll
+     for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+-      sums.packed = add128b(sums, vals[rank]);
++      PackedStruct val;
++      val.packed = *reinterpret_cast<int4 const*>(&((T*)peer_comm_buffer_ptrs[rank])[iter_offset]);
++      sums.packed = add128b(sums, val);
+     }
+ 
+     // Store to the destination buffer.
+-    *reinterpret_cast<int4*>(&reinterpret_cast<T*>(params.local_output_buffer_ptr)[iter_offset]) = sums.packed;
++    *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
+   }
++  block_barrier<false>(
++      params.peer_barrier_ptrs_out, params.barrier_flag, params.local_rank, RANKS_PER_NODE, tidx, bidx, grid_size);
+ }
+ 
+ template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true>
+@@ -368,7 +368,7 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
+ 
+     // Sum the values from the different ranks.
+     PackedType sums;
+-    sums.packed = {0, 0, 0, 0};
++    sums.packed = make_int4(0, 0, 0, 0);
+ #pragma unroll
+     for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+@@ -437,10 +437,6 @@ std::tuple<int, int> kernelLaunchConfig(AllReduceStrategyType algo, AllReducePar
+       assert(params.elts_total % (elts_per_thread * params.ranks_per_node) == 0);
+       size_t const total_threads = roundUp(params.elts_total / (elts_per_thread * params.ranks_per_node), WARP_SIZE);
+ 
+-      /*
+-      threads_per_block = std::min(DEFAULT_BLOCK_SIZE, total_threads);
+-      blocks_per_grid = std::min(static_cast<size_t>(MAX_ALL_REDUCE_BLOCKS), divUp(total_threads, threads_per_block));
+-      */
+       while (total_threads % blocks_per_grid != 0 || total_threads / blocks_per_grid > DEFAULT_BLOCK_SIZE) {
+         blocks_per_grid += 1;
+       }
+diff --git a/sgl-kernel/include/trt_reduce_internal.cuh b/sgl-kernel/include/trt_reduce_internal.cuh
+index c670c994d..8cb4ee460 100644
+--- a/sgl-kernel/include/trt_reduce_internal.cuh
++++ b/sgl-kernel/include/trt_reduce_internal.cuh
+@@ -82,7 +82,7 @@ inline AllReduceStrategyType SelectImplementation(size_t message_size, int world
+   const size_t maxWorkspaceSize = GetMaxRequiredWorkspaceSize(world_size);
+ 
+   if (message_size > maxWorkspaceSize) {
+-    assert(false && "Custom allreduce do not ring currently");
++    assert(false && "Custom allreduce do not support ring currently");
+     return AllReduceStrategyType::RING;
+   }
+ 

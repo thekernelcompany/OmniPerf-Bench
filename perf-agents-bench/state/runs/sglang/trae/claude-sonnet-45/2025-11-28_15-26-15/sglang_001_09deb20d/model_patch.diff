@@ -1,0 +1,107 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index f95c30786..1ce18b8ee 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -38,30 +38,50 @@ class LogitsProcessor(nn.Module):
+ 
+     def _get_top_logprobs(self, all_logprobs, input_metadata: InputMetadata):
+         if input_metadata.forward_mode == ForwardMode.DECODE:
++            # Vectorize topk by computing once with the maximum k and slicing per row
+             decode_top_logprobs = []
++            k_list = input_metadata.top_logprobs_nums
++            k_max = max(k_list) if len(k_list) > 0 else 0
++            if k_max > 0:
++                t = all_logprobs.topk(k_max, dim=-1)
++                values, indices = t.values, t.indices
+             for i in range(all_logprobs.shape[0]):
+-                k = input_metadata.top_logprobs_nums[i]
+-                t = all_logprobs[i].topk(k)
+-                v_cpu = t.values.cpu().tolist()
+-                p_cpu = t.indices.cpu().tolist()
++                k = k_list[i]
++                if k == 0:
++                    decode_top_logprobs.append([])
++                    continue
++                v_cpu = values[i, :k].tolist()
++                p_cpu = indices[i, :k].tolist()
+                 decode_top_logprobs.append(list(zip(v_cpu, p_cpu)))
+             return None, decode_top_logprobs
+         else:
++            # Compute topk once for all rows with the maximum k to reduce kernel launches
+             prefill_top_logprobs, decode_top_logprobs = [], []
++            k_list = input_metadata.top_logprobs_nums
++            k_max = max(k_list) if len(k_list) > 0 else 0
++            if k_max > 0:
++                t_all = all_logprobs.topk(k_max, dim=-1)
++                vs_all, ps_all = t_all.values, t_all.indices
+             pt = 0
+-            # NOTE: the GPU-CPU overhead can be reduced
+             extend_seq_lens_cpu = input_metadata.extend_seq_lens
+-            for i in range(len(input_metadata.extend_seq_lens)):
+-                if extend_seq_lens_cpu[i] == 0:
++            for i in range(len(extend_seq_lens_cpu)):
++                L = int(extend_seq_lens_cpu[i])
++                if L == 0:
+                     continue
+-                k = input_metadata.top_logprobs_nums[i]
+-                t = all_logprobs[pt : pt + extend_seq_lens_cpu[i]].topk(k)
+-                vs_cpu = t.values.cpu().tolist()
+-                ps_cpu = t.indices.cpu().tolist()
+-                prefill_top_logprobs.append(
+-                    [list(zip(vs_cpu[j], ps_cpu[j])) for j in range(len(vs_cpu) - 1)]
+-                )
+-                decode_top_logprobs.append(list(zip(vs_cpu[-1], ps_cpu[-1])))
++                k = k_list[i]
++                if k == 0:
++                    prefill_top_logprobs.append([[] for _ in range(L - 1)])
++                    decode_top_logprobs.append([])
++                else:
++                    vs_seg = vs_all[pt : pt + L, :k]
++                    ps_seg = ps_all[pt : pt + L, :k]
++                    vs_cpu = vs_seg.tolist()
++                    ps_cpu = ps_seg.tolist()
++                    prefill_top_logprobs.append(
++                        [list(zip(vs_cpu[j], ps_cpu[j])) for j in range(L - 1)]
++                    )
++                    decode_top_logprobs.append(list(zip(vs_cpu[-1], ps_cpu[-1])))
++                pt += L
+             return prefill_top_logprobs, decode_top_logprobs
+ 
+     def forward(self, input_ids, hidden_states, weight, input_metadata: InputMetadata):
+@@ -98,7 +118,9 @@ class LogitsProcessor(nn.Module):
+                     all_logits = tensor_model_parallel_all_gather(all_logits)
+                 all_logits = all_logits[:, : self.config.vocab_size]
+ 
+-            all_logprobs = torch.log(torch.softmax(all_logits.float(), dim=-1) + 1e-6)
++            all_logprobs = all_logits.float()
++            all_logits = None
++            all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
+ 
+             prefill_top_logprobs, decode_top_logprobs = self._get_top_logprobs(
+                 all_logprobs, input_metadata
+@@ -119,9 +141,10 @@ class LogitsProcessor(nn.Module):
+ 
+                 # Compute the logprobs and normalized logprobs for the prefill tokens.
+                 # Note that we pad a zero at the end of each sequence for easy computation.
++                device = all_logprobs.device
+                 prefill_token_logprobs = all_logprobs[
+-                    torch.arange(all_logprobs.shape[0], device="cuda"),
+-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
++                    torch.arange(all_logprobs.shape[0], device=device),
++                    torch.cat([input_ids[1:], input_ids.new_zeros(1)]),
+                 ]
+ 
+                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index f283635c3..55bd9e80c 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -589,7 +589,7 @@ class ModelRpcServer:
+                     + len(req.output_ids)
+                     - req.prompt_tokens,
+                     "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
+-                    "finish_reason": req.finish_reason,
++                    "finish_reason": str(req.finish_reason),
+                     "hit_stop_str": req.hit_stop_str,
+                 }
+                 if req.return_logprob:

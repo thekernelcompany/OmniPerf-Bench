@@ -1,0 +1,208 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a303b..6c2ce7dea 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -209,6 +209,11 @@ class Scheduler(
+     SchedulerDisaggregationPrefillMixin,
+ ):
+     """A scheduler that manages a tensor parallel GPU worker."""
++    # Small tensor caches to reduce per-step allocations in coordination/reduction paths.
++    _mlp_sync_gather_bufs: Dict[Tuple[int, int], torch.Tensor] = {}
++    _mlp_sync_local_buf: Optional[torch.Tensor] = None
++    _tbo_preparer = None
++
+ 
+     def __init__(
+         self,
+@@ -362,6 +367,12 @@ class Scheduler(
+         self.pp_group = get_pp_group()
+         self.world_group = get_world_group()
+ 
++
++        # Buffers reused across steps
++        self._coord_dp_local_info: Optional[torch.Tensor] = None
++        self._coord_dp_global_info: Optional[torch.Tensor] = None
++        self._grammar_sync_tensor: Optional[torch.Tensor] = None
++
+         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+         global_server_args_dict.update(worker_global_server_args_dict)
+         set_random_seed(self.random_seed)
+@@ -1402,25 +1413,24 @@ class Scheduler(
+     def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+         """Coordinate the DP attention batch."""
+ 
+-        local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
+-            dtype=torch.int64,
+-        )
+-        global_info = torch.empty(
+-            (self.server_args.dp_size, self.attn_tp_size, 1),
+-            dtype=torch.int64,
+-        )
++        # Reuse small coordination buffers to reduce per-step allocation overhead.
++        if self._coord_dp_local_info is None:
++            self._coord_dp_local_info = torch.empty((1,), dtype=torch.int64)
++        self._coord_dp_local_info[0] = 1 if (new_batch is not None) else 0
++
++        shape = (self.server_args.dp_size, self.attn_tp_size, 1)
++        buf = self._coord_dp_global_info
++        if buf is None or tuple(buf.shape) != shape:
++            self._coord_dp_global_info = torch.empty(shape, dtype=torch.int64)
++            buf = self._coord_dp_global_info
++
+         torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
++            buf.flatten(),
++            self._coord_dp_local_info,
+             group=self.tp_cpu_group,
+         )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
+-        return any_new_batch
++        # Any DP worker has forward batch
++        return bool(buf[:, 0, 0].any().item())
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         # Merge the prefill batch into the running batch
+@@ -1817,13 +1827,10 @@ class Scheduler(
+         else:
+             num_tokens = local_batch.extend_num_tokens
+             num_tokens_for_logprob = sum(
+-                [
+-                    # We should have at least 1 token for sample in every case.
+-                    max(extend_len - logprob_start_len, 1)
+-                    for logprob_start_len, extend_len in zip(
+-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+-                    )
+-                ]
++                max(extend_len - logprob_start_len, 1)
++                for logprob_start_len, extend_len in zip(
++                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
++                )
+             )
+ 
+         if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
+@@ -1840,42 +1847,50 @@ class Scheduler(
+             local_batch.forward_mode.is_extend() if local_batch else False
+         )
+ 
+-        tbo_preparer = TboDPAttentionPreparer()
+-
+-        local_info = torch.tensor(
+-            [
+-                num_tokens,
+-                can_cuda_graph,
+-                num_tokens_for_logprob,
+-                is_extend_in_batch,
+-                *tbo_preparer.prepare_all_gather(
+-                    local_batch,
+-                    deepep_mode,
+-                    enable_deepep_moe,
+-                    enable_two_batch_overlap,
+-                ),
+-            ],
+-            dtype=torch.int64,
+-        )
+-        global_info = torch.empty(
+-            (dp_size, attn_tp_size, 6),
+-            dtype=torch.int64,
++        # Reuse a cached preparer and gather buffers to reduce overhead.
++        if Scheduler._tbo_preparer is None:
++            Scheduler._tbo_preparer = TboDPAttentionPreparer()
++        tbo_preparer = Scheduler._tbo_preparer
++
++        # local info: [num_tokens, can_cuda_graph, num_tokens_for_logprob, is_extend_in_batch, ...]
++        if Scheduler._mlp_sync_local_buf is None:
++            Scheduler._mlp_sync_local_buf = torch.empty((6,), dtype=torch.int64)
++        local_info = Scheduler._mlp_sync_local_buf
++        local_info[0] = int(num_tokens)
++        local_info[1] = int(can_cuda_graph)
++        local_info[2] = int(num_tokens_for_logprob)
++        local_info[3] = int(is_extend_in_batch)
++        a5, a6 = tbo_preparer.prepare_all_gather(
++            local_batch,
++            deepep_mode,
++            enable_deepep_moe,
++            enable_two_batch_overlap,
+         )
++        local_info[4] = int(a5)
++        local_info[5] = int(a6)
++
++        shape = (dp_size, attn_tp_size, 6)
++        key = (dp_size, attn_tp_size)
++        global_info = Scheduler._mlp_sync_gather_bufs.get(key)
++        if global_info is None or tuple(global_info.shape) != shape:
++            global_info = torch.empty(shape, dtype=torch.int64)
++            Scheduler._mlp_sync_gather_bufs[key] = global_info
++
+         torch.distributed.all_gather_into_tensor(
+             global_info.flatten(),
+             local_info,
+             group=tp_cpu_group,
+         )
+-        global_num_tokens = global_info[:, 0, 0].tolist()
+-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
+-        global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+-        is_extend_in_batch = global_info[:, 0, 3].tolist()
++        global_num_tokens_t = global_info[:, 0, 0]
++        can_cuda_graph = int(global_info[:, 0, 1].min().item())
++        global_num_tokens_for_logprob_t = global_info[:, 0, 2]
++        is_extend_any = bool(global_info[:, 0, 3].any().item())
+ 
+         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
+             global_info[:, :, 4:6]
+         )
+ 
+-        if local_batch is None and max(global_num_tokens) > 0:
++        if local_batch is None and int(global_num_tokens_t.max().item()) > 0:
+             local_batch = get_idle_batch()
+ 
+         if local_batch is not None:
+@@ -1884,11 +1899,11 @@ class Scheduler(
+                 local_batch.global_num_tokens = [num_tokens]
+                 local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
+             else:
+-                local_batch.global_num_tokens = global_num_tokens
++                local_batch.global_num_tokens = global_num_tokens_t.tolist()
+                 local_batch.global_num_tokens_for_logprob = (
+-                    global_num_tokens_for_logprob
++                    global_num_tokens_for_logprob_t.tolist()
+                 )
+-            local_batch.is_extend_in_batch = any(is_extend_in_batch)
++            local_batch.is_extend_in_batch = is_extend_any
+             local_batch.tbo_split_seq_index = tbo_split_seq_index
+             local_batch.global_forward_mode = global_forward_mode
+ 
+@@ -1896,8 +1911,7 @@ class Scheduler(
+             if not disable_cuda_graph:
+                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
+ 
+-        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
+-        return local_batch, any(is_extend_in_batch)
++        return local_batch, is_extend_any
+ 
+     def get_idle_batch(self):
+         idle_batch = ScheduleBatch.init_new(
+@@ -1947,11 +1961,15 @@ class Scheduler(
+ 
+         if tp_size > 1:
+             # Sync across TP ranks to make sure they have the same number of ready requests
+-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
++            if self._grammar_sync_tensor is None:
++                self._grammar_sync_tensor = torch.empty(2, dtype=torch.int32)
++            self._grammar_sync_tensor[0] = int(num_ready_reqs)
++            self._grammar_sync_tensor[1] = int(num_timeout_reqs)
+             torch.distributed.all_reduce(
+-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
++                self._grammar_sync_tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+             )
+-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
++            num_ready_reqs_max = int(self._grammar_sync_tensor[0].item())
++            num_timeout_reqs_max = int(self._grammar_sync_tensor[1].item())
+ 
+             for i in range(num_ready_reqs, num_ready_reqs_max):
+                 req = self.grammar_queue[i]

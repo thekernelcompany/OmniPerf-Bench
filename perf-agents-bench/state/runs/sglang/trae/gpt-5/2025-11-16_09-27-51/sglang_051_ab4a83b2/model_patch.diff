@@ -1,0 +1,114 @@
+diff --git a/python/sglang/srt/managers/policy_scheduler.py b/python/sglang/srt/managers/policy_scheduler.py
+index 04169e808..810f0167a 100644
+--- a/python/sglang/srt/managers/policy_scheduler.py
++++ b/python/sglang/srt/managers/policy_scheduler.py
+@@ -112,19 +112,30 @@ class PrefillAdder:
+         rem_input_tokens: int,
+         rem_chunk_tokens: Optional[int],
+         mixed_with_decode_tokens: int = 0,
++        running_batch: Optional["ScheduleBatch"] = None,
++        new_token_ratio: float = 0.0,
+     ):
+         self.tree_cache = tree_cache
++        # Track total before deductions for logging/metrics if needed
++        self.total_tokens = rem_total_tokens
++        # Remaining capacities after accounting for mixed decode tokens
+         self.rem_total_tokens = rem_total_tokens - mixed_with_decode_tokens
+         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+         self.rem_chunk_tokens = rem_chunk_tokens
+         if self.rem_chunk_tokens is not None:
+             self.rem_chunk_tokens -= mixed_with_decode_tokens
+ 
++        # Caches / states for scheduling
++        self.req_states = None
+         self.can_run_list = []
+         self.new_inflight_req = None
+         self.log_hit_tokens = 0
+         self.log_input_tokens = 0
+ 
++        # Optionally deduct running tokens upfront
++        if running_batch is not None and new_token_ratio > 0.0:
++            self.remove_running_tokens(running_batch, new_token_ratio)
++
+     def no_remaining_tokens(self):
+         return (
+             self.rem_total_tokens <= 0
+@@ -139,15 +150,14 @@ class PrefillAdder:
+     def remove_running_tokens(
+         self, running_batch: ScheduleBatch, new_token_ratio: float
+     ):
++        # Deduct the estimated number of decode tokens from capacity using a generator
+         self.rem_total_tokens -= sum(
+-            [
+-                min(
+-                    (r.sampling_params.max_new_tokens - len(r.output_ids)),
+-                    CLIP_MAX_NEW_TOKENS,
+-                )
+-                * new_token_ratio
+-                for r in running_batch.reqs
+-            ]
++            min(
++                (r.sampling_params.max_new_tokens - len(r.output_ids)),
++                CLIP_MAX_NEW_TOKENS,
++            )
++            * new_token_ratio
++            for r in running_batch.reqs
+         )
+ 
+     def _prefill_one_req(
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 8fc03b859..21cf3844c 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -23,6 +23,7 @@ import time
+ import warnings
+ from typing import Any, List, Optional, Union
+ 
++import numpy as np
+ import torch
+ import torch.distributed
+ import torch.distributed as dist
+@@ -413,10 +414,11 @@ class ModelTpServer:
+             self.max_prefill_tokens,
+             self.chunked_prefill_size,
+             num_mixed_running,
++            running_batch=self.running_batch,
++            new_token_ratio=self.new_token_ratio,
+         )
+ 
+-        if self.running_batch is not None:
+-            adder.remove_running_tokens(self.running_batch, self.new_token_ratio)
++        # Tokens from running decode requests are already deducted in PrefillAdder
+ 
+         has_inflight = self.current_inflight_req is not None
+         if self.current_inflight_req is not None:
+@@ -487,7 +489,8 @@ class ModelTpServer:
+             self.token_to_kv_pool,
+             self.tree_cache,
+         )
+-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
++        can_run_set = set(can_run_list)
++        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+         return new_batch
+ 
+     def forward_prefill_batch(self, batch: ScheduleBatch):
+@@ -931,7 +934,9 @@ def broadcast_recv_input(
+         else:
+             serialized_data = pickle.dumps(data)
+             size = len(serialized_data)
+-            tensor_data = torch.ByteTensor(list(serialized_data))
++            # Avoid slow Python list conversion by leveraging numpy view
++            np_arr = np.frombuffer(serialized_data, dtype=np.uint8)
++            tensor_data = torch.from_numpy(np_arr)
+             tensor_size = torch.tensor([size], dtype=torch.long)
+ 
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+@@ -948,6 +953,7 @@ def broadcast_recv_input(
+         tensor_data = torch.empty(size, dtype=torch.uint8)
+         dist.broadcast(tensor_data, src=0, group=dist_group)
+ 
+-        serialized_data = bytes(tensor_data.tolist())
++        # Faster conversion back to bytes without building Python lists
++        serialized_data = tensor_data.numpy().tobytes()
+         data = pickle.loads(serialized_data)
+         return data

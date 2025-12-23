@@ -1,0 +1,105 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index e77164372..ba39c0b8c 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -48,6 +48,24 @@ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --dis
+ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ ```
+ 
++### Advanced Configuration
++
++PD Disaggregation with Mooncake supports the following environment variables for fine-grained control over system behavior.
++
++#### Prefill Server Configuration
++| Variable | Description | Default |
++|:--------:|:-----------:|:--------:|
++| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
++| **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the maximum pending tasks in the parallel transfer queue | `4` |
++| **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `30` |
++
++#### Decode Server Configuration
++| Variable | Description | Default |
++|:--------:|:-----------:|:--------:|
++| **`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`** | Interval (seconds) between health checks to prefill bootstrap servers | `5.0` |
++| **`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`** | Consecutive heartbeat failures before marking prefill server offline | `2` |
++
++
+ ## NIXL
+ ### Requirements
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 4c3faeeb6..0841b4e35 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -187,6 +187,8 @@ class MooncakeKVManager(BaseKVManager):
+             self.bootstrap_time_out = get_int_env_var(
+                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 30
+             )
++            # Cache computed shard index per bootstrap room to avoid repeated string parsing
++            self._shard_cache: Dict[int, int] = {}
+         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+             self.heartbeat_failures = {}
+             self.session_pool = defaultdict(requests.Session)
+@@ -467,7 +469,7 @@ class MooncakeKVManager(BaseKVManager):
+                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                         self.update_status(room, KVPoll.WaitingForInput)
+ 
+-        threading.Thread(target=bootstrap_thread).start()
++        threading.Thread(target=bootstrap_thread, daemon=True).start()
+ 
+     def start_decode_thread(self):
+         self.rank_port = get_free_port()
+@@ -504,14 +506,9 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            for bootstrap_room in self.addr_to_rooms_tracker[
+-                                bootstrap_addr
+-                            ]:
+-                                # Remove KVPoll.Success requests from the map
+-                                if bootstrap_room not in self.request_status:
+-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+-                                        bootstrap_room
+-                                    )
++                            rooms = self.addr_to_rooms_tracker[bootstrap_addr]
++                            # Remove finished rooms efficiently
++                            self.addr_to_rooms_tracker[bootstrap_addr] = [r for r in rooms if r in self.request_status]
+                         else:
+                             logger.info(
+                                 f"Attempting to reconnect to {bootstrap_addr}..."
+@@ -537,8 +534,8 @@ class MooncakeKVManager(BaseKVManager):
+                             if bootstrap_addr in self.session_pool:
+                                 del self.session_pool[bootstrap_addr]
+ 
+-        threading.Thread(target=decode_thread).start()
+-        threading.Thread(target=heartbeat_checker).start()
++        threading.Thread(target=decode_thread, daemon=True).start()
++        threading.Thread(target=heartbeat_checker, daemon=True).start()
+ 
+     def add_transfer_request(
+         self,
+@@ -564,8 +561,13 @@ class MooncakeKVManager(BaseKVManager):
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
+         dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+-        shard_idx = session_port_sum % len(self.transfer_queues)
++        shard_idx = self._shard_cache.get(bootstrap_room)
++        if shard_idx is None:
++            session_port_sum = 0
++            for session in dst_infos:
++                session_port_sum += int(session.split(":")[1])
++            shard_idx = session_port_sum % len(self.transfer_queues)
++            self._shard_cache[bootstrap_room] = shard_idx
+ 
+         self.transfer_queues[shard_idx].put(
+             TransferKVChunk(
+@@ -903,7 +905,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
+         """Fetch the prefill parallel info from the bootstrap server."""
+         try:
+             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
+-            response = requests.get(url)
++            response = requests.get(url, timeout=5)
+             if response.status_code == 200:
+                 prefill_parallel_info = response.json()
+                 return int(prefill_parallel_info["prefill_tp_size"]), int(

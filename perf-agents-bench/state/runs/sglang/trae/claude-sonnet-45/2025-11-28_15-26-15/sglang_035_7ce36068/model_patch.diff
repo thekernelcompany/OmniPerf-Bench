@@ -1,0 +1,119 @@
+diff --git a/python/sglang/srt/managers/tp_worker_overlap_thread.py b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+index 5d78b97ce..d40df8ea7 100644
+--- a/python/sglang/srt/managers/tp_worker_overlap_thread.py
++++ b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+@@ -54,8 +54,12 @@ class TpModelWorkerClient:
+         self.future_token_ids_map = torch.empty(
+             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
+         )
++        
++        # Cache for frequently used tensors to reduce allocations
++        self.arange_cache = {}
++        self.max_cache_size = 64
+ 
+-        # Launch a thread
++        # Launch threads
+         self.input_queue = Queue()
+         self.output_queue = Queue()
+         self.forward_stream = torch.cuda.Stream()
+@@ -64,6 +68,12 @@ class TpModelWorkerClient:
+         )
+         self.forward_thread.start()
+ 
++        self.copy_queue = Queue()
++        self.copy_thread = threading.Thread(
++            target=self.copy_thread_func,
++        )
++        self.copy_thread.start()
++
+     def get_worker_info(self):
+         return self.worker.get_worker_info()
+ 
+@@ -79,10 +89,36 @@ class TpModelWorkerClient:
+             self.worker.model_runner.token_to_kv_pool,
+         )
+ 
++    def copy_thread_func(self):
++        while True:
++            next_token_ids, future_next_token_ids = self.copy_queue.get()
++            # Update the future token ids map
++            self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
++                torch.int32
++            )
++
+     def forward_thread_func(self):
+         with torch.cuda.stream(self.forward_stream):
+             self.forward_thread_func_()
+ 
++    def _get_arange_tensor(self, start, end):
++        """Get or create cached arange tensor for common batch sizes."""
++        bs = end - start
++        if bs in self.arange_cache:
++            cached = self.arange_cache[bs]
++            # Adjust the cached tensor to the current range
++            return cached + start
++        
++        # Create new tensor
++        result = torch.arange(start, end, dtype=torch.int32, device=self.device)
++        
++        # Cache if size is reasonable and cache not full
++        if bs <= self.max_cache_size and len(self.arange_cache) < 32:
++            # Store normalized version (0 to bs)
++            self.arange_cache[bs] = torch.arange(0, bs, dtype=torch.int32, device=self.device)
++        
++        return result
++
+     @torch.inference_mode()
+     def forward_thread_func_(self):
+         while True:
+@@ -90,28 +126,25 @@ class TpModelWorkerClient:
+ 
+             # Resolve future tokens in the input
+             input_ids = model_worker_batch.input_ids
+-            input_ids[:] = torch.where(
+-                input_ids < 0,
+-                self.future_token_ids_map[torch.clamp(-input_ids, min=0)],
+-                input_ids,
+-            )
++            # Optimize: Use in-place operations to avoid creating temporary tensors
++            mask = input_ids < 0
++            if mask.any():
++                input_ids[mask] = self.future_token_ids_map[torch.clamp(-input_ids[mask], min=0)]
+ 
+             # Run forward
+             logits_output, next_token_ids = self.worker.forward_batch_generation(
+                 model_worker_batch
+             )
+ 
+-            # Update the future token ids map
++            # Prepare future token ids update in parallel
+             bs = len(model_worker_batch.seq_lens)
+-            future_next_token_ids = torch.arange(
++            future_next_token_ids = self._get_arange_tensor(
+                 -(future_token_ids_ct + bs),
+                 -(future_token_ids_ct),
+-                dtype=torch.int32,
+-                device=self.device,
+-            )
+-            self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
+-                torch.int32
+             )
++            
++            # Offload the copy operation to the copy thread
++            self.copy_queue.put((next_token_ids, future_next_token_ids))
+ 
+             # Set the result
+             next_token_ids = next_token_ids.tolist()
+@@ -128,11 +161,9 @@ class TpModelWorkerClient:
+ 
+         # Allocate output future objects
+         bs = len(model_worker_batch.seq_lens)
+-        future_next_token_ids = torch.arange(
++        future_next_token_ids = self._get_arange_tensor(
+             -(self.future_token_ids_ct + bs),
+             -(self.future_token_ids_ct),
+-            dtype=torch.int32,
+-            device=self.device,
+         )
+         self.future_token_ids_ct = (
+             self.future_token_ids_ct + bs

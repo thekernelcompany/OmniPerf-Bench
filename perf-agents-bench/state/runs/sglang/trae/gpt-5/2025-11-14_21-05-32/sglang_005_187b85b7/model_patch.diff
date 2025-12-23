@@ -1,0 +1,106 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/memory_pool.py b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+index 6e8edaf92..e555a1b8f 100644
+--- a/python/sglang/srt/disaggregation/mooncake/memory_pool.py
++++ b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+@@ -11,15 +11,21 @@ from torch.cuda.memory import CUDAPluggableAllocator
+ class MooncakeNVLinkAllocator:
+     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+     _lock: Final = threading.Lock()
++    _so_path: Optional[str] = None
+ 
+     @classmethod
+     def _get_so_path(cls) -> str:
+         """Dynamically locate hook.so in the mooncake package installation"""
++        # Fast-path: cached result
++        if cls._so_path is not None:
++            return cls._so_path
++
+         try:
+             # Attempt to locate package resource
+             with resources.path("mooncake", "hook.so") as so_path:
+                 if so_path.exists():
+-                    return str(so_path)
++                    cls._so_path = str(so_path)
++                    return cls._so_path
+         except (ImportError, FileNotFoundError, TypeError):
+             pass
+ 
+@@ -30,11 +36,14 @@ class MooncakeNVLinkAllocator:
+             base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
+             so_path = os.path.join(base_path, "hook.so")
+             if os.path.exists(so_path):
+-                return so_path
++                cls._so_path = so_path
++                return cls._so_path
+         except (ImportError, FileNotFoundError, TypeError):
+-            raise ImportError(
+-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+-            )
++            pass
++
++        raise ImportError(
++            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
++        )
+ 
+     @classmethod
+     def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f1b..3bb8a014e 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -303,7 +303,7 @@ class MHATokenToKVPool(KVCache):
+                 # [size, head_num, head_dim] for each layer
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.k_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -311,7 +311,7 @@ class MHATokenToKVPool(KVCache):
+                     for _ in range(self.layer_num)
+                 ]
+                 self.v_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -620,7 +620,7 @@ class MLATokenToKVPool(KVCache):
+             ):
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.kv_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                         dtype=self.store_dtype,
+                         device=device,
+@@ -758,13 +758,13 @@ class DoubleSparseTokenToKVPool(KVCache):
+         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+             # [size, head_num, head_dim] for each layer
+             self.k_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+             ]
+             self.v_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+diff --git a/scripts/ci_install_dependency.sh b/scripts/ci_install_dependency.sh
+index 922c886c4..85b497b6d 100755
+--- a/scripts/ci_install_dependency.sh
++++ b/scripts/ci_install_dependency.sh
+@@ -23,7 +23,7 @@ pip install -e "python[dev]"
+ pip list
+ 
+ # Install additional dependencies
+-pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
++pip install mooncake-transfer-engine==0.3.3.post2 nvidia-cuda-nvrtc-cu12
+ 
+ # For lmms_evals evaluating MMMU
+ git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

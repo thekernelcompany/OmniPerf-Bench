@@ -1,0 +1,301 @@
+diff --git a/README.md b/README.md
+index 2ac666c6b..7c33dd632 100644
+--- a/README.md
++++ b/README.md
+@@ -316,10 +316,10 @@ client = openai.Client(
+ 
+ # Text completion
+ response = client.completions.create(
+-	model="default",
+-	prompt="The capital of France is",
+-	temperature=0,
+-	max_tokens=32,
++    model="default",
++    prompt="The capital of France is",
++    temperature=0,
++    max_tokens=32,
+ )
+ print(response)
+ 
+@@ -377,6 +377,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
+ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
+ ```
+ - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
++- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
++```
++# Node 0
++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 0
++
++# Node 1
++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 1
++```
+ 
+ ### Supported Models
+ - Llama
+diff --git a/benchmark/latency_throughput/bench_one.py b/benchmark/latency_throughput/bench_one.py
+index cfd96b54c..345b09de1 100644
+--- a/benchmark/latency_throughput/bench_one.py
++++ b/benchmark/latency_throughput/bench_one.py
+@@ -14,6 +14,8 @@ import requests
+ def run_one_batch_size(bs):
+     url = f"{args.host}:{args.port}"
+     max_new_tokens = args.max_tokens
++    input_len = args.input_len if args.input_len else 1
++    output_len = max_new_tokens
+ 
+     if args.input_len:
+         input_ids = [
+@@ -96,8 +98,8 @@ def run_one_batch_size(bs):
+         ret = response.json()
+     print(ret)
+ 
+-    output_throughput = bs * max_new_tokens / latency
+-    overall_throughput = bs * (args.input_len + max_new_tokens) / latency
++    output_throughput = bs * output_len / latency
++    overall_throughput = bs * (input_len + output_len) / latency
+     print(f"latency: {latency:.2f} s")
+     print(f"decode throughput: {output_throughput:.2f} token/s")
+     print(f"overall throughput: {overall_throughput:.2f} token/s")
+diff --git a/benchmark/latency_throughput/bench_serving.py b/benchmark/latency_throughput/bench_serving.py
+index 23e8245f2..b79dfb133 100644
+--- a/benchmark/latency_throughput/bench_serving.py
++++ b/benchmark/latency_throughput/bench_serving.py
+@@ -121,6 +121,7 @@ async def send_request(
+     output_len: int,
+     best_of: int,
+     use_beam_search: bool,
++    session: aiohttp.ClientSession,
+ ) -> None:
+     request_start_time = time.perf_counter()
+ 
+@@ -174,23 +175,21 @@ async def send_request(
+         raise ValueError(f"Unknown backend: {backend}")
+ 
+     if backend != "ginfer":
+-        timeout = aiohttp.ClientTimeout(total=3 * 3600)
+-        async with aiohttp.ClientSession(timeout=timeout) as session:
+-            while True:
+-                async with session.post(
+-                    api_url, headers=headers, json=pload
+-                ) as response:
+-                    chunks = []
+-                    async for chunk, _ in response.content.iter_chunks():
+-                        chunks.append(chunk)
+-                output = b"".join(chunks).decode("utf-8")
+-                output = json.loads(output)
+-
+-                # Re-send the request if it failed.
+-                if "error" not in output:
+-                    break
+-                else:
+-                    print(output)
++        while True:
++            async with session.post(
++                api_url, headers=headers, json=pload
++            ) as response:
++                chunks = []
++                async for chunk, _ in response.content.iter_chunks():
++                    chunks.append(chunk)
++            output = b"".join(chunks).decode("utf-8")
++            output = json.loads(output)
++
++            # Re-send the request if it failed.
++            if "error" not in output:
++                break
++            else:
++                print(output)
+     else:
+         import grpc
+         from ginfer import sampler_pb2, sampler_pb2_grpc
+@@ -225,22 +224,25 @@ async def benchmark(
+     use_beam_search: bool,
+     request_rate: float,
+ ) -> None:
+-    tasks: List[asyncio.Task] = []
+-    async for request in get_request(input_requests, request_rate):
+-        prompt, prompt_len, output_len = request
+-        task = asyncio.create_task(
+-            send_request(
+-                backend,
+-                api_url,
+-                prompt,
+-                prompt_len,
+-                output_len,
+-                best_of,
+-                use_beam_search,
++    timeout = aiohttp.ClientTimeout(total=3 * 3600)
++    async with aiohttp.ClientSession(timeout=timeout) as session:
++        tasks: List[asyncio.Task] = []
++        async for request in get_request(input_requests, request_rate):
++            prompt, prompt_len, output_len = request
++            task = asyncio.create_task(
++                send_request(
++                    backend,
++                    api_url,
++                    prompt,
++                    prompt_len,
++                    output_len,
++                    best_of,
++                    use_beam_search,
++                    session,
++                )
+             )
+-        )
+-        tasks.append(task)
+-    await tqdm_asyncio.gather(*tasks)
++            tasks.append(task)
++        await tqdm_asyncio.gather(*tasks)
+ 
+ 
+ def main(args: argparse.Namespace):
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..7a8039814
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,103 @@
++diff --git a/README.md b/README.md
++index 2ac666c6b..7c33dd632 100644
++--- a/README.md
+++++ b/README.md
++@@ -316,10 +316,10 @@ client = openai.Client(
++ 
++ # Text completion
++ response = client.completions.create(
++-	model="default",
++-	prompt="The capital of France is",
++-	temperature=0,
++-	max_tokens=32,
+++    model="default",
+++    prompt="The capital of France is",
+++    temperature=0,
+++    max_tokens=32,
++ )
++ print(response)
++ 
++@@ -377,6 +377,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
++ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --mem-fraction-static 0.7
++ ```
++ - See [hyperparameter_tuning.md](docs/hyperparameter_tuning.md) on tuning hyperparameters for better performance.
+++- Add `--nnodes 2` to run tensor parallelism on multiple nodes. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-1` be the hostname of the first node and `50000` be an available port.
+++```
+++# Node 0
+++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 0
+++
+++# Node 1
+++python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --tp 4 --nccl-init-addr sgl-dev-1:50000 --nnodes 2 --node-rank 1
+++```
++ 
++ ### Supported Models
++ - Llama
++diff --git a/benchmark/latency_throughput/bench_one.py b/benchmark/latency_throughput/bench_one.py
++index cfd96b54c..345b09de1 100644
++--- a/benchmark/latency_throughput/bench_one.py
+++++ b/benchmark/latency_throughput/bench_one.py
++@@ -14,6 +14,8 @@ import requests
++ def run_one_batch_size(bs):
++     url = f"{args.host}:{args.port}"
++     max_new_tokens = args.max_tokens
+++    input_len = args.input_len if args.input_len else 1
+++    output_len = max_new_tokens
++ 
++     if args.input_len:
++         input_ids = [
++@@ -96,8 +98,8 @@ def run_one_batch_size(bs):
++         ret = response.json()
++     print(ret)
++ 
++-    output_throughput = bs * max_new_tokens / latency
++-    overall_throughput = bs * (args.input_len + max_new_tokens) / latency
+++    output_throughput = bs * output_len / latency
+++    overall_throughput = bs * (input_len + output_len) / latency
++     print(f"latency: {latency:.2f} s")
++     print(f"decode throughput: {output_throughput:.2f} token/s")
++     print(f"overall throughput: {overall_throughput:.2f} token/s")
++diff --git a/benchmark/latency_throughput/bench_serving.py b/benchmark/latency_throughput/bench_serving.py
++index 23e8245f2..b79dfb133 100644
++--- a/benchmark/latency_throughput/bench_serving.py
+++++ b/benchmark/latency_throughput/bench_serving.py
++@@ -121,6 +121,7 @@ async def send_request(
++     output_len: int,
++     best_of: int,
++     use_beam_search: bool,
+++    session: aiohttp.ClientSession,
++ ) -> None:
++     request_start_time = time.perf_counter()
++ 
++@@ -174,23 +175,21 @@ async def send_request(
++         raise ValueError(f"Unknown backend: {backend}")
++ 
++     if backend != "ginfer":
++-        timeout = aiohttp.ClientTimeout(total=3 * 3600)
++-        async with aiohttp.ClientSession(timeout=timeout) as session:
++-            while True:
++-                async with session.post(
++-                    api_url, headers=headers, json=pload
++-                ) as response:
++-                    chunks = []
++-                    async for chunk, _ in response.content.iter_chunks():
++-                        chunks.append(chunk)
++-                output = b"".join(chunks).decode("utf-8")
++-                output = json.loads(output)
++-
++-                # Re-send the request if it failed.
++-                if "error" not in output:
++-                    break
++-                else:
++-                    print(output)
+++        while True:
+++            async with session.post(
+++                api_url, headers=headers, json=pload
+++            ) as response:
+++                chunks = []
+++                async for chunk, _ in response.content.iter_chunks():
+++                    chunks.append(chunk)
+++            output = b"".join(chunks).decode("utf-8")
+++            output = json.loads(output)
+++
+++            # Re-send the request if it failed.
+++     
+\ No newline at end of file
+diff --git a/python/sglang/README.md b/python/sglang/README.md
+index c8c093706..b931af656 100644
+--- a/python/sglang/README.md
++++ b/python/sglang/README.md
+@@ -2,7 +2,7 @@
+ 
+ - `backend`: Various backends for the language interpreter.
+ - `lang`: The frontend language.
+-- `srt`: The runtime for running local models.
++- `srt`: The runtime for running local models. Includes distributed serving options (e.g., `--nnodes`, `--node-rank`, `--nccl-init-addr`).
+ - `test`: Test utilities.
+ - `api.py`: Public API.
+ - `bench_latency.py`: Benchmark utilities.
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index d68d9af32..989870857 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -187,8 +187,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index 6cda67dea..d4d28c5e4 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -208,7 +208,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
+                 f"[node_rank={server_args.node_rank}]: Listen for connections..."
+             )
+             while True:
+-                pass
++                time.sleep(1)
+ 
+     # Launch processes
+     tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)

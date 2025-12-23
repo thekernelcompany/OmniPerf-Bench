@@ -1,0 +1,245 @@
+diff --git a/benchmark/lora/launch_server.py b/benchmark/lora/launch_server.py
+index 1fa4d7135..340216e8e 100644
+--- a/benchmark/lora/launch_server.py
++++ b/benchmark/lora/launch_server.py
+@@ -1,7 +1,7 @@
+ import argparse
+ import os
+ 
+-NUM_LORAS = 128
++NUM_LORAS = 8
+ LORA_PATH = {
+     "base": "mistralai/Mistral-7B-Instruct-v0.3",
+     "lora": "/home/ying/test_lora",
+@@ -11,13 +11,13 @@ LORA_PATH = {
+ def launch_server(args):
+     base_path = LORA_PATH["base"]
+     lora_path = LORA_PATH["lora"]
+-    max_loras_per_batch = 4
+ 
+     if args.base_only:
+-        cmd = f"python -m sglang.launch_server --model {base_path} "
++        cmd = f"python3 -m sglang.launch_server --model {base_path} "
+     else:
+-        cmd = f"python -m sglang.launch_server --model {base_path} --lora-paths "
+-        for i in range(NUM_LORAS):
++        cmd = f"python3 -m sglang.launch_server --model {base_path} --lora-paths "
++        num = getattr(args, "num_loras", NUM_LORAS)
++        for i in range(num):
+             lora_name = f"lora{i}"
+             cmd += f"{lora_name}={lora_path} "
+     cmd += f"--disable-radix --disable-cuda-graph "
+@@ -32,7 +32,7 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--num-loras",
+         type=int,
+-        default=128,
++        default=8,
+     )
+     parser.add_argument(
+         "--base-only",
+@@ -41,7 +41,7 @@ if __name__ == "__main__":
+     parser.add_argument(
+         "--max-loras-per-batch",
+         type=int,
+-        default=8,
++        default=4,
+     )
+     parser.add_argument(
+         "--max-running-requests",
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index 379b233bd..72198b547 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -120,12 +120,11 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         )
+         # FIXME
+         assert lora_a_output.shape[-1] == self.lora_rank * 2
+-        lora_output = torch.empty_like(base_output)
+-        output_dim = lora_output.shape[-1] // 2
++        output_dim = base_output.shape[-1] // 2
+         for i in range(2):
+             left = output_dim * i
+             right = left + output_dim
+-            lora_output[:, left:right] = self.segment_gemm.run(
++            seg = self.segment_gemm.run(
+                 x=lora_a_output[
+                     :, self.lora_rank * i : self.lora_rank * (i + 1)
+                 ].contiguous(),
+@@ -135,7 +134,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+                 seg_lens=self.seq_lens,
+                 weight_indices=self.weight_indices,
+             )
+-        return base_output + lora_output * self.scaling
++            base_output[:, left:right].add_(seg, alpha=self.scaling)
++        return base_output
+ 
+ 
+ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -165,10 +165,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             weight_indices=self.weight_indices,
+         )
+         # FIXME parallelize qkv
+-        lora_output = torch.empty_like(base_output)
+         # q
+         output_dim_q = self.B_buffer_q.shape[-2]
+-        lora_output[:, :output_dim_q] = self.segment_gemm.run(
++        q_seg = self.segment_gemm.run(
+             x=lora_a_output[:, : self.lora_rank].contiguous(),
+             weights=self.B_buffer_q,
+             batch_size=self.bs,
+@@ -176,24 +175,24 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             seg_lens=self.seq_lens,
+             weight_indices=self.weight_indices,
+         )
++        base_output[:, :output_dim_q].add_(q_seg, alpha=self.scaling)
+         # kv
+         output_dim_kv = self.B_buffer_kv.shape[-2] // 2
+         for i in range(2):
+             left = output_dim_kv * i
+             right = left + output_dim_kv
+-            lora_output[:, output_dim_q + left : output_dim_q + right] = (
+-                self.segment_gemm.run(
+-                    x=lora_a_output[
+-                        :, self.lora_rank * (i + 1) : self.lora_rank * (i + 2)
+-                    ].contiguous(),
+-                    weights=self.B_buffer_kv[:, left:right, :].contiguous(),
+-                    batch_size=self.bs,
+-                    weight_column_major=True,
+-                    seg_lens=self.seq_lens,
+-                    weight_indices=self.weight_indices,
+-                )
++            kv_seg = self.segment_gemm.run(
++                x=lora_a_output[
++                    :, self.lora_rank * (i + 1) : self.lora_rank * (i + 2)
++                ].contiguous(),
++                weights=self.B_buffer_kv[:, left:right, :].contiguous(),
++                batch_size=self.bs,
++                weight_column_major=True,
++                seg_lens=self.seq_lens,
++                weight_indices=self.weight_indices,
+             )
+-        return base_output + lora_output * self.scaling
++            base_output[:, output_dim_q + left : output_dim_q + right].add_(kv_seg, alpha=self.scaling)
++        return base_output
+ 
+ 
+ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -227,7 +226,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+             seg_lens=self.seq_lens,
+             weight_indices=self.weight_indices,
+         )
+-        return base_output + lora_output * self.scaling
++        return base_output.add_(lora_output, alpha=self.scaling)
+ 
+     def forward(self, input_):
+         # duplicate the logic in RowParallelLinear
+@@ -299,11 +298,10 @@ class LoRALayer(nn.Module):
+ 
+     def load_to_gpu(self):
+         for name, weight in self.weights.items():
+-            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
++            self.weight_gpu[name] = weight.to(device="cuda", dtype=torch.float16, non_blocking=True)
+ 
+     def offload_from_gpu(self):
+-        for name, weight in self.weights.items():
+-            self.weight_gpu[name] = None
++        self.weight_gpu.clear()
+ 
+ 
+ class LoRAAdapter(nn.Module):
+@@ -332,17 +330,16 @@ class LoRAAdapter(nn.Module):
+             "kv_proj": 2,
+             "gate_up_proj": 2,
+         }
+-        return stacked_rank[module_name] if module_name in stacked_rank else 1
++        return stacked_rank.get(module_name, 1)
+ 
+     def load_to_gpu(self):
+         for name, weight in self.weights.items():
+-            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
++            self.weights_gpu[name] = weight.to(device="cuda", dtype=torch.float16, non_blocking=True)
+         for layer in self.layers:
+             layer.load_to_gpu()
+ 
+     def offload_from_gpu(self):
+-        for name, weight in self.weights.items():
+-            self.weights_gpu[name] = None
++        self.weights_gpu.clear()
+         for layer in self.layers:
+             layer.offload_from_gpu()
+ 
+@@ -364,7 +361,7 @@ class LoRAAdapter(nn.Module):
+         # stack kv_proj and gate_up_proj
+         for i in range(self.base_hf_config.num_hidden_layers):
+             layer = self.layers[i]
+-            weight_names = [name for name, _ in layer.weights.items()]
++            weight_names = list(layer.weights.keys())
+             for weight_name in weight_names:
+                 if "k_proj" in weight_name:
+                     q_name = weight_name.replace("k_proj", "q_proj")
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 59cd7e157..a9849c5ef 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -138,9 +138,7 @@ class LoRAManager:
+         self.origin_target_modules = set()
+         for name, path in self.lora_paths.items():
+             self.configs[name] = LoRAConfig(path)
+-            self.origin_target_modules = set(self.origin_target_modules) | set(
+-                self.configs[name].target_modules
+-            )
++            self.origin_target_modules |= set(self.configs[name].target_modules)
+         if hasattr(self.base_model, "get_module_name"):
+             self.target_modules = {
+                 self.base_model.get_module_name(module)
+@@ -155,9 +153,9 @@ class LoRAManager:
+             self.target_modules = {
+                 get_module_name(module) for module in self.origin_target_modules
+             }
+-        self.target_weights = set(
+-            [get_stacked_name(module) for module in self.origin_target_modules]
+-        )
++        self.target_weights = {
++            get_stacked_name(module) for module in self.origin_target_modules
++        }
+ 
+         # load all weights to cpu
+         self.loras = []
+@@ -172,7 +170,7 @@ class LoRAManager:
+             self.loras[-1].initialize_weights()
+ 
+         # misc lora configs
+-        self.max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
++        self.max_lora_dim = max(x.hf_config["r"] for x in self.configs.values())
+         self.scaling = self.loras[0].scaling
+         # FIXME remove the restrictions
+         assert all(x.hf_config["r"] == self.max_lora_dim for x in self.configs.values())
+@@ -252,9 +250,6 @@ class LoRAManager:
+     def load_lora(self, uid, buffer_id):
+         num_layer = self.base_hf_config.num_hidden_layers
+         if uid is None:
+-            for i in range(num_layer):
+-                for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] *= 0
+             return
+ 
+         for i in range(num_layer):
+@@ -295,11 +290,13 @@ class LoRAManager:
+         seg_lens = (
+             forward_batch.extend_seq_lens
+             if forward_batch.forward_mode.is_extend()
+-            else torch.ones(bs)
++            else torch.ones(bs, dtype=torch.int32)
++        )
++        weight_indices = torch.tensor(
++            [self.buffer_id[p] for p in forward_batch.lora_paths],
++            dtype=torch.int64,
++            device="cuda",
+         )
+-        weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
+-        for i, lora_path in enumerate(forward_batch.lora_paths):
+-            weight_indices[i] = self.buffer_id[lora_path]
+ 
+         for module_name, module in self.lora_modules:
+             layer_id = get_layer_id(module_name)

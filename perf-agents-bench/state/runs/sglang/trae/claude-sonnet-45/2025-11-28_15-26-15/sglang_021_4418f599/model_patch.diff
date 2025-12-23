@@ -1,0 +1,67 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index b299c3037..99fc479c0 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -569,14 +569,23 @@ class DeepseekV2AttentionMLA(nn.Module):
+     def dispatch_attn_forward_method(
+         self, forward_batch: ForwardBatch
+     ) -> AttnForwardMethod:
++        # Precompute frequently used checks to reduce Python-side overhead in hot path.
++        mode = forward_batch.forward_mode
++        is_extend = mode.is_extend()
++        is_target_verify = mode.is_target_verify()
++        is_draft_extend = mode.is_draft_extend()
++        if forward_batch.extend_prefix_lens_cpu is not None:
++            sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
++        else:
++            sum_extend_prefix_lens = 0
+         if self.attention_backend == "flashinfer":
+             # Flashinfer MLA: Do not absorb when enabling ragged prefill
+             if (
+                 not self.flashinfer_mla_disable_ragged
+-                and forward_batch.forward_mode.is_extend()
+-                and not forward_batch.forward_mode.is_target_verify()
+-                and not forward_batch.forward_mode.is_draft_extend()
+-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
++                and is_extend
++                and not is_target_verify
++                and not is_draft_extend
++                and sum_extend_prefix_lens == 0
+             ):
+                 return AttnForwardMethod.MHA
+             else:
+@@ -584,12 +593,14 @@ class DeepseekV2AttentionMLA(nn.Module):
+         elif self.attention_backend == "fa3":
+             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
+             if (
+-                forward_batch.forward_mode.is_extend()
++                is_extend
+                 and not self.disable_chunked_prefix_cache
+-                and not forward_batch.forward_mode.is_target_verify()
+-                and not forward_batch.forward_mode.is_draft_extend()
+-                and sum(forward_batch.extend_prefix_lens_cpu)
+-                >= self.chunked_prefix_cache_threshold
++                and not is_target_verify
++                and not is_draft_extend
++                and (
++                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
++                    or sum_extend_prefix_lens == 0
++                )
+             ):
+                 return AttnForwardMethod.MHA_CHUNKED_KV
+             else:
+@@ -597,10 +608,10 @@ class DeepseekV2AttentionMLA(nn.Module):
+         else:
+             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
+             if (
+-                forward_batch.forward_mode.is_extend()
+-                and not forward_batch.forward_mode.is_target_verify()
+-                and not forward_batch.forward_mode.is_draft_extend()
+-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
++                is_extend
++                and not is_target_verify
++                and not is_draft_extend
++                and sum_extend_prefix_lens == 0
+             ):
+                 return AttnForwardMethod.MHA
+             else:

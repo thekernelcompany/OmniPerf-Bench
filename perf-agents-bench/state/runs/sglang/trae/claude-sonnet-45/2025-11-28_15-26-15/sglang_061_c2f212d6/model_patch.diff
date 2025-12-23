@@ -1,0 +1,132 @@
+diff --git a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+index 1a2036dc0..387248f5b 100644
+--- a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
++++ b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+@@ -22,16 +22,19 @@ def _decode_kernel(
+     b: tl.constexpr,
+     h: tl.constexpr,
+     n: tl.constexpr,
+-    d: tl.constexpr,
+-    e: tl.constexpr,
++    d: tl.constexpr,  # padded d
++    e: tl.constexpr,  # padded e
++    d_original: tl.constexpr,
++    e_original: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr = 32,
+ ):
+     off_bh = tl.program_id(0)
+     off_h = off_bh % h
+ 
+-    qk_offset = off_bh * n * d
+-    v_offset = off_bh * n * e
+-    o_offset = off_bh * n * e
+-    kv_offset = off_bh * d * e
++    qk_offset = off_bh * n * d_original
++    v_offset = off_bh * n * e_original
++    o_offset = off_bh * n * e_original
++    kv_offset = off_bh * d_original * e_original
+ 
+     s = tl.load(S + off_h)
+     ratio = tl.exp(-s)
+@@ -39,21 +42,30 @@ def _decode_kernel(
+     d_idx = tl.arange(0, d)
+     e_idx = tl.arange(0, e)
+ 
+-    q = tl.load(Q + qk_offset + d_idx)
+-    k = tl.load(K + qk_offset + d_idx)
+-    v = tl.load(V + v_offset + e_idx)
++    d_mask = d_idx < d_original
++    e_mask = e_idx < e_original
+ 
+-    kv = tl.load(KV + kv_offset + d_idx[:, None] * e + e_idx[None, :])
++    q = tl.load(Q + qk_offset + d_idx, mask=d_mask, other=0.0).to(tl.float32)
++    k = tl.load(K + qk_offset + d_idx, mask=d_mask, other=0.0).to(tl.float32)
++    v = tl.load(V + v_offset + e_idx, mask=e_mask, other=0.0).to(tl.float32)
++
++    kv = tl.load(
++        KV + kv_offset + d_idx[:, None] * e_original + e_idx[None, :],
++        mask=d_mask[:, None] & e_mask[None, :],
++        other=0.0,
++    ).to(tl.float32)
+ 
+     k_v_prod = k[:, None] * v[None, :]
+     kv = ratio * kv + k_v_prod
+ 
+     tl.store(
+-        KV + kv_offset + d_idx[:, None] * e + e_idx[None, :], kv.to(KV.dtype.element_ty)
++        KV + kv_offset + d_idx[:, None] * e_original + e_idx[None, :],
++        kv.to(KV.dtype.element_ty),
++        mask=d_mask[:, None] & e_mask[None, :],
+     )
+ 
+     o = tl.sum(q[:, None] * kv, axis=0)
+-    tl.store(Out + o_offset + e_idx, o.to(Out.dtype.element_ty))
++    tl.store(Out + o_offset + e_idx, o.to(Out.dtype.element_ty), mask=e_mask)
+ 
+ 
+ def lightning_attn_decode(q, k, v, kv, s):
+@@ -66,47 +78,41 @@ def lightning_attn_decode(q, k, v, kv, s):
+     d_padded = next_power_of_2(d)
+     e_padded = next_power_of_2(e)
+ 
+-    # Pad inputs
+-    q_padded = F.pad(q, (0, d_padded - d))
+-    k_padded = F.pad(k, (0, d_padded - d))
+-    v_padded = F.pad(v, (0, e_padded - e))
+-    kv_padded = F.pad(kv, (0, e_padded - e, 0, d_padded - d))
+-
+     # Ensure inputs are contiguous
+-    q_padded = q_padded.contiguous()
+-    k_padded = k_padded.contiguous()
+-    v_padded = v_padded.contiguous()
+-    kv_padded = kv_padded.contiguous().to(torch.float32)
++    q = q.contiguous()
++    k = k.contiguous()
++    v = v.contiguous()
++    kv = kv.contiguous()
+     s = s.contiguous()
+ 
+-    # Create output tensor (padded)
+-    o_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
++    # Create output tensor
++    o = torch.empty(b, h, n, e, dtype=v.dtype, device=v.device)
+ 
+     # Launch kernel
+     grid = (b * h, 1)
+     _decode_kernel[grid](
+-        q_padded,
+-        k_padded,
+-        v_padded,
+-        kv_padded,
+-        o_padded,
++        q,
++        k,
++        v,
++        kv,
++        o,
+         s,
+         b=b,
+         h=h,
+         n=n,
+         d=d_padded,
+         e=e_padded,
++        d_original=d,
++        e_original=e,
+     )
+ 
+-    # Remove padding
+-    o = o_padded[..., :e]
+-    kv_out = kv_padded[..., :d, :e]
+-
+-    return o, kv_out
++    return o, kv
+ 
+ 
+ def next_power_of_2(n):
+-    return 2 ** (int(math.ceil(math.log(n, 2))))
++    if n <= 1:
++        return 1
++    return 1 << ((n - 1).bit_length())
+ 
+ 
+ class MiniMaxText01LightningAttention(nn.Module):

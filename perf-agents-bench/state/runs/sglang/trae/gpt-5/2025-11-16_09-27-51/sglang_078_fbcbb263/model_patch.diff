@@ -1,0 +1,73 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 181ac7eef..e621f4496 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -22,7 +22,7 @@ BaseTokenToKVPool maps a token location to its KV cache data.
+ """
+ 
+ import logging
+-from typing import List, Tuple, Union
++from typing import List, Tuple, Union, TYPE_CHECKING
+ 
+ import torch
+ 
+@@ -126,11 +126,16 @@ class BaseTokenToKVPool:
+         select_index = self.free_slots[:need_size]
+         self.free_slots = self.free_slots[need_size:]
+ 
+-        return select_index.to(self.device, non_blocking=True)
++        # Avoid unnecessary device transfer when already on CPU
++        if isinstance(self.device, str) and self.device.startswith("cuda"):
++            return select_index.to(self.device, non_blocking=True)
++        return select_index
+ 
+     def free(self, free_index: torch.Tensor):
+         if self.is_not_in_free_group:
+-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
++            if free_index.device.type != "cpu":
++                free_index = free_index.cpu()
++            self.free_slots = torch.concat((self.free_slots, free_index))
+         else:
+             self.free_group.append(free_index)
+ 
+@@ -141,7 +146,11 @@ class BaseTokenToKVPool:
+     def free_group_end(self):
+         self.is_not_in_free_group = True
+         if self.free_group:
+-            self.free(torch.concat(self.free_group))
++            free_tensor = torch.concat(self.free_group)
++            if free_tensor.device.type != "cpu":
++                free_tensor = free_tensor.cpu()
++            self.free_slots = torch.concat((self.free_slots, free_tensor))
++        self.free_group = []
+ 
+     def clear(self):
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+@@ -221,18 +230,17 @@ class MHATokenToKVPool(BaseTokenToKVPool):
+         cache_v: torch.Tensor,
+     ):
+         layer_id = layer.layer_id
+-        copy_two_array(
+-            loc,
+-            self.k_buffer[layer_id],
+-            cache_k,
+-            self.v_buffer[layer_id],
+-            cache_v,
+-            self.dtype,
+-            self.store_dtype,
+-        )
++        if cache_k.dtype != self.dtype:
++            cache_k = cache_k.to(self.dtype)
++            cache_v = cache_v.to(self.dtype)
++        if self.store_dtype != self.dtype:
++            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
++            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
++        else:
++            self.k_buffer[layer_id][loc] = cache_k
++            self.v_buffer[layer_id][loc] = cache_v
+ 
+ 
+-@torch.compile(dynamic=True)
+ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
+     dst_1[loc] = src_1.to(dtype).view(store_dtype)
+     dst_2[loc] = src_2.to(dtype).view(store_dtype)

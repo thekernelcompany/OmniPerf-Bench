@@ -1,0 +1,118 @@
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index dea4a7d04..045e90083 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -21,19 +21,19 @@ SRT = SGLang Runtime.
+ import asyncio
+ import atexit
+ import dataclasses
+-import json
+ import logging
+ import multiprocessing as mp
+ import os
+ import threading
+ import time
+ from http import HTTPStatus
+-from typing import Dict, List, Optional, Union
++from typing import AsyncIterator, Dict, List, Optional, Union
+ 
+ # Fix a bug of Python threading
+ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+ 
+ import aiohttp
++import orjson
+ import requests
+ import uvicorn
+ import uvloop
+@@ -192,14 +192,14 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+     """Handle a generate request."""
+     if obj.stream:
+ 
+-        async def stream_results():
++        async def stream_results() -> AsyncIterator[bytes]:
+             try:
+                 async for out in tokenizer_manager.generate_request(obj, request):
+-                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
++                    yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
+             except ValueError as e:
+                 out = {"error": {"message": str(e)}}
+-                yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+-            yield "data: [DONE]\n\n"
++                yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
++            yield b"data: [DONE]\n\n"
+ 
+         return StreamingResponse(
+             stream_results(),
+@@ -635,11 +635,10 @@ class Runtime:
+         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+             async with session.post(self.generate_url, json=json_data) as response:
+                 async for chunk, _ in response.content.iter_chunks():
+-                    chunk = chunk.decode("utf-8")
+-                    if chunk and chunk.startswith("data:"):
+-                        if chunk == "data: [DONE]\n\n":
++                    if chunk and chunk.startswith(b"data:"):
++                        if chunk == b"data: [DONE]\n\n":
+                             break
+-                        data = json.loads(chunk[5:].strip("\n"))
++                        data = orjson.loads(chunk[5:].strip())
+                         if "text" in data:
+                             cur = data["text"][pos:]
+                             if cur:
+@@ -672,7 +671,7 @@ class Runtime:
+             self.url + "/generate",
+             json=json_data,
+         )
+-        return json.dumps(response.json())
++        return orjson.dumps(response.json()).decode("utf-8")
+ 
+     def encode(
+         self,
+@@ -696,7 +695,7 @@ class Runtime:
+                 self.url + "/judge",
+                 json=json_data,
+             )
+-        return json.dumps(response.json())
++        return orjson.dumps(response.json()).decode("utf-8")
+ 
+     def __del__(self):
+         self.shutdown()
+@@ -745,8 +744,8 @@ class Engine:
+         ret = loop.run_until_complete(generate_request(obj, None))
+ 
+         if stream is True:
+-            STREAM_END_SYMBOL = "data: [DONE]"
+-            STREAM_CHUNK_START_SYMBOL = "data:"
++            STREAM_END_SYMBOL = b"data: [DONE]"
++            STREAM_CHUNK_START_SYMBOL = b"data:"
+ 
+             def generator_wrapper():
+                 offset = 0
+@@ -758,7 +757,7 @@ class Engine:
+                     if chunk.startswith(STREAM_END_SYMBOL):
+                         break
+                     else:
+-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
++                        data = orjson.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :].strip())
+                         data["text"] = data["text"][offset:]
+                         offset += len(data["text"])
+                         yield data
+@@ -792,8 +791,8 @@ class Engine:
+         ret = await generate_request(obj, None)
+ 
+         if stream is True:
+-            STREAM_END_SYMBOL = "data: [DONE]"
+-            STREAM_CHUNK_START_SYMBOL = "data:"
++            STREAM_END_SYMBOL = b"data: [DONE]"
++            STREAM_CHUNK_START_SYMBOL = b"data:"
+ 
+             generator = ret.body_iterator
+ 
+@@ -807,7 +806,7 @@ class Engine:
+                     if chunk.startswith(STREAM_END_SYMBOL):
+                         break
+                     else:
+-                        data = json.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :])
++                        data = orjson.loads(chunk[len(STREAM_CHUNK_START_SYMBOL) :].strip())
+                         data["text"] = data["text"][offset:]
+                         offset += len(data["text"])
+                         yield data

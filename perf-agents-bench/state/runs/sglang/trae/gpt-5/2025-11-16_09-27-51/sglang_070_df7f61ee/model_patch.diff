@@ -1,0 +1,214 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a440..9897ba832 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -26,6 +26,7 @@ from sglang.srt.configs.model_config import ModelConfig
+ from sglang.srt.managers import eplb_algorithms
+ from sglang.srt.model_loader import get_model_architecture
+ from sglang.srt.server_args import ServerArgs
++from sglang.srt.managers.schedule_batch import global_server_args_dict
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -35,7 +36,8 @@ class ExpertLocationMetadata:
+     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
+-    logical_to_rank_dispatch_physical_map: torch.Tensor  # (layers, num_logical_experts)
++    # (layers, num_logical_experts)
++    logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+ 
+     # -------------------------------- properties ------------------------------------
+ 
+@@ -70,11 +72,8 @@ class ExpertLocationMetadata:
+         num_layers_2, num_logical_experts_1 = (
+             self.logical_to_all_physical_map_num_valid.shape
+         )
+-        num_layers_3, num_logical_experts_2 = (
+-            self.logical_to_rank_dispatch_physical_map.shape
+-        )
+-        assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
+-        assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
++        assert num_layers_0 == num_layers_1 == num_layers_2
++        assert num_logical_experts_0 == num_logical_experts_1
+         assert num_physical_experts_0 == num_physical_experts_1
+ 
+     # -------------------------------- construction ------------------------------------
+@@ -200,17 +199,22 @@ class ExpertLocationMetadata:
+             logical_to_all_physical_map != -1, dim=-1
+         )
+ 
+-        return ExpertLocationMetadata(
+-            physical_to_logical_map=physical_to_logical_map,
+-            logical_to_all_physical_map=logical_to_all_physical_map_padded,
+-            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+-            logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
++        ep_algo = global_server_args_dict.get("ep_dispatch_algorithm")
++        logical_to_rank_map = None
++        if ep_algo == "static":
++            logical_to_rank_map = compute_logical_to_rank_dispatch_physical_map(
+                 logical_to_all_physical_map=logical_to_all_physical_map,
+                 num_gpus=ep_size,
+                 num_physical_experts=num_physical_experts,
+                 # TODO improve when we have real EP rank
+                 ep_rank=torch.distributed.get_rank() % ep_size,
+-            ),
++            )
++
++        return ExpertLocationMetadata(
++            physical_to_logical_map=physical_to_logical_map,
++            logical_to_all_physical_map=logical_to_all_physical_map_padded,
++            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
++            logical_to_rank_dispatch_physical_map=logical_to_rank_map,
+         )
+ 
+     # -------------------------------- mutation ------------------------------------
+@@ -230,8 +234,14 @@ class ExpertLocationMetadata:
+             "logical_to_all_physical_map_num_valid",
+             "logical_to_rank_dispatch_physical_map",
+         ]:
++            src = getattr(other, field)
+             dst = getattr(self, field)
+-            dst[...] = getattr(other, field)
++            if src is None:
++                setattr(self, field, None)
++            elif dst is None:
++                setattr(self, field, src)
++            else:
++                dst[...] = src
+ 
+     # -------------------------------- usage ------------------------------------
+ 
+@@ -310,44 +320,54 @@ def compute_logical_to_rank_dispatch_physical_map(
+     num_local_physical_experts = num_physical_experts // num_gpus
+     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+     dtype = logical_to_all_physical_map.dtype
++    device = logical_to_all_physical_map.device
+ 
+-    logical_to_rank_dispatch_physical_map = torch.full(
+-        size=(num_gpus, num_layers, num_logical_experts),
+-        fill_value=-1,
+-        dtype=dtype,
+-    )
++    # Only compute the mapping for the current ep_rank to reduce memory/time
++    out = torch.empty((num_layers, num_logical_experts), dtype=dtype)
++    out.fill_(-1)
+ 
+     for layer_id in range(num_layers):
+         for logical_expert_id in range(num_logical_experts):
+             candidate_physical_expert_ids = _logical_to_all_physical_raw(
+                 logical_to_all_physical_map, layer_id, logical_expert_id
+             )
+-            output_partial = logical_to_rank_dispatch_physical_map[
+-                :, layer_id, logical_expert_id
+-            ]
+-
+-            for gpu_id in range(num_gpus):
+-                same_gpu_physical_expert_ids = [
+-                    physical_expert_id
+-                    for physical_expert_id in candidate_physical_expert_ids
+-                    if _compute_gpu_id_of_physical_expert(
+-                        physical_expert_id, num_local_physical_experts
+-                    )
+-                    == gpu_id
+-                ]
+-                if len(same_gpu_physical_expert_ids) > 0:
+-                    output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
+-
+-            num_remain = torch.sum(output_partial == -1).item()
+-            output_partial[output_partial == -1] = torch.tensor(
+-                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
+-                dtype=dtype,
+-            )
+ 
+-    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
++            # Track which GPUs have a local candidate and find the first local for ep_rank
++            seen_gpus = set()
++            local_choice = None
++            for physical_expert_id in candidate_physical_expert_ids:
++                gid = _compute_gpu_id_of_physical_expert(
++                    physical_expert_id, num_local_physical_experts
++                )
++                if gid == ep_rank and local_choice is None:
++                    local_choice = physical_expert_id
++                seen_gpus.add(gid)
++
++            if local_choice is not None:
++                out[layer_id, logical_expert_id] = local_choice
++            else:
++                # Number of GPUs that don't have a local candidate
++                num_remain = max(0, num_gpus - len(seen_gpus))
++                if num_remain == 0:
++                    # Fallback: choose fairly from candidates
++                    out[layer_id, logical_expert_id] = _fair_choices(
++                        candidate_physical_expert_ids, k=1, r=r
++                    )[0]
++                else:
++                    # Position of this ep_rank among GPUs without local candidates
++                    pos = 0
++                    for gid in range(ep_rank):
++                        if gid not in seen_gpus:
++                            pos += 1
++                    choices = _fair_choices(
++                        candidate_physical_expert_ids, k=num_remain, r=r
++                    )
++                    # Safety in case pos >= len(choices) due to any corner case
++                    pos = min(pos, len(choices) - 1)
++                    out[layer_id, logical_expert_id] = choices[pos]
+ 
+-    device = logical_to_all_physical_map.device
+-    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
++    assert torch.all(out != -1)
++    return out.to(device)
+ 
+ 
+ def _logical_to_all_physical_raw(
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01a2..2a31f5549 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -17,15 +17,15 @@ from typing import Literal, Optional
+ 
+ import torch
+ 
+-from sglang.srt.managers.expert_location import get_global_expert_location_metadata
++from sglang.srt.managers.expert_location import get_global_expert_location_metadata, compute_logical_to_rank_dispatch_physical_map
+ from sglang.srt.managers.schedule_batch import global_server_args_dict
+ 
+ 
+ @dataclass
+ class ExpertLocationDispatchInfo:
+-    ep_dispatch_algorithm: Literal["static", "random"]
++    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]]
+     # (num_logical_experts,)
+-    partial_logical_to_rank_dispatch_physical_map: torch.Tensor
++    partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+     # (num_logical_experts, X)
+     partial_logical_to_all_physical_map: torch.Tensor
+     # (num_logical_experts,)
+@@ -40,11 +40,22 @@ class ExpertLocationDispatchInfo:
+         if ep_dispatch_algorithm is None:
+             return None
+ 
++        partial_rank_map = None
++        if ep_dispatch_algorithm == "static":
++            ltr = expert_location_metadata.logical_to_rank_dispatch_physical_map
++            if ltr is None:
++                ltr = compute_logical_to_rank_dispatch_physical_map(
++                    logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map,
++                    num_gpus=expert_location_metadata.ep_size,
++                    num_physical_experts=expert_location_metadata.num_physical_experts,
++                    ep_rank=torch.distributed.get_rank() % expert_location_metadata.ep_size,
++                )
++                expert_location_metadata.logical_to_rank_dispatch_physical_map = ltr
++            partial_rank_map = ltr[layer_id, :]
++
+         return cls(
+             ep_dispatch_algorithm=ep_dispatch_algorithm,
+-            partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
+-                layer_id, :
+-            ],
++            partial_logical_to_rank_dispatch_physical_map=partial_rank_map,
+             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
+                 layer_id, :
+             ],
