@@ -117,6 +117,14 @@ class PrepareExecutor:
         metadata_dir = Path(experiment_cfg.get("metadata_json_dir", "")).resolve() if experiment_cfg.get("metadata_json_dir") else None
         generators_dir = Path(experiment_cfg.get("generators_dir", "")).resolve() if experiment_cfg.get("generators_dir") else None
 
+        # Determine agent type early to control prompt construction
+        default_agent_early = str(self.cfg["agents"].get("default", "openhands"))
+        # Fair evaluation: suppress human optimization details (diff, stats, hints)
+        # but keep commit message as a hint for all agents
+        suppress_human_data = True
+        # Detach worktree from git history to prevent agent from accessing human commit
+        detach_from_history = True
+
         def process(item: Dict[str, Any]):
             item_id = item["item_id"]
             logger.info(f"Starting task processing: {item_id}")
@@ -136,7 +144,7 @@ class PrepareExecutor:
                 pre = resolve_precommit(rm.base_dir, human, None, item.get("pre_parent_index", 1))
                 logger.info(f"Resolved pre commit: {pre}")
 
-            wt_dir = rm.create_worktree(pre, item_id)
+            wt_dir = rm.create_worktree(pre, item_id, detach_from_history=detach_from_history)
 
             # Determine target files: if none provided, derive from pre..human diff
             provided_targets = task_cfg["optimization_contract"].get("target_files", [])
@@ -169,44 +177,50 @@ class PrepareExecutor:
 
             # Create a headless task file (text) from the prompt for -f usage
             # Add richer context to guide the agent
-            try:
-                import subprocess as _sp
-                commit_msg = _sp.check_output(["git", "show", "--no-patch", "--pretty=%B", human], cwd=rm.base_dir).decode().strip()
-            except Exception:
-                commit_msg = ""
-            try:
-                diff_stat = _sp.check_output(["git", "diff", "--stat", pre, human], cwd=rm.base_dir).decode().strip()
-            except Exception:
-                diff_stat = ""
+            # NOTE: For claude_code, we suppress human data to prevent reward hacking
+            commit_msg = ""
+            diff_stat = ""
+            if not suppress_human_data:
+                try:
+                    import subprocess as _sp
+                    commit_msg = _sp.check_output(["git", "show", "--no-patch", "--pretty=%B", human], cwd=rm.base_dir).decode().strip()
+                except Exception:
+                    commit_msg = ""
+                try:
+                    diff_stat = _sp.check_output(["git", "diff", "--stat", pre, human], cwd=rm.base_dir).decode().strip()
+                except Exception:
+                    diff_stat = ""
 
             # Read the actual commit data (diff/apis/perf_command)
+            # NOTE: For claude_code, we suppress human data to prevent reward hacking
             commit_data: Dict[str, Any] | None = None
             diff_text = ""
-            # Candidate paths: new configurable dir first, then legacy workspace path (if present)
-            candidate_paths: list[Path] = []
-            if metadata_dir:
-                candidate_paths.append(Path(metadata_dir) / f"{human}.json")
-            candidate_paths.append(Path(f"/workspace/OmniPerf-Bench/tmp_single_commit/{human}.json"))
-            for cand in candidate_paths:
-                try:
-                    if cand.exists():
-                        with open(cand, "r") as f:
-                            commit_data = json.load(f)
-                        diff_text = commit_data.get("diff_text", "") or diff_text
-                        break
-                except Exception:
-                    commit_data = None
-            
-            # If no diff from JSON, get it from git
-            if not diff_text:
-                try:
-                    diff_text = subprocess.check_output(
-                        ["git", "diff", pre, human], 
-                        cwd=rm.base_dir,
-                        text=True
-                    ).strip()
-                except Exception:
-                    diff_text = ""
+            if not suppress_human_data:
+                # Candidate paths: new configurable dir first, then legacy workspace path (if present)
+                candidate_paths: list[Path] = []
+                if metadata_dir:
+                    candidate_paths.append(Path(metadata_dir) / f"{human}.json")
+                candidate_paths.append(Path(f"/workspace/OmniPerf-Bench/tmp_single_commit/{human}.json"))
+                for cand in candidate_paths:
+                    try:
+                        if cand.exists():
+                            with open(cand, "r") as f:
+                                commit_data = json.load(f)
+                            diff_text = commit_data.get("diff_text", "") or diff_text
+                            break
+                    except Exception:
+                        commit_data = None
+
+                # If no diff from JSON, get it from git
+                if not diff_text:
+                    try:
+                        diff_text = subprocess.check_output(
+                            ["git", "diff", pre, human],
+                            cwd=rm.base_dir,
+                            text=True
+                        ).strip()
+                    except Exception:
+                        diff_text = ""
             
             # Create a concrete test script that demonstrates what we're optimizing
             # This follows the GSO format more closely
@@ -404,37 +418,39 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     task_lines.append("```")
             
             # Analyze the actual commit diff to understand what needs to be optimized
+            # NOTE: For claude_code, we skip this to prevent reward hacking
             optimization_hints = []
-            
-            # Get the actual diff to analyze what was changed
-            try:
-                diff_output = subprocess.check_output(
-                    ["git", "diff", pre, human], 
-                    cwd=rm.base_dir,
-                    text=True
-                ).strip()
-                
-                # Analyze the diff for specific patterns
-                if "torch.zeros" in diff_output and "torch.empty" in diff_output:
-                    optimization_hints.append("- Replace torch.zeros with torch.empty where initialization is not needed")
-                    optimization_hints.append("- Avoid unnecessary memory initialization overhead")
-                
-                if "fill_" in diff_output:
-                    optimization_hints.append("- Remove unnecessary tensor filling operations")
-                
-                if "BlockScan" in diff_output or "cub::" in diff_output:
-                    optimization_hints.append("- Use efficient parallel algorithms for prefix sum computation")
-                
-                if any(x in diff_output for x in ["cumsum", "prefix sum"]):
-                    optimization_hints.append("- Optimize cumulative sum calculations")
-                    
-            except Exception:
-                # Fallback to commit message analysis
-                if commit_msg:
-                    if "speed up" in commit_msg.lower():
-                        optimization_hints.append("- Focus on performance bottlenecks in the identified files")
-                    if "align" in commit_msg.lower() and "kernel" in commit_msg.lower():
-                        optimization_hints.append("- Optimize alignment and memory access patterns in CUDA kernels")
+
+            if not suppress_human_data:
+                # Get the actual diff to analyze what was changed
+                try:
+                    diff_output = subprocess.check_output(
+                        ["git", "diff", pre, human],
+                        cwd=rm.base_dir,
+                        text=True
+                    ).strip()
+
+                    # Analyze the diff for specific patterns
+                    if "torch.zeros" in diff_output and "torch.empty" in diff_output:
+                        optimization_hints.append("- Replace torch.zeros with torch.empty where initialization is not needed")
+                        optimization_hints.append("- Avoid unnecessary memory initialization overhead")
+
+                    if "fill_" in diff_output:
+                        optimization_hints.append("- Remove unnecessary tensor filling operations")
+
+                    if "BlockScan" in diff_output or "cub::" in diff_output:
+                        optimization_hints.append("- Use efficient parallel algorithms for prefix sum computation")
+
+                    if any(x in diff_output for x in ["cumsum", "prefix sum"]):
+                        optimization_hints.append("- Optimize cumulative sum calculations")
+
+                except Exception:
+                    # Fallback to commit message analysis
+                    if commit_msg:
+                        if "speed up" in commit_msg.lower():
+                            optimization_hints.append("- Focus on performance bottlenecks in the identified files")
+                        if "align" in commit_msg.lower() and "kernel" in commit_msg.lower():
+                            optimization_hints.append("- Optimize alignment and memory access patterns in CUDA kernels")
             
             # If we have specific optimization hints, add them
             if optimization_hints:
@@ -559,7 +575,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 iterations = args_cfg.get("iterations", 50)
                 max_budget = args_cfg.get("max_budget_per_task", 10.0)
                 use_python_api = bool(args_cfg.get("use_python_api", True))
-            elif default_agent in {"trae", "codex", "codex_cli"}:
+            elif default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
                 agent_cfg = self.cfg["agents"].get(default_agent, {})
                 cli = agent_cfg.get("cli", "python")
                 time_budget = int(agent_cfg.get("time_budget_minutes", 60))
@@ -629,8 +645,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         "-b", str(max_budget)
                     ]
 
-            elif default_agent in {"trae", "codex", "codex_cli"}:
-                # Run Trae/Codex (module) or Codex CLI
+            elif default_agent in {"trae", "codex", "codex_cli", "claude_code"}:
+                # Run Trae/Codex (module), Codex CLI, or Claude Code
                 if default_agent == "trae":
                     cmd = [
                         cli, "-m", "trae_agent.cli", "run",
@@ -655,7 +671,7 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     ]
                     if trae_config_file:
                         cmd.extend(["--config-file", str(trae_config_file)])
-                else:  # codex_cli
+                elif default_agent == "codex_cli":
                     # Invoke the locally installed Codex CLI directly using non-interactive exec
                     # Read task prompt content to pass as a single PROMPT argument
                     try:
@@ -671,6 +687,24 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     if profile:
                         cmd += ["-p", str(profile)]
                     cmd += [prompt_text]
+                else:  # claude_code
+                    # Invoke Claude Code CLI in non-interactive print mode
+                    # Read task prompt from existing task_file - will be passed via stdin
+                    try:
+                        claude_prompt_text = Path(task_file).read_text()
+                    except Exception:
+                        claude_prompt_text = ""
+
+                    model = args_cfg.get("model") or os.environ.get("CLAUDE_MODEL", "sonnet")
+
+                    # Note: prompt passed via stdin (not as argument) to handle long/complex prompts
+                    cmd = [
+                        cli, "-p",  # Non-interactive print mode
+                        "--output-format", "json",  # Structured output
+                        "--dangerously-skip-permissions",  # Like codex_cli's --sandbox danger-full-access
+                        "--model", str(model),
+                        "--disallowedTools", "WebFetch,WebSearch",  # Block web access
+                    ]
                 logger.info(f"{default_agent} agent command: {' '.join(map(str, cmd))}")
                 logger.info(f"{default_agent} config file: {trae_config_file}")
 
@@ -958,8 +992,11 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         env["CODEX_STEP_LOG_FILE"] = step_log_path
                     
                     # Use Popen for real-time output streaming (same as OpenHands)
+                    # For claude_code, pass prompt via stdin to handle long/complex prompts
+                    stdin_pipe = subprocess.PIPE if default_agent == "claude_code" else None
                     proc = subprocess.Popen(
                         cmd,
+                        stdin=stdin_pipe,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
@@ -968,6 +1005,10 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         bufsize=1,
                         universal_newlines=True
                     )
+                    # Write prompt to stdin for claude_code and close it
+                    if default_agent == "claude_code" and proc.stdin:
+                        proc.stdin.write(claude_prompt_text)
+                        proc.stdin.close()
                     
                     stdout_lines = []
                     stderr_lines = []
@@ -1002,9 +1043,15 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                                     stderr_lines.append(line)
                                     logger.warning(f"{agent_label} STDERR: {line}")
                                     sys.stderr.flush()
-                    
+
                     # Read any remaining output
-                    remaining_stdout, remaining_stderr = proc.communicate()
+                    # For claude_code, stdin is already closed, so we use wait() + read()
+                    if default_agent == "claude_code":
+                        proc.wait()
+                        remaining_stdout = proc.stdout.read() if proc.stdout else ""
+                        remaining_stderr = proc.stderr.read() if proc.stderr else ""
+                    else:
+                        remaining_stdout, remaining_stderr = proc.communicate()
                     if remaining_stdout:
                         for line in remaining_stdout.split('\n'):
                             if line.strip():
@@ -1032,6 +1079,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                             jw.write_trae_logs(stdout_content, stderr_content)
                         elif default_agent == "codex":
                             jw.write_codex_logs(stdout_content, stderr_content)
+                        elif default_agent == "claude_code":
+                            jw.write_claude_code_logs(stdout_content, stderr_content)
                         else:
                             jw.write_openhands_logs(stdout_content, stderr_content)
                     except Exception:
@@ -1060,8 +1109,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         logger.error(f"Stderr: {stderr_content}")
                 
                 # Determine status based on actual task completion, not just return code
-                if default_agent in {"trae", "codex"}:
-                    # For Trae/Codex, check if commits were made or files changed
+                if default_agent in {"trae", "codex", "claude_code"}:
+                    # For Trae/Codex/Claude Code, check if commits were made or files changed
                     status = "success" if task_completed else "error"
                 else:
                     # For OpenHands, use return code
@@ -1144,8 +1193,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
                 if len(changed) == 0:
                     logger.warning("No file changes detected.")
-                    # For Trae/Codex agent, check if this is due to detection bug vs actual no changes
-                    if default_agent in {"trae", "codex"}:
+                    # For Trae/Codex/Claude Code agent, check if this is due to detection bug vs actual no changes
+                    if default_agent in {"trae", "codex", "claude_code"}:
                         # Check if there are any commits made by agent
                         try:
                             commits = subprocess.check_output([

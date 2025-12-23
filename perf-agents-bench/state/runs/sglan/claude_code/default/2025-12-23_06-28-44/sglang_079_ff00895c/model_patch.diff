@@ -1,0 +1,203 @@
+diff --git a/sgl-kernel/csrc/cpu/norm.cpp b/sgl-kernel/csrc/cpu/norm.cpp
+index 391a0d4..7dce52e 100644
+--- a/sgl-kernel/csrc/cpu/norm.cpp
++++ b/sgl-kernel/csrc/cpu/norm.cpp
+@@ -25,9 +25,9 @@ void rmsnorm_kernel_impl(
+       fVec sum_fvec = fVec(float(0));
+       float sum_val = float(0);
+ 
+-      int64_t d;
+-#pragma GCC unroll 4
+-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
++      int64_t d = 0;
++#pragma GCC unroll 8
++      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+         bVec x_bvec = bVec::loadu(input_ptr + d);
+         fVec x_fvec0, x_fvec1;
+         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+@@ -35,7 +35,7 @@ void rmsnorm_kernel_impl(
+         sum_fvec += x_fvec0 * x_fvec0;
+         sum_fvec += x_fvec1 * x_fvec1;
+       }
+-#pragma GCC unroll 4
++#pragma GCC unroll 8
+       for (; d < hidden_size; ++d) {
+         float x_val = static_cast<float>(input_ptr[d]);
+         sum_val += x_val * x_val;
+@@ -45,8 +45,9 @@ void rmsnorm_kernel_impl(
+       float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+       const fVec scale_fvec = fVec(rsqrt_var);
+ 
+-#pragma GCC unroll 4
+-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
++      d = 0;
++#pragma GCC unroll 8
++      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+         bVec x_bvec = bVec::loadu(input_ptr + d);
+         fVec x_fvec0, x_fvec1;
+         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+@@ -61,7 +62,7 @@ void rmsnorm_kernel_impl(
+         bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+         out_bvec.store(out_ptr + d);
+       }
+-#pragma GCC unroll 4
++#pragma GCC unroll 8
+       for (; d < hidden_size; ++d) {
+         float x_val = static_cast<float>(input_ptr[d]);
+         float w_val = static_cast<float>(weight[d]);
+@@ -96,9 +97,9 @@ void fused_add_rmsnorm_kernel_impl(
+       fVec sum_fvec = fVec(float(0));
+       float sum_val = float(0);
+ 
+-      int64_t d;
+-#pragma GCC unroll 4
+-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
++      int64_t d = 0;
++#pragma GCC unroll 8
++      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+         bVec x_bvec = bVec::loadu(input_ptr + d);
+         fVec x_fvec0, x_fvec1;
+         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+@@ -119,7 +120,7 @@ void fused_add_rmsnorm_kernel_impl(
+         x_fvec0.store(buffer_ptr + d);
+         x_fvec1.store(buffer_ptr + d + fVec::size());
+       }
+-#pragma GCC unroll 4
++#pragma GCC unroll 8
+       for (; d < hidden_size; ++d) {
+         float x_val = static_cast<float>(input_ptr[d]);
+         float r_val = static_cast<float>(residual_ptr[d]);
+@@ -135,8 +136,9 @@ void fused_add_rmsnorm_kernel_impl(
+       float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+       const fVec scale_fvec = fVec(rsqrt_var);
+ 
+-#pragma GCC unroll 4
+-      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
++      d = 0;
++#pragma GCC unroll 8
++      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
+         fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+ 
+@@ -149,7 +151,7 @@ void fused_add_rmsnorm_kernel_impl(
+         bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+         x_bvec.store(input_ptr + d);
+       }
+-#pragma GCC unroll 4
++#pragma GCC unroll 8
+       for (; d < hidden_size; ++d) {
+         float x_val = buffer_ptr[d] * rsqrt_var * static_cast<float>(weight[d]);
+         input_ptr[d] = x_val;
+diff --git a/sgl-kernel/csrc/cpu/rope.cpp b/sgl-kernel/csrc/cpu/rope.cpp
+index 64bc297..7e03023 100644
+--- a/sgl-kernel/csrc/cpu/rope.cpp
++++ b/sgl-kernel/csrc/cpu/rope.cpp
+@@ -39,6 +39,7 @@ void rope_kernel_impl(
+       cos_start = t_emb_pos + p * HR;
+       // step 1) apply_rotary_pos_emb for the rotary_dim elements in every
+       // head of query/key
++#pragma GCC unroll 4
+       for (int64_t h = 0; h < rotary_dim; h += 2) {
+         scalar_t cos = cos_start[h >> 1];
+         scalar_t sin = sin_start[h >> 1];
+@@ -49,10 +50,11 @@ void rope_kernel_impl(
+         q_pe_out[out_offset_q + h] = out1;
+         q_pe_out[out_offset_q + h + 1] = out2;
+       }
++      int64_t k_pe_offset = seq * k_pe_stride_s;
++#pragma GCC unroll 4
+       for (int64_t h = 0; h < HK; h += 2) {
+         scalar_t cos = cos_start[h >> 1];
+         scalar_t sin = sin_start[h >> 1];
+-        int64_t k_pe_offset = seq * k_pe_stride_s;
+         scalar_t in1_k = k_pe[k_pe_offset + h];
+         scalar_t in2_k = k_pe[k_pe_offset + h + 1];
+         scalar_t out1_k = in1_k * cos - in2_k * sin;
+diff --git a/sgl-kernel/csrc/cpu/topk.cpp b/sgl-kernel/csrc/cpu/topk.cpp
+index 6a6b64d..6b672ef 100644
+--- a/sgl-kernel/csrc/cpu/topk.cpp
++++ b/sgl-kernel/csrc/cpu/topk.cpp
+@@ -81,20 +81,23 @@ void grouped_topk_kernel_impl(
+     alignas(64) float scores[NUM_EXPERTS];
+ 
+     using elem_t = std::pair<float, int32_t>;
+-    std::vector<elem_t> queue(num_groups);
+-    std::vector<elem_t> queue2(topk_group * num_experts_per_group);
++    std::vector<elem_t> queue;
++    queue.reserve(num_groups);
++    std::vector<elem_t> queue2;
++    queue2.reserve(topk_group * num_experts_per_group);
+ 
+     for (int64_t i = begin; i < end; ++i) {
+       // do softmax to get scores
+       softmax<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+ 
+       // find max score per group
++      queue.clear();
+       for (int64_t g = 0; g < num_groups; ++g) {
+         float gmax = -std::numeric_limits<float>::infinity();
+         for (int64_t e = 0; e < num_experts_per_group; ++e) {
+           gmax = std::max(gmax, scores[g * num_experts_per_group + e]);
+         }
+-        queue[g] = {gmax, g};
++        queue.push_back({gmax, g});
+       }
+ 
+       // find group topk
+@@ -103,11 +106,12 @@ void grouped_topk_kernel_impl(
+             return x.first > y.first;
+           });
+ 
++      queue2.clear();
+       for (int64_t g = 0; g < topk_group; ++g) {
+         int32_t group_idx = queue[g].second;
+         for (int64_t e = 0; e < num_experts_per_group; ++e) {
+           int32_t expert_idx = group_idx * num_experts_per_group + e;
+-          queue2[g * num_experts_per_group + e] = {scores[expert_idx], expert_idx};
++          queue2.push_back({scores[expert_idx], expert_idx});
+         }
+       }
+ 
+@@ -194,14 +198,17 @@ void biased_grouped_topk_kernel_impl(
+     alignas(64) float scores2[NUM_EXPERTS];
+ 
+     using elem_t = std::pair<float, int32_t>;
+-    std::vector<elem_t> queue(num_groups);
+-    std::vector<elem_t> queue2(topk_group * num_experts_per_group);
++    std::vector<elem_t> queue;
++    queue.reserve(num_groups);
++    std::vector<elem_t> queue2;
++    queue2.reserve(topk_group * num_experts_per_group);
+ 
+     for (int64_t i = begin; i < end; ++i) {
+       // do sigmoid to get scores
+       sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+       apply_bias<scalar_t, NUM_EXPERTS>(scores2, scores, bias);
+ 
++      queue.clear();
+       for (int64_t g = 0; g < num_groups; ++g) {
+         // find the max
+         float gmax = at::vec::reduce_all<float>(
+@@ -228,7 +235,7 @@ void biased_grouped_topk_kernel_impl(
+         // restore scores for choice
+         scores2[first_max_idx] = gmax;
+ 
+-        queue[g] = {gmax + gmax2, g};
++        queue.push_back({gmax + gmax2, g});
+       }
+ 
+       // find group topk
+@@ -237,11 +244,12 @@ void biased_grouped_topk_kernel_impl(
+             return x.first > y.first;
+           });
+ 
++      queue2.clear();
+       for (int64_t g = 0; g < topk_group; ++g) {
+         int32_t group_idx = queue[g].second;
+         for (int64_t e = 0; e < num_experts_per_group; ++e) {
+           int32_t expert_idx = group_idx * num_experts_per_group + e;
+-          queue2[g * num_experts_per_group + e] = {scores2[expert_idx], expert_idx};
++          queue2.push_back({scores2[expert_idx], expert_idx});
+         }
+       }
+ 

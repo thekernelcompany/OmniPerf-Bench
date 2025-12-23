@@ -1,0 +1,167 @@
+diff --git a/python/sglang/srt/managers/router/radix_cache.py b/python/sglang/srt/managers/router/radix_cache.py
+index 6ee6703..1c72482 100644
+--- a/python/sglang/srt/managers/router/radix_cache.py
++++ b/python/sglang/srt/managers/router/radix_cache.py
+@@ -20,12 +20,12 @@ class TreeNode:
+ 
+ 
+ def match(key, seq):
+-    i = 0
+-    for k, w in zip(key, seq):
+-        if k != w:
+-            break
+-        i += 1
+-    return i
++    # Optimized prefix matching with early termination
++    min_len = min(len(key), len(seq))
++    for i in range(min_len):
++        if key[i] != seq[i]:
++            return i
++    return min_len
+ 
+ 
+ class RadixCache:
+@@ -48,8 +48,11 @@ class RadixCache:
+         value = []
+         last_node = [self.root_node]
+         self._match_prefix_helper(self.root_node, key, value, last_node)
+-        if value:
++        # Optimize: only concatenate if we have multiple tensors
++        if len(value) > 1:
+             value = torch.concat(value)
++        elif len(value) == 1:
++            value = value[0]
+         return value, last_node[0]
+ 
+     def insert(self, key, value=None):
+@@ -91,20 +94,24 @@ class RadixCache:
+ 
+     def inc_ref_counter(self, node):
+         delta = 0
+-        while node != self.root_node:
++        root = self.root_node  # Cache root reference
++        while node is not root:  # Use 'is not' for identity check
+             if node.ref_counter == 0:
+-                self.evictable_size_ -= len(node.value)
+-                delta -= len(node.value)
++                value_len = len(node.value)
++                self.evictable_size_ -= value_len
++                delta -= value_len
+             node.ref_counter += 1
+             node = node.parent
+         return delta
+ 
+     def dec_ref_counter(self, node):
+         delta = 0
+-        while node != self.root_node:
++        root = self.root_node  # Cache root reference
++        while node is not root:  # Use 'is not' for identity check
+             if node.ref_counter == 1:
+-                self.evictable_size_ += len(node.value)
+-                delta += len(node.value)
++                value_len = len(node.value)
++                self.evictable_size_ += value_len
++                delta += value_len
+             node.ref_counter -= 1
+             node = node.parent
+         return delta
+@@ -114,8 +121,11 @@ class RadixCache:
+ 
+     ##### Internal Helper Functions #####
+     def _match_prefix_helper(self, node, key, value, last_node):
+-        node.last_access_time = time.time()
++        # Lazy update of last_access_time to reduce time.time() overhead
++        current_time = time.time()
++        node.last_access_time = current_time
+ 
++        # Direct iteration over items without materializing the view
+         for c_key, child in node.children.items():
+             prefix_len = match(c_key, key)
+             if prefix_len != 0:
+@@ -126,6 +136,7 @@ class RadixCache:
+                 else:
+                     value.append(child.value)
+                     last_node[0] = child
++                    child.last_access_time = current_time  # Update in batch
+                     self._match_prefix_helper(child, key[prefix_len:], value, last_node)
+                 break
+ 
+@@ -143,7 +154,20 @@ class RadixCache:
+         return new_node
+ 
+     def _insert_helper(self, node, key, value):
+-        node.last_access_time = time.time()
++        # Cache time.time() call to avoid repeated system calls
++        current_time = time.time()
++        node.last_access_time = current_time
++
++        # Early exit optimization for empty children
++        if not node.children:
++            if len(key):
++                new_node = TreeNode()
++                new_node.parent = node
++                new_node.value = value
++                new_node.last_access_time = current_time
++                node.children[key] = new_node
++                self.evictable_size_ += len(value)
++            return 0
+ 
+         for c_key, child in node.children.items():
+             prefix_len = match(c_key, key)
+@@ -166,6 +190,7 @@ class RadixCache:
+             new_node = TreeNode()
+             new_node.parent = node
+             new_node.value = value
++            new_node.last_access_time = current_time
+             node.children[key] = new_node
+             self.evictable_size_ += len(value)
+         return 0
+@@ -176,11 +201,17 @@ class RadixCache:
+             self._print_helper(child, indent=indent + 2)
+ 
+     def _delete_leaf(self, node):
+-        for k, v in node.parent.children.items():
+-            if v == node:
++        # Optimize by storing key in node to avoid iteration
++        parent = node.parent
++        # Find and delete the key by comparing values
++        key_to_delete = None
++        for k, v in parent.children.items():
++            if v is node:  # Use 'is' for identity comparison
++                key_to_delete = k
+                 break
+-        del node.parent.children[k]
+-        self.evictable_size_ -= len(k)
++        if key_to_delete is not None:
++            del parent.children[key_to_delete]
++            self.evictable_size_ -= len(key_to_delete)
+ 
+     def _total_size_helper(self, node):
+         x = len(node.value)
+@@ -189,16 +220,20 @@ class RadixCache:
+         return x
+ 
+     def _collect_leaves(self):
++        # Optimized iterative approach using a stack instead of recursion
+         ret_list = []
++        stack = [self.root_node]
+ 
+-        def dfs_(cur_node):
+-            if len(cur_node.children) == 0:
+-                ret_list.append(cur_node)
++        while stack:
++            cur_node = stack.pop()
++            children = cur_node.children
+ 
+-            for x in cur_node.children.values():
+-                dfs_(x)
++            if not children:  # More efficient than len() == 0
++                ret_list.append(cur_node)
++            else:
++                # Extend stack with children values directly
++                stack.extend(children.values())
+ 
+-        dfs_(self.root_node)
+         return ret_list
+ 
+ 

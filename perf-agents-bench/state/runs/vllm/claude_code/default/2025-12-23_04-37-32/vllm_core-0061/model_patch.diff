@@ -1,0 +1,112 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 43f30f710..30b3a6729 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -68,8 +68,8 @@ class BlockPool:
+             The cached block if it exists, or None.
+         """
+         if block_hash in self.cached_block_hash_to_block:
+-            first_block_id = list(
+-                self.cached_block_hash_to_block[block_hash].keys())[0]
++            first_block_id = next(iter(
++                self.cached_block_hash_to_block[block_hash].keys()))
+             return self.cached_block_hash_to_block[block_hash][first_block_id]
+         return None
+ 
+@@ -171,8 +171,7 @@ class BlockPool:
+                 f"Cannot get {num_blocks} free blocks from the pool")
+ 
+         ret: list[KVCacheBlock] = []
+-        idx = 0
+-        while idx < num_blocks:
++        for _ in range(num_blocks):
+             # First allocate blocks.
+             curr_block = self.free_block_queue.popleft()
+             assert curr_block.ref_cnt == 0
+@@ -183,7 +182,6 @@ class BlockPool:
+ 
+             curr_block.incr_ref()
+             ret.append(curr_block)
+-            idx += 1
+ 
+         return ret
+ 
+@@ -199,15 +197,20 @@ class BlockPool:
+             True if the block is evicted, False otherwise.
+         """
+         block_hash = block.block_hash
+-        if block_hash and block_hash in self.cached_block_hash_to_block:
+-            block.reset_hash()
+-            del self.cached_block_hash_to_block[block_hash][block.block_id]
++        if block_hash is None:
++            return False
++
++        block_dict = self.cached_block_hash_to_block.get(block_hash)
++        if block_dict is None:
++            return False
+ 
+-            if len(self.cached_block_hash_to_block[block_hash]) == 0:
+-                del self.cached_block_hash_to_block[block_hash]
++        block.reset_hash()
++        del block_dict[block.block_id]
+ 
+-            return True
+-        return False
++        if not block_dict:
++            del self.cached_block_hash_to_block[block_hash]
++
++        return True
+ 
+     def touch(self, blocks: list[KVCacheBlock]) -> None:
+         """Touch a block increases its reference count by 1, and may remove
+@@ -217,11 +220,13 @@ class BlockPool:
+         Args:
+             blocks: A list of blocks to touch.
+         """
++        null_block = self.null_block
++        free_block_queue = self.free_block_queue
+         for block in blocks:
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+             # candidate), so remove it.
+-            if block.ref_cnt == 0 and block != self.null_block:
+-                self.free_block_queue.remove(block)
++            if block.ref_cnt == 0 and block != null_block:
++                free_block_queue.remove(block)
+             block.incr_ref()
+ 
+     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+@@ -232,11 +237,13 @@ class BlockPool:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+         """
++        null_block = self.null_block
++        free_block_queue = self.free_block_queue
+         for block in ordered_blocks:
+             block.decr_ref()
+             # null_block should not be added to the free list.
+-            if block.ref_cnt == 0 and block != self.null_block:
+-                self.free_block_queue.append(block)
++            if block.ref_cnt == 0 and block != null_block:
++                free_block_queue.append(block)
+ 
+     def reset_prefix_cache(self) -> bool:
+         """Reset prefix cache. This function may be used in RLHF
+@@ -254,13 +261,14 @@ class BlockPool:
+                 "blocks (%d) are not freed yet", num_used_blocks - 1)
+             return False
+ 
++        # Remove all hashes from cached blocks only (optimization).
++        for block_dict in self.cached_block_hash_to_block.values():
++            for block_id in block_dict:
++                self.blocks[block_id].reset_hash()
++
+         # Remove all hashes so that no new blocks will hit.
+         self.cached_block_hash_to_block = defaultdict(dict)
+ 
+-        # Remove all hashes from all blocks.
+-        for block in self.blocks:
+-            block.reset_hash()
+-
+         logger.info("Successfully reset prefix cache")
+         return True
+ 

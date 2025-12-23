@@ -1,0 +1,41 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index a9ef97391..3d614444b 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -15,7 +15,9 @@ def get_token_bin_counts_and_mask(
+     bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
++    # Use constant tensor instead of ones_like to reduce memory allocation
++    ones = torch.ones((), dtype=torch.long, device=tokens.device)
++    bin_counts.scatter_add_(1, tokens, ones.expand_as(tokens))
+     bin_counts = bin_counts[:, :vocab_size]
+     mask = bin_counts > 0
+ 
+@@ -45,12 +47,19 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++
++    # Compute combined mask once to avoid redundant operations
++    combined_mask = prompt_mask | output_mask
++
++    # Expand penalties using unsqueeze instead of repeat to avoid memory copy
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(dim=1)
++
++    # Apply repetition penalties using broadcasting instead of indexing
++    positive_mask = logits > 0
++
++    penalty_values = torch.where(combined_mask, repetition_penalties_expanded, 1.0)
++    logits = torch.where(positive_mask, logits / penalty_values, logits * penalty_values)
++
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+     logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts

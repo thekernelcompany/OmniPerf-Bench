@@ -1,0 +1,91 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 5d8b3f423..22b7c8d1e 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -137,26 +137,23 @@ def apply_top_k_top_p_tpu(
+     probs_sort, _ = probs.sort(dim=-1, descending=False)
+ 
+     if k is not None:
+-        top_k_count = probs_sort.size(1) - k.to(torch.long)  # shape: (batch, )
+-        top_k_count = top_k_count.unsqueeze(dim=1)
++        top_k_count = (probs_sort.size(1) - k.to(torch.long)).unsqueeze(dim=1)
+         top_k_cutoff = probs_sort.gather(-1, top_k_count)
+ 
+         # Make sure the no top-k rows are no-op.
+         no_top_k_mask = (k == logits.shape[1]).unsqueeze(dim=1)
+         top_k_cutoff.masked_fill_(no_top_k_mask, -float("inf"))
+ 
+-        elements_to_discard = probs < top_k_cutoff
+-        logits.masked_fill_(elements_to_discard, -float("inf"))
++        logits.masked_fill_(probs < top_k_cutoff, -float("inf"))
+ 
+     if p is not None:
+         cumprob = torch.cumsum(probs_sort, dim=-1)
+         top_p_mask = cumprob <= 1 - p.unsqueeze(dim=1)
+         top_p_mask[:, -1] = False  # at least one
+ 
+-        top_p_count = top_p_mask.sum(dim=-1).unsqueeze(1)
++        top_p_count = top_p_mask.sum(dim=-1, keepdim=True)
+         top_p_cutoff = probs_sort.gather(-1, top_p_count)
+-        elements_to_discard = probs < top_p_cutoff
+-        logits.masked_fill_(elements_to_discard, -float("inf"))
++        logits.masked_fill_(probs < top_p_cutoff, -float("inf"))
+ 
+     return logits
+ 
+@@ -184,24 +181,22 @@ def apply_top_k_top_p(
+ 
+     if k is not None:
+         # Apply top-k.
+-        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
++        top_k_indices = (logits_sort.size(1) - k.to(torch.long)).unsqueeze(dim=1)
+         # Get all the top_k values.
+-        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+-        top_k_mask = logits_sort < top_k_mask
+-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
++        top_k_cutoff = logits_sort.gather(1, top_k_indices)
++        logits_sort.masked_fill_(logits_sort < top_k_cutoff, -float("inf"))
+ 
+     if p is not None:
+         # Apply top-p.
+         probs_sort = logits_sort.softmax(dim=-1)
+-        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
++        torch.cumsum(probs_sort, dim=-1, out=probs_sort)
++        top_p_mask = probs_sort <= 1 - p.unsqueeze(dim=1)
+         # at least one
+         top_p_mask[:, -1] = False
+         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+-    return logits
++    return logits_sort.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+ 
+ 
+ def apply_top_k_only(
+@@ -217,11 +212,11 @@ def apply_top_k_only(
+     """
+     no_top_k_mask = k == logits.shape[1]
+     # Set non-top-k rows to 1 so that we can gather.
+-    k = k.masked_fill(no_top_k_mask, 1)
+-    max_top_k = k.max()
++    k_masked = k.masked_fill(no_top_k_mask, 1)
++    max_top_k = k_masked.max()
+     # topk.values tensor has shape [batch_size, max_top_k].
+     # Convert top k to 0-based index in range [0, max_top_k).
+-    k_index = k.sub_(1).unsqueeze(1)
++    k_index = (k_masked - 1).unsqueeze(1)
+     top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
+     # Handle non-topk rows.
+     top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
+@@ -250,7 +245,8 @@ def random_sample(
+         # one by one. Optimize this.
+         for i, generator in generators.items():
+             q[i].exponential_(generator=generator)
+-    return probs.div_(q).argmax(dim=-1).view(-1)
++    probs.div_(q)
++    return probs.argmax(dim=-1, keepdim=False)
+ 
+ 
+ def flashinfer_sample(

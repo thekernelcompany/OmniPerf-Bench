@@ -1,0 +1,44 @@
+diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py
+index 3dd12e2e2..5fc75dc19 100644
+--- a/vllm/core/evictor_v2.py
++++ b/vllm/core/evictor_v2.py
+@@ -59,6 +59,7 @@ class BlockMetaData():
+     Here we use physical block id as the dict key, as there maybe several
+     blocks with the same content hash, but their physical id is unique.
+     """
++    __slots__ = ('content_hash', 'num_hashed_tokens', 'last_accessed')
+ 
+     def __init__(self, content_hash: int, num_hashed_tokens: int,
+                  last_accessed: float):
+@@ -85,12 +86,14 @@ class LRUEvictor(Evictor):
+         if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block = next(iter(self.free_table.values()))
+-        evicted_block_id = next(iter(self.free_table.keys()))
++        # Use single items() iterator instead of separate keys/values iterators
++        items = iter(self.free_table.items())
++        evicted_block_id, evicted_block = next(items)
++
+         # The blocks with the lowest timestamps should be placed consecutively
+         # at the start of OrderedDict. Loop through all these blocks to
+         # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
++        for _id, block in items:
+             if evicted_block.last_accessed > block.last_accessed or (
+                     evicted_block.last_accessed == block.last_accessed and
+                     evicted_block.num_hashed_tokens < block.num_hashed_tokens):
+@@ -111,10 +114,11 @@ class LRUEvictor(Evictor):
+         self.free_table[block_id].last_accessed = last_accessed
+ 
+     def remove(self, block_id: int):
+-        if block_id not in self.free_table:
++        try:
++            self.free_table.pop(block_id)
++        except KeyError:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
+ 
+     @property
+     def num_blocks(self) -> int:

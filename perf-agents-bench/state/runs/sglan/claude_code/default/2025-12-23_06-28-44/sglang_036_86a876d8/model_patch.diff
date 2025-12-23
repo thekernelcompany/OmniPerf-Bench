@@ -1,0 +1,46 @@
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 19fa180..348e955 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -117,10 +117,12 @@ class EagleDraftInput:
+     ):
+         bs = self.accept_length.numel()
+ 
+-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
++        qo_indptr = torch.empty((bs + 1,), dtype=torch.int32, device="cuda")
++        qo_indptr[0] = 0
+         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
+ 
+-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
++        cum_kv_seq_len = torch.empty((bs + 1,), dtype=torch.int32, device="cuda")
++        cum_kv_seq_len[0] = 0
+         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+ 
+         # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
+@@ -278,9 +280,10 @@ class EagleVerifyInput:
+             dtype=torch.int32,
+             device="cuda",
+         )
+-        cum_kv_seq_len = torch.zeros(
++        cum_kv_seq_len = torch.empty(
+             (batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        cum_kv_seq_len[0] = 0
+ 
+         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+@@ -738,12 +741,13 @@ def select_top_k_tokens(
+         hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+         scores = topk_p  # shape: (b, topk)
+ 
++        # Optimize: use expand instead of repeat for memory efficiency
+         tree_info = (
+             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
+             topk_index,  # shape: (b, topk)
+             torch.arange(-1, topk, dtype=torch.long, device="cuda")
+             .unsqueeze(0)
+-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
++            .expand(topk_p.shape[0], -1),  # shape: (b, topk + 1)
+         )
+     else:
+         # The later decode steps

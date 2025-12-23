@@ -1,0 +1,75 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 42ae9d2..982a55a 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -297,8 +297,8 @@ class DeepseekV2MoE(nn.Module):
+         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+     ) -> torch.Tensor:
+         shared_output = None
+-        topk_idx = torch.full(
+-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++        topk_idx = torch.empty(
++            (0, self.top_k), dtype=torch.int, device=hidden_states.device
+         )
+         topk_weights = torch.empty(
+             (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+@@ -815,7 +815,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+             q_nope_out = torch.bmm(
+                 q_nope.to(torch.bfloat16).transpose(0, 1),
+-                self.w_kc.to(torch.bfloat16) * self.w_scale,
++                self.w_kc_bf16_scaled,
+             )
+         elif self.w_kc.dtype == torch.float8_e4m3fn:
+             q_nope_val, q_nope_scale = input_to_float8(
+@@ -846,7 +846,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+             attn_bmm_output = torch.bmm(
+                 attn_output.to(torch.bfloat16).transpose(0, 1),
+-                self.w_vc.to(torch.bfloat16) * self.w_scale,
++                self.w_vc_bf16_scaled,
+             )
+         elif self.w_vc.dtype == torch.float8_e4m3fn:
+             attn_output_val, attn_output_scale = input_to_float8(
+@@ -893,7 +893,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+             q_nope_out = torch.bmm(
+                 q_nope.to(torch.bfloat16).transpose(0, 1),
+-                self.w_kc.to(torch.bfloat16) * self.w_scale,
++                self.w_kc_bf16_scaled,
+             )
+         elif self.w_kc.dtype == torch.float8_e4m3fn:
+             q_nope_val, q_nope_scale = input_to_float8(
+@@ -989,7 +989,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+             attn_bmm_output = torch.bmm(
+                 attn_output.to(torch.bfloat16).transpose(0, 1),
+-                self.w_vc.to(torch.bfloat16) * self.w_scale,
++                self.w_vc_bf16_scaled,
+             )
+         elif self.w_vc.dtype == torch.float8_e4m3fn:
+             attn_output_val, attn_output_scale = input_to_float8(
+@@ -1461,7 +1461,7 @@ class DeepseekV2ForCausalLM(nn.Module):
+                 w_kc, w_vc = w.unflatten(
+                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
++                self_attn.w_kc = w_kc.contiguous()
+                 self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                 if (
+                     hasattr(self_attn.kv_b_proj, "weight_scale")
+@@ -1471,6 +1471,14 @@ class DeepseekV2ForCausalLM(nn.Module):
+                     if _is_hip:
+                         self_attn.w_scale *= 2.0
+ 
++                # Pre-compute weight conversions for float8_e4m3fnuz to avoid repeated conversions
++                if self_attn.w_kc.dtype == torch.float8_e4m3fnuz:
++                    self_attn.w_kc_bf16_scaled = self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
++                    self_attn.w_vc_bf16_scaled = self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
++                else:
++                    self_attn.w_kc_bf16_scaled = None
++                    self_attn.w_vc_bf16_scaled = None
++
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)

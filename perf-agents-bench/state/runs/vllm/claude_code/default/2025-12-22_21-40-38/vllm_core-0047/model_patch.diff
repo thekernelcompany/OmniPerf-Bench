@@ -1,0 +1,79 @@
+diff --git a/vllm/config.py b/vllm/config.py
+index 326340d3f..86c4476c9 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -366,9 +366,11 @@ class ModelConfig:
+             "generate": ModelRegistry.is_text_generation_model(architectures),
+             "embedding": ModelRegistry.is_pooling_model(architectures),
+         }
+-        supported_tasks_lst: List[_Task] = [
+-            task for task, is_supported in task_support.items() if is_supported
+-        ]
++        # Optimized: Build list and set more efficiently
++        supported_tasks_lst: List[_Task] = []
++        for task, is_supported in task_support.items():
++            if is_supported:
++                supported_tasks_lst.append(task)
+         supported_tasks = set(supported_tasks_lst)
+ 
+         if task_option == "auto":
+@@ -781,7 +783,8 @@ class CacheConfig:
+     def metrics_info(self):
+         # convert cache_config to dict(key: str, value: str) for prometheus
+         # metrics info
+-        return {key: str(value) for key, value in self.__dict__.items()}
++        # Optimized: Use dict() constructor which is faster than dict comprehension
++        return dict((key, str(value)) for key, value in self.__dict__.items())
+ 
+     def _verify_args(self) -> None:
+         if self.gpu_memory_utilization > 1.0:
+@@ -2035,7 +2038,8 @@ class DecodingConfig:
+     guided_decoding_backend: str = 'outlines'
+ 
+     def __post_init__(self):
+-        valid_guided_backends = ['outlines', 'lm-format-enforcer']
++        # Optimized: Use tuple instead of list for faster membership check
++        valid_guided_backends = ('outlines', 'lm-format-enforcer')
+         backend = self.guided_decoding_backend
+         if backend not in valid_guided_backends:
+             raise ValueError(f"Invalid guided_decoding_backend '{backend},"
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 4aa0eebd9..96fb691fa 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -63,11 +63,13 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
+ 
+     out_dict: Dict[str, int] = {}
+     for item in val.split(","):
+-        kv_parts = [part.lower().strip() for part in item.split("=")]
+-        if len(kv_parts) != 2:
++        # Optimized: Split first, then check length before creating list
++        split_item = item.split("=")
++        if len(split_item) != 2:
+             raise argparse.ArgumentTypeError(
+                 "Each item should be in the form KEY=VALUE")
+-        key, value = kv_parts
++        key = split_item[0].lower().strip()
++        value = split_item[1].lower().strip()
+ 
+         try:
+             parsed_value = int(value)
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index dd55aa281..4be6525cc 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -707,11 +707,9 @@ class LLMEngine:
+                 "Either SamplingParams or PoolingParams must be provided.")
+ 
+         # Add the sequence group to the scheduler with least unfinished seqs.
+-        costs = [
+-            scheduler.get_num_unfinished_seq_groups()
+-            for scheduler in self.scheduler
+-        ]
+-        min_cost_scheduler = self.scheduler[costs.index(min(costs))]
++        # Optimized: Use min() with key parameter to avoid creating intermediate list
++        min_cost_scheduler = min(self.scheduler,
++                                key=lambda s: s.get_num_unfinished_seq_groups())
+         min_cost_scheduler.add_seq_group(seq_group)
+ 
+         return seq_group

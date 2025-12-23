@@ -1,0 +1,76 @@
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 8aed0fead..0e9c721b8 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -90,9 +90,9 @@ class LlamaMLP(nn.Module):
+         self.act_fn = SiluAndMul()
+ 
+     def forward(self, x):
+-        gate_up, _ = self.gate_up_proj(x)
++        gate_up = self.gate_up_proj(x)[0]
+         x = self.act_fn(gate_up)
+-        x, _ = self.down_proj(x)
++        x = self.down_proj(x)[0]
+         return x
+ 
+ 
+@@ -133,6 +133,9 @@ class LlamaAttention(nn.Module):
+                                 self.hidden_size // self.total_num_heads)
+         self.q_size = self.num_heads * self.head_dim
+         self.kv_size = self.num_kv_heads * self.head_dim
++        # Pre-compute split indices for QKV slicing
++        self.q_end = self.q_size
++        self.k_end = self.q_end + self.kv_size
+         self.scaling = self.head_dim**-0.5
+         self.rope_theta = rope_theta
+         self.max_position_embeddings = max_position_embeddings
+@@ -183,11 +186,14 @@ class LlamaAttention(nn.Module):
+         kv_cache: torch.Tensor,
+         attn_metadata: AttentionMetadata,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
+-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        qkv = self.qkv_proj(hidden_states)[0]
++        # Use pre-computed indices and slicing for better performance
++        q = qkv[..., :self.q_end]
++        k = qkv[..., self.q_end:self.k_end]
++        v = qkv[..., self.k_end:]
+         q, k = self.rotary_emb(positions, q, k)
+         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+-        output, _ = self.o_proj(attn_output)
++        output = self.o_proj(attn_output)[0]
+         return output
+ 
+ 
+@@ -256,10 +262,8 @@ class LlamaDecoderLayer(nn.Module):
+         else:
+             hidden_states, residual = self.input_layernorm(
+                 hidden_states, residual)
+-        hidden_states = self.self_attn(positions=positions,
+-                                       hidden_states=hidden_states,
+-                                       kv_cache=kv_cache,
+-                                       attn_metadata=attn_metadata)
++        hidden_states = self.self_attn(
++            positions, hidden_states, kv_cache, attn_metadata)
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(
+@@ -335,11 +339,13 @@ class LlamaModel(nn.Module):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        for i in range(self.start_layer, self.end_layer):
+-            layer = self.layers[i]
+-            hidden_states, residual = layer(positions, hidden_states,
+-                                            kv_caches[i - self.start_layer],
+-                                            attn_metadata, residual)
++        # Cache start_layer to avoid repeated attribute access
++        start_layer = self.start_layer
++        for i in range(start_layer, self.end_layer):
++            hidden_states, residual = self.layers[i](
++                positions, hidden_states,
++                kv_caches[i - start_layer],
++                attn_metadata, residual)
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors({

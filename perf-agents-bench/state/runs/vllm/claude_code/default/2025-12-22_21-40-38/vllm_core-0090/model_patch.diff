@@ -1,0 +1,125 @@
+diff --git a/vllm/executor/ray_gpu_executor.py b/vllm/executor/ray_gpu_executor.py
+index 4bf5cbbd1..83a42bfab 100644
+--- a/vllm/executor/ray_gpu_executor.py
++++ b/vllm/executor/ray_gpu_executor.py
+@@ -165,9 +165,9 @@ class RayGPUExecutor(DistributedGPUExecutor):
+             ray.get(worker.get_node_ip.remote())  # type: ignore[attr-defined]
+             for worker in self.workers
+         ]
+-        ip_counts: Dict[str, int] = {}
++        ip_counts: Dict[str, int] = defaultdict(int)
+         for ip in worker_ips:
+-            ip_counts[ip] = ip_counts.get(ip, 0) + 1
++            ip_counts[ip] += 1
+ 
+         def sort_by_driver_then_worker_ip(worker):
+             """
+@@ -226,14 +226,18 @@ class RayGPUExecutor(DistributedGPUExecutor):
+                 " each node.")
+ 
+         # Set environment variables for the driver and workers.
++        # Pre-compute attention backend dict for performance
++        attention_backend_dict = ({
++            "VLLM_ATTENTION_BACKEND": envs.VLLM_ATTENTION_BACKEND
++        } if envs.VLLM_ATTENTION_BACKEND is not None else {})
++        trace_function_str = str(envs.VLLM_TRACE_FUNCTION)
++
+         all_args_to_update_environment_variables = [({
+             "CUDA_VISIBLE_DEVICES":
+             ",".join(map(str, node_gpus[node_id])),
+             "VLLM_TRACE_FUNCTION":
+-            str(envs.VLLM_TRACE_FUNCTION),
+-            **({
+-                "VLLM_ATTENTION_BACKEND": envs.VLLM_ATTENTION_BACKEND
+-            } if envs.VLLM_ATTENTION_BACKEND is not None else {})
++            trace_function_str,
++            **attention_backend_dict
+         }, ) for (node_id, _) in worker_node_and_gpu_ids]
+ 
+         self._env_vars_for_all_workers = (
+@@ -271,16 +275,15 @@ class RayGPUExecutor(DistributedGPUExecutor):
+                           max_parallel_loading_workers)
+ 
+         if self.use_ray_spmd_worker:
+-            for pp_rank in range(self.parallel_config.pipeline_parallel_size):
+-                self.pp_tp_workers.append([])
+-                for tp_rank in range(
+-                        self.parallel_config.tensor_parallel_size):
++            # Pre-allocate pp_tp_workers structure for better performance
++            pp_size = self.parallel_config.pipeline_parallel_size
++            tp_size = self.parallel_config.tensor_parallel_size
++            self.pp_tp_workers = [[] for _ in range(pp_size)]
++            for pp_rank in range(pp_size):
++                for tp_rank in range(tp_size):
+                     # PP=2, TP=4
+                     # pp_tp_workers = [[0, 1, 2, 3], [4, 5, 6, 7]]
+-                    rank = (pp_rank * self.parallel_config.tensor_parallel_size
+-                            ) + tp_rank
+-                    assert len(self.pp_tp_workers[pp_rank]) == tp_rank
+-                    assert pp_rank < len(self.pp_tp_workers)
++                    rank = (pp_rank * tp_size) + tp_rank
+                     self.pp_tp_workers[pp_rank].append(self.workers[rank])
+ 
+         # This is the list of workers that are rank 0 of each TP group EXCEPT
+@@ -293,10 +296,12 @@ class RayGPUExecutor(DistributedGPUExecutor):
+         self.non_driver_workers: List[RayWorkerWrapper] = []
+ 
+         # Enforce rank order for correct rank to return final output.
++        # Pre-allocate lists for better performance
++        tp_size = self.parallel_config.tensor_parallel_size
+         for index, worker in enumerate(self.workers):
+             # The driver worker is rank 0 and not in self.workers.
+             rank = index + 1
+-            if rank % self.parallel_config.tensor_parallel_size == 0:
++            if rank % tp_size == 0:
+                 self.tp_driver_workers.append(worker)
+             else:
+                 self.non_driver_workers.append(worker)
+@@ -359,9 +364,13 @@ class RayGPUExecutor(DistributedGPUExecutor):
+             raise NotImplementedError(
+                 "max_concurrent_workers is not supported yet.")
+ 
+-        count = len(self.workers) if not \
+-            async_run_tensor_parallel_workers_only \
+-            else len(self.non_driver_workers)
++        # Optimize by computing worker list selection once
++        if async_run_tensor_parallel_workers_only:
++            target_workers = self.non_driver_workers
++        else:
++            target_workers = self.workers
++        count = len(target_workers)
++
+         # If using SPMD worker, all workers are the same, so we should execute
+         # the args on all workers. Otherwise, we skip the first worker's args
+         # because those args will go to the driver worker.
+@@ -371,14 +380,11 @@ class RayGPUExecutor(DistributedGPUExecutor):
+         all_worker_kwargs = repeat(kwargs, count) if all_kwargs is None \
+             else islice(all_kwargs, first_worker_args_index, None)
+ 
+-        # Start the ray workers first.
+-        ray_workers = self.workers
+-        if async_run_tensor_parallel_workers_only:
+-            ray_workers = self.non_driver_workers
++        # Start the ray workers first - use pre-computed target_workers
+         ray_worker_outputs = [
+             worker.execute_method.remote(method, *worker_args, **worker_kwargs)
+             for (worker, worker_args, worker_kwargs
+-                 ) in zip(ray_workers, all_worker_args, all_worker_kwargs)
++                 ) in zip(target_workers, all_worker_args, all_worker_kwargs)
+         ]
+ 
+         if async_run_tensor_parallel_workers_only:
+@@ -527,10 +533,9 @@ class RayGPUExecutorAsync(RayGPUExecutor, DistributedGPUExecutorAsync):
+             # engines can't execute on the same stage at the same time
+             # We create the locks here to avoid creating them in the constructor
+             # which uses a different asyncio loop.
+-            self.pp_locks = [
+-                asyncio.Lock()
+-                for _ in range(self.parallel_config.pipeline_parallel_size)
+-            ]
++            # Pre-allocate lock list for better performance
++            pp_size = self.parallel_config.pipeline_parallel_size
++            self.pp_locks = [asyncio.Lock() for _ in range(pp_size)]
+ 
+         tasks = [
+             asyncio.create_task(

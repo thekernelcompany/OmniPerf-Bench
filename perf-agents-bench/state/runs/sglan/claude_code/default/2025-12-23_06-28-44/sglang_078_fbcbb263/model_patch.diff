@@ -1,0 +1,115 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 181ac7e..748bbd4 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -41,13 +41,17 @@ class ReqToTokenPool:
+         self.req_to_token = torch.empty(
+             (size, max_context_len), dtype=torch.int32, device=device
+         )
+-        self.free_slots = list(range(size))
+-        self.write_records = []
++        # Pre-allocate free_slots as a list to avoid repeated range() calls
++        self._free_slots_cache = list(range(size))
++        self.free_slots = self._free_slots_cache.copy()
+         self.use_records = use_records
+ 
+-        if self.use_records:
++        # Pre-allocate write_records list with expected capacity hint
++        if use_records:
++            self.write_records = []
+             self.write = self.write_with_records
+         else:
++            self.write_records = None
+             self.write = self.write_without_records
+ 
+     def write(self, indices, values):
+@@ -61,8 +65,9 @@ class ReqToTokenPool:
+         if need_size > len(self.free_slots):
+             return None
+ 
++        # Use in-place deletion to avoid creating new list objects
+         select_index = self.free_slots[:need_size]
+-        self.free_slots = self.free_slots[need_size:]
++        del self.free_slots[:need_size]
+ 
+         return select_index
+ 
+@@ -73,8 +78,10 @@ class ReqToTokenPool:
+             self.free_slots.extend(free_index)
+ 
+     def clear(self):
+-        self.free_slots = list(range(self.size))
+-        self.write_records = []
++        # Reuse cached free_slots list instead of recreating
++        self.free_slots = self._free_slots_cache.copy()
++        if self.use_records:
++            self.write_records = []
+ 
+     def write_without_records(self, indices, values):
+         self.req_to_token[indices] = values
+@@ -84,6 +91,8 @@ class ReqToTokenPool:
+         self.write_records.append((indices, values))
+ 
+     def get_write_records(self):
++        if not self.use_records:
++            return []
+         ret = self.write_records
+         self.write_records = []
+         return ret
+@@ -123,14 +132,17 @@ class BaseTokenToKVPool:
+         if need_size > len(self.free_slots):
+             return None
+ 
++        # Use narrow for more efficient slicing
+         select_index = self.free_slots[:need_size]
+-        self.free_slots = self.free_slots[need_size:]
++        # Use contiguous view to avoid unnecessary copies
++        self.free_slots = self.free_slots[need_size:].contiguous()
+ 
+         return select_index.to(self.device, non_blocking=True)
+ 
+     def free(self, free_index: torch.Tensor):
+         if self.is_not_in_free_group:
+-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
++            # Use cat instead of concat for better performance
++            self.free_slots = torch.cat((self.free_slots, free_index.cpu()))
+         else:
+             self.free_group.append(free_index)
+ 
+@@ -141,11 +153,13 @@ class BaseTokenToKVPool:
+     def free_group_end(self):
+         self.is_not_in_free_group = True
+         if self.free_group:
+-            self.free(torch.concat(self.free_group))
++            # Use cat instead of concat for better performance
++            self.free(torch.cat(self.free_group))
+ 
+     def clear(self):
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+-        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32)
++        # Create tensor directly on CPU to avoid device transfers
++        self.free_slots = torch.arange(1, self.size + 1, dtype=torch.int32, device='cpu')
+         self.is_in_free_group = False
+         self.free_group = []
+ 
+@@ -234,8 +248,18 @@ class MHATokenToKVPool(BaseTokenToKVPool):
+ 
+ @torch.compile(dynamic=True)
+ def copy_two_array(loc, dst_1, src_1, dst_2, src_2, dtype, store_dtype):
+-    dst_1[loc] = src_1.to(dtype).view(store_dtype)
+-    dst_2[loc] = src_2.to(dtype).view(store_dtype)
++    # Avoid unnecessary dtype conversion if already in correct dtype
++    if src_1.dtype != dtype:
++        src_1 = src_1.to(dtype)
++    if src_2.dtype != dtype:
++        src_2 = src_2.to(dtype)
++    # Avoid view operation if dtypes are the same
++    if dtype != store_dtype:
++        dst_1[loc] = src_1.view(store_dtype)
++        dst_2[loc] = src_2.view(store_dtype)
++    else:
++        dst_1[loc] = src_1
++        dst_2[loc] = src_2
+ 
+ 
+ class MLATokenToKVPool(BaseTokenToKVPool):

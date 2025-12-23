@@ -1,0 +1,76 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c376797a..180b04df9 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -183,9 +183,10 @@ def _get_bin_counts_and_mask(
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     # Compute the bin counts for the tokens.
+     # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
++    bin_counts = torch.empty((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
++    bin_counts.fill_(0)
+     bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+     bin_counts = bin_counts[:, :vocab_size]
+     mask = bin_counts > 0
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d173..17c3075e1 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -389,24 +389,25 @@ class SamplingTensors:
+                 query_len = seq_group.query_len
+                 assert query_len is not None
+                 prefill_len = len(seq_group.prompt_logprob_indices)
+-                temperatures += [temperature] * prefill_len
+-                top_ps += [top_p] * prefill_len
+-                top_ks += [top_k] * prefill_len
+-                min_ps += [min_p] * prefill_len
+-                presence_penalties += [0] * prefill_len
+-                frequency_penalties += [0] * prefill_len
+-                repetition_penalties += [1] * prefill_len
++                temperatures.extend([temperature] * prefill_len)
++                top_ps.extend([top_p] * prefill_len)
++                top_ks.extend([top_k] * prefill_len)
++                min_ps.extend([min_p] * prefill_len)
++                presence_penalties.extend([0] * prefill_len)
++                frequency_penalties.extend([0] * prefill_len)
++                repetition_penalties.extend([1] * prefill_len)
+ 
+             if seq_group.do_sample:
+                 sample_lens = len(seq_group.sample_indices)
+                 assert sample_lens == len(seq_ids)
+-                temperatures += [temperature] * len(seq_ids)
+-                top_ps += [top_p] * len(seq_ids)
+-                top_ks += [top_k] * len(seq_ids)
+-                min_ps += [min_p] * len(seq_ids)
+-                presence_penalties += [p] * len(seq_ids)
+-                frequency_penalties += [f] * len(seq_ids)
+-                repetition_penalties += [r] * len(seq_ids)
++                seq_len = len(seq_ids)
++                temperatures.extend([temperature] * seq_len)
++                top_ps.extend([top_p] * seq_len)
++                top_ks.extend([top_k] * seq_len)
++                min_ps.extend([min_p] * seq_len)
++                presence_penalties.extend([p] * seq_len)
++                frequency_penalties.extend([f] * seq_len)
++                repetition_penalties.extend([r] * seq_len)
+ 
+             if is_prompt:
+                 prompt_best_of.append(sampling_params.best_of)
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 0cd4c7e71..ee5ccade6 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -132,8 +132,9 @@ class SequenceData:
+         self._update_cached_all_tokens()
+ 
+     def _update_cached_all_tokens(self):
+-        self._cached_all_token_ids: List[int] = (self._prompt_token_ids +
+-                                                 self._output_token_ids)
++        # Optimize by extending instead of creating new list
++        self._cached_all_token_ids = self._prompt_token_ids[:]
++        self._cached_all_token_ids.extend(self._output_token_ids)
+ 
+     @property
+     def prompt_token_ids(self) -> Tuple[int, ...]:

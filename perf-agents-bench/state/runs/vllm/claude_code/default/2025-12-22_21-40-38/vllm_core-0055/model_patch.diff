@@ -1,0 +1,156 @@
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index 1e808e21b..d057b2648 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -32,10 +32,9 @@ class RefCounter(RefCounterProtocol):
+     """
+ 
+     def __init__(self, all_block_indices: Iterable[BlockId]):
++        # Optimize: Use dict.fromkeys() which is faster than dict comprehension
+         deduped = set(all_block_indices)
+-        self._refcounts: Dict[BlockId,
+-                              RefCount] = {index: 0
+-                                           for index in deduped}
++        self._refcounts: Dict[BlockId, RefCount] = dict.fromkeys(deduped, 0)
+ 
+     def incr(self, block_id: BlockId) -> RefCount:
+         assert block_id in self._refcounts
+@@ -242,10 +241,8 @@ class BlockList:
+     def update(self, blocks: List[Block]):
+         self._blocks = blocks
+ 
+-        # Cache block ids for fast query
+-        self._block_ids = []
+-        for block in self._blocks:
+-            self._add_block_id(block.block_id)
++        # Optimize: Use list comprehension instead of loop with append
++        self._block_ids = [block.block_id for block in self._blocks]
+ 
+     def append_token_ids(self, block_index: int, token_ids: List[int]) -> None:
+         block = self._blocks[block_index]
+diff --git a/vllm/core/block/naive_block.py b/vllm/core/block/naive_block.py
+index 0c1e88314..e6e29aa1d 100644
+--- a/vllm/core/block/naive_block.py
++++ b/vllm/core/block/naive_block.py
+@@ -401,7 +401,8 @@ class NaiveBlock(Block):
+         Args:
+             token_ids (List[int]): The token IDs to be appended to the block.
+         """
+-        if len(token_ids) == 0:
++        # Optimize: Early return without len() call if token_ids is empty
++        if not token_ids:
+             return
+ 
+         assert len(token_ids) <= self.num_empty_slots
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23ee..e16e46682 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -25,12 +25,14 @@ class BlockTracker:
+     __slots__ = ("active", "last_accessed", "computed")
+ 
+     def reset(self):
+-        self.last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
+-        self.computed: bool = False
++        self.last_accessed = _DEFAULT_LAST_ACCESSED_TIME
++        self.computed = False
+ 
+     def __init__(self):
+-        self.active: bool = False
+-        self.reset()
++        # Optimize: Initialize all attributes directly without calling reset()
++        self.active = False
++        self.last_accessed = _DEFAULT_LAST_ACCESSED_TIME
++        self.computed = False
+ 
+     def enable(self):
+         assert not self.active
+@@ -146,19 +148,28 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None)
+-        assert block.content_hash is not None
+-
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+-        if cached_block_id is not None:
+-            block.block_id = cached_block_id
+-            self._incr_refcount_cached_block(block)
+-            return block
+-        self._block_pool.free_block(block)
++        # Optimize: Check if block size matches to compute hash directly
++        if len(token_ids) == self._block_size:
++            # Compute hash directly without creating a temporary block
++            is_first_block = prev_block is None
++            prev_block_hash = (None if is_first_block else
++                             prev_block.content_hash)
++
++            # Only proceed if we can compute the hash (prev block must have hash if exists)
++            if prev_block_hash is not None or is_first_block:
++                content_hash = PrefixCachingBlock.hash_block_tokens(
++                    is_first_block, prev_block_hash, token_ids)
++
++                cached_block_id = self._cached_blocks.get(content_hash, None)
++                if cached_block_id is not None:
++                    # Create block pointing to cached data
++                    block = self._block_pool.init_block(prev_block=prev_block,
++                                                        token_ids=token_ids,
++                                                        block_size=self._block_size,
++                                                        physical_block_id=None)
++                    block.block_id = cached_block_id
++                    self._incr_refcount_cached_block(block)
++                    return block
+ 
+         # No cached block => Allocate a new block
+         block = self.allocate_mutable_block(prev_block)
+@@ -688,16 +699,11 @@ class PrefixCachingBlock(Block):
+         """Incrementally computes the number of tokens that there is
+         till the current block (included)
+         """
+-        res = 0
+-
+-        # Add all previous blocks
+-        if self._prev_block is not None:
+-            res += self._prev_block.num_tokens_total
+-
+-        # Add current block
+-        res += len(self.token_ids)
+-
+-        self._cached_num_tokens_total = res
++        # Optimize: Calculate directly without intermediate variable
++        self._cached_num_tokens_total = (
++            (self._prev_block.num_tokens_total if self._prev_block is not None else 0) +
++            len(self.token_ids)
++        )
+ 
+     @property
+     def computed(self) -> bool:
+@@ -726,12 +732,10 @@ class PrefixCachingBlock(Block):
+         assert self.content_hash is None
+         assert not self.computed
+ 
+-        if len(token_ids) == 0:
++        # Optimize: Early return without len() call if token_ids is empty
++        if not token_ids:
+             return
+ 
+-        # Ensure there are input tokens
+-        assert token_ids, "Got token_ids = {}".format(token_ids)
+-
+         # Naive block handles CoW.
+         self._block.append_token_ids(token_ids)
+         self._update_num_tokens_total()
+@@ -828,7 +832,8 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        # Optimize: use tuple() instead of unpacking to avoid creating intermediate objects
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ class ComputedBlocksTracker:

@@ -1,0 +1,51 @@
+diff --git a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+index 7016ff34c..c6bce577b 100644
+--- a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
++++ b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+@@ -33,6 +33,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
+         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
+ 
++        # Optimize: Cache the weight_and_reduce implementation to avoid repeated instantiation
++        self._cached_weight_and_reduce = TopKWeightAndReduceContiguous()
++
+     def num_dispatchers(self) -> int:
+         return self.num_dispatchers_
+ 
+@@ -112,10 +115,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # DeepEP's topk_ids output refers to the local experts directly. Offset
+         # the topk_ids to move it back to the global experts space so it aligns
+         # with existing vLLM interfaces.
+-        expert_topk_ids = torch.where(
+-            expert_topk_ids == -1,
+-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
+-            expert_topk_ids + self.rank_expert_offset)
++        # Optimize: Use in-place operations instead of torch.where to reduce memory allocation
++        mask = expert_topk_ids == -1
++        expert_topk_ids.add_(self.rank_expert_offset)
++        expert_topk_ids[mask] = num_experts - 1 if self.rank_expert_offset == 0 else 0
+ 
+         # Makes a GPU-CPU copy.
+         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
+@@ -142,7 +145,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+             # TODO: this only works for topK=1, will need to update for topK>1
+             assert topk == 1, (
+                 "apply_router_weight_on_input is only implemented for topk=1")
+-            a1 = a1 * topk_weights.to(a1.dtype)
++            # Optimize: Avoid unnecessary dtype conversion when dtypes match
++            topk_weights_typed = topk_weights if topk_weights.dtype == a1.dtype else topk_weights.to(a1.dtype)
++            a1 = a1 * topk_weights_typed
+ 
+         if quant_config.per_act_token_quant:
+             a1q, a1q_scale = moe_kernel_quantize_input(
+@@ -195,8 +200,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # fused_expert_output can have 0 tokens - This happens when none of the
+         # tokens from the all2all reach this EP rank.
+         if fused_expert_output.numel() != 0:
++            # Optimize: Use cached instance instead of creating new one each time
+             if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+-                weight_and_reduce_impl = TopKWeightAndReduceContiguous()
++                weight_and_reduce_impl = self._cached_weight_and_reduce
+             fused_expert_output = weight_and_reduce_impl.apply(
+                 output=None,
+                 fused_expert_output=fused_expert_output,

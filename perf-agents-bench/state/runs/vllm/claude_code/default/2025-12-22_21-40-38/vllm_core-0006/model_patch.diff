@@ -1,0 +1,94 @@
+diff --git a/vllm/attention/ops/triton_unified_attention.py b/vllm/attention/ops/triton_unified_attention.py
+index c65f09523..71525b2a9 100644
+--- a/vllm/attention/ops/triton_unified_attention.py
++++ b/vllm/attention/ops/triton_unified_attention.py
+@@ -145,6 +145,10 @@ def kernel_unified_attention_2d(
+                               mask=query_mask_1,
+                               other=0.0)
+ 
++    # Load scale factors once before the loop
++    k_scale_val = tl.load(k_scale)
++    v_scale_val = tl.load(v_scale)
++
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+ 
+     # iterate through tiles
+@@ -173,7 +177,7 @@ def kernel_unified_attention_2d(
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
++                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
+         else:
+             K = K_load
+ 
+@@ -186,7 +190,7 @@ def kernel_unified_attention_2d(
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
++                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
+         else:
+             V = V_load
+ 
+@@ -195,9 +199,7 @@ def kernel_unified_attention_2d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -362,6 +364,10 @@ def kernel_unified_attention_3d(
+                               mask=query_mask_1,
+                               other=0.0)
+ 
++    # Load scale factors once before the loop
++    k_scale_val = tl.load(k_scale)
++    v_scale_val = tl.load(v_scale)
++
+     num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+ 
+     # iterate through tiles within current segment
+@@ -392,7 +398,7 @@ def kernel_unified_attention_3d(
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
++                K = (K_load.to(tl.float32) * k_scale_val).to(Q.dtype)
+         else:
+             K = K_load
+ 
+@@ -405,7 +411,7 @@ def kernel_unified_attention_3d(
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
++                V = (V_load.to(tl.float32) * v_scale_val).to(Q.dtype)
+         else:
+             V = V_load
+ 
+@@ -414,9 +420,7 @@ def kernel_unified_attention_3d(
+         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+ 
+         # S : (BLOCK_M, BLOCK_SIZE)
+-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+-
+-        S += scale * tl.dot(Q, K)
++        S = scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -511,8 +515,7 @@ def reduce_segments(
+ 
+     # create masks for subsequent loads
+     act_num_segments = cdiv_fn(seq_len, blocks_per_segment * BLOCK_SIZE)
+-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32)
++    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < act_num_segments
+     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1,
+                         0).to(tl.int1)
+ 

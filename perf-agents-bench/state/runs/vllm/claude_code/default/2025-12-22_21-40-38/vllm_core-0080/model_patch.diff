@@ -1,0 +1,109 @@
+diff --git a/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
+index 628aa5c7b..36da69b7d 100644
+--- a/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
+@@ -16,6 +16,11 @@ from vllm.utils.deep_gemm import (fp8_m_grouped_gemm_nt_masked,
+ 
+ logger = init_logger(__name__)
+ 
++# Cache fp8 dtype info to avoid repeated lookups
++_FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
++_FP8_MAX = _FP8_E4M3FN_INFO.max
++_FP8_MIN = _FP8_E4M3FN_INFO.min
++
+ 
+ @triton.jit
+ def _silu_mul_fp8_quant_deep_gemm(
+@@ -69,25 +74,29 @@ def _silu_mul_fp8_quant_deep_gemm(
+     # number of valid tokens for this expert
+     n_tokens = tl.load(counts_ptr + e * stride_counts_e).to(tl.int64)
+ 
+-    cols = tl.arange(0, BLOCK)
+-    cols = cols.to(tl.int64)
++    cols = tl.arange(0, BLOCK).to(tl.int64)
+     mask_h = cols < BLOCK
+ 
+-    t = tl.zeros([], tl.int64)
+-    while t < n_tokens:
+-        base_i_offset = (e * stride_i_e + t * stride_i_t +
+-                         g * GROUP_SIZE * stride_i_h)
+-        base_yq_offset = (e * stride_yq_e + t * stride_yq_t +
+-                          g * GROUP_SIZE * stride_yq_h)
+-        base_ys_offset = e * stride_ys_e + t * stride_ys_t + g * stride_ys_g
+-
+-        mask = mask_h
+-        x = tl.load(input_ptr + base_i_offset + cols * stride_i_h,
+-                    mask=mask,
++    # Pre-compute expert and group offsets that don't change per token
++    base_e_offset_i = e * stride_i_e + g * GROUP_SIZE * stride_i_h
++    base_e_offset_yq = e * stride_yq_e + g * GROUP_SIZE * stride_yq_h
++    base_e_offset_ys = e * stride_ys_e + g * stride_ys_g
++
++    cols_stride_i_h = cols * stride_i_h
++    cols_stride_yq_h = cols * stride_yq_h
++    h_offset = H * stride_i_h
++
++    for t in range(n_tokens):
++        base_i_offset = base_e_offset_i + t * stride_i_t
++        base_yq_offset = base_e_offset_yq + t * stride_yq_t
++        base_ys_offset = base_e_offset_ys + t * stride_ys_t
++
++        x = tl.load(input_ptr + base_i_offset + cols_stride_i_h,
++                    mask=mask_h,
+                     other=0.0).to(tl.float32)
+-        y2 = tl.load(input_ptr + base_i_offset + H * stride_i_h +
+-                     cols * stride_i_h,
+-                     mask=mask,
++        y2 = tl.load(input_ptr + base_i_offset + h_offset +
++                     cols_stride_i_h,
++                     mask=mask_h,
+                      other=0.0).to(tl.float32)
+ 
+         x = x * (1.0 / (1.0 + tl.exp(-x)))
+@@ -99,11 +108,9 @@ def _silu_mul_fp8_quant_deep_gemm(
+             tl.log2(scale_raw))) if use_ue8m0 else scale_raw
+         y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+ 
+-        tl.store(y_q_ptr + base_yq_offset + cols * stride_yq_h, y_q, mask=mask)
++        tl.store(y_q_ptr + base_yq_offset + cols_stride_yq_h, y_q, mask=mask_h)
+         tl.store(y_s_ptr + base_ys_offset, y_s)
+ 
+-        t += 1
+-
+ 
+ def silu_mul_fp8_quant_deep_gemm(
+     y: torch.Tensor,  # (E, T, 2*H) float32
+@@ -128,8 +135,9 @@ def silu_mul_fp8_quant_deep_gemm(
+     assert H % group_size == 0, "H must be divisible by group_size"
+     assert tokens_per_expert.ndim == 1 and tokens_per_expert.shape[0] == E, \
+         "tokens_per_expert must be shape (E,)"
+-    tokens_per_expert = tokens_per_expert.to(device=y.device,
+-                                             dtype=torch.int32)
++    if tokens_per_expert.device != y.device or tokens_per_expert.dtype != torch.int32:
++        tokens_per_expert = tokens_per_expert.to(device=y.device,
++                                                 dtype=torch.int32)
+ 
+     # allocate outputs
+     fp8_dtype = torch.float8_e4m3fn
+@@ -154,10 +162,6 @@ def silu_mul_fp8_quant_deep_gemm(
+     # A loop inside the kernel handles the token dim
+     grid = (E * G, )
+ 
+-    f_info = torch.finfo(fp8_dtype)
+-    fp8_max = f_info.max
+-    fp8_min = f_info.min
+-
+     _silu_mul_fp8_quant_deep_gemm[grid](
+         y,
+         y_q,
+@@ -176,8 +180,8 @@ def silu_mul_fp8_quant_deep_gemm(
+         stride_ys_g,
+         stride_cnt_e,
+         eps,
+-        fp8_min,
+-        fp8_max,
++        _FP8_MIN,
++        _FP8_MAX,
+         is_blackwell_deep_gemm_used(),
+         BLOCK=group_size,
+         num_warps=4,

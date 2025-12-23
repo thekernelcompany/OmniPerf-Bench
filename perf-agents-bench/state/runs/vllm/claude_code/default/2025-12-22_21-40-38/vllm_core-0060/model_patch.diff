@@ -1,0 +1,109 @@
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 9bb11907f..a36695e36 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -324,7 +324,7 @@ async def ping(raw_request: Request) -> Response:
+ @router.post("/tokenize")
+ @with_cancellation
+ async def tokenize(request: TokenizeRequest, raw_request: Request):
+-    handler = tokenization(raw_request)
++    handler = raw_request.app.state.openai_serving_tokenization
+ 
+     generator = await handler.create_tokenize(request, raw_request)
+     if isinstance(generator, ErrorResponse):
+@@ -339,7 +339,7 @@ async def tokenize(request: TokenizeRequest, raw_request: Request):
+ @router.post("/detokenize")
+ @with_cancellation
+ async def detokenize(request: DetokenizeRequest, raw_request: Request):
+-    handler = tokenization(raw_request)
++    handler = raw_request.app.state.openai_serving_tokenization
+ 
+     generator = await handler.create_detokenize(request, raw_request)
+     if isinstance(generator, ErrorResponse):
+@@ -369,9 +369,9 @@ async def show_version():
+ @with_cancellation
+ async def create_chat_completion(request: ChatCompletionRequest,
+                                  raw_request: Request):
+-    handler = chat(raw_request)
++    handler = raw_request.app.state.openai_serving_chat
+     if handler is None:
+-        return base(raw_request).create_error_response(
++        return raw_request.app.state.openai_serving_tokenization.create_error_response(
+             message="The model does not support Chat Completions API")
+ 
+     generator = await handler.create_chat_completion(request, raw_request)
+@@ -389,9 +389,9 @@ async def create_chat_completion(request: ChatCompletionRequest,
+ @router.post("/v1/completions")
+ @with_cancellation
+ async def create_completion(request: CompletionRequest, raw_request: Request):
+-    handler = completion(raw_request)
++    handler = raw_request.app.state.openai_serving_completion
+     if handler is None:
+-        return base(raw_request).create_error_response(
++        return raw_request.app.state.openai_serving_tokenization.create_error_response(
+             message="The model does not support Completions API")
+ 
+     generator = await handler.create_completion(request, raw_request)
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 14e41346d..15ea60ec2 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -41,17 +41,23 @@ assert _LONG_INFO.max == _MOCK_LONG_INFO.max
+ class OpenAIBaseModel(BaseModel):
+     # OpenAI API does allow extra fields
+     model_config = ConfigDict(extra="allow")
++    # Cache field names per class to avoid recomputation
++    _field_names_cache: dict = {}
+ 
+     @model_validator(mode="before")
+     @classmethod
+     def __log_extra_fields__(cls, data):
+         if isinstance(data, dict):
+-            # Get all class field names and their potential aliases
+-            field_names = set()
+-            for field_name, field in cls.model_fields.items():
+-                field_names.add(field_name)
+-                if hasattr(field, 'alias') and field.alias:
+-                    field_names.add(field.alias)
++            # Use cached field names if available
++            if cls not in cls._field_names_cache:
++                field_names = set()
++                for field_name, field in cls.model_fields.items():
++                    field_names.add(field_name)
++                    if hasattr(field, 'alias') and field.alias:
++                        field_names.add(field.alias)
++                cls._field_names_cache[cls] = field_names
++            else:
++                field_names = cls._field_names_cache[cls]
+ 
+             # Compare against both field names and aliases
+             extra_fields = data.keys() - field_names
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 749f4f504..eea2b30fd 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -134,9 +134,10 @@ class OutputProcessor:
+         request_outputs: List[RequestOutput] = []
+         reqs_to_abort: List[str] = []
+         iteration_stats = IterationStats(self.log_stats)
++        request_states = self.request_states  # Cache dict lookup
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+-            req_state = self.request_states.get(req_id)
++            req_state = request_states.get(req_id)
+             if req_state is None:
+                 # Ignore output for already-aborted request.
+                 continue
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 45450165e..ef29ed4af 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -48,7 +48,7 @@ class Request:
+         self.prompt_token_ids = prompt_token_ids
+         self.num_prompt_tokens = len(self.prompt_token_ids)
+         self._output_token_ids: List[int] = []
+-        self._all_token_ids: List[int] = self.prompt_token_ids.copy()
++        self._all_token_ids: List[int] = list(self.prompt_token_ids)
+         self.num_computed_tokens = 0
+ 
+         # Multi-modal related

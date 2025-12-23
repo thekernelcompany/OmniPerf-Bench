@@ -1,0 +1,55 @@
+diff --git a/csrc/moe/moe_permute_unpermute_op.cu b/csrc/moe/moe_permute_unpermute_op.cu
+index 13aecd800..e827d9b11 100644
+--- a/csrc/moe/moe_permute_unpermute_op.cu
++++ b/csrc/moe/moe_permute_unpermute_op.cu
+@@ -49,7 +49,7 @@ void moe_permute(
+   auto permuted_experts_id = torch::empty_like(topk_ids);
+   auto dst_row_id2src_row_id_map = torch::empty_like(src_row_id2dst_row_id_map);
+   auto align_expert_first_token_offset =
+-      torch::zeros_like(expert_first_token_offset);
++      torch::empty_like(expert_first_token_offset);
+ 
+   CubKeyValueSorter sorter{};
+   int64_t* valid_num_ptr = nullptr;
+diff --git a/vllm/model_executor/layers/fused_moe/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+index ff49d7bb7..44006f3fa 100644
+--- a/vllm/model_executor/layers/fused_moe/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+@@ -136,11 +136,10 @@ def run_cutlass_moe_fp8(
+                                      dtype=torch.int32,
+                                      device=device)
+ 
+-        # With expert_map each Rank processes only a subset of experts. As
+-        # a result not all of a_map and c2 tensors are filled. We fill it
+-        # zeros for correctness.
++        # With expert_map each Rank processes only a subset of experts.
++        # The a_map tensor will be populated by get_cutlass_moe_mm_data.
+         if expert_map is not None:
+-            a_map = torch.zeros((local_topk_ids.numel()),
++            a_map = torch.empty((local_topk_ids.numel()),
+                                 dtype=torch.int32,
+                                 device=device)
+         else:
+@@ -170,12 +169,6 @@ def run_cutlass_moe_fp8(
+         c2 = _resize_cache(workspace2, (M * topk, N))
+         c3 = _resize_cache(workspace13, (M * topk, K))
+ 
+-    if not per_act_token and (expert_map is not None or use_batched_format):
+-        # this is necessary to avoid imprecise scale calculation caused by
+-        # random data in the unused workspace. The workspace is unused when
+-        # this rank handles only partial tokens, or when it is batched .
+-        c1.fill_(0)
+-
+     ops.cutlass_moe_mm(c1, a1q, w1, a1q_scale, w1_scale, expert_offsets,
+                        problem_sizes1, ab_strides1, ab_strides1, c_strides1,
+                        per_act_token, per_out_ch)
+@@ -185,9 +178,6 @@ def run_cutlass_moe_fp8(
+     a2q, a2q_scale = ops.scaled_fp8_quant(
+         c2, a2_scale, use_per_token_if_dynamic=per_act_token)
+ 
+-    if expert_map is not None:
+-        c3.fill_(0)
+-
+     ops.cutlass_moe_mm(c3, a2q, w2, a2q_scale, w2_scale, expert_offsets,
+                        problem_sizes2, ab_strides2, ab_strides2, c_strides2,
+                        per_act_token, per_out_ch)

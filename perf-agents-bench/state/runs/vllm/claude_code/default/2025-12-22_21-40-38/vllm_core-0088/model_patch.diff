@@ -1,0 +1,331 @@
+diff --git a/benchmarks/kernels/benchmark_reshape_and_cache_flash.py b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+new file mode 100644
+index 000000000..724ddd367
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_reshape_and_cache_flash.py
+@@ -0,0 +1,246 @@
++"""Benchmark script for reshape_and_cache_flash kernel performance."""
++
++import argparse
++import random
++import time
++from typing import Optional
++
++import torch
++
++from vllm import _custom_ops as ops
++
++
++def benchmark_reshape_and_cache_flash(
++    num_tokens: int,
++    num_heads: int,
++    head_size: int,
++    block_size: int,
++    num_blocks: int,
++    dtype: torch.dtype,
++    kv_cache_dtype: str = "auto",
++    device: str = "cuda",
++    num_iters: int = 100,
++) -> float:
++    """Benchmark the reshape_and_cache_flash kernel.
++
++    Args:
++        num_tokens: Number of tokens to cache
++        num_heads: Number of attention heads
++        head_size: Size of each attention head
++        block_size: Size of cache blocks
++        num_blocks: Number of cache blocks
++        dtype: Data type for tensors
++        kv_cache_dtype: KV cache dtype ("auto" or "fp8")
++        device: Device to run on
++        num_iters: Number of iterations for benchmarking
++
++    Returns:
++        Average time in milliseconds
++    """
++    torch.manual_seed(0)
++    random.seed(0)
++
++    # Create slot mapping
++    num_slots = block_size * num_blocks
++    slot_mapping_lst = random.sample(range(num_slots), num_tokens)
++    slot_mapping = torch.tensor(slot_mapping_lst,
++                                dtype=torch.long,
++                                device=device)
++
++    # Create input data - use empty+fill instead of randn for faster setup
++    qkv = torch.empty(num_tokens, 3, num_heads, head_size,
++                     dtype=dtype, device=device)
++    qkv.normal_()
++    _, key, value = qkv.unbind(dim=1)
++
++    # Create KV caches - use empty instead of zeros
++    key_cache = torch.empty(num_blocks,
++                           block_size,
++                           num_heads,
++                           head_size,
++                           dtype=dtype,
++                           device=device)
++    value_cache = torch.empty(num_blocks,
++                             block_size,
++                             num_heads,
++                             head_size,
++                             dtype=dtype,
++                             device=device)
++
++    # Get scales
++    k_scale = (key.amax() / 64.0).to(torch.float32)
++    v_scale = (value.amax() / 64.0).to(torch.float32)
++
++    # Warmup
++    for _ in range(10):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                   slot_mapping, kv_cache_dtype, k_scale,
++                                   v_scale)
++
++    if device.startswith("cuda"):
++        torch.cuda.synchronize()
++
++    # Benchmark
++    start = time.perf_counter()
++    for _ in range(num_iters):
++        ops.reshape_and_cache_flash(key, value, key_cache, value_cache,
++                                   slot_mapping, kv_cache_dtype, k_scale,
++                                   v_scale)
++
++    if device.startswith("cuda"):
++        torch.cuda.synchronize()
++
++    end = time.perf_counter()
++    avg_time_ms = (end - start) * 1000 / num_iters
++
++    return avg_time_ms
++
++
++def benchmark_cache_allocation(num_blocks: int,
++                               block_size: int,
++                               entry_size: int,
++                               dtype: torch.dtype,
++                               device: str = "cuda",
++                               num_iters: int = 100) -> tuple[float, float]:
++    """Benchmark cache allocation with zeros vs empty.
++
++    Returns:
++        Tuple of (zeros_time_ms, empty_time_ms)
++    """
++    # Benchmark torch.zeros
++    if device.startswith("cuda"):
++        torch.cuda.synchronize()
++
++    start = time.perf_counter()
++    for _ in range(num_iters):
++        cache = torch.zeros(num_blocks,
++                          block_size,
++                          entry_size,
++                          dtype=dtype,
++                          device=device)
++        if device.startswith("cuda"):
++            torch.cuda.synchronize()
++
++    end = time.perf_counter()
++    zeros_time_ms = (end - start) * 1000 / num_iters
++
++    # Benchmark torch.empty
++    if device.startswith("cuda"):
++        torch.cuda.synchronize()
++
++    start = time.perf_counter()
++    for _ in range(num_iters):
++        cache = torch.empty(num_blocks,
++                          block_size,
++                          entry_size,
++                          dtype=dtype,
++                          device=device)
++        if device.startswith("cuda"):
++            torch.cuda.synchronize()
++
++    end = time.perf_counter()
++    empty_time_ms = (end - start) * 1000 / num_iters
++
++    speedup = zeros_time_ms / empty_time_ms if empty_time_ms > 0 else 0
++    print(f"  torch.zeros: {zeros_time_ms:.4f} ms")
++    print(f"  torch.empty: {empty_time_ms:.4f} ms")
++    print(f"  Speedup: {speedup:.2f}x")
++
++    return zeros_time_ms, empty_time_ms
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Benchmark reshape_and_cache_flash kernel")
++    parser.add_argument("--num-tokens",
++                       type=int,
++                       default=42,
++                       help="Number of tokens")
++    parser.add_argument("--num-heads",
++                       type=int,
++                       default=8,
++                       help="Number of heads")
++    parser.add_argument("--head-size",
++                       type=int,
++                       default=128,
++                       help="Head size")
++    parser.add_argument("--block-size",
++                       type=int,
++                       default=16,
++                       help="Block size")
++    parser.add_argument("--num-blocks",
++                       type=int,
++                       default=1024,
++                       help="Number of blocks")
++    parser.add_argument("--dtype",
++                       type=str,
++                       default="float16",
++                       choices=["float16", "bfloat16", "float32"],
++                       help="Data type")
++    parser.add_argument("--kv-cache-dtype",
++                       type=str,
++                       default="auto",
++                       choices=["auto", "fp8"],
++                       help="KV cache dtype")
++    parser.add_argument("--device",
++                       type=str,
++                       default="cuda",
++                       help="Device")
++    parser.add_argument("--num-iters",
++                       type=int,
++                       default=100,
++                       help="Number of iterations")
++
++    args = parser.parse_args()
++
++    dtype_map = {
++        "float16": torch.float16,
++        "bfloat16": torch.bfloat16,
++        "float32": torch.float32,
++    }
++    dtype = dtype_map[args.dtype]
++
++    print("=" * 80)
++    print("Reshape and Cache Flash Kernel Benchmark")
++    print("=" * 80)
++    print(f"Configuration:")
++    print(f"  num_tokens: {args.num_tokens}")
++    print(f"  num_heads: {args.num_heads}")
++    print(f"  head_size: {args.head_size}")
++    print(f"  block_size: {args.block_size}")
++    print(f"  num_blocks: {args.num_blocks}")
++    print(f"  dtype: {args.dtype}")
++    print(f"  kv_cache_dtype: {args.kv_cache_dtype}")
++    print(f"  device: {args.device}")
++    print()
++
++    # Test reshape_and_cache_flash kernel
++    print("1. Benchmarking reshape_and_cache_flash kernel:")
++    avg_time = benchmark_reshape_and_cache_flash(
++        args.num_tokens,
++        args.num_heads,
++        args.head_size,
++        args.block_size,
++        args.num_blocks,
++        dtype,
++        args.kv_cache_dtype,
++        args.device,
++        args.num_iters,
++    )
++    print(f"  Average time: {avg_time:.4f} ms")
++    print()
++
++    # Test cache allocation
++    print("2. Benchmarking cache allocation (zeros vs empty):")
++    entry_size = args.num_heads * args.head_size
++    benchmark_cache_allocation(args.num_blocks, args.block_size, entry_size,
++                              dtype, args.device, args.num_iters)
++    print()
++
++    print("=" * 80)
++    print("Benchmark Complete")
++    print("=" * 80)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 88559c8fe..dbc9ab342 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -133,8 +133,8 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
+ 
+   // Create data structures for the kernel.
+   // Create an array of pointers to the key and value caches.
+-  int64_t key_cache_ptrs[num_layers];
+-  int64_t value_cache_ptrs[num_layers];
++  std::vector<int64_t> key_cache_ptrs(num_layers);
++  std::vector<int64_t> value_cache_ptrs(num_layers);
+   for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+     key_cache_ptrs[layer_idx] =
+         reinterpret_cast<int64_t>(key_caches[layer_idx].data_ptr());
+@@ -148,10 +148,10 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
+   // Move the data structures to the GPU.
+   // NOTE: This synchronizes the CPU and GPU.
+   torch::Tensor key_cache_ptrs_tensor =
+-      torch::from_blob(key_cache_ptrs, {num_layers}, torch::kInt64)
++      torch::from_blob(key_cache_ptrs.data(), {num_layers}, torch::kInt64)
+           .to(cache_device);
+   torch::Tensor value_cache_ptrs_tensor =
+-      torch::from_blob(value_cache_ptrs, {num_layers}, torch::kInt64)
++      torch::from_blob(value_cache_ptrs.data(), {num_layers}, torch::kInt64)
+           .to(cache_device);
+ 
+   // Launch the kernel.
+diff --git a/tests/kernels/attention/test_cache.py b/tests/kernels/attention/test_cache.py
+index 789507615..b6b1cd819 100644
+--- a/tests/kernels/attention/test_cache.py
++++ b/tests/kernels/attention/test_cache.py
+@@ -474,7 +474,7 @@ def _create_mla_cache(
+     device: str,
+ ) -> torch.Tensor:
+     cache_dtype = torch.uint8 if kv_cache_dtype == "fp8" else dtype
+-    return torch.zeros(num_blocks,
++    return torch.empty(num_blocks,
+                        block_size,
+                        entry_size,
+                        dtype=cache_dtype,
+@@ -486,7 +486,7 @@ def _fill_mla_cache(cache: torch.Tensor, kv_cache_dtype: str):
+ 
+     vals = torch.randn(*cache.shape, device=cache.device, dtype=rand_dtype)
+     if kv_cache_dtype == "fp8":
+-        temp = torch.zeros_like(cache)
++        temp = torch.empty_like(cache)
+         ops.convert_fp8(temp, vals, 1.0, kv_dtype=kv_cache_dtype)
+         vals = temp
+     cache.copy_(vals)
+@@ -532,7 +532,8 @@ def test_concat_and_cache_mla(
+     scale = torch.tensor(0.1, dtype=torch.float32, device=device)
+     kv_cache = _create_mla_cache(num_blocks, block_size, entry_size, dtype,
+                                  kv_cache_dtype, device)
+-    ref_temp = torch.zeros(*kv_cache.shape, dtype=dtype, device=device)
++    ref_temp = torch.empty(*kv_cache.shape, dtype=dtype, device=device)
++    ref_temp.zero_()
+ 
+     for i in range(num_tokens):
+         slot = slot_mapping[i].item()
+@@ -742,7 +743,7 @@ def test_gather_cache_mla(kv_lora_rank, qk_rope_head_dim, block_size,
+         perm = torch.randperm(num_blocks, device=device)
+         block_table[b, :] = perm
+ 
+-    dst = torch.zeros((total_tokens, entry_size),
++    dst = torch.empty((total_tokens, entry_size),
+                       dtype=src_cache.dtype,
+                       device=device)
+ 
+@@ -814,7 +815,8 @@ def test_concat_and_cache_mla_cpu(
+     scale = torch.tensor(0.1, dtype=torch.float32, device=device)
+     kv_cache = _create_mla_cache(num_blocks, block_size, entry_size, dtype,
+                                  kv_cache_dtype, device)
+-    ref_temp = torch.zeros(*kv_cache.shape, dtype=dtype, device=device)
++    ref_temp = torch.empty(*kv_cache.shape, dtype=dtype, device=device)
++    ref_temp.zero_()
+ 
+     for i in range(num_tokens):
+         slot = slot_mapping[i].item()

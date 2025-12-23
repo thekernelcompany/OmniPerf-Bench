@@ -1,0 +1,81 @@
+diff --git a/vllm/worker/neuron_worker.py b/vllm/worker/neuron_worker.py
+index 5f0eb0019..0a4dea5bc 100644
+--- a/vllm/worker/neuron_worker.py
++++ b/vllm/worker/neuron_worker.py
+@@ -42,20 +42,25 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+             vllm_config=vllm_config)
+         self.is_driver_worker = is_driver_worker
+ 
++        # Cache frequently accessed config values to reduce property lookups
++        self._max_num_seqs = self.scheduler_config.max_num_seqs
++
+     def execute_model(
+         self,
+         execute_model_req: Optional[ExecuteModelRequest] = None,
+     ) -> Optional[List[SamplerOutput]]:
+-        assert execute_model_req is not None
+-        assert (not execute_model_req.blocks_to_swap_in
+-                and not execute_model_req.blocks_to_swap_out
+-                and not execute_model_req.blocks_to_copy), (
+-                    "Cache operations are not supported for Neuron backend.")
+-        assert execute_model_req.num_lookahead_slots == 0, (
+-            "lookahead not supported for Neuron backend.")
+-        output = LocalOrDistributedWorkerBase.execute_model(
++        # Combine assertions for better performance - single check instead of three
++        if (execute_model_req is None or
++            execute_model_req.blocks_to_swap_in or
++            execute_model_req.blocks_to_swap_out or
++            execute_model_req.blocks_to_copy):
++            raise AssertionError(
++                "Cache operations are not supported for Neuron backend.")
++        if execute_model_req.num_lookahead_slots != 0:
++            raise AssertionError(
++                "lookahead not supported for Neuron backend.")
++        return LocalOrDistributedWorkerBase.execute_model(
+             self, execute_model_req)
+-        return output
+ 
+     def init_device(self) -> None:
+         self.init_distributed_environment()
+@@ -76,21 +81,20 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+         # Set the number of GPU blocks to be the same as the maximum number of
+         # sequences that can be processed in a single batch. This is equivalent
+         # to schedule without PagedAttention.
+-        num_gpu_blocks = self.scheduler_config.max_num_seqs
+-
+-        # Swap not yet supported with Neuron backend.
+-        num_cpu_blocks = 0
+-
+-        return num_gpu_blocks, num_cpu_blocks
++        # Use cached value to avoid property lookup overhead
++        return self._max_num_seqs, 0
+ 
+     def initialize_cache(self, num_gpu_blocks: int,
+                          num_cpu_blocks: int) -> None:
+         """Initialize the KV cache.
+         """
+ 
+-        # Different values are not tested.
+-        assert num_cpu_blocks == 0
+-        assert num_gpu_blocks == self.scheduler_config.max_num_seqs
++        # Different values are not tested. Combined checks for efficiency.
++        if num_cpu_blocks != 0 or num_gpu_blocks != self._max_num_seqs:
++            raise AssertionError(
++                f"Invalid cache config: expected num_cpu_blocks=0 and "
++                f"num_gpu_blocks={self._max_num_seqs}, got "
++                f"num_cpu_blocks={num_cpu_blocks}, num_gpu_blocks={num_gpu_blocks}")
+ 
+         self.cache_config.num_gpu_blocks = num_gpu_blocks
+         self.cache_config.num_cpu_blocks = num_cpu_blocks
+@@ -106,8 +110,9 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+     @torch.inference_mode()
+     def prepare_worker_input(
+             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+-        return WorkerInput(num_seq_groups=len(
+-            execute_model_req.seq_group_metadata_list), )
++        # Optimize by directly passing length without intermediate tuple
++        num_groups = len(execute_model_req.seq_group_metadata_list)
++        return WorkerInput(num_seq_groups=num_groups)
+ 
+     def execute_worker(self, worker_input: WorkerInput) -> None:
+         pass

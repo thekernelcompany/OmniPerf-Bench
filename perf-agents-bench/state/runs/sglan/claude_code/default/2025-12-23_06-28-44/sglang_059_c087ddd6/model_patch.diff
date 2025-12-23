@@ -1,0 +1,259 @@
+diff --git a/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+new file mode 100644
+index 0000000..d25a456
+--- /dev/null
++++ b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+@@ -0,0 +1,189 @@
++import argparse
++import time
++
++import torch
++import triton
++
++from sglang.srt.layers.moe.ep_moe.kernels import (
++    run_moe_ep_preproess,
++    pre_reorder_triton_kernel,
++    post_reorder_triton_kernel,
++)
++
++
++def benchmark_ep_preprocess(
++    num_tokens: int,
++    num_experts: int,
++    topk: int,
++    num_iters: int = 100,
++):
++    """Benchmark the EP MoE preprocessing kernel."""
++    # Create input data
++    topk_ids = torch.randint(
++        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
++    )
++
++    # Warmup
++    for _ in range(10):
++        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
++            topk_ids, num_experts
++        )
++
++    # Benchmark
++    torch.cuda.synchronize()
++    start = time.time()
++
++    for _ in range(num_iters):
++        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
++            topk_ids, num_experts
++        )
++
++    torch.cuda.synchronize()
++    duration = time.time() - start
++
++    avg_time = duration / num_iters
++    print(
++        f"EP Preprocess: num_tokens={num_tokens}, num_experts={num_experts}, "
++        f"topk={topk}, avg_time={avg_time*1000:.4f}ms"
++    )
++    return avg_time
++
++
++def benchmark_reorder_kernels(
++    num_tokens: int,
++    hidden_size: int,
++    num_experts: int,
++    topk: int,
++    num_iters: int = 100,
++):
++    """Benchmark the pre and post reorder kernels."""
++    # Create input data
++    topk_ids = torch.randint(
++        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
++    )
++    topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32, device="cuda")
++    input_tensor = torch.randn(num_tokens, hidden_size, dtype=torch.float16, device="cuda")
++
++    # Preprocess to get indices
++    reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(topk_ids, num_experts)
++
++    # Allocate output tensors
++    gateup_input = torch.empty(
++        topk_ids.numel(), hidden_size, dtype=torch.float16, device="cuda"
++    )
++    output = torch.empty(num_tokens, hidden_size, dtype=torch.float16, device="cuda")
++
++    BLOCK_SIZE = 128
++
++    # Warmup
++    for _ in range(10):
++        pre_reorder_triton_kernel[(num_tokens,)](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            None,
++            0,
++            num_experts - 1,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++
++    # Benchmark pre-reorder
++    torch.cuda.synchronize()
++    start = time.time()
++
++    for _ in range(num_iters):
++        pre_reorder_triton_kernel[(num_tokens,)](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            None,
++            0,
++            num_experts - 1,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++
++    torch.cuda.synchronize()
++    duration = time.time() - start
++
++    avg_time = duration / num_iters
++    print(
++        f"Pre-Reorder: num_tokens={num_tokens}, hidden_size={hidden_size}, "
++        f"avg_time={avg_time*1000:.4f}ms"
++    )
++
++    # Benchmark post-reorder
++    down_output = torch.randn(
++        topk_ids.numel(), hidden_size, dtype=torch.float16, device="cuda"
++    )
++
++    # Warmup
++    for _ in range(10):
++        post_reorder_triton_kernel[(num_tokens,)](
++            down_output,
++            output,
++            src2dst,
++            topk_ids,
++            topk_weights,
++            0,
++            num_experts - 1,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++
++    torch.cuda.synchronize()
++    start = time.time()
++
++    for _ in range(num_iters):
++        post_reorder_triton_kernel[(num_tokens,)](
++            down_output,
++            output,
++            src2dst,
++            topk_ids,
++            topk_weights,
++            0,
++            num_experts - 1,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++
++    torch.cuda.synchronize()
++    duration = time.time() - start
++
++    avg_time = duration / num_iters
++    print(
++        f"Post-Reorder: num_tokens={num_tokens}, hidden_size={hidden_size}, "
++        f"avg_time={avg_time*1000:.4f}ms"
++    )
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--num-tokens", type=int, default=4096)
++    parser.add_argument("--hidden-size", type=int, default=4096)
++    parser.add_argument("--num-experts", type=int, default=64)
++    parser.add_argument("--topk", type=int, default=2)
++    parser.add_argument("--num-iters", type=int, default=100)
++    args = parser.parse_args()
++
++    print("Benchmarking EP MoE Preprocessing and Reordering Kernels")
++    print("=" * 60)
++
++    benchmark_ep_preprocess(
++        args.num_tokens, args.num_experts, args.topk, args.num_iters
++    )
++
++    benchmark_reorder_kernels(
++        args.num_tokens,
++        args.hidden_size,
++        args.num_experts,
++        args.topk,
++        args.num_iters,
++    )
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..1261766 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -121,7 +121,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
+     )
+     torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
+     num_minus_one = seg_indptr[0]
+-    seg_indptr = seg_indptr - num_minus_one
++    seg_indptr.sub_(num_minus_one)
+ 
+     BLOCK_SIZE = 512
+     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+@@ -151,7 +151,8 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -479,7 +480,6 @@ def post_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+     topk_weights_ptr = topk_weights_ptr + src_idx * topk
+ 
+-    computed = False
+     store_ptr = output_ptr + src_idx * hidden_size
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+         offset = start_offset + tl.arange(0, BLOCK_SIZE)
+@@ -489,7 +489,6 @@ def post_reorder_triton_kernel(
+         for idx in range(topk):
+             expert_id = tl.load(topk_ids_ptr + idx)
+             if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-                computed = True
+                 dst_idx = tl.load(src2dst_ptr + idx)
+                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+@@ -497,14 +496,6 @@ def post_reorder_triton_kernel(
+                 sum_vec += in_data * weigh_scale
+         tl.store(store_ptr + offset, sum_vec, mask=mask)
+ 
+-    if computed == False:
+-        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-            mask = offset < hidden_size
+-            tl.store(
+-                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+-            )
+-
+ 
+ @triton.jit
+ def compute_m_range(
+@@ -679,7 +670,8 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )

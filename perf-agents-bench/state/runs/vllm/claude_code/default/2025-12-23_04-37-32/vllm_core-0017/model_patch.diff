@@ -1,0 +1,246 @@
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index d705f3d91..aca6886ad 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -208,7 +208,9 @@ class BlockTable:
+         occupied by each block. After freeing all the blocks, the `_blocks` list
+         is set to `None`.
+         """
+-        assert self._is_allocated
++        if not self._is_allocated:
++            return
++
+         for block in self._blocks:
+             self._allocator.free(block)
+         self._blocks = []
+@@ -269,11 +271,10 @@ class BlockTable:
+ 
+     def _get_all_token_ids(self) -> List[int]:
+         # NOTE: This function is O(seq_len); use sparingly.
+-        token_ids: List[int] = []
+-
+         if not self._is_allocated:
+-            return token_ids
++            return []
+ 
++        token_ids: List[int] = []
+         for block in self._blocks:
+             token_ids.extend(block.token_ids)
+ 
+@@ -322,6 +323,9 @@ class BlockTable:
+         than the block size, since the last allocated block may be partially
+         full.
+         """
++        if not token_ids:
++            return []
++
+         first_chunk_size = self._block_size - (self._num_full_slots %
+                                                self._block_size)
+         token_blocks = [token_ids[:first_chunk_size]] + chunk_list(
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index d2787d696..efb435d83 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -37,28 +37,20 @@ class RefCounter(RefCounterProtocol):
+                                            for index in deduped}
+ 
+     def incr(self, block_id: BlockId) -> RefCount:
+-        assert block_id in self._refcounts
+-        pre_incr_refcount = self._refcounts[block_id]
+-
+-        assert pre_incr_refcount >= 0
+-
+-        post_incr_refcount = pre_incr_refcount + 1
+-        self._refcounts[block_id] = post_incr_refcount
+-        return post_incr_refcount
++        refcount = self._refcounts[block_id]
++        assert refcount >= 0
++        refcount += 1
++        self._refcounts[block_id] = refcount
++        return refcount
+ 
+     def decr(self, block_id: BlockId) -> RefCount:
+-        assert block_id in self._refcounts
+         refcount = self._refcounts[block_id]
+-
+         assert refcount > 0
+         refcount -= 1
+-
+         self._refcounts[block_id] = refcount
+-
+         return refcount
+ 
+     def get(self, block_id: BlockId) -> RefCount:
+-        assert block_id in self._refcounts
+         return self._refcounts[block_id]
+ 
+     def as_readonly(self) -> "ReadOnlyRefCounter":
+diff --git a/vllm/core/block/naive_block.py b/vllm/core/block/naive_block.py
+index 50f27bab3..d8fd1ccbe 100644
+--- a/vllm/core/block/naive_block.py
++++ b/vllm/core/block/naive_block.py
+@@ -142,9 +142,8 @@ class NaiveBlockAllocator(BlockAllocator):
+         if not self._free_block_indices:
+             raise BlockAllocator.NoFreeBlocksError()
+ 
+-        block_id = next(iter(self._free_block_indices))
++        block_id = self._free_block_indices.pop()
+         self._refcounter.incr(block_id)
+-        self._free_block_indices.remove(block_id)
+         return block_id
+ 
+     def _free_block_id(self, block_id: BlockId) -> None:
+@@ -262,10 +261,16 @@ class NaiveBlockAllocator(BlockAllocator):
+         return num_touched_blocks
+ 
+     def swap_out(self, blocks: List[Block]) -> None:
++        if not blocks:
++            return
++
+         for block in blocks:
+             self.free(block)
+ 
+     def swap_in(self, blocks: List[Block]) -> None:
++        if not blocks:
++            return
++
+         for block in blocks:
+             if block.is_full:
+                 alloc = self.allocate_immutable(block.prev_block,
+@@ -321,6 +326,9 @@ class NaiveBlock(Block):
+         Args:
+             token_ids (List[int]): The token IDs to be appended to the block.
+         """
++        if not token_ids:
++            return
++
+         self._append_token_ids_no_cow(token_ids)
+ 
+         if self._block_id is not None:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74e4..e0ac2b04f 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -211,8 +211,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         if refcount == 1:
+             # if block get referred, then it shall not be in evictor
+             # and put it into _blocks for tracking
+-            if block_id in self.evictor:
+-                self.evictor.remove(block_id)
++            self.evictor.remove(block_id)
++            self._blocks[block_id] = block
++        elif block_id not in self._blocks:
+             self._blocks[block_id] = block
+ 
+     def free(self, block: Block) -> None:
+@@ -385,6 +386,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         info in evictor's metadata.
+         """
+ 
++        if not block_ids:
++            return
++
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 self._blocks[block_id].last_accessed = now
+@@ -397,6 +401,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         """Mark blocks as computed, used in prefix caching."""
+ 
++        if not block_ids:
++            return
++
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 # only those full block is valid for prefix caching
+@@ -420,6 +427,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         compyted would be taken consideration.
+         """
+ 
++        if not seq_block_ids:
++            return []
++
+         # NOTE We exclude the last block to avoid the case where the entire
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.
+@@ -432,7 +442,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # It returns a list of int although type annotation says list of string.
+         return commonprefix([
+             ids for ids in ids_list  # type: ignore
+-            if ids != []
++            if ids
+         ])
+ 
+     def get_num_blocks_touched(self,
+@@ -444,13 +454,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         Args:
+             blocks (List[Block]): The potential blocks to swap.
+-            num_lookahead_slots (int): number of lookahead slots (0 for 
++            num_lookahead_slots (int): number of lookahead slots (0 for
+                 swap out).
+-        
++
+         Returns:
+             int: the number of blocks that will be touched by
+                 swapping in/out the given blocks and num_lookahead_slots.
+         """
++        if not blocks:
++            return 0
++
+         num_touched_blocks = 0
+         for block in blocks:
+             if not block.is_full:
+@@ -466,23 +479,29 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         return num_touched_blocks
+ 
+     def swap_out(self, blocks: List[Block]) -> None:
+-        """Execute the swap out actions. Basically just free the 
++        """Execute the swap out actions. Basically just free the
+         given blocks.
+ 
+         Args:
+             blocks: List of blocks to be swapped out.
+         """
++        if not blocks:
++            return
++
+         for block in blocks:
+             self.free(block)
+ 
+     def swap_in(self, blocks: List[Block]) -> None:
+-        """Execute the swap int actions. Change the block id from 
+-        old allocator to current allocator for each block to finish 
+-        the block table update. 
++        """Execute the swap int actions. Change the block id from
++        old allocator to current allocator for each block to finish
++        the block table update.
+ 
+         Args:
+             blocks: List of blocks to be swapped in.
+         """
++        if not blocks:
++            return
++
+         for block in blocks:
+             if block.is_full:
+                 alloc = self.allocate_immutable(block.prev_block,
+@@ -569,7 +588,8 @@ class PrefixCachingBlock(Block):
+         Args:
+             token_ids (List[int]): The token IDs to be appended to the block.
+         """
+-        assert token_ids
++        if not token_ids:
++            return
+ 
+         # naive block handles CoW.
+         self._block.append_token_ids(token_ids)
+@@ -685,7 +705,7 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ def assert_prefix_caching_block_or_none(block: Optional[Block]):

@@ -1,0 +1,105 @@
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index 9ae5801..9008856 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -80,7 +80,7 @@ class Sampler(nn.Module):
+ 
+                 if not torch.all(success):
+                     logger.warning("Detected errors during sampling!")
+-                    batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
++                    batch_next_token_ids = torch.empty_like(batch_next_token_ids).fill_(0)
+             elif global_server_args_dict["sampling_backend"] == "pytorch":
+                 # A slower fallback implementation with torch native operations.
+                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index fac008d..6541549 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -543,9 +543,7 @@ class ScheduleBatch:
+                     or len(req.prefix_indices) >= im.num_image_tokens
+                 )
+ 
+-        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
++        self.encoder_lens = torch.tensor(self.encoder_lens_cpu, dtype=torch.int32, device=self.device)
+ 
+         # Strip encoder infos
+         pt = 0
+@@ -574,24 +572,16 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Reassign
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
++        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32, device=self.device)
++        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+-                self.device, non_blocking=True
+-            )
++            self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32).to(
+-                self.device, non_blocking=True
+-            )
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
+         else:
+             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
+ 
+@@ -645,15 +635,9 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Set fields
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
+-        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
++        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32, device=self.device)
++        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32, device=self.device)
++        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+ 
+         self.out_cache_loc = out_cache_loc
+ 
+@@ -926,9 +910,7 @@ class ScheduleBatch:
+             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+ 
+         self.reqs = [self.reqs[i] for i in keep_indices]
+-        new_indices = torch.tensor(keep_indices, dtype=torch.int32).to(
+-            self.device, non_blocking=True
+-        )
++        new_indices = torch.tensor(keep_indices, dtype=torch.int32, device=self.device)
+         self.req_pool_indices = self.req_pool_indices[new_indices]
+         self.seq_lens = self.seq_lens[new_indices]
+         self.out_cache_loc = None
+diff --git a/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py b/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
+index c9e0f07..9006150 100644
+--- a/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
++++ b/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
+@@ -43,11 +43,11 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
+             batch_first=True,
+             padding_value=self.orchestrator.vocab_size,
+         )
+-        self.stop_token_penalties = torch.zeros(
++        self.stop_token_penalties = torch.empty(
+             size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size + 1),
+             dtype=torch.float32,
+             device=self.orchestrator.device,
+-        ).scatter_add_(
++        ).fill_(0).scatter_add_(
+             dim=1,
+             index=padded_stop_token_ids,
+             src=torch.full_like(

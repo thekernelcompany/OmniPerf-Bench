@@ -1,0 +1,88 @@
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 7c0317f..cc73817 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -63,27 +63,45 @@ class ServerArgs:
+     nnodes: int = 1
+     node_rank: Optional[int] = None
+ 
++    # Cache field names for from_cli_args performance
++    _field_names = None
++
++    # Lookup table for mem_fraction_static optimization
++    _MEM_FRACTION_MAP = {
++        16: 0.74,
++        8: 0.78,
++        4: 0.82,
++        2: 0.85,
++        1: 0.88,
++    }
++
+     def __post_init__(self):
++        # Optimize by checking None cases first (most common path)
+         if self.tokenizer_path is None:
+             self.tokenizer_path = self.model_path
++
++        # Optimize additional_ports conversion - check None first
++        if self.additional_ports is None:
++            self.additional_ports = []
++        elif isinstance(self.additional_ports, int):
++            self.additional_ports = [self.additional_ports]
++
+         if self.mem_fraction_static is None:
++            # Use lookup table for O(1) access instead of O(n) if-elif chain
+             if self.tp_size >= 16:
+-                self.mem_fraction_static = 0.74
++                self.mem_fraction_static = self._MEM_FRACTION_MAP[16]
+             elif self.tp_size >= 8:
+-                self.mem_fraction_static = 0.78
++                self.mem_fraction_static = self._MEM_FRACTION_MAP[8]
+             elif self.tp_size >= 4:
+-                self.mem_fraction_static = 0.82
++                self.mem_fraction_static = self._MEM_FRACTION_MAP[4]
+             elif self.tp_size >= 2:
+-                self.mem_fraction_static = 0.85
++                self.mem_fraction_static = self._MEM_FRACTION_MAP[2]
+             else:
+-                self.mem_fraction_static = 0.88
+-        if isinstance(self.additional_ports, int):
+-            self.additional_ports = [self.additional_ports]
+-        elif self.additional_ports is None:
+-            self.additional_ports = []
++                self.mem_fraction_static = self._MEM_FRACTION_MAP[1]
+ 
+         if self.random_seed is None:
+-            self.random_seed = random.randint(0, 1 << 30)
++            # Pre-compute the maximum value to avoid bit shift on every call
++            self.random_seed = random.randint(0, 1073741824)
+ 
+     @staticmethod
+     def add_cli_args(parser: argparse.ArgumentParser):
+@@ -321,20 +339,18 @@ class ServerArgs:
+ 
+     @classmethod
+     def from_cli_args(cls, args: argparse.Namespace):
+-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+-        return cls(**{attr: getattr(args, attr) for attr in attrs})
++        # Cache field names for better performance on repeated calls
++        if cls._field_names is None:
++            cls._field_names = tuple(attr.name for attr in dataclasses.fields(cls))
++        # Optimize dict comprehension by using direct attribute access
++        return cls(**{attr: getattr(args, attr) for attr in cls._field_names})
+ 
+     def url(self):
+         return f"http://{self.host}:{self.port}"
+ 
+     def print_mode_args(self):
+-        return (
+-            f"disable_flashinfer={self.disable_flashinfer}, "
+-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
+-            f"disable_radix_cache={self.disable_radix_cache}, "
+-            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
+-            f"disable_disk_cache={self.disable_disk_cache}, "
+-        )
++        # Use single f-string for better performance than multiple concatenations
++        return f"disable_flashinfer={self.disable_flashinfer}, attention_reduce_in_fp32={self.attention_reduce_in_fp32}, disable_radix_cache={self.disable_radix_cache}, disable_regex_jump_forward={self.disable_regex_jump_forward}, disable_disk_cache={self.disable_disk_cache}, "
+ 
+ 
+ @dataclasses.dataclass

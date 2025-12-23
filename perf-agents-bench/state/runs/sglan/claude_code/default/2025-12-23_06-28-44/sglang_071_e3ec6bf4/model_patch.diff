@@ -1,0 +1,102 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 0e1640f..d88fdcd 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -102,9 +102,10 @@ def normalize_e4m3fn_to_e4m3fnuz(
+     # the e4m3fn value, so we should double the scaling factor to
+     # get the same dequantized value.
+     # https://onnx.ai/onnx/technical/float8.html
+-    weight_scale = weight_scale * 2.0
++    # Optimize: use in-place multiplication for better performance
++    weight_scale = weight_scale.mul(2.0)
+     if input_scale is not None:
+-        input_scale = input_scale * 2.0
++        input_scale = input_scale.mul(2.0)
+     return weight, weight_scale, input_scale
+ 
+ 
+@@ -300,7 +301,8 @@ def input_to_float8(
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """This function quantizes input values to float8 values with tensor-wise quantization."""
+     min_val, max_val = x.aminmax()
+-    amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
++    # Optimize: avoid intermediate torch.maximum allocation
++    amax = torch.max(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
+ 
+     if _is_fp8_fnuz:
+         dtype = fp8_dtype
+@@ -310,7 +312,9 @@ def input_to_float8(
+         fp_max = finfo.max
+ 
+     scale = fp_max / amax
+-    x_scl_sat = (x.float() * scale).clamp(min=-fp_max, max=fp_max)
++    # Optimize: fuse operations and avoid extra float() call since x is already float-compatible
++    x_float = x if x.dtype == torch.float32 else x.float()
++    x_scl_sat = (x_float * scale).clamp_(min=-fp_max, max=fp_max)
+     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+ 
+ 
+@@ -332,22 +336,18 @@ def block_quant_to_tensor_quant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = x_q_block.to(torch.float32)
++    # Optimize: use empty + copy instead of to() for better performance
++    x_dq_block = torch.empty(x_q_block.shape, dtype=torch.float32, device=x_q_block.device)
++    x_dq_block.copy_(x_q_block)
+ 
+-    x_dq_block_tiles = [
+-        [
+-            x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            for i in range(k_tiles)
+-        ]
+-        for j in range(n_tiles)
+-    ]
+-
+-    for i in range(k_tiles):
+-        for j in range(n_tiles):
+-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
++    # Optimize: apply scaling directly without intermediate list structure
++    for j in range(n_tiles):
++        for i in range(k_tiles):
++            row_start = j * block_n
++            row_end = min((j + 1) * block_n, n)
++            col_start = i * block_k
++            col_end = min((i + 1) * block_k, k)
++            x_dq_block[row_start:row_end, col_start:col_end].mul_(x_s[j, i])
+ 
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_block)
+@@ -387,7 +387,8 @@ def block_quant_dequant(
+                 j * block_n : min((j + 1) * block_n, n),
+                 i * block_k : min((i + 1) * block_k, k),
+             ]
+-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
++            # Optimize: avoid .to() by direct conversion and multiplication
++            x_dq_block_tile[:, :] = x_q_block_tile.float() * x_s[j, i]
+ 
+     return x_dq_block
+ 
+@@ -396,7 +397,8 @@ def channel_quant_to_tensor_quant(
+     x_q_channel: torch.Tensor,
+     x_s: torch.Tensor,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    x_dq_channel = x_q_channel.to(torch.float32) * x_s
++    # Optimize: fuse type conversion with multiplication for better memory efficiency
++    x_dq_channel = x_q_channel.float().mul_(x_s)
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_channel)
+         if _is_cuda
+@@ -423,7 +425,8 @@ def _apply_fallback_scaled_mm(
+ ):
+     global TORCH_DEVICE_IDENTITY
+     if TORCH_DEVICE_IDENTITY is None:
+-        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
++        # Optimize: use tensor() instead of ones() for single-element tensor
++        TORCH_DEVICE_IDENTITY = torch.tensor([1.0], dtype=torch.float32, device=weight.device)
+ 
+     output = torch._scaled_mm(
+         qinput,

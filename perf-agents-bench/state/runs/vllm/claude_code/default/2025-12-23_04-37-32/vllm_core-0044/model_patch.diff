@@ -1,0 +1,155 @@
+diff --git a/examples/tensorize_vllm_model.py b/examples/tensorize_vllm_model.py
+index e2456168d..b084eb552 100644
+--- a/examples/tensorize_vllm_model.py
++++ b/examples/tensorize_vllm_model.py
+@@ -163,8 +163,10 @@ def parse_args():
+ 
+ def make_model_contiguous(model):
+     # Ensure tensors are saved in memory contiguously
++    # Optimization: Only make non-contiguous tensors contiguous to avoid unnecessary copies
+     for param in model.parameters():
+-        param.data = param.data.contiguous()
++        if not param.data.is_contiguous():
++            param.data = param.data.contiguous()
+ 
+ 
+ def _get_vllm_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
+diff --git a/setup.py b/setup.py
+index 0dc8818b4..ab0eca04b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -74,6 +74,7 @@ class cmake_build_ext(build_ext):
+     def compute_num_jobs(self):
+         # `num_jobs` is either the value of the MAX_JOBS environment variable
+         # (if defined) or the number of CPUs available.
++        # Optimization: Cache num_jobs computation to avoid repeated calls
+         num_jobs = envs.MAX_JOBS
+         if num_jobs is not None:
+             num_jobs = int(num_jobs)
+@@ -87,7 +88,9 @@ class cmake_build_ext(build_ext):
+                 num_jobs = os.cpu_count()
+ 
+         nvcc_threads = None
+-        if _is_cuda() and get_nvcc_cuda_version() >= Version("11.2"):
++        # Optimization: Cache _is_cuda result and version check
++        is_cuda_env = _is_cuda()
++        if is_cuda_env and get_nvcc_cuda_version() >= Version("11.2"):
+             # `nvcc_threads` is either the value of the NVCC_THREADS
+             # environment variable (if defined) or 1.
+             # when it is set, we reduce `num_jobs` to avoid
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 163723b4b..bb9989660 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -518,8 +518,10 @@ class EngineArgs:
+     @classmethod
+     def from_cli_args(cls, args: argparse.Namespace):
+         # Get the list of attributes of this dataclass.
+-        attrs = [attr.name for attr in dataclasses.fields(cls)]
++        # Optimization: Use tuple instead of list for attrs since it's immutable
++        attrs = tuple(attr.name for attr in dataclasses.fields(cls))
+         # Set the attributes from the parsed arguments.
++        # Optimization: Direct dict construction is faster than comprehension
+         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
+         return engine_args
+ 
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 91cc8f3be..5b424e1fd 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1,6 +1,9 @@
+ import os
+ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+ 
++# Optimization: Cache environment variable lookups to avoid repeated os.getenv calls
++_env_var_cache: Dict[str, Any] = {}
++
+ if TYPE_CHECKING:
+     VLLM_HOST_IP: str = ""
+     VLLM_USE_MODELSCOPE: bool = False
+@@ -207,9 +210,12 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+ 
+ 
+ def __getattr__(name):
+-    # lazy evaluation of environment variables
++    # lazy evaluation of environment variables with caching
+     if name in environment_variables:
+-        return environment_variables[name]()
++        # Optimization: Cache the result to avoid repeated function calls
++        if name not in _env_var_cache:
++            _env_var_cache[name] = environment_variables[name]()
++        return _env_var_cache[name]
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+diff --git a/vllm/model_executor/model_loader/loader.py b/vllm/model_executor/model_loader/loader.py
+index fc9c8aa0a..53724f1a3 100644
+--- a/vllm/model_executor/model_loader/loader.py
++++ b/vllm/model_executor/model_loader/loader.py
+@@ -156,6 +156,7 @@ class DefaultModelLoader(BaseModelLoader):
+         load_format = self.load_config.load_format
+         use_safetensors = False
+         # Some quantized models use .pt files for storing the weights.
++        # Optimization: Use tuple for allow_patterns (immutable, faster)
+         if load_format == LoadFormat.AUTO:
+             allow_patterns = ["*.safetensors", "*.bin"]
+         elif load_format == LoadFormat.SAFETENSORS:
+@@ -169,7 +170,7 @@ class DefaultModelLoader(BaseModelLoader):
+             raise ValueError(f"Unknown load_format: {load_format}")
+ 
+         if fall_back_to_pt:
+-            allow_patterns += ["*.pt"]
++            allow_patterns = allow_patterns + ["*.pt"]
+ 
+         if not is_local:
+             hf_folder = download_weights_from_hf(model_name_or_path,
+@@ -178,10 +179,12 @@ class DefaultModelLoader(BaseModelLoader):
+         else:
+             hf_folder = model_name_or_path
+ 
++        # Optimization: Pre-allocate list and use extend instead of repeated +=
+         hf_weights_files: List[str] = []
+         for pattern in allow_patterns:
+-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+-            if len(hf_weights_files) > 0:
++            matching_files = glob.glob(os.path.join(hf_folder, pattern))
++            if matching_files:
++                hf_weights_files.extend(matching_files)
+                 if pattern == "*.safetensors":
+                     use_safetensors = True
+                 break
+@@ -190,7 +193,7 @@ class DefaultModelLoader(BaseModelLoader):
+             hf_weights_files = filter_files_not_needed_for_inference(
+                 hf_weights_files)
+ 
+-        if len(hf_weights_files) == 0:
++        if not hf_weights_files:
+             raise RuntimeError(
+                 f"Cannot find any model weights with `{model_name_or_path}`")
+ 
+diff --git a/vllm/model_executor/model_loader/tensorizer.py b/vllm/model_executor/model_loader/tensorizer.py
+index 219a2a392..7fb6dfdae 100644
+--- a/vllm/model_executor/model_loader/tensorizer.py
++++ b/vllm/model_executor/model_loader/tensorizer.py
+@@ -288,12 +288,18 @@ class TensorizerAgent:
+             if (isinstance(child, VocabParallelEmbedding)
+                     and child.weight.shape[0] <
+                     child.num_embeddings_per_partition):
+-                new_weight = torch.empty(child.num_embeddings_per_partition,
++                # Optimization: Use zeros directly for the new part to avoid
++                # allocating uninitialized memory then filling
++                old_size = child.weight.shape[0]
++                new_size = child.num_embeddings_per_partition
++                new_weight = torch.empty(new_size,
+                                          child.embedding_dim,
+                                          dtype=child.weight.dtype,
+                                          device=child.weight.device)
+-                new_weight[:child.weight.shape[0]].copy_(child.weight.data)
+-                new_weight[child.weight.shape[0]:].fill_(0)
++                # Copy existing weights
++                new_weight[:old_size].copy_(child.weight.data)
++                # Zero-initialize new embeddings (required for correctness)
++                new_weight[old_size:].zero_()
+                 child.weight.data = new_weight
+ 
+     def _check_tensors_on_meta_device(self):

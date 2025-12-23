@@ -28,6 +28,10 @@ class JournalWriter:
         (self.dir / "codex_stdout.txt").write_text(stdout)
         (self.dir / "codex_stderr.txt").write_text(stderr)
 
+    def write_claude_code_logs(self, stdout: str, stderr: str):
+        (self.dir / "claude_code_stdout.txt").write_text(stdout)
+        (self.dir / "claude_code_stderr.txt").write_text(stderr)
+
     def write_journal(self, payload: Dict[str, Any]):
         payload.setdefault("timestamps", {})
         payload["timestamps"].setdefault("written", time.time())

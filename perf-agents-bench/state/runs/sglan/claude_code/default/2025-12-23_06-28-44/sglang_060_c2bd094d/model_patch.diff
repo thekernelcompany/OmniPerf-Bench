@@ -1,0 +1,53 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 6d6c432..233b5de 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -42,7 +42,7 @@ def deepep_compute_src2dst_triton_kernel(
+ 
+ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     # Find offet
+@@ -147,7 +147,8 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -531,7 +532,8 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index a9b443a..fe4907e 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -851,13 +851,8 @@ class DeepEPMoE(EPMoE):
+             self.grouped_gemm_runner = GroupedGemmRunner(
+                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
+             )
+-        seg_indptr_cur_rank = torch.cat(
+-            [
+-                torch.zeros(
+-                    1, device=tokens_per_expert.device, dtype=tokens_per_expert.dtype
+-                ),
+-                torch.cumsum(tokens_per_expert, dim=0),
+-            ]
++        seg_indptr_cur_rank = torch.nn.functional.pad(
++            torch.cumsum(tokens_per_expert, dim=0), (1, 0), value=0
+         )
+         reorder_topk_ids = torch.repeat_interleave(tokens_per_expert)
+         if self.activation_scheme == "dynamic" and not self.use_block_quant:

@@ -1,0 +1,66 @@
+diff --git a/docker/Dockerfile.rocm b/docker/Dockerfile.rocm
+index 84ea69cc0..e988d2daa 100644
+--- a/docker/Dockerfile.rocm
++++ b/docker/Dockerfile.rocm
+@@ -33,14 +33,10 @@ RUN git clone ${SGL_REPO} \
+ RUN cp -r /sgl-workspace/sglang /sglang
+ RUN python -m pip cache purge
+ 
+-RUN pip install IPython \
+-    && pip install orjson \
+-    && pip install python-multipart \
+-    && pip install torchao \
+-    && pip install pybind11
++RUN pip install --no-cache-dir IPython orjson python-multipart torchao pybind11
+ 
+-RUN pip uninstall -y triton
+-RUN git clone ${TRITON_REPO} \
++RUN pip uninstall -y triton \
++    && git clone ${TRITON_REPO} \
+     && cd triton \
+     && git checkout ${TRITON_COMMIT} \
+     && cd python \
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index cbacd90c0..eeb71c998 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -263,10 +263,9 @@ def moe_align_block_size(
+         by block_size for proper block matrix operations.
+     """
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+-    sorted_ids = torch.empty(
+-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
++    sorted_ids = torch.full(
++        (max_num_tokens_padded,), topk_ids.numel(), dtype=torch.int32, device=topk_ids.device
+     )
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty(
+         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+@@ -784,7 +783,7 @@ def fused_experts_impl(
+     else:
+         out_hidden_states = torch.empty_like(hidden_states)
+ 
+-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
++    for chunk in range(triton.cdiv(num_tokens, CHUNK_SIZE)):
+         begin_chunk_idx, end_chunk_idx = (
+             chunk * CHUNK_SIZE,
+             min((chunk + 1) * CHUNK_SIZE, num_tokens),
+@@ -801,7 +800,7 @@ def fused_experts_impl(
+             # so the cache size and config are already set correctly and
+             # do not need to be adjusted.
+             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
++            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk * topk_ids.shape[1]]
+             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+             config = get_config_func(tokens_in_chunk)
+ 
+@@ -855,7 +854,7 @@ def fused_experts_impl(
+         )
+ 
+         torch.sum(
+-            intermediate_cache3.view(*intermediate_cache3.shape),
++            intermediate_cache3,
+             dim=1,
+             out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+         )

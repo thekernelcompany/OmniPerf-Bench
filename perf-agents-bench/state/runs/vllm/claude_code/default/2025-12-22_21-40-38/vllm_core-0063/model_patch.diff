@@ -1,0 +1,122 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e79145300..675c64285 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -59,7 +59,7 @@ class InputBatch:
+         # Find a way to reduce the CPU memory usage.
+         # This buffer is not directly transferred to the GPU, so it does not
+         # need to be pinned.
+-        self.token_ids_cpu_tensor = torch.zeros(
++        self.token_ids_cpu_tensor = torch.empty(
+             (max_num_reqs, max_model_len),
+             device="cpu",
+             dtype=torch.int32,
+@@ -67,15 +67,15 @@ class InputBatch:
+         )
+         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+         self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
+-        self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
++        self.num_prompt_tokens = np.empty(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+-        self.block_table = torch.zeros(
++        self.block_table = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device=self.device,
+             dtype=torch.int32,
+         )
+-        self.block_table_cpu_tensor = torch.zeros(
++        self.block_table_cpu_tensor = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device="cpu",
+             dtype=torch.int32,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54e8..ced71df60 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -125,13 +125,13 @@ class GPUModelRunner:
+         self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -143,32 +143,40 @@ class GPUModelRunner:
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.seq_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device="cpu",
+                                              pin_memory=self.pin_memory)
+         self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
+ 
++        # Pre-allocated buffers for cascade attention to avoid repeated allocations
++        self.cu_prefix_query_lens_buf = torch.empty(2,
++                                                     dtype=torch.int32,
++                                                     device=self.device)
++        self.cu_prefix_kv_lens_buf = torch.empty(2,
++                                                  dtype=torch.int32,
++                                                  device=self.device)
++
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+         # Remove stopped requests from the cached states.
+         # Keep the states of the pre-empted requests.
+@@ -426,14 +434,14 @@ class GPUModelRunner:
+             )
+ 
+         if use_cascade:
+-            # TODO: Optimize.
+-            cu_prefix_query_lens = torch.tensor(
+-                [0, total_num_scheduled_tokens],
+-                dtype=torch.int32,
+-                device=self.device)
+-            cu_prefix_kv_lens = torch.tensor([0, common_prefix_len],
+-                                             dtype=torch.int32,
+-                                             device=self.device)
++            # Use pre-allocated buffers to avoid repeated tensor allocations
++            self.cu_prefix_query_lens_buf[0] = 0
++            self.cu_prefix_query_lens_buf[1] = total_num_scheduled_tokens
++            cu_prefix_query_lens = self.cu_prefix_query_lens_buf
++
++            self.cu_prefix_kv_lens_buf[0] = 0
++            self.cu_prefix_kv_lens_buf[1] = common_prefix_len
++            cu_prefix_kv_lens = self.cu_prefix_kv_lens_buf
+             cu_suffix_kv_lens = (
+                 self.seq_start_loc_np[:num_reqs + 1] -
+                 self.arange_np[:num_reqs + 1] * common_prefix_len)

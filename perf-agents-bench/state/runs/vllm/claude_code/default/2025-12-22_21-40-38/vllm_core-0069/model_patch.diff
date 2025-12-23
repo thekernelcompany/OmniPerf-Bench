@@ -1,0 +1,124 @@
+diff --git a/tests/tokenization/test_detokenize.py b/tests/tokenization/test_detokenize.py
+index 442173939..62440d001 100644
+--- a/tests/tokenization/test_detokenize.py
++++ b/tests/tokenization/test_detokenize.py
+@@ -41,7 +41,7 @@ def _run_incremental_decode(tokenizer, all_input_ids,
+         if prev_tokens is None:
+             prev_tokens = new_tokens
+         else:
+-            prev_tokens += new_tokens
++            prev_tokens.extend(new_tokens)
+     return decoded_text
+ 
+ 
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index 724782841..29c45d672 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -737,8 +737,10 @@ class LLMEngine:
+     def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:
+         """Decodes the new token for a sequence."""
+         all_input_ids = seq.get_token_ids()
+-        self._decode_logprobs(seq, prms, seq.output_logprobs[-1],
+-                              all_input_ids)
++        output_logprobs = seq.output_logprobs
++        if output_logprobs:
++            self._decode_logprobs(seq, prms, output_logprobs[-1],
++                                  all_input_ids)
+ 
+         (new_tokens, new_output_text, prefix_offset,
+          read_offset) = detokenize_incrementally(
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index f7a1a19a8..9d99e6f97 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -22,10 +22,13 @@ def get_cached_tokenizer(
+     each time they are called, leading to a significant slowdown. This
+     function caches these properties for faster access."""
+ 
++    # Cache as sets for O(1) membership testing
+     tokenizer_all_special_ids = set(tokenizer.all_special_ids)
+     tokenizer_all_special_tokens_extended = (
+         tokenizer.all_special_tokens_extended)
+     tokenizer_all_special_tokens = set(tokenizer.all_special_tokens)
++    # Pre-cache added_vocab for performance
++    tokenizer_added_vocab = tokenizer.get_added_vocab()
+ 
+     class CachedTokenizer(tokenizer.__class__):
+ 
+@@ -41,6 +44,9 @@ def get_cached_tokenizer(
+         def all_special_tokens_extended(self):
+             return tokenizer_all_special_tokens_extended
+ 
++        def get_added_vocab(self):
++            return tokenizer_added_vocab
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     tokenizer.__class__ = CachedTokenizer
+@@ -132,30 +138,35 @@ def _convert_tokens_to_string_with_added_encoders(
+ ) -> str:
+     # Adapted from
+     # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/tokenization_utils.py#L921
+-    # NOTE(woosuk): The following code is slow because it runs a for loop over
+-    # the output_tokens. In Python, running a for loop over a list can be slow
+-    # even when the loop body is very simple.
++    # Optimized to reduce overhead from repeated function calls and membership tests
++    if not output_tokens:
++        return ""
++
++    # Use cached properties to avoid repeated lookups
++    all_special_tokens = tokenizer.all_special_tokens
++    added_vocab = tokenizer.get_added_vocab()
++
+     sub_texts = []
+     current_sub_text = []
+-    all_special_tokens = set(tokenizer.all_special_tokens)
++
+     for token in output_tokens:
+         if skip_special_tokens and token in all_special_tokens:
+             continue
+-        if token in tokenizer.get_added_vocab():
++        if token in added_vocab:
+             if current_sub_text:
+-                sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-                sub_texts.append(sub_text)
++                sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
+                 current_sub_text = []
+             sub_texts.append(token)
+         else:
+             current_sub_text.append(token)
++
+     if current_sub_text:
+-        sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-        sub_texts.append(sub_text)
+-    if spaces_between_special_tokens:
+-        return " ".join(sub_texts)
+-    else:
+-        return "".join(sub_texts)
++        sub_texts.append(tokenizer.convert_tokens_to_string(current_sub_text))
++
++    if not sub_texts:
++        return ""
++
++    return " ".join(sub_texts) if spaces_between_special_tokens else "".join(sub_texts)
+ 
+ 
+ # Based on
+@@ -179,12 +190,13 @@ def detokenize_incrementally(
+         # 5 is an arbitrary value that should work for all
+         # tokenizers (bigger = more conservative).
+         # Subtract 1 extra to account for the generated token.
+-        prefix_offset = max(len(output_tokens) - 6, 0)
++        output_len = len(output_tokens)
++        prefix_offset = max(output_len - 6, 0)
+         # If the first new token is a special token, we can't skip 1 extra token
+         if skip_special_tokens and new_token_id in tokenizer.all_special_ids:
+-            read_offset = max(len(output_tokens), 0)
++            read_offset = output_len
+         else:
+-            read_offset = max(len(output_tokens) - 1, 0)
++            read_offset = max(output_len - 1, 0)
+     else:
+         # Put new_token_id in a list so skip_special_tokens is respected
+         new_tokens = tokenizer.convert_ids_to_tokens(

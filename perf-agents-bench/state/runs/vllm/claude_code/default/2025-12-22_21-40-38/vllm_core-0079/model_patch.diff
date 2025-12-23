@@ -1,0 +1,36 @@
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index 0b55854de..49a7fc1b7 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -532,14 +532,14 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
++
++                # Prepend zeros using pad instead of cat to avoid extra allocation
++                cu_seq_lens = torch.nn.functional.pad(
++                    _chunk_cu_seq_lens, (1, 0), value=0)
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=cu_seq_lens,
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -975,9 +975,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+             )
+ 
+         # slice by `:v.shape[-1]` in order to remove v headdim padding
+-        output = output\
+-            .view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]\
+-                .reshape(-1, self.num_heads * v.shape[-1])
++        # Optimized: direct slice and reshape without intermediate view
++        output = output[:, :, :v.shape[-1]].reshape(-1, self.num_heads * v.shape[-1])
+ 
+         return self.o_proj(output)[0]
+ 

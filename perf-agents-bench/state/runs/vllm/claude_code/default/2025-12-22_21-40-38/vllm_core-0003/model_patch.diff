@@ -1,0 +1,61 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 00260313e..9db253b7e 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -19,6 +19,13 @@ from vllm.utils import direct_register_custom_op
+ 
+ logger = init_logger(__name__)
+ 
++# Mapping from PyTorch dtypes to Triton compute types
++_DTYPE_TO_COMPUTE_TYPE = {
++    torch.bfloat16: tl.bfloat16,
++    torch.float16: tl.float16,
++    torch.float32: tl.float32,
++}
++
+ 
+ @triton.jit
+ def write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token,
+@@ -537,9 +544,10 @@ def moe_align_block_size_triton(
+     tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    cumsum[0] = 0
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -621,10 +629,10 @@ def moe_align_block_size(
+         by block_size for proper block matrix operations.
+     """
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+-    sorted_ids = torch.empty((max_num_tokens_padded, ),
+-                             dtype=torch.int32,
+-                             device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
++    sorted_ids = torch.full((max_num_tokens_padded, ),
++                            topk_ids.numel(),
++                            dtype=torch.int32,
++                            device=topk_ids.device)
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.
+@@ -1250,13 +1258,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+                                       device=hidden_states.device,
+                                       dtype=hidden_states.dtype)
+ 
+-    if hidden_states.dtype == torch.bfloat16:
+-        compute_type = tl.bfloat16
+-    elif hidden_states.dtype == torch.float16:
+-        compute_type = tl.float16
+-    elif hidden_states.dtype == torch.float32:
+-        compute_type = tl.float32
+-    else:
++    compute_type = _DTYPE_TO_COMPUTE_TYPE.get(hidden_states.dtype)
++    if compute_type is None:
+         raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+ 
+     if inplace:

@@ -1,0 +1,104 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/reasoning/qwen3_reasoning_parser.py b/vllm/reasoning/qwen3_reasoning_parser.py
+index f588f4016..333725d40 100644
+--- a/vllm/reasoning/qwen3_reasoning_parser.py
++++ b/vllm/reasoning/qwen3_reasoning_parser.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import re
+ from collections.abc import Sequence
+ from typing import Optional, Union
+ 
+@@ -31,8 +30,9 @@ class Qwen3ReasoningParser(ReasoningParser):
+         self.think_start_token = "<think>"
+         self.think_end_token = "</think>"
+ 
+-        self.reasoning_regex = re.compile(
+-            rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL)
++        # Cache token lengths for better performance
++        self.think_start_token_len = len(self.think_start_token)
++        self.think_end_token_len = len(self.think_end_token)
+ 
+         if not self.model_tokenizer:
+             raise ValueError(
+@@ -88,7 +88,7 @@ class Qwen3ReasoningParser(ReasoningParser):
+                 # extract reasoning content
+                 end_index = delta_text.find(self.think_end_token)
+                 reasoning_content = delta_text[:end_index]
+-                content = delta_text[end_index + len(self.think_end_token):]
++                content = delta_text[end_index + self.think_end_token_len:]
+                 return DeltaMessage(reasoning_content=reasoning_content,
+                                     content=content if content else None)
+             elif self.think_end_token_id in previous_token_ids:
+@@ -105,9 +105,9 @@ class Qwen3ReasoningParser(ReasoningParser):
+                 start_index = delta_text.find(self.think_start_token)
+                 end_index = delta_text.find(self.think_end_token)
+                 reasoning_content = delta_text[start_index +
+-                                               len(self.think_start_token
+-                                                   ):end_index]
+-                content = delta_text[end_index + len(self.think_end_token):]
++                                               self.think_start_token_len:
++                                               end_index]
++                content = delta_text[end_index + self.think_end_token_len:]
+                 return DeltaMessage(reasoning_content=reasoning_content,
+                                     content=content if content else None)
+             else:
+@@ -121,29 +121,31 @@ class Qwen3ReasoningParser(ReasoningParser):
+     def extract_reasoning_content(
+             self, model_output: str, request: ChatCompletionRequest
+     ) -> tuple[Optional[str], Optional[str]]:
++        """
++        Extract reasoning content from the model output.
+ 
+-        # Check if the model output contains the <think> tokens.
+-        if (self.think_start_token not in model_output
+-                or self.think_end_token not in model_output):
++        For text <think>abc</think>xyz:
++        - 'abc' goes to reasoning_content
++        - 'xyz' goes to content (return value)
++        """
++        # Use partition for efficient string splitting
++        before, sep1, after_start = model_output.partition(
++            self.think_start_token)
++        if not sep1:
++            # No start token found
+             return None, model_output
+-        else:
+-            # Use a regex to find the reasoning content
+-            reasoning_content = self.reasoning_regex.findall(model_output)[0]
+-
+-            # Remove the reasoning content from the model output
+-            # Although <think> token is always at the
+-            # beginning of the line, we cannot guarantee that the
+-            # other models will follow this convention.
+-            # Therefore, we need to add :start_index.
+-            start_index = model_output.find(self.think_start_token)
+-            if start_index != -1:
+-                end_index = start_index + len(
+-                    f"{self.think_start_token}{reasoning_content}{self.think_end_token}"
+-                )
+-                model_output = model_output[:start_index] + \
+-                                model_output[end_index:]
+-
+-                if len(model_output) == 0:
+-                    return reasoning_content, None
+-
+-            return reasoning_content, model_output
++
++        # Find the end token in the remaining text
++        reasoning, sep2, after_end = after_start.partition(
++            self.think_end_token)
++        if not sep2:
++            # No end token found
++            return None, model_output
++
++        # Combine the content before and after the reasoning block
++        content = before + after_end
++
++        if not content:
++            return reasoning, None
++
++        return reasoning, content

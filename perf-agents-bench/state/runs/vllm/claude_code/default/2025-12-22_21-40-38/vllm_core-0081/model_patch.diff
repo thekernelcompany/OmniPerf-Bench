@@ -1,0 +1,107 @@
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index 329b03a57..304fe0623 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -74,10 +74,13 @@ class TokenizerDataCache:
+             # Vendored from xgrammar logic since we cannot pickle the tokenizer
+             # https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98 # noqa: E501
+             try:
+-                encoded_vocab = [
+-                    token for token, _ in sorted(tokenizer.get_vocab().items(),
+-                                                 key=lambda x: x[1])
+-                ]
++                vocab_dict = tokenizer.get_vocab()
++                # Optimize: Use list comprehension with direct indexing
++                # Pre-allocate list and fill by index instead of sorting
++                vocab_size = len(vocab_dict)
++                encoded_vocab = [None] * vocab_size
++                for token, idx in vocab_dict.items():
++                    encoded_vocab[idx] = token
+             except AttributeError as e:
+                 raise ValueError(
+                     f"Cannot get the vocabulary of the tokenizer "
+@@ -273,6 +276,8 @@ class XGrammarLogitsProcessor:
+     matchers: list[xgr.GrammarMatcher] = field(default_factory=list)
+     batch_size: int = field(default=1)
+     prefilled: bool = field(default=False)
++    # Cache for device-specific token bitmask to avoid repeated transfers
++    _device_bitmask_cache: dict[str, torch.Tensor] = field(default_factory=dict)
+ 
+     def __getstate__(self) -> dict[str, Any]:
+         return {'config': self.config}
+@@ -285,6 +290,7 @@ class XGrammarLogitsProcessor:
+         self.batch_size = 1
+         self.token_bitmask = None  # type: ignore[assignment]
+         self.prefilled = False
++        self._device_bitmask_cache = {}
+ 
+     def _ensure_ctx(self):
+         """Lazily initialize the processor in the worker process"""
+@@ -315,35 +321,55 @@ class XGrammarLogitsProcessor:
+         if not self.prefilled:
+             # Have not sampled a token yet
+             self.prefilled = True
++            # Fill bitmasks for initial state
++            for i, matcher in enumerate(self.matchers):
++                if not matcher.is_terminated():
++                    matcher.fill_next_token_bitmask(self.token_bitmask, i)
+         else:
++            # Accept token and fill next bitmask in one pass
++            sampled_token = input_ids[-1]
+             for i, matcher in enumerate(self.matchers):
+                 if not matcher.is_terminated():
+-                    sampled_token = input_ids[-1]
+                     assert self.matchers[i].accept_token(sampled_token)
+-
+-        for i, matcher in enumerate(self.matchers):
+-            if not matcher.is_terminated():
+-                # @ubospica: ideally, fill_next_token_bitmask should be
+-                # parallelized with model decoding
+-                # See https://github.com/vllm-project/vllm/pull/10785/files#r1864278303
+-                matcher.fill_next_token_bitmask(self.token_bitmask, i)
++                    # @ubospica: ideally, fill_next_token_bitmask should be
++                    # parallelized with model decoding
++                    # See https://github.com/vllm-project/vllm/pull/10785/files#r1864278303
++                    matcher.fill_next_token_bitmask(self.token_bitmask, i)
+ 
+         # token_bitmask is a CPU tensor for use with accept_token and
+         # fill_next_token_bitmask so we move it to the device of scores
+         device_type = scores.device.type
++        device_str = str(scores.device)
+         dtype = scores.dtype
++
++        # Cache device-specific bitmask to avoid repeated transfers
++        if device_str not in self._device_bitmask_cache:
++            self._device_bitmask_cache[device_str] = self.token_bitmask.to(
++                scores.device, non_blocking=True)
++        else:
++            # Update cached tensor in-place
++            self._device_bitmask_cache[device_str].copy_(
++                self.token_bitmask, non_blocking=True)
++
++        device_bitmask = self._device_bitmask_cache[device_str]
++
+         if device_type != "cuda":
+             # xgrammar on cpu only supports float32 scores
+             # see: https://github.com/mlc-ai/xgrammar/blob/c1b64920cad24f44f235778c1c00bb52d57da01a/python/xgrammar/kernels/apply_token_bitmask_inplace_cpu.py#L22
+-            scores = scores.to("cpu").float().unsqueeze(0)
++            # Optimize: Use inplace operations and combine ops
++            if dtype != torch.float32:
++                scores = scores.to(dtype=torch.float32)
++            scores = scores.unsqueeze(0)
+ 
+         # Note: In this method, if the tensors have different dimensions
+         # on CPU device fails, but on GPU it runs without error. Hence the
+         # unsqueeze above for scores, to match the token bitmask shape
+-        xgr.apply_token_bitmask_inplace(
+-            scores, self.token_bitmask.to(scores.device, non_blocking=True))
++        xgr.apply_token_bitmask_inplace(scores, device_bitmask)
++
+         if device_type != "cuda":
+-            scores = scores.to(dtype).to(device_type).squeeze()
++            scores = scores.squeeze_(0)
++            if dtype != torch.float32:
++                scores = scores.to(dtype=dtype)
+ 
+         return scores
+ 

@@ -1,0 +1,133 @@
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 1be806bbf..b7263b682 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -81,14 +81,11 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
+ 
+   const int64_t src_block_offset = src_block_number * numel_per_block;
+   const int64_t dst_block_offset = dst_block_number * numel_per_block;
++  // Process both key and value caches in a single loop for better cache locality
+   for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+     int64_t src_offset = src_block_offset + i;
+     int64_t dst_offset = dst_block_offset + i;
+     key_cache[dst_offset] = key_cache[src_offset];
+-  }
+-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+-    int64_t src_offset = src_block_offset + i;
+-    int64_t dst_offset = dst_block_offset + i;
+     value_cache[dst_offset] = value_cache[src_offset];
+   }
+ }
+@@ -110,34 +107,50 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
+   TORCH_CHECK(cache_device.is_cuda());
+ 
+   // Create data structures for the kernel.
++  // block_mapping is a 2D tensor with shape (num_pairs, 2).
++  int num_pairs = block_mapping.size(0);
++
++  // Set device guard before any GPU operations
++  const at::cuda::OptionalCUDAGuard device_guard(cache_device);
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++  // Directly allocate tensors on GPU to avoid CPU-GPU synchronization.
++  // Use empty instead of zeros since we'll overwrite all values immediately.
++  torch::Tensor key_cache_ptrs_tensor =
++      torch::empty({num_layers}, torch::TensorOptions()
++                                      .dtype(torch::kInt64)
++                                      .device(cache_device));
++  torch::Tensor value_cache_ptrs_tensor =
++      torch::empty({num_layers}, torch::TensorOptions()
++                                      .dtype(torch::kInt64)
++                                      .device(cache_device));
++
+   // Create an array of pointers to the key and value caches.
+-  int64_t key_cache_ptrs[num_layers];
+-  int64_t value_cache_ptrs[num_layers];
++  int64_t* key_cache_ptrs = key_cache_ptrs_tensor.data_ptr<int64_t>();
++  int64_t* value_cache_ptrs = value_cache_ptrs_tensor.data_ptr<int64_t>();
++
++  // Fill the GPU tensors directly from GPU pointers
++  std::vector<int64_t> key_ptrs_host(num_layers);
++  std::vector<int64_t> value_ptrs_host(num_layers);
+   for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+-    key_cache_ptrs[layer_idx] =
++    key_ptrs_host[layer_idx] =
+         reinterpret_cast<int64_t>(key_caches[layer_idx].data_ptr());
+-    value_cache_ptrs[layer_idx] =
++    value_ptrs_host[layer_idx] =
+         reinterpret_cast<int64_t>(value_caches[layer_idx].data_ptr());
+   }
+ 
+-  // block_mapping is a 2D tensor with shape (num_pairs, 2).
+-  int num_pairs = block_mapping.size(0);
+-
+-  // Move the data structures to the GPU.
+-  // NOTE: This synchronizes the CPU and GPU.
+-  torch::Tensor key_cache_ptrs_tensor =
+-      torch::from_blob(key_cache_ptrs, {num_layers}, torch::kInt64)
+-          .to(cache_device);
+-  torch::Tensor value_cache_ptrs_tensor =
+-      torch::from_blob(value_cache_ptrs, {num_layers}, torch::kInt64)
+-          .to(cache_device);
++  // Use async memcpy to transfer pointer arrays to GPU
++  cudaMemcpyAsync(key_cache_ptrs, key_ptrs_host.data(),
++                  num_layers * sizeof(int64_t),
++                  cudaMemcpyHostToDevice, stream);
++  cudaMemcpyAsync(value_cache_ptrs, value_ptrs_host.data(),
++                  num_layers * sizeof(int64_t),
++                  cudaMemcpyHostToDevice, stream);
+ 
+   // Launch the kernel.
+   const int numel_per_block = key_caches[0][0].numel();
+   dim3 grid(num_layers, num_pairs);
+   dim3 block(std::min(1024, numel_per_block));
+-  const at::cuda::OptionalCUDAGuard device_guard(cache_device);
+-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(
+       key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
+         vllm::copy_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
+@@ -280,7 +293,13 @@ void reshape_and_cache(
+   int value_stride = value.stride(0);
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(num_heads * head_size, 512));
++  // Optimize block size to be a multiple of warp size (32) for better occupancy
++  int threads = num_heads * head_size;
++  threads = std::min(threads, 1024);
++  // Round down to nearest multiple of 32 for optimal warp utilization
++  threads = (threads / 32) * 32;
++  threads = std::max(threads, 32);
++  dim3 block(threads);
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+@@ -321,7 +340,13 @@ void reshape_and_cache_flash(
+   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+ 
+   dim3 grid(num_tokens);
+-  dim3 block(std::min(num_heads * head_size, 512));
++  // Optimize block size to be a multiple of warp size (32) for better occupancy
++  int threads = num_heads * head_size;
++  threads = std::min(threads, 1024);
++  // Round down to nearest multiple of 32 for optimal warp utilization
++  threads = (threads / 32) * 32;
++  threads = std::max(threads, 32);
++  dim3 block(threads);
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ 
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index d37989055..227b712bc 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -80,7 +80,9 @@ class FlashAttentionImpl(AttentionImpl):
+         self.scale = float(scale)
+         self.num_kv_heads = num_kv_heads
+         if alibi_slopes is not None:
+-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
++            # Create tensor directly on CUDA to avoid CPU allocation + transfer
++            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32,
++                                       device='cuda')
+         self.alibi_slopes = alibi_slopes
+         if sliding_window is None:
+             self.sliding_window = (-1, -1)

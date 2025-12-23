@@ -1,0 +1,78 @@
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 419855062..abd518515 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -337,8 +337,7 @@ class Scheduler:
+                     self.free_seq(seq)
+ 
+     def has_unfinished_seqs(self) -> bool:
+-        return len(self.waiting) != 0 or len(self.running) != 0 or len(
+-            self.swapped) != 0
++        return bool(self.waiting or self.running or self.swapped)
+ 
+     def get_num_unfinished_seq_groups(self) -> int:
+         return len(self.waiting) + len(self.running) + len(self.swapped)
+@@ -594,7 +593,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = waiting_queue.copy()
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -691,12 +690,12 @@ class Scheduler:
+         )
+         # Make sure we include num running seqs before scheduling prefill,
+         # so that we don't schedule beyond max_num_seqs for prefill.
++        curr_loras = set() if self.lora_enabled else None
+         for seq_group in self.running:
+             budget.add_num_seqs(seq_group.request_id,
+                                 seq_group.get_max_num_running_seqs())
+-        curr_loras = set(
+-            seq_group.lora_int_id
+-            for seq_group in self.running) if self.lora_enabled else None
++            if curr_loras is not None:
++                curr_loras.add(seq_group.lora_int_id)
+ 
+         remaining_waiting, prefills = (self.waiting,
+                                        SchedulerPrefillOutputs.create_empty())
+@@ -899,15 +898,15 @@ class Scheduler:
+             # seq_id -> physical block numbers
+             block_tables: Dict[int, List[int]] = {}
+ 
+-            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
++            running_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
++            for seq in running_seqs:
+                 seq_id = seq.seq_id
+                 seq_data[seq_id] = seq.data
+                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                 self.block_manager.access_all_blocks_in_seq(seq, now)
+ 
+             common_computed_block_nums = (
+-                self.block_manager.get_common_computed_block_ids(
+-                    seq_group.get_seqs(status=SequenceStatus.RUNNING)))
++                self.block_manager.get_common_computed_block_ids(running_seqs))
+ 
+             # It assumes the scheduled_seq_groups is ordered by
+             # prefill < decoding.
+@@ -979,9 +978,7 @@ class Scheduler:
+             cows = self.block_manager.append_slots(seq, num_lookahead_slots)
+ 
+             for src, dests in cows.items():
+-                if src not in blocks_to_copy:
+-                    blocks_to_copy[src] = []
+-                blocks_to_copy[src].extend(dests)
++                blocks_to_copy.setdefault(src, []).extend(dests)
+ 
+     def _preempt(
+         self,
+@@ -1064,7 +1061,7 @@ class Scheduler:
+         # Delay scheduling prompts to let waiting queue fill up
+         if self.scheduler_config.delay_factor > 0 and self.waiting:
+             earliest_arrival_time = min(
+-                [e.metrics.arrival_time for e in self.waiting])
++                e.metrics.arrival_time for e in self.waiting)
+             passed_delay = (
+                 (now - earliest_arrival_time) >
+                 (self.scheduler_config.delay_factor * self.last_prompt_latency)

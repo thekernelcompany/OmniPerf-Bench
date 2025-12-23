@@ -234,7 +234,7 @@ def plan(task: str, commits: Optional[str] = typer.Option(None, help="Path to co
 
 
 @app.command()
-def prepare(task: str, from_plan: str = typer.Option("state/plan.json", "--from-plan", "-p"), bench_cfg: str = "bench.yaml", max_workers: int = 4, resume: bool = True):
+def prepare(task: str, from_plan: str = typer.Option("state/plan.json", "--from-plan", "-p"), bench_cfg: str = "bench.yaml", max_workers: int = 4, resume: bool = True, run_id: Optional[str] = typer.Option(None, "--run-id", help="Resume a specific run ID (e.g., vllm/claude_code/default/2025-12-22_21-40-38)")):
     """Run OpenHands (host) for each plan item, enforce targets, and write journals."""
     task_p = Path(task)
     plan_p = Path(from_plan)
@@ -259,7 +259,11 @@ def prepare(task: str, from_plan: str = typer.Option("state/plan.json", "--from-
         agent_name = str(cfg.get("agents", {}).get("default", "unknown"))
         model_name = _get_model_name(cfg, agent_name)
 
-        run_path = _build_hierarchical_run_path(repo_name, agent_name, model_name)
+        # Use provided run_id or generate new one
+        if run_id:
+            run_path = run_id
+        else:
+            run_path = _build_hierarchical_run_path(repo_name, agent_name, model_name)
 
         typer.echo(f"Run path: {run_path}")
         typer.echo(f"  Repo:   {repo_name}")

@@ -1,0 +1,158 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..b4a4f09 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -40,13 +40,13 @@ def compute_split_seq_index(
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+     overall_sum = sum(arr)
+-    accumulator, split_index = 0, 0
+-    for value in arr[:-1]:
++    half_sum = overall_sum >> 1  # Bit shift is faster than division by 2
++    accumulator = 0
++    for split_index, value in enumerate(arr[:-1]):
+         accumulator += value
+-        split_index += 1
+-        if accumulator >= overall_sum // 2:
+-            break
+-    return split_index
++        if accumulator >= half_sum:
++            return split_index + 1
++    return len(arr) - 1
+ 
+ 
+ def compute_split_token_index(
+@@ -114,18 +114,23 @@ class TboDPAttentionPreparer:
+         return local_can_run_tbo, local_forward_mode
+ 
+     def compute_output(self, partial_global_info):
++        # Early exit if two_batch_overlap is disabled
++        if not self.enable_two_batch_overlap:
++            return None, None
++
+         local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
++
++        # Early exit if local can't run tbo
++        if not local_can_run_tbo_aggregated:
++            return None, None
++
+         forward_modes = partial_global_info[:, 0, 1].tolist()
+ 
+         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
+             forward_modes
+         )
+ 
+-        can_run_tbo = (
+-            self.enable_two_batch_overlap
+-            and local_can_run_tbo_aggregated
+-            and forward_mode_agree
+-        )
++        can_run_tbo = forward_mode_agree
+ 
+         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
+         global_forward_mode = global_forward_mode if can_run_tbo else None
+@@ -139,21 +144,32 @@ class TboDPAttentionPreparer:
+ 
+     @staticmethod
+     def _compute_global_forward_mode(forward_modes):
+-        converted_forward_modes = [
+-            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+-            for x in forward_modes
+-        ]
+-        forward_mode_agree = TboDPAttentionPreparer._is_all_same(
+-            converted_forward_modes
+-        )
++        # Convert IDLE to DECODE in-place check
++        idle_value = ForwardMode.IDLE.value
++        decode_value = ForwardMode.DECODE.value
++
++        # Convert first element
++        first_mode = decode_value if forward_modes[0] == idle_value else forward_modes[0]
++
++        # Check if all match while converting on the fly
++        forward_mode_agree = True
++        for x in forward_modes[1:]:
++            converted = decode_value if x == idle_value else x
++            if converted != first_mode:
++                forward_mode_agree = False
++                break
++
+         global_forward_mode = (
+-            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
++            ForwardMode(first_mode) if forward_mode_agree else None
+         )
+         return global_forward_mode, forward_mode_agree
+ 
+     @staticmethod
+     def _is_all_same(x):
+-        return all(value == x[0] for value in x)
++        if not x:
++            return True
++        first = x[0]
++        return all(value == first for value in x[1:])
+ 
+ 
+ class TboForwardBatchPreparer:
+@@ -211,6 +227,8 @@ class TboForwardBatchPreparer:
+ 
+         output_dict = dict()
+ 
++        # Process token-based attributes efficiently
++        token_slice = slice(start_token_index, end_token_index)
+         for key in [
+             "input_ids",
+             "positions",
+@@ -220,9 +238,10 @@ class TboForwardBatchPreparer:
+             assert (
+                 old_value.shape[0] == num_tokens
+             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+-            output_dict[key] = old_value[start_token_index:end_token_index]
++            output_dict[key] = old_value[token_slice]
+ 
+-        for key in [
++        # Process sequence-based attributes efficiently
++        seq_keys = [
+             "req_pool_indices",
+             "seq_lens",
+             "seq_lens_cpu",
+@@ -233,14 +252,15 @@ class TboForwardBatchPreparer:
+             "extend_seq_lens_cpu",
+             "extend_logprob_start_lens_cpu",
+             "lora_paths",
+-        ]:
++        ]
++        seq_slice = slice(start_seq_index, end_seq_index)
++        for key in seq_keys:
+             old_value = getattr(batch, key)
+-            if old_value is None:
+-                continue
+-            assert (
+-                len(old_value) == num_seqs
+-            ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+-            output_dict[key] = old_value[start_seq_index:end_seq_index]
++            if old_value is not None:
++                assert (
++                    len(old_value) == num_seqs
++                ), f"{key=} {old_value=} {num_seqs=} {batch=}"
++                output_dict[key] = old_value[seq_slice]
+ 
+         for key in [
+             "forward_mode",
+@@ -268,7 +288,7 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,
+@@ -423,7 +443,7 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
+         assert (value_a is None) == (value_b is None)
+         if value_a is None:
+             return None
+-        return torch.concat([value_a, value_b], dim=0)
++        return torch.cat([value_a, value_b], dim=0)
+ 
+     return _handle_key("hidden_states"), _handle_key("residual")
+ 

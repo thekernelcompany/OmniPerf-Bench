@@ -1,0 +1,142 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a6651a..f658615a0 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -152,9 +152,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                                             token_ids=token_ids,
+                                             block_size=self._block_size,
+                                             physical_block_id=None)
+-        assert block.content_hash is not None
++        content_hash = block.content_hash
++        assert content_hash is not None
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        cached_block_id = self._cached_blocks.get(content_hash, None)
+         if cached_block_id is not None:
+             self.metric_data.query(hit=True)
+             block.block_id = cached_block_id
+@@ -241,8 +242,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         # Add the cached block to the evictor
+         # (This keeps the cached block around so it can be reused)
++        tracker = self._block_tracker[block_id]
+         self.evictor.add(block_id, block.content_hash, block.num_tokens_total,
+-                         self._block_tracker[block_id].last_accessed)
++                         tracker.last_accessed)
+ 
+         # Stop tracking the block
+         self._untrack_block_id(block_id)
+@@ -412,9 +414,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def is_block_cached(self, block: Block) -> bool:
+         assert block.content_hash is not None
+-        if block.content_hash in self._cached_blocks:
+-            return True
+-        return False
++        return block.content_hash in self._cached_blocks
+ 
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+@@ -498,8 +498,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+ 
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
++            tracker = self._block_tracker[block_id]
++            if tracker.active:
++                tracker.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -512,16 +513,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+         assert block_id is not None
+-        self._block_tracker[block_id].enable()
+-        self._block_tracker[block_id].computed = computed
++        tracker = self._block_tracker[block_id]
++        tracker.enable()
++        tracker.computed = computed
+ 
+     def _untrack_block_id(self, block_id: Optional[BlockId]) -> None:
+         assert block_id is not None
+         self._block_tracker[block_id].disable()
+ 
+     def block_is_computed(self, block_id: int) -> bool:
+-        if self._block_tracker[block_id].active:
+-            return self._block_tracker[block_id].computed
++        tracker = self._block_tracker[block_id]
++        if tracker.active:
++            return tracker.computed
+         else:
+             return block_id in self.evictor
+ 
+@@ -575,9 +578,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         Args:
+             blocks (List[Block]): The potential blocks to swap.
+-            num_lookahead_slots (int): number of lookahead slots (0 for 
++            num_lookahead_slots (int): number of lookahead slots (0 for
+                 swap out).
+-        
++
+         Returns:
+             int: the number of blocks that will be touched by
+                 swapping in/out the given blocks and num_lookahead_slots.
+@@ -586,16 +589,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         for block in blocks:
+             if not block.is_full:
+                 num_touched_blocks += 1
+-                if num_lookahead_slots > block.num_empty_slots:
++                num_empty = block.num_empty_slots
++                if num_lookahead_slots > num_empty:
+                     num_touched_blocks += cdiv(
+-                        num_lookahead_slots - block.num_empty_slots,
++                        num_lookahead_slots - num_empty,
+                         self._block_size)
+             else:
+                 # If the block has a match in the cache and the cached block
+                 # is not referenced, then we still count it as a touched block
++                content_hash = block.content_hash
+                 if not self.is_block_cached(block) or \
+-                    (block.content_hash is not None and \
+-                     self._cached_blocks[block.content_hash] in self.evictor):
++                    (content_hash is not None and \
++                     self._cached_blocks[content_hash] in self.evictor):
+                     num_touched_blocks += 1
+         return num_touched_blocks
+ 
+@@ -795,17 +800,19 @@ class PrefixCachingBlock(Block):
+         full.
+         """
+         # If the hash is already computed, return it.
+-        if self._cached_content_hash is not None:
+-            return self._cached_content_hash
++        cached_hash = self._cached_content_hash
++        if cached_hash is not None:
++            return cached_hash
+ 
+         # We cannot compute a hash for the current block because it is not full.
+         if not self.is_full:
+             return None
+ 
+-        is_first_block = self._prev_block is None
++        prev_block = self._prev_block
++        is_first_block = prev_block is None
+         prev_block_hash = (
+             None if is_first_block else
+-            self._prev_block.content_hash  # type: ignore
++            prev_block.content_hash  # type: ignore
+         )
+ 
+         # Previous block exists but does not yet have a hash.
+@@ -840,7 +847,7 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ class ComputedBlocksTracker:

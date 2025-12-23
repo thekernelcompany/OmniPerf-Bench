@@ -1,0 +1,144 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f80bf878f..1dc0528bd 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -742,19 +742,10 @@ def compute_hash() -> str:
+     variables, ensure that it is included in the factors list if
+     it affects the computation graph. For example, different values
+     of VLLM_PP_LAYER_PARTITION will generate different computation
+-    graphs, so it is included in the factors list. The env vars that 
++    graphs, so it is included in the factors list. The env vars that
+     affect the choice of different kernels or attention backends should
+     also be included in the factors list.
+     """
+-    factors: list[Any] = []
+-
+-    # summarize environment variables
+-    def factorize(name: str):
+-        if __getattr__(name):
+-            factors.append(__getattr__(name))
+-        else:
+-            factors.append("None")
+-
+     # The values of envs may affects the computation graph.
+     # TODO(DefTruth): hash all environment variables?
+     # for key in environment_variables:
+@@ -767,10 +758,15 @@ def compute_hash() -> str:
+         "VLLM_DP_RANK",
+         "VLLM_DP_SIZE",
+     ]
++
++    # Optimize by using list comprehension and caching __getattr__ result
++    # Also optimize string conversion by building string incrementally
++    factors: list[Any] = []
+     for key in environment_variables_to_hash:
+         if key in environment_variables:
+-            factorize(key)
+-
+-    hash_str = hashlib.md5(str(factors).encode()).hexdigest()
++            value = __getattr__(key)
++            factors.append(value if value else "None")
+ 
+-    return hash_str
++    # Optimize: convert to bytes directly without intermediate string
++    factors_str = str(factors)
++    return hashlib.md5(factors_str.encode()).hexdigest()
+diff --git a/vllm/v1/serial_utils.py b/vllm/v1/serial_utils.py
+index 3af6793fd..832ca4b8b 100644
+--- a/vllm/v1/serial_utils.py
++++ b/vllm/v1/serial_utils.py
+@@ -38,7 +38,9 @@ class MsgpackEncoder:
+ 
+     def encode(self, obj: Any) -> Sequence[bytestr]:
+         try:
+-            self.aux_buffers = bufs = [b'']
++            # Optimize: pre-allocate list with expected size
++            bufs = [None]
++            self.aux_buffers = bufs
+             bufs[0] = self.encoder.encode(obj)
+             # This `bufs` list allows us to collect direct pointers to backing
+             # buffers of tensors and np arrays, and return them along with the
+@@ -58,14 +60,14 @@ class MsgpackEncoder:
+             self.aux_buffers = None
+ 
+     def enc_hook(self, obj: Any) -> Any:
+-        if isinstance(obj, torch.Tensor):
++        # Optimize: check most common types first
++        if isinstance(obj, np.ndarray):
++            # Fall back to pickle for object or void kind ndarrays.
++            if obj.dtype.kind not in ('O', 'V'):
++                return self._encode_ndarray(obj)
++        elif isinstance(obj, torch.Tensor):
+             return self._encode_ndarray(obj.numpy())
+-
+-        # Fall back to pickle for object or void kind ndarrays.
+-        if isinstance(obj, np.ndarray) and obj.dtype.kind not in ('O', 'V'):
+-            return self._encode_ndarray(obj)
+-
+-        if isinstance(obj, FunctionType):
++        elif isinstance(obj, FunctionType):
+             # `pickle` is generally faster than cloudpickle, but can have
+             # problems serializing methods.
+             return msgpack.Ext(CUSTOM_TYPE_CLOUDPICKLE, cloudpickle.dumps(obj))
+@@ -77,8 +79,13 @@ class MsgpackEncoder:
+         self, obj: np.ndarray
+     ) -> tuple[str, tuple[int, ...], Union[int, memoryview]]:
+         assert self.aux_buffers is not None
+-        arr_data = obj.data if obj.data.c_contiguous else obj.tobytes()
+-        if not obj.shape or obj.nbytes < MIN_NOCOPY_BUF_SIZE:
++        # Optimize: cache obj.data and check contiguity once
++        obj_data = obj.data
++        arr_data = obj_data if obj_data.c_contiguous else obj.tobytes()
++        # Optimize: compute size check directly
++        nbytes = obj.nbytes
++
++        if not obj.shape or nbytes < MIN_NOCOPY_BUF_SIZE:
+             # Encode small arrays and scalars inline. Using this extension type
+             # ensures we can avoid copying when decoding.
+             data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr_data)
+@@ -108,30 +115,33 @@ class MsgpackDecoder:
+         self.aux_buffers: Sequence[bytestr] = ()
+ 
+     def decode(self, bufs: Union[bytestr, Sequence[bytestr]]) -> Any:
+-        if isinstance(bufs, (bytes, bytearray, memoryview, zmq.Frame)):
+-            # TODO - This check can become `isinstance(bufs, bytestr)`
+-            # as of Python 3.10.
+-            return self.decoder.decode(bufs)
+-
+-        self.aux_buffers = bufs
+-        try:
+-            return self.decoder.decode(bufs[0])
+-        finally:
+-            self.aux_buffers = ()
++        # Optimize: check sequence type first (more common in our use case)
++        if not isinstance(bufs, (bytes, bytearray, memoryview, zmq.Frame)):
++            # bufs is a sequence
++            self.aux_buffers = bufs
++            try:
++                return self.decoder.decode(bufs[0])
++            finally:
++                self.aux_buffers = ()
++        # TODO - This check can become `isinstance(bufs, bytestr)`
++        # as of Python 3.10.
++        return self.decoder.decode(bufs)
+ 
+     def dec_hook(self, t: type, obj: Any) -> Any:
+         # Given native types in `obj`, convert to type `t`.
++        # Optimize: check isclass once and use elif for mutual exclusion
+         if isclass(t):
+             if issubclass(t, np.ndarray):
+                 return self._decode_ndarray(obj)
+-            if issubclass(t, torch.Tensor):
++            elif issubclass(t, torch.Tensor):
+                 return torch.from_numpy(self._decode_ndarray(obj))
+         return obj
+ 
+     def _decode_ndarray(self, arr: Any) -> np.ndarray:
+         dtype, shape, data = arr
++        # Optimize: reduce function calls by caching dtype conversion
+         buffer = self.aux_buffers[data] if isinstance(data, int) else data
+-        return np.ndarray(buffer=buffer, dtype=np.dtype(dtype), shape=shape)
++        return np.ndarray(buffer=buffer, dtype=dtype, shape=shape)
+ 
+     def ext_hook(self, code: int, data: memoryview) -> Any:
+         if code == CUSTOM_TYPE_RAW_VIEW:

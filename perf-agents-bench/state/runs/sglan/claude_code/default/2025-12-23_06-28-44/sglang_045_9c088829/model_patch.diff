@@ -1,0 +1,178 @@
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index fdde7dd..4de85c8 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -581,15 +581,16 @@ class GroupCoordinator:
+         if self.mq_broadcaster is not None:
+             assert src == 0, "Message queue broadcaster only supports src=0"
+             return self.mq_broadcaster.broadcast_object(obj)
++        src_rank = self.ranks[src]  # Cache the src rank lookup
+         if self.rank_in_group == src:
+             torch.distributed.broadcast_object_list(
+-                [obj], src=self.ranks[src], group=self.cpu_group
++                [obj], src=src_rank, group=self.cpu_group
+             )
+             return obj
+         else:
+             recv = [None]
+             torch.distributed.broadcast_object_list(
+-                recv, src=self.ranks[src], group=self.cpu_group
++                recv, src=src_rank, group=self.cpu_group
+             )
+             return recv[0]
+ 
+@@ -624,16 +625,15 @@ class GroupCoordinator:
+         # Serialize object to tensor and get the size as well
+         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+ 
+-        size_tensor = torch.tensor(
+-            [object_tensor.numel()], dtype=torch.long, device="cpu"
+-        )
++        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
++        size_tensor[0] = object_tensor.numel()
+ 
+         # Send object size
+-
+-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
++        dst_rank = self.ranks[dst]  # Cache the dst rank lookup
++        torch.distributed.send(size_tensor, dst=dst_rank, group=self.cpu_group)
+ 
+         # Send object
+-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
++        torch.distributed.send(object_tensor, dst=dst_rank, group=self.cpu_group)
+ 
+         return None
+ 
+@@ -650,8 +650,9 @@ class GroupCoordinator:
+         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+ 
+         # Receive object size
++        src_rank = self.ranks[src]  # Cache the src rank lookup
+         rank_size = torch.distributed.recv(
+-            size_tensor, src=self.ranks[src], group=self.cpu_group
++            size_tensor, src=src_rank, group=self.cpu_group
+         )
+ 
+         # Tensor to receive serialized objects into.
+@@ -662,7 +663,7 @@ class GroupCoordinator:
+         )
+ 
+         rank_object = torch.distributed.recv(
+-            object_tensor, src=self.ranks[src], group=self.cpu_group
++            object_tensor, src=src_rank, group=self.cpu_group
+         )
+ 
+         assert (
+@@ -692,6 +693,7 @@ class GroupCoordinator:
+         assert src < self.world_size, f"Invalid src rank ({src})"
+ 
+         rank_in_group = self.rank_in_group
++        src_rank = self.ranks[src]  # Cache the src rank lookup
+         if rank_in_group == src:
+             metadata_list: List[Tuple[Any, Any]] = []
+             assert isinstance(
+@@ -710,12 +712,12 @@ class GroupCoordinator:
+                 if tensor.is_cpu:
+                     # use metadata_group for CPU tensors
+                     handle = torch.distributed.broadcast(
+-                        tensor, src=self.ranks[src], group=metadata_group, async_op=True
++                        tensor, src=src_rank, group=metadata_group, async_op=True
+                     )
+                 else:
+                     # use group for GPU tensors
+                     handle = torch.distributed.broadcast(
+-                        tensor, src=self.ranks[src], group=group, async_op=True
++                        tensor, src=src_rank, group=group, async_op=True
+                     )
+                 async_handles.append(handle)
+             for async_handle in async_handles:
+@@ -738,14 +740,14 @@ class GroupCoordinator:
+                         # use metadata_group for CPU tensors
+                         handle = torch.distributed.broadcast(
+                             tensor,
+-                            src=self.ranks[src],
++                            src=src_rank,
+                             group=metadata_group,
+                             async_op=True,
+                         )
+                     else:
+                         # use group for GPU tensors
+                         handle = torch.distributed.broadcast(
+-                            tensor, src=self.ranks[src], group=group, async_op=True
++                            tensor, src=src_rank, group=group, async_op=True
+                         )
+                     async_handles.append(handle)
+                     tensor_dict[key] = tensor
+@@ -789,6 +791,7 @@ class GroupCoordinator:
+         # `send_object_list` has serialization & deserialization,
+         # all happening on CPU. Therefore, we can use the CPU group.
+         self.send_object(metadata_list, dst=dst)
++        dst_rank = self.ranks[dst]  # Cache the dst rank lookup
+         for tensor in tensor_list:
+             if tensor.numel() == 0:
+                 # Skip sending empty tensors.
+@@ -801,11 +804,11 @@ class GroupCoordinator:
+             if tensor.is_cpu:
+                 # use metadata_group for CPU tensors
+                 torch.distributed.send(
+-                    tensor, dst=self.ranks[dst], group=metadata_group
++                    tensor, dst=dst_rank, group=metadata_group
+                 )
+             else:
+                 # use group for GPU tensors
+-                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
++                torch.distributed.send(tensor, dst=dst_rank, group=group)
+         return None
+ 
+     def recv_tensor_dict(
+@@ -834,6 +837,7 @@ class GroupCoordinator:
+ 
+         recv_metadata_list = self.recv_object(src=src)
+         tensor_dict: Dict[str, Any] = {}
++        src_rank = self.ranks[src]  # Cache the src rank lookup
+         for key, value in recv_metadata_list:
+             if isinstance(value, TensorMetadata):
+                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+@@ -855,11 +859,11 @@ class GroupCoordinator:
+                 if tensor.is_cpu:
+                     # use metadata_group for CPU tensors
+                     torch.distributed.recv(
+-                        tensor, src=self.ranks[src], group=metadata_group
++                        tensor, src=src_rank, group=metadata_group
+                     )
+                 else:
+                     # use group for GPU tensors
+-                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
++                    torch.distributed.recv(tensor, src=src_rank, group=group)
+                 if use_all_gather:
+                     # do the allgather
+                     tensor = all_gather_group.all_gather(tensor, dim=0)  # type: ignore
+@@ -889,7 +893,8 @@ class GroupCoordinator:
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+             pynccl_comm.send(tensor, dst)
+         else:
+-            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
++            dst_rank = self.ranks[dst]
++            torch.distributed.send(tensor, dst_rank, self.device_group)
+ 
+     def recv(
+         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
+@@ -904,7 +909,8 @@ class GroupCoordinator:
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+             pynccl_comm.recv(tensor, src)
+         else:
+-            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
++            src_rank = self.ranks[src]
++            torch.distributed.recv(tensor, src_rank, self.device_group)
+         return tensor
+ 
+     def destroy(self):
+@@ -1290,7 +1296,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
+     world_size = torch.distributed.get_world_size(group=pg)
+ 
+     # local tensor in each process to store the result
+-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
++    is_in_the_same_node = torch.zeros(world_size, dtype=torch.int32)
+ 
+     # global ranks of the processes in the group
+     ranks = torch.distributed.get_process_group_ranks(pg)

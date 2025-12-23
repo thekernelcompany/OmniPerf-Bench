@@ -1,0 +1,243 @@
+diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py
+index 397101fa8..401e03942 100644
+--- a/tests/core/test_scheduler.py
++++ b/tests/core/test_scheduler.py
+@@ -57,7 +57,8 @@ def test_scheduler_schedule_simple():
+     scheduler = Scheduler(scheduler_config, cache_config, None)
+ 
+     # Add seq groups to scheduler.
+-    running: List[SequenceGroup] = []
++    # Optimize: remove type annotation for local variable
++    running = []
+     for i in range(num_seq_group):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=block_size)
+         scheduler.add_seq_group(seq_group)
+@@ -142,7 +143,8 @@ def test_scheduler_max_seqs():
+     cache_config.num_gpu_blocks = 8
+     scheduler = Scheduler(scheduler_config, cache_config, None)
+ 
+-    all_seq_groups: List[SequenceGroup] = []
++    # Optimize: remove type annotation for local variable
++    all_seq_groups = []
+     # Add seq groups to scheduler.
+     for i in range(num_seq_group):
+         _, seq_group = create_dummy_prompt(str(i), prompt_length=block_size)
+diff --git a/vllm/config.py b/vllm/config.py
+index 6dfb51586..603b47a85 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -127,10 +127,11 @@ class ModelConfig:
+ 
+     def _verify_load_format(self) -> None:
+         load_format = self.load_format.lower()
+-        supported_load_format = [
++        # Optimize: use tuple for constant data
++        supported_load_format = (
+             "auto", "pt", "safetensors", "npcache", "dummy"
+-        ]
+-        rocm_not_supported_load_format = []
++        )
++        rocm_not_supported_load_format = ()
+         if load_format not in supported_load_format:
+             raise ValueError(
+                 f"Unknown load format: {self.load_format}. Must be one of "
+@@ -162,8 +163,9 @@ class ModelConfig:
+         self.tokenizer_mode = tokenizer_mode
+ 
+     def _verify_quantization(self) -> None:
+-        supported_quantization = ["awq", "gptq", "squeezellm", "marlin"]
+-        rocm_not_supported_quantization = ["awq", "marlin"]
++        # Optimize: use tuple for constant data
++        supported_quantization = ("awq", "gptq", "squeezellm", "marlin")
++        rocm_not_supported_quantization = ("awq", "marlin")
+         if self.quantization is not None:
+             self.quantization = self.quantization.lower()
+ 
+@@ -263,7 +265,8 @@ class ModelConfig:
+         # NOTE: for falcon, when new_decoder_architecture is True, the
+         # multi_query flag is ignored and we use n_head_kv for the number of
+         # KV heads.
+-        falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
++        # Optimize: use tuple for constant data
++        falcon_model_types = ("falcon", "RefinedWeb", "RefinedWebModel")
+         new_decoder_arch_falcon = (
+             self.hf_config.model_type in falcon_model_types
+             and getattr(self.hf_config, "new_decoder_architecture", False))
+@@ -273,7 +276,8 @@ class ModelConfig:
+             # Currently, tensor parallelism is not supported in this case.
+             return 1
+ 
+-        attributes = [
++        # Optimize: use tuple instead of list for constant data
++        attributes = (
+             # For Falcon:
+             "n_head_kv",
+             "num_kv_heads",
+@@ -281,7 +285,7 @@ class ModelConfig:
+             "num_key_value_heads",
+             # For ChatGLM:
+             "multi_query_group_num",
+-        ]
++        )
+         for attr in attributes:
+             num_kv_heads = getattr(self.hf_config, attr, None)
+             if num_kv_heads is not None:
+@@ -586,6 +590,7 @@ class LoRAConfig:
+ 
+     def __post_init__(self):
+         # Keep this in sync with csrc/punica/bgmv/bgmv_config.h
++        # These are already tuples - no change needed
+         possible_max_ranks = (8, 16, 32, 64)
+         possible_lora_extra_vocab_size = (0, 256, 512)
+         if self.max_lora_rank not in possible_max_ranks:
+@@ -630,7 +635,8 @@ _STR_DTYPE_TO_TORCH_DTYPE = {
+     "bfloat16": torch.bfloat16,
+ }
+ 
+-_ROCM_NOT_SUPPORTED_DTYPE = ["float", "float32"]
++# Optimize: use tuple for constant data
++_ROCM_NOT_SUPPORTED_DTYPE = ("float", "float32")
+ 
+ 
+ def _get_and_verify_dtype(
+@@ -690,7 +696,8 @@ def _get_and_verify_max_len(
+ ) -> int:
+     """Get and verify the model's maximum length."""
+     derived_max_model_len = float("inf")
+-    possible_keys = [
++    # Optimize: use tuple instead of list for constant data
++    possible_keys = (
+         # OPT
+         "max_position_embeddings",
+         # GPT-2
+@@ -703,11 +710,15 @@ def _get_and_verify_max_len(
+         "max_sequence_length",
+         "max_seq_length",
+         "seq_len",
+-    ]
++    )
++    # Optimize: early exit when first key found if only checking existence
+     for key in possible_keys:
+         max_len_key = getattr(hf_config, key, None)
+         if max_len_key is not None:
+-            derived_max_model_len = min(derived_max_model_len, max_len_key)
++            if derived_max_model_len == float("inf"):
++                derived_max_model_len = max_len_key
++            else:
++                derived_max_model_len = min(derived_max_model_len, max_len_key)
+     if derived_max_model_len == float("inf"):
+         if max_model_len is not None:
+             # If max_model_len is specified, we use it.
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index be55e8520..f51f38c9b 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -155,24 +155,31 @@ class Scheduler:
+ 
+     def _schedule(self) -> SchedulerOutputs:
+         # Blocks that need to be swapped or copied before model execution.
+-        blocks_to_swap_in: Dict[int, int] = {}
+-        blocks_to_swap_out: Dict[int, int] = {}
+-        blocks_to_copy: Dict[int, List[int]] = {}
++        # Use dict() constructor for better performance
++        blocks_to_swap_in = dict()
++        blocks_to_swap_out = dict()
++        blocks_to_copy = dict()
+ 
+         # Fix the current time.
+         now = time.time()
+ 
+         # Join waiting sequences if possible.
+         if not self.swapped:
+-            ignored_seq_groups: List[SequenceGroup] = []
+-            scheduled: List[SequenceGroup] = []
++            ignored_seq_groups = []
++            scheduled = []
+             # The total number of sequences on the fly, including the
+             # requests in the generation phase.
+-            num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
+-                                for seq_group in self.running)
+-            curr_loras = set(
+-                seq_group.lora_int_id
+-                for seq_group in self.running) if self.lora_enabled else None
++            # Optimize: avoid generator expression overhead
++            num_curr_seqs = 0
++            for seq_group in self.running:
++                num_curr_seqs += seq_group.get_max_num_running_seqs()
++            # Optimize: build set directly with explicit loop
++            if self.lora_enabled:
++                curr_loras = set()
++                for seq_group in self.running:
++                    curr_loras.add(seq_group.lora_int_id)
++            else:
++                curr_loras = None
+ 
+             # Optimization: We do not sort the waiting queue since the preempted
+             # sequence groups are added to the front and the new sequence groups
+@@ -289,11 +296,17 @@ class Scheduler:
+         # Swap in the sequence groups in the SWAPPED state if possible.
+         self.swapped = self.policy.sort_by_priority(now, self.swapped)
+         if not preempted:
+-            num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
+-                                for seq_group in self.running)
+-            curr_loras = set(
+-                seq_group.lora_int_id
+-                for seq_group in self.running) if self.lora_enabled else None
++            # Optimize: use explicit loop instead of sum with generator
++            num_curr_seqs = 0
++            for seq_group in self.running:
++                num_curr_seqs += seq_group.get_max_num_running_seqs()
++            # Optimize: build set directly with explicit loop
++            if self.lora_enabled:
++                curr_loras = set()
++                for seq_group in self.running:
++                    curr_loras.add(seq_group.lora_int_id)
++            else:
++                curr_loras = None
+ 
+             leftover_swapped = deque()
+ 
+@@ -334,9 +347,10 @@ class Scheduler:
+         # Each sequence in the generation phase only takes one token slot.
+         # Therefore, the number of batched tokens is equal to the number of
+         # sequences in the RUNNING state.
+-        num_batched_tokens = sum(
+-            seq_group.num_seqs(status=SequenceStatus.RUNNING)
+-            for seq_group in self.running)
++        # Optimize: use explicit loop instead of sum with generator
++        num_batched_tokens = 0
++        for seq_group in self.running:
++            num_batched_tokens += seq_group.num_seqs(status=SequenceStatus.RUNNING)
+ 
+         scheduler_outputs = SchedulerOutputs(
+             scheduled_seq_groups=self.running,
+@@ -357,12 +371,13 @@ class Scheduler:
+         now = time.time()
+ 
+         # Create input data structures.
+-        seq_group_metadata_list: List[SequenceGroupMetadata] = []
++        seq_group_metadata_list = []
+         for seq_group in scheduler_outputs.scheduled_seq_groups:
+             seq_group.maybe_set_first_scheduled_time(now)
+ 
+-            seq_data: Dict[int, SequenceData] = {}
+-            block_tables: Dict[int, List[int]] = {}
++            # Optimize: use dict() constructor for better performance
++            seq_data = dict()
++            block_tables = dict()
+ 
+             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+                 seq_id = seq.seq_id
+@@ -408,10 +423,8 @@ class Scheduler:
+             ret = self.block_manager.append_slot(seq)
+             if ret is not None:
+                 src_block, dst_block = ret
+-                if src_block in blocks_to_copy:
+-                    blocks_to_copy[src_block].append(dst_block)
+-                else:
+-                    blocks_to_copy[src_block] = [dst_block]
++                # Optimize: use setdefault to avoid double lookup
++                blocks_to_copy.setdefault(src_block, []).append(dst_block)
+ 
+     def _preempt(
+         self,

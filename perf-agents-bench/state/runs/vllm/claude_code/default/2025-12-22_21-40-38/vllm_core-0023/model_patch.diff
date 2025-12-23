@@ -1,0 +1,244 @@
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index d073dd6d2..b73b33601 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -22,8 +22,13 @@ __global__ void rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce redundant address calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  const scalar_t* __restrict__ input_base = input + base_offset;
++  scalar_t* __restrict__ out_base = out + base_offset;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input_base[idx];
+     variance += x * x;
+   }
+ 
+@@ -36,10 +41,12 @@ __global__ void rms_norm_kernel(
+   }
+   __syncthreads();
+ 
++  // Cache s_variance in register to avoid shared memory access in loop
++  const float norm_factor = s_variance;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    float x = (float)input_base[idx];
++    out_base[idx] = ((scalar_t)(x * norm_factor)) * weight[idx];
+   }
+ }
+ 
+@@ -110,12 +117,17 @@ fused_add_rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce redundant address calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  scalar_t* __restrict__ input_base = input + base_offset;
++  scalar_t* __restrict__ residual_base = residual + base_offset;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    scalar_t z = input_base[idx];
++    z += residual_base[idx];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual_base[idx] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -127,10 +139,12 @@ fused_add_rms_norm_kernel(
+   }
+   __syncthreads();
+ 
++  // Cache s_variance in register to avoid shared memory access in loop
++  const float norm_factor = s_variance;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    input[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    float x = (float)residual_base[idx];
++    input_base[idx] = ((scalar_t)(x * norm_factor)) * weight[idx];
+   }
+ }
+ 
+diff --git a/csrc/layernorm_quant_kernels.cu b/csrc/layernorm_quant_kernels.cu
+index d595b9e88..8ff3c1d7d 100644
+--- a/csrc/layernorm_quant_kernels.cu
++++ b/csrc/layernorm_quant_kernels.cu
+@@ -31,8 +31,13 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce redundant address calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  const scalar_t* __restrict__ input_base = input + base_offset;
++  fp8_type* __restrict__ out_base = out + base_offset;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input_base[idx];
+     variance += x * x;
+   }
+ 
+@@ -45,14 +50,14 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   }
+   __syncthreads();
+ 
+-  // invert scale to avoid division
+-  float const scale_inv = 1.0f / *scale;
++  // Cache shared memory values in registers and invert scale to avoid division
++  const float norm_factor = s_variance;
++  const float scale_inv = 1.0f / *scale;
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    float x = (float)input_base[idx];
++    float const out_norm = ((scalar_t)(x * norm_factor)) * weight[idx];
++    out_base[idx] = scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
+   }
+ }
+ 
+@@ -134,12 +139,18 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce redundant address calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  scalar_t* __restrict__ input_base = input + base_offset;
++  scalar_t* __restrict__ residual_base = residual + base_offset;
++  fp8_type* __restrict__ out_base = out + base_offset;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    scalar_t z = input_base[idx];
++    z += residual_base[idx];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual_base[idx] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -151,14 +162,14 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   }
+   __syncthreads();
+ 
+-  // invert scale to avoid division
+-  float const scale_inv = 1.0f / *scale;
++  // Cache shared memory values in registers and invert scale to avoid division
++  const float norm_factor = s_variance;
++  const float scale_inv = 1.0f / *scale;
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    float x = (float)residual_base[idx];
++    float const out_norm = ((scalar_t)(x * norm_factor)) * weight[idx];
++    out_base[idx] = scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
+   }
+ }
+ 
+diff --git a/csrc/quantization/fp8/common.cu b/csrc/quantization/fp8/common.cu
+index f3f9f669e..ddb7355cd 100644
+--- a/csrc/quantization/fp8/common.cu
++++ b/csrc/quantization/fp8/common.cu
+@@ -16,13 +16,15 @@ __global__ void scaled_fp8_quant_kernel(fp8_type* __restrict__ out,
+                                         const scalar_t* __restrict__ input,
+                                         const float* __restrict__ scale,
+                                         int64_t num_elems) {
+-  int tid = blockDim.x * blockIdx.x + threadIdx.x;
++  // Compute thread ID once to reduce instruction overhead
++  const int tid = blockDim.x * blockIdx.x + threadIdx.x;
++  const int stride = blockDim.x * gridDim.x;
+ 
+   // Invert the scale so that we can use multiplications to avoid expensive
+   // division.
+   const float inverted_scale = 1.0f / (*scale);
+   scaled_fp8_conversion_vec<scalar_t, true>(
+-      out, input, inverted_scale, num_elems, tid, blockDim.x * gridDim.x);
++      out, input, inverted_scale, num_elems, tid, stride);
+ }
+ 
+ template <typename scalar_t, typename fp8_type>
+@@ -30,23 +32,24 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel(
+     fp8_type* __restrict__ out, float* __restrict__ scale,
+     scalar_t const* __restrict__ input, float const* __restrict__ scale_ub,
+     const int hidden_size) {
+-  int const tid = threadIdx.x;
+-  int const token_idx = blockIdx.x;
++  const int tid = threadIdx.x;
++  const int token_idx = blockIdx.x;
++  const int stride = blockDim.x;
+ 
+   // Use int64 to avoid overflowing an int32 when calculating this offset
+-  int64_t offset = static_cast<int64_t>(token_idx) * hidden_size;
++  const int64_t offset = static_cast<int64_t>(token_idx) * hidden_size;
+   scalar_t const* __restrict__ token_input = &input[offset];
+   fp8_type* __restrict__ token_output = &out[offset];
+ 
+   // For vectorization, token_input and token_output pointers need to be
+   // aligned at 32-byte and 16-byte addresses respectively.
+-  bool const can_vectorize = hidden_size % 16 == 0;
++  const bool can_vectorize = hidden_size % 16 == 0;
+ 
+   float absmax_val = 0.0f;
+   if (can_vectorize) {
+-    absmax_val = thread_max_vec(token_input, hidden_size, tid, blockDim.x);
++    absmax_val = thread_max_vec(token_input, hidden_size, tid, stride);
+   } else {
+-    for (int i = tid; i < hidden_size; i += blockDim.x) {
++    for (int i = tid; i < hidden_size; i += stride) {
+       float const x = static_cast<float>(token_input[i]);
+       absmax_val = fmaxf(absmax_val, fabsf(x));
+     }
+@@ -58,26 +61,26 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel(
+       BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, blockDim.x);
+   __shared__ float token_scale;
+   if (tid == 0) {
+-    if (scale_ub) {
+-      token_scale = fminf(block_absmax_val_maybe, *scale_ub);
+-    } else {
+-      token_scale = block_absmax_val_maybe;
+-    }
++    float max_val = scale_ub ? fminf(block_absmax_val_maybe, *scale_ub)
++                             : block_absmax_val_maybe;
+     // token scale computation
+-    token_scale = fmaxf(token_scale / quant_type_max_v<fp8_type>,
++    token_scale = fmaxf(max_val / quant_type_max_v<fp8_type>,
+                         min_scaling_factor<fp8_type>::val());
+     scale[token_idx] = token_scale;
+   }
+   __syncthreads();
+ 
++  // Cache shared memory value in register
++  const float scale_factor = token_scale;
++
+   // Note that we don't use inverted scales so we can match FBGemm impl.
+   if (can_vectorize) {
+     scaled_fp8_conversion_vec<scalar_t, false>(
+-        token_output, token_input, token_scale, hidden_size, tid, blockDim.x);
++        token_output, token_input, scale_factor, hidden_size, tid, stride);
+   } else {
+-    for (int i = tid; i < hidden_size; i += blockDim.x) {
++    for (int i = tid; i < hidden_size; i += stride) {
+       token_output[i] = scaled_fp8_conversion<false, fp8_type>(
+-          static_cast<float>(token_input[i]), token_scale);
++          static_cast<float>(token_input[i]), scale_factor);
+     }
+   }
+ }

@@ -1,0 +1,73 @@
+diff --git a/cacheflow/models/attention.py b/cacheflow/models/attention.py
+index 8b132e442..15949d97d 100644
+--- a/cacheflow/models/attention.py
++++ b/cacheflow/models/attention.py
+@@ -37,7 +37,8 @@ class GPTCacheFlowAttention(nn.Module):
+         prefix_sum = [0]
+         for prompt_len in prompt_lens:
+             prefix_sum.append(prefix_sum[-1] + prompt_len)
+-        prefix_sum = torch.tensor(prefix_sum, dtype=torch.int, device=device)
++        # Use from_numpy for potential performance improvement if available
++        prefix_sum = torch.as_tensor(prefix_sum, dtype=torch.int, device=device)
+         max_prompt_len = max(prompt_lens)
+ 
+         # FIXME(woosuk): Unnecessary copy. Optimize this.
+diff --git a/cacheflow/models/sample.py b/cacheflow/models/sample.py
+index 87eeccb61..db624f704 100644
+--- a/cacheflow/models/sample.py
++++ b/cacheflow/models/sample.py
+@@ -31,7 +31,7 @@ class Sampler(nn.Module):
+         temperatures = _get_temperatures(input_metadata)
+         assert len(temperatures) == logits.shape[0]
+         if any(t != 1.0 for t in temperatures):
+-            t = torch.tensor(
++            t = torch.as_tensor(
+                 temperatures, dtype=logits.dtype, device=logits.device)
+             # Use in-place division to avoid creating a new tensor.
+             logits.div_(t.unsqueeze(dim=1))
+@@ -45,7 +45,7 @@ class Sampler(nn.Module):
+         top_ps = _get_top_ps(input_metadata)
+         assert len(top_ps) == probs.shape[0]
+         if any(p < 1.0 for p in top_ps):
+-            p = torch.tensor(top_ps, dtype=probs.dtype, device=probs.device)
++            p = torch.as_tensor(top_ps, dtype=probs.dtype, device=probs.device)
+             probs = _apply_top_p(probs, p)
+ 
+         # Sample the next tokens.
+@@ -177,7 +177,7 @@ def _sample_from_generation_tokens(
+     if sampling_params.use_beam_search:
+         # Beam search.
+         # Add cumulative logprobs for the sequences in the group.
+-        seq_logprobs = torch.tensor(
++        seq_logprobs = torch.as_tensor(
+             seq_logprobs, dtype=torch.float, device=logprobs.device)
+         logprobs = logprobs + seq_logprobs.unsqueeze(dim=1)
+ 
+diff --git a/cacheflow/parallel_utils/tensor_parallel/layers.py b/cacheflow/parallel_utils/tensor_parallel/layers.py
+index 978ca04e6..d21b44e3a 100644
+--- a/cacheflow/parallel_utils/tensor_parallel/layers.py
++++ b/cacheflow/parallel_utils/tensor_parallel/layers.py
+@@ -198,8 +198,8 @@ class VocabParallelEmbedding(torch.nn.Module):
+             # Build the mask.
+             input_mask = (input_ < self.vocab_start_index) | \
+                          (input_ >= self.vocab_end_index)
+-            # Mask the input.
+-            masked_input = input_.clone() - self.vocab_start_index
++            # Mask the input - subtraction creates new tensor, no need for clone.
++            masked_input = input_ - self.vocab_start_index
+             masked_input[input_mask] = 0
+         else:
+             masked_input = input_
+diff --git a/cacheflow/worker/worker.py b/cacheflow/worker/worker.py
+index f309cf12f..dc0fa99ea 100644
+--- a/cacheflow/worker/worker.py
++++ b/cacheflow/worker/worker.py
+@@ -81,7 +81,7 @@ class Worker:
+             rank=rank,
+         )
+         # A small all_reduce for warmup.
+-        torch.distributed.all_reduce(torch.zeros(1).cuda())
++        torch.distributed.all_reduce(torch.empty(1, device='cuda'))
+         initialize_model_parallel(tensor_parallel_size,
+                                   pipeline_parallel_size)
+ 

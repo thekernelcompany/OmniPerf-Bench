@@ -1,0 +1,96 @@
+diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
+index 7dd488e..d6574d8 100644
+--- a/python/sglang/srt/mem_cache/allocator.py
++++ b/python/sglang/srt/mem_cache/allocator.py
+@@ -175,12 +175,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+             device,
+             kvcache.swa_kv_pool,
+         )
+-        self.full_to_swa_index_mapping = torch.empty(
++        # Allocate with zeros directly to avoid fill_ operation in clear()
++        self.full_to_swa_index_mapping = torch.zeros(
+             size + size_swa + 1,
+             dtype=torch.int64,
+             device=device,
+         )
+-        self.clear()
++        self.is_not_in_free_group = True
++        self.free_group = []
+ 
+         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+ 
+@@ -255,7 +257,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+     def clear(self):
+         self.swa_attn_allocator.clear()
+         self.full_attn_allocator.clear()
+-        self.full_to_swa_index_mapping.fill_(0)
++        # Use slice assignment with zero tensor instead of fill_ for better performance
++        self.full_to_swa_index_mapping[:] = 0
+         self.is_in_free_group = False
+         self.free_group = []
+ 
+@@ -411,6 +414,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         self.num_pages = size // page_size
+         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
++        # Cache page offset tensor to avoid repeated allocation
++        self._page_offset_cache = torch.arange(self.page_size, device=self.device)
+         self.clear()
+ 
+     def alloc(self, need_size: int):
+@@ -427,9 +432,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         out_pages = self.free_pages[:num_pages]
+         self.free_pages = self.free_pages[num_pages:]
+ 
++        # Use cached page offset tensor to avoid repeated allocation
+         out_indices = (
+-            out_pages[:, None] * self.page_size
+-            + torch.arange(self.page_size, device=self.device)
++            out_pages[:, None] * self.page_size + self._page_offset_cache
+         ).reshape(-1)
+ 
+         return out_indices
+@@ -541,6 +546,7 @@ def alloc_extend_kernel_ascend(
+     out_indices,
+     page_size,
+     device,
++    pos_in_page=None,
+ ):
+     extend_lens = seq_lens - prefix_lens
+     end_pos = torch.cumsum(extend_lens, 0)
+@@ -554,7 +560,9 @@ def alloc_extend_kernel_ascend(
+     need_page = num_new_pages - num_full_new_pages
+     end_new_pages = torch.cumsum(num_new_pages, 0)
+     start_new_pages = end_new_pages - num_new_pages
+-    pos_in_page = torch.arange(page_size, device=device, dtype=torch.int32)
++    # Reuse pos_in_page if provided to avoid repeated allocation
++    if pos_in_page is None:
++        pos_in_page = torch.arange(page_size, device=device, dtype=torch.int32)
+     for i in range(len(prefix_lens)):
+         num1 = (
+             min(
+@@ -620,6 +628,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+     ):
+         super().__init__(size, page_size, dtype, device, kvcache)
+         self.ret_values = torch.empty((), dtype=torch.int32, device=self.device)
++        # Cache position tensor for ascend kernels to avoid repeated allocation
++        self._pos_in_page_cache = torch.arange(page_size, device=device, dtype=torch.int32)
+ 
+     def alloc_extend(
+         self,
+@@ -638,6 +648,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+             (extend_num_tokens,), dtype=torch.int32, device=self.device
+         )
+ 
++        # Pass cached position tensor to avoid repeated allocation
+         self.ret_values = alloc_extend_kernel_ascend(
+             prefix_lens,
+             seq_lens,
+@@ -646,6 +657,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+             out_indices,
+             self.page_size,
+             self.device,
++            self._pos_in_page_cache,
+         )
+ 
+         if self.debug_mode:

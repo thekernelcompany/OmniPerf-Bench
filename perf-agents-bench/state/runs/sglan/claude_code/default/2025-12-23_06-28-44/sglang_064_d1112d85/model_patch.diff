@@ -1,0 +1,126 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 32a11c1..d0b0aa4 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -228,19 +228,18 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+     if obj.stream:
+ 
+         async def stream_results() -> AsyncIterator[bytes]:
++            data_prefix = b"data: "
++            data_suffix = b"\n\n"
++            orjson_option = orjson.OPT_NON_STR_KEYS
+             try:
+                 async for out in _global_state.tokenizer_manager.generate_request(
+                     obj, request
+                 ):
+-                    yield b"data: " + orjson.dumps(
+-                        out, option=orjson.OPT_NON_STR_KEYS
+-                    ) + b"\n\n"
++                    yield data_prefix + orjson.dumps(out, option=orjson_option) + data_suffix
+             except ValueError as e:
+                 out = {"error": {"message": str(e)}}
+                 logger.error(f"Error: {e}")
+-                yield b"data: " + orjson.dumps(
+-                    out, option=orjson.OPT_NON_STR_KEYS
+-                ) + b"\n\n"
++                yield data_prefix + orjson.dumps(out, option=orjson_option) + data_suffix
+             yield b"data: [DONE]\n\n"
+ 
+         return StreamingResponse(
+@@ -330,16 +329,8 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
+         "message": message,
+         "num_paused_requests": num_paused_requests,
+     }
+-    if success:
+-        return ORJSONResponse(
+-            content,
+-            status_code=HTTPStatus.OK,
+-        )
+-    else:
+-        return ORJSONResponse(
+-            content,
+-            status_code=HTTPStatus.BAD_REQUEST,
+-        )
++    status_code = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(content, status_code=status_code)
+ 
+ 
+ @app.post("/init_weights_update_group")
+@@ -351,10 +342,8 @@ async def init_weights_update_group(
+         obj, request
+     )
+     content = {"success": success, "message": message}
+-    if success:
+-        return ORJSONResponse(content, status_code=200)
+-    else:
+-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
++    status_code = 200 if success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(content, status_code=status_code)
+ 
+ 
+ @app.post("/update_weights_from_distributed")
+@@ -368,10 +357,8 @@ async def update_weights_from_distributed(
+         )
+     )
+     content = {"success": success, "message": message}
+-    if success:
+-        return ORJSONResponse(content, status_code=200)
+-    else:
+-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
++    status_code = 200 if success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(content, status_code=status_code)
+ 
+ 
+ @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+@@ -505,9 +492,10 @@ async def openai_v1_embeddings(raw_request: Request):
+ def available_models():
+     """Show available models."""
+     served_model_names = [_global_state.tokenizer_manager.served_model_name]
+-    model_cards = []
+-    for served_model_name in served_model_names:
+-        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
++    model_cards = [
++        ModelCard(id=served_model_name, root=served_model_name)
++        for served_model_name in served_model_names
++    ]
+     return ModelList(data=model_cards)
+ 
+ 
+@@ -570,14 +558,15 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
+     if not vertex_req.instances:
+         return []
+     inputs = {}
++    first_instance = vertex_req.instances[0]
+     for input_key in ("text", "input_ids", "input_embeds"):
+-        if vertex_req.instances[0].get(input_key):
++        if first_instance.get(input_key):
+             inputs[input_key] = [
+-                instance.get(input_key) for instance in vertex_req.instances
++                instance[input_key] for instance in vertex_req.instances
+             ]
+             break
+     image_data = [
+-        instance.get("image_data")
++        instance["image_data"]
+         for instance in vertex_req.instances
+         if instance.get("image_data") is not None
+     ] or None
+diff --git a/test/srt/test_input_embeddings.py b/test/srt/test_input_embeddings.py
+index 015aabe..6a135e8 100644
+--- a/test/srt/test_input_embeddings.py
++++ b/test/srt/test_input_embeddings.py
+@@ -35,12 +35,12 @@ class TestInputEmbeds(unittest.TestCase):
+         """Generate input embeddings for a given text."""
+         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+         embeddings = self.ref_model.get_input_embeddings()(input_ids)
+-        return embeddings.squeeze().tolist()  # Convert tensor to a list for API use
++        return embeddings.squeeze(0).tolist()  # Convert tensor to a list for API use
+ 
+     def send_request(self, payload):
+         """Send a POST request to the API and return the response."""
+         response = requests.post(
+-            self.base_url + "/generate",
++            f"{self.base_url}/generate",
+             json=payload,
+             timeout=30,  # Set a reasonable timeout for the API request
+         )

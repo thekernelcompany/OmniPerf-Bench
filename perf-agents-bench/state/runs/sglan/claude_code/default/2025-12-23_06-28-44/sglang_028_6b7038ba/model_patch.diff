@@ -1,0 +1,241 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 5a97072..2204d94 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -197,12 +197,11 @@ async def health_generate(request: Request) -> Response:
+ @app.get("/get_model_info")
+ async def get_model_info():
+     """Get the model information."""
+-    result = {
++    return {
+         "model_path": _global_state.tokenizer_manager.model_path,
+         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
+         "is_generation": _global_state.tokenizer_manager.is_generation,
+     }
+-    return result
+ 
+ 
+ @app.get("/get_server_info")
+@@ -227,22 +226,23 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
+ async def generate_request(obj: GenerateReqInput, request: Request):
+     """Handle a generate request."""
+     if obj.stream:
++        # Pre-compute static byte strings
++        data_prefix = b"data: "
++        data_suffix = b"\n\n"
++        done_msg = b"data: [DONE]\n\n"
+ 
+         async def stream_results() -> AsyncIterator[bytes]:
+             try:
+                 async for out in _global_state.tokenizer_manager.generate_request(
+                     obj, request
+                 ):
+-                    yield b"data: " + orjson.dumps(
+-                        out, option=orjson.OPT_NON_STR_KEYS
+-                    ) + b"\n\n"
++                    yield data_prefix + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + data_suffix
+             except ValueError as e:
+-                out = {"error": {"message": str(e)}}
+                 logger.error(f"Error: {e}")
+-                yield b"data: " + orjson.dumps(
+-                    out, option=orjson.OPT_NON_STR_KEYS
+-                ) + b"\n\n"
+-            yield b"data: [DONE]\n\n"
++                yield data_prefix + orjson.dumps(
++                    {"error": {"message": str(e)}}, option=orjson.OPT_NON_STR_KEYS
++                ) + data_suffix
++            yield done_msg
+ 
+         return StreamingResponse(
+             stream_results(),
+@@ -354,16 +354,10 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
+         "message": message,
+         "num_paused_requests": num_paused_requests,
+     }
+-    if success:
+-        return ORJSONResponse(
+-            content,
+-            status_code=HTTPStatus.OK,
+-        )
+-    else:
+-        return ORJSONResponse(
+-            content,
+-            status_code=HTTPStatus.BAD_REQUEST,
+-        )
++    return ORJSONResponse(
++        content,
++        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
++    )
+ 
+ 
+ @app.post("/init_weights_update_group")
+@@ -374,11 +368,10 @@ async def init_weights_update_group(
+     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
+         obj, request
+     )
+-    content = {"success": success, "message": message}
+-    if success:
+-        return ORJSONResponse(content, status_code=200)
+-    else:
+-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
++    return ORJSONResponse(
++        {"success": success, "message": message},
++        status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
+ 
+ 
+ @app.post("/update_weights_from_distributed")
+@@ -391,11 +384,10 @@ async def update_weights_from_distributed(
+             obj, request
+         )
+     )
+-    content = {"success": success, "message": message}
+-    if success:
+-        return ORJSONResponse(content, status_code=200)
+-    else:
+-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
++    return ORJSONResponse(
++        {"success": success, "message": message},
++        status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
+ 
+ 
+ @app.api_route("/get_weights_by_name", methods=["GET", "POST"])
+@@ -403,10 +395,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
+     """Get model parameter by name."""
+     try:
+         ret = await _global_state.tokenizer_manager.get_weights_by_name(obj, request)
+-        if ret is None:
+-            return _create_error_response("Get parameter by name failed")
+-        else:
+-            return ORJSONResponse(ret, status_code=200)
++        return _create_error_response("Get parameter by name failed") if ret is None else ORJSONResponse(ret, status_code=200)
+     except Exception as e:
+         return _create_error_response(e)
+ 
+@@ -438,11 +427,9 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
+     """Open a session, and return its unique session id."""
+     try:
+         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
+-        if session_id is None:
+-            raise Exception(
+-                "Failed to open the session. Check if a session with the same id is still open."
+-            )
+-        return session_id
++        return session_id if session_id is not None else _create_error_response(
++            "Failed to open the session. Check if a session with the same id is still open."
++        )
+     except Exception as e:
+         return _create_error_response(e)
+ 
+@@ -469,21 +456,20 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
+     """
+     A native API endpoint to parse function calls from a text.
+     """
+-    # 1) Initialize the parser based on the request body
++    # Initialize the parser based on the request body
+     parser = FunctionCallParser(tools=obj.tools, tool_call_parser=obj.tool_call_parser)
+ 
+-    # 2) Call the non-stream parsing method (non-stream)
++    # Call the non-stream parsing method (non-stream)
+     normal_text, calls = parser.parse_non_stream(obj.text)
+ 
+-    # 3) Organize the response content
+-    response_data = {
+-        "normal_text": normal_text,
+-        "calls": [
+-            call.model_dump() for call in calls
+-        ],  # Convert pydantic objects to dictionaries
+-    }
+-
+-    return ORJSONResponse(content=response_data, status_code=200)
++    # Organize the response content
++    return ORJSONResponse(
++        content={
++            "normal_text": normal_text,
++            "calls": [call.model_dump() for call in calls],
++        },
++        status_code=200
++    )
+ 
+ 
+ @app.post("/separate_reasoning")
+@@ -491,19 +477,20 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
+     """
+     A native API endpoint to separate reasoning from a text.
+     """
+-    # 1) Initialize the parser based on the request body
++    # Initialize the parser based on the request body
+     parser = ReasoningParser(model_type=obj.reasoning_parser)
+ 
+-    # 2) Call the non-stream parsing method (non-stream)
++    # Call the non-stream parsing method (non-stream)
+     reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+ 
+-    # 3) Organize the response content
+-    response_data = {
+-        "reasoning_text": reasoning_text,
+-        "text": normal_text,
+-    }
+-
+-    return ORJSONResponse(content=response_data, status_code=200)
++    # Organize the response content
++    return ORJSONResponse(
++        content={
++            "reasoning_text": reasoning_text,
++            "text": normal_text,
++        },
++        status_code=200
++    )
+ 
+ 
+ ##### OpenAI-compatible API endpoints #####
+@@ -529,9 +516,7 @@ async def openai_v1_embeddings(raw_request: Request):
+ def available_models():
+     """Show available models."""
+     served_model_names = [_global_state.tokenizer_manager.served_model_name]
+-    model_cards = []
+-    for served_model_name in served_model_names:
+-        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
++    model_cards = [ModelCard(id=name, root=name) for name in served_model_names]
+     return ModelList(data=model_cards)
+ 
+ 
+@@ -593,18 +578,16 @@ async def sagemaker_chat_completions(raw_request: Request):
+ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
+     if not vertex_req.instances:
+         return []
++
+     inputs = {}
++    first_instance = vertex_req.instances[0]
+     for input_key in ("text", "input_ids", "input_embeds"):
+-        if vertex_req.instances[0].get(input_key):
+-            inputs[input_key] = [
+-                instance.get(input_key) for instance in vertex_req.instances
+-            ]
++        if first_instance.get(input_key):
++            inputs[input_key] = [instance.get(input_key) for instance in vertex_req.instances]
+             break
+-    image_data = [
+-        instance.get("image_data")
+-        for instance in vertex_req.instances
+-        if instance.get("image_data") is not None
+-    ] or None
++
++    image_data = [instance.get("image_data") for instance in vertex_req.instances if instance.get("image_data") is not None] or None
++
+     req = GenerateReqInput(
+         **inputs,
+         image_data=image_data,
+@@ -693,10 +676,8 @@ def _wait_and_warmup(
+     image_token_text: str,
+     launch_callback: Optional[Callable[[], None]] = None,
+ ):
+-    headers = {}
+     url = server_args.url()
+-    if server_args.api_key:
+-        headers["Authorization"] = f"Bearer {server_args.api_key}"
++    headers = {"Authorization": f"Bearer {server_args.api_key}"} if server_args.api_key else {}
+ 
+     # Wait until the server is launched
+     success = False

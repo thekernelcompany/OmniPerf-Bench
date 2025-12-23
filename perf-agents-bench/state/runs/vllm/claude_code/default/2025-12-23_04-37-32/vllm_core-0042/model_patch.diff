@@ -1,0 +1,97 @@
+diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+index 4e82424d6..08836e0b7 100644
+--- a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+@@ -102,15 +102,19 @@ async def handle_request():
+         global count
+         global prefill_instances
+         global prefill_cv
++        # Cache the list conversion outside the lock for better performance
+         with prefill_cv:
+-            prefill_list = list(prefill_instances.items())
+-            prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
++            # Directly access items without creating intermediate list
++            prefill_items = tuple(prefill_instances.items())
++        prefill_addr, prefill_zmq_addr = prefill_items[count % len(prefill_items)]
+ 
+         global decode_instances
+         global decode_cv
++        # Cache the list conversion outside the lock for better performance
+         with decode_cv:
+-            decode_list = list(decode_instances.items())
+-            decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
++            # Directly access items without creating intermediate list
++            decode_items = tuple(decode_instances.items())
++        decode_addr, decode_zmq_addr = decode_items[count % len(decode_items)]
+ 
+         print(
+             f"handle_request count: {count}, [HTTP:{prefill_addr}, "
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+index 52f589a6d..2bf06572a 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+@@ -40,10 +40,12 @@ class ReqMeta:
+     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
+                   block_size: int) -> "ReqMeta":
+         valid_num_tokens = len(token_ids)
+-        token_ids_tensor = torch.tensor(token_ids)
+-        block_ids_tensor = torch.tensor(block_ids)
++        # Use torch.as_tensor for better performance - avoids copying if possible
++        token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long)
++        block_ids_tensor = torch.as_tensor(block_ids, dtype=torch.long)
+         num_blocks = block_ids_tensor.shape[0]
+-        block_offsets = torch.arange(0, block_size)
++        # Explicitly specify dtype to avoid implicit conversions
++        block_offsets = torch.arange(0, block_size, dtype=torch.long)
+         slot_mapping = block_offsets.reshape((1, block_size)) + \
+                 block_ids_tensor.reshape((num_blocks, 1)) * block_size
+         slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
+@@ -160,8 +162,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
+                         "🚧src_kv_cache does not match, num_slot:%d, "
+                         "num_token:%d, request_id:%s", len(slot_mapping),
+                         num_token, request_id)
+-
+-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
++                # Removed unnecessary reshape - view operations modify underlying tensor in-place
+             else:
+                 num_pages = dst_kv_cache_layer_shape[1]
+                 page_size = dst_kv_cache_layer_shape[2]
+@@ -179,8 +180,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
+                         "🚧src_kv_cache does not match, num_slot:%d, "
+                         "num_token:%d, request_id:%s", len(slot_mapping),
+                         num_token, request_id)
+-
+-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
++                # Removed unnecessary reshape - view operations modify underlying tensor in-place
+ 
+         # Get the metadata
+         metadata: KVConnectorMetadata = \
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+index 6c9ccb2e3..5e8b517d9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+@@ -369,8 +369,10 @@ class P2pNcclEngine:
+ 
+                     if data["ret"] == 0:
+                         comm, rank = self.comms[remote_address.decode()]
+-                        self._send(comm, tensor.to(self.device), rank ^ 1,
+-                                   self.send_stream)
++                        # Avoid unnecessary device transfer if already on correct device
++                        if tensor.device != self.device:
++                            tensor = tensor.to(self.device)
++                        self._send(comm, tensor, rank ^ 1, self.send_stream)
+                 else:
+                     logger.warning(
+                         "🚧Unexpected, Received message from %s, data:%s",
+@@ -440,7 +442,10 @@ class P2pNcclEngine:
+                 response.decode())
+             return False
+ 
+-        self._send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
++        # Avoid unnecessary device transfer if already on correct device
++        if tensor.device != self.device:
++            tensor = tensor.to(self.device)
++        self._send(comm, tensor, rank ^ 1, self.send_stream)
+ 
+         if self.send_type == "PUT_ASYNC":
+             self._have_sent_tensor_id(tensor_id)

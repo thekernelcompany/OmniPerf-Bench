@@ -1,0 +1,127 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 5a97072de..a3a3e925a 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -21,7 +21,7 @@ import asyncio
+ import dataclasses
+ import json
+ import logging
+-import multiprocessing as multiprocessing
++import multiprocessing.connection as _mp_conn
+ import os
+ import threading
+ import time
+@@ -33,7 +33,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+ 
+ from contextlib import asynccontextmanager
+ 
+-import numpy as np
+ import orjson
+ import requests
+ import uvicorn
+@@ -172,12 +171,17 @@ async def health_generate(request: Request) -> Response:
+             break
+ 
+     tic = time.time()
++    deadline = tic + HEALTH_CHECK_TIMEOUT
++    tm = _global_state.tokenizer_manager
+     task = asyncio.create_task(gen())
+-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
++    while True:
++        now = time.time()
++        if now >= deadline:
++            break
+         await asyncio.sleep(1)
+-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
++        if tm.last_receive_tstamp > tic:
+             task.cancel()
+-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
++            tm.rid_to_state.pop(rid, None)
+             return Response(status_code=200)
+ 
+     task.cancel()
+@@ -229,19 +233,16 @@ async def generate_request(obj: GenerateReqInput, request: Request):
+     if obj.stream:
+ 
+         async def stream_results() -> AsyncIterator[bytes]:
++            opt = orjson.OPT_NON_STR_KEYS
+             try:
+                 async for out in _global_state.tokenizer_manager.generate_request(
+                     obj, request
+                 ):
+-                    yield b"data: " + orjson.dumps(
+-                        out, option=orjson.OPT_NON_STR_KEYS
+-                    ) + b"\n\n"
++                    yield b"data: " + orjson.dumps(out, option=opt) + b"\n\n"
+             except ValueError as e:
+                 out = {"error": {"message": str(e)}}
+                 logger.error(f"Error: {e}")
+-                yield b"data: " + orjson.dumps(
+-                    out, option=orjson.OPT_NON_STR_KEYS
+-                ) + b"\n\n"
++                yield b"data: " + orjson.dumps(out, option=opt) + b"\n\n"
+             yield b"data: [DONE]\n\n"
+ 
+         return StreamingResponse(
+@@ -528,10 +529,8 @@ async def openai_v1_embeddings(raw_request: Request):
+ @app.get("/v1/models", response_class=ORJSONResponse)
+ def available_models():
+     """Show available models."""
+-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+-    model_cards = []
+-    for served_model_name in served_model_names:
+-        model_cards.append(ModelCard(id=served_model_name, root=served_model_name))
++    name = _global_state.tokenizer_manager.served_model_name
++    model_cards = [ModelCard(id=name, root=name)]
+     return ModelList(data=model_cards)
+ 
+ 
+@@ -615,14 +614,13 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
+ 
+ 
+ def _create_error_response(e):
+-    return ORJSONResponse(
+-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+-    )
++    msg = str(e)
++    return ORJSONResponse({"error": {"message": msg}}, status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
+ def launch_server(
+     server_args: ServerArgs,
+-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
++    pipe_finish_writer: Optional[_mp_conn.Connection] = None,
+     launch_callback: Optional[Callable[[], None]] = None,
+ ):
+     """
+@@ -689,7 +687,7 @@ def launch_server(
+ 
+ def _wait_and_warmup(
+     server_args: ServerArgs,
+-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
++    pipe_finish_writer: Optional[_mp_conn.Connection],
+     image_token_text: str,
+     launch_callback: Optional[Callable[[], None]] = None,
+ ):
+@@ -700,10 +698,11 @@ def _wait_and_warmup(
+ 
+     # Wait until the server is launched
+     success = False
++    s = requests.Session()
+     for _ in range(120):
+         time.sleep(1)
+         try:
+-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
++            res = s.get(url + "/get_model_info", timeout=5, headers=headers)
+             assert res.status_code == 200, f"{res=}, {res.text=}"
+             success = True
+             break
+@@ -737,6 +736,8 @@ def _wait_and_warmup(
+     # Debug dumping
+     if server_args.debug_tensor_dump_input_file:
+         json_data.pop("text", None)
++        # Lazy import numpy only when debugging to avoid heavy import at startup
++        import numpy as np
+         json_data["input_ids"] = np.load(
+             server_args.debug_tensor_dump_input_file
+         ).tolist()

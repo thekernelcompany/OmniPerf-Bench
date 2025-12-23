@@ -1,0 +1,101 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index d07527304..082b8ea85 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -146,15 +146,20 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    # Use broadcasting instead of repeat to reduce memory allocation
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(1)
++    penalty_mask = prompt_mask | output_mask
++    # Apply repetition penalty where needed
++    # Clone logits where penalty should be applied to avoid in-place issues
++    penalized_logits = torch.where(logits > 0, logits / repetition_penalties_expanded,
++                                   logits * repetition_penalties_expanded)
++    logits = torch.where(penalty_mask, penalized_logits, logits)
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
++    # Use unsqueeze instead of unsqueeze_ to avoid modifying original tensors
++    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
++    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
+     return logits
+ 
+ 
+@@ -175,14 +180,15 @@ def _apply_top_k_top_p(
+     # Apply top-p.
+     probs_sort = logits_sort.softmax(dim=-1)
+     probs_sum = probs_sort.cumsum(dim=-1)
+-    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+-    # at least one
+-    top_p_mask[:, -1] = False
++    # Shift cumsum to include current token in the kept set
++    # This ensures at least one token is kept (the last/highest prob)
++    top_p_mask = probs_sum - probs_sort > 1 - p.unsqueeze(dim=1)
+     logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    src = torch.arange(logits_idx.shape[-1],
+-                       device=logits_idx.device).expand_as(logits_idx)
++    # Optimize by avoiding expand - use unsqueeze + expand_as pattern
++    vocab_size = logits_idx.shape[-1]
++    src = torch.arange(vocab_size, device=logits_idx.device).unsqueeze(0).expand_as(logits_idx)
+     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+                                                            index=logits_idx,
+                                                            src=src)
+@@ -200,7 +206,8 @@ def _apply_min_p(
+     """
+     probs = torch.softmax(logits, dim=-1)
+     top_probs, _ = probs.max(dim=-1, keepdim=True)
+-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
++    # Use unsqueeze instead of unsqueeze_ to avoid modifying original tensor
++    scaled_min_p = min_p.unsqueeze(dim=1) * top_probs
+     tokens_to_remove = probs < scaled_min_p
+     logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
+ 
+@@ -288,7 +295,8 @@ def _beam_search_sample(
+             cumulative_logprobs = [
+                 seq_data[seq_id].cumulative_logprob for seq_id in seq_ids
+             ]
+-            cumulative_logprobs = torch.tensor(
++            # Optimize tensor creation from list
++            cumulative_logprobs = torch.as_tensor(
+                 cumulative_logprobs,
+                 dtype=torch.float,
+                 device=seq_group_logprobs.device)
+@@ -323,9 +331,10 @@ def _multinomial(
+         # This allows us to do sampling with replacement by creating
+         # num_samples copies of each row in the tensor, and then
+         # batch sampling the resulting tensor.
+-        probs = probs[:, None, :].expand(probs.shape[0], num_samples,
+-                                         probs.shape[1]).contiguous().view(
+-                                             -1, probs.shape[1])
++        # Optimize by using reshape instead of contiguous().view()
++        batch_size, vocab_size = probs.shape
++        probs = probs[:, None, :].expand(batch_size, num_samples,
++                                         vocab_size).reshape(-1, vocab_size)
+     q = torch.empty_like(probs)
+     if seq_groups is None:
+         q.exponential_()
+@@ -517,11 +526,12 @@ def _get_ranks(x: torch.Tensor, indices: List[int]) -> torch.Tensor:
+ 
+     Returns:
+         torch.Tensor: 1D tensor of shape (N,) where N is the no. of tokens.
+-                    Each element in the returned tensor represents the rank 
++                    Each element in the returned tensor represents the rank
+                     of the chosen token in the input logprob tensor.
+     """
+     vals = x[range(len(x)), indices]
+-    return (x > vals[:, None]).long().sum(1) + 1
++    # Optimize: use sum(dim=1) instead of sum(1) for clarity and potential optimization
++    return (x > vals[:, None]).long().sum(dim=1) + 1
+ 
+ 
+ def _get_logprobs(

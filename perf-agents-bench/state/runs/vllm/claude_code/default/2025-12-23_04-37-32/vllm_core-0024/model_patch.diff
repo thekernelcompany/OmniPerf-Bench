@@ -1,0 +1,45 @@
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+index 3ff162170..155a981d8 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+@@ -82,18 +82,21 @@ def scaled_mm_kernel(a_ptr, b_ptr, scale_a_ptr, scale_b_ptr, c_ptr, bias_ptr,
+         b_ptrs += BLOCK_SIZE_K * stride_bk
+ 
+     # Apply scale at end.
+-    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
++    masks_scale_a = masks_scale_am[:, None]
+     scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
+     # Need to broadcast to the appropriate size, if scale_a is already
+     # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
+     # for scale_b below.
+     scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+-    accumulator = scale_a * accumulator.to(tl.float32)
+ 
+-    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
++    masks_scale_b = masks_scale_bn[:, None]
+     scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+-    accumulator = scale_b.T * accumulator.to(tl.float32)
++
++    # Convert once and apply both scales
++    accumulator = accumulator.to(tl.float32)
++    accumulator = scale_a * accumulator
++    accumulator = scale_b.T * accumulator
+ 
+     # Convert to output format.
+     c = accumulator.to(c_ptr.type.element_ty)
+@@ -109,8 +112,6 @@ def scaled_mm_kernel(a_ptr, b_ptr, scale_a_ptr, scale_b_ptr, c_ptr, bias_ptr,
+     # Save output
+     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+-    offs_cm = offs_cm.to(tl.int64)
+-    offs_cn = offs_cn.to(tl.int64)
+     c_ptrs = (c_ptr + stride_cm * offs_cm[:, None] +
+               stride_cn * offs_cn[None, :])
+     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+@@ -181,4 +182,4 @@ def triton_scaled_mm(input: torch.Tensor,
+                            BLOCK_SIZE_SCALE_A=block_size_sa,
+                            BLOCK_SIZE_SCALE_B=block_size_sb)
+ 
+-    return result.to(out_dtype)
++    return result

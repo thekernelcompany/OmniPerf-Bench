@@ -1,0 +1,99 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..cc8f795 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1242,8 +1242,9 @@ class Scheduler(
+         can_run_list: List[Req],
+         running_bs: int,
+     ):
+-        gap_latency = time.perf_counter() - self.last_prefill_stats_tic
+-        self.last_prefill_stats_tic = time.perf_counter()
++        current_time = time.perf_counter()
++        gap_latency = current_time - self.last_prefill_stats_tic
++        self.last_prefill_stats_tic = current_time
+         self.last_input_throughput = self.last_prefill_tokens / gap_latency
+         self.last_prefill_tokens = adder.log_input_tokens
+ 
+@@ -1295,8 +1296,9 @@ class Scheduler(
+     ):
+         batch = running_batch or self.running_batch
+ 
+-        gap_latency = time.perf_counter() - self.last_decode_stats_tic
+-        self.last_decode_stats_tic = time.perf_counter()
++        current_time = time.perf_counter()
++        gap_latency = current_time - self.last_decode_stats_tic
++        self.last_decode_stats_tic = current_time
+         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+         self.num_generated_tokens = 0
+         num_running_reqs = len(batch.reqs)
+@@ -1402,12 +1404,8 @@ class Scheduler(
+     def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+         """Coordinate the DP attention batch."""
+ 
+-        local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
+-            dtype=torch.int64,
+-        )
++        local_info = torch.empty(1, dtype=torch.int64)
++        local_info[0] = (new_batch is not None)
+         global_info = torch.empty(
+             (self.server_args.dp_size, self.attn_tp_size, 1),
+             dtype=torch.int64,
+@@ -1579,8 +1577,9 @@ class Scheduler(
+             for req in can_run_list:
+                 req.queue_time_end = time.perf_counter()
+ 
++        can_run_set = set(can_run_list)
+         self.waiting_queue = [
+-            x for x in self.waiting_queue if x not in set(can_run_list)
++            x for x in self.waiting_queue if x not in can_run_set
+         ]
+ 
+         if adder.new_chunked_req is not None:
+@@ -1842,21 +1841,19 @@ class Scheduler(
+ 
+         tbo_preparer = TboDPAttentionPreparer()
+ 
+-        local_info = torch.tensor(
+-            [
+-                num_tokens,
+-                can_cuda_graph,
+-                num_tokens_for_logprob,
+-                is_extend_in_batch,
+-                *tbo_preparer.prepare_all_gather(
+-                    local_batch,
+-                    deepep_mode,
+-                    enable_deepep_moe,
+-                    enable_two_batch_overlap,
+-                ),
+-            ],
+-            dtype=torch.int64,
++        tbo_values = tbo_preparer.prepare_all_gather(
++            local_batch,
++            deepep_mode,
++            enable_deepep_moe,
++            enable_two_batch_overlap,
+         )
++        local_info = torch.empty(6, dtype=torch.int64)
++        local_info[0] = num_tokens
++        local_info[1] = can_cuda_graph
++        local_info[2] = num_tokens_for_logprob
++        local_info[3] = is_extend_in_batch
++        local_info[4] = tbo_values[0]
++        local_info[5] = tbo_values[1]
+         global_info = torch.empty(
+             (dp_size, attn_tp_size, 6),
+             dtype=torch.int64,
+@@ -1947,7 +1944,9 @@ class Scheduler(
+ 
+         if tp_size > 1:
+             # Sync across TP ranks to make sure they have the same number of ready requests
+-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
++            tensor = torch.empty(2, dtype=torch.int32)
++            tensor[0] = num_ready_reqs
++            tensor[1] = num_timeout_reqs
+             torch.distributed.all_reduce(
+                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+             )

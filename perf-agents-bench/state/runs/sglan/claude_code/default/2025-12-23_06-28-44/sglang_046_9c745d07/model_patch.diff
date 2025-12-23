@@ -1,0 +1,116 @@
+diff --git a/python/sglang/srt/constrained/outlines_backend.py b/python/sglang/srt/constrained/outlines_backend.py
+index cc68b97..fcbe132 100644
+--- a/python/sglang/srt/constrained/outlines_backend.py
++++ b/python/sglang/srt/constrained/outlines_backend.py
+@@ -60,13 +60,17 @@ class OutlinesGrammar(BaseGrammarObject):
+         suffix_bytes = []
+         continuation_range = range(0x80, 0xC0)
+         cur_state = self.state
+-        while (
+-            len(jump_forward_bytes) and jump_forward_bytes[0][0] in continuation_range
+-        ):
++        idx = 0
++        while idx < len(jump_forward_bytes) and jump_forward_bytes[idx][0] in continuation_range:
+             # continuation bytes
+-            byte_edge = jump_forward_bytes.pop(0)
++            byte_edge = jump_forward_bytes[idx]
+             suffix_bytes.append(byte_edge[0])
+             cur_state = byte_edge[1]
++            idx += 1
++
++        # Remove processed bytes
++        if idx > 0:
++            del jump_forward_bytes[:idx]
+ 
+         suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
+         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
+@@ -82,7 +86,8 @@ class OutlinesGrammar(BaseGrammarObject):
+         self.state = next_state
+ 
+     def fill_vocab_mask(self, vocab_mask: torch.Tensor):
+-        vocab_mask.fill_(1)
++        # Set all positions to 1 (masked) first, then unmask allowed tokens
++        vocab_mask[:] = 1
+         vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+ 
+     def copy(self):
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 02750d5..e286c7d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -502,8 +502,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index a341c2b..a9bceac 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -53,19 +53,19 @@ class SamplingBatchInfo:
+             torch.tensor(
+                 [r.sampling_params.temperature for r in reqs],
+                 dtype=torch.float,
++                device=device,
+             )
+             .view(-1, 1)
+-            .to(device, non_blocking=True)
+         )
+         top_ps = torch.tensor(
+-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
++        )
+         top_ks = torch.tensor(
+-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
++        )
+         min_ps = torch.tensor(
+-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
++        )
+ 
+         ret = cls(
+             temperatures=temperatures,
+@@ -125,7 +125,7 @@ class SamplingBatchInfo:
+             else:
+                 if self.linear_penalties is None:
+                     bs = self.penalizer_orchestrator.batch.batch_size()
+-                    self.linear_penalties = torch.zeros(
++                    self.linear_penalties = torch.empty(
+                         (bs, self.vocab_size),
+                         dtype=torch.float32,
+                         device=self.device,
+@@ -137,7 +137,7 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
+-        self.vocab_mask = torch.zeros(
++        self.vocab_mask = torch.empty(
+             len(self.temperatures),
+             self.vocab_size,
+             dtype=torch.bool,
+@@ -178,11 +178,10 @@ class SamplingBatchInfo:
+                 shape, dtype = lhs.shape[1:], lhs.dtype
+             else:
+                 shape, dtype = rhs.shape[1:], rhs.dtype
+-            with torch.dtype(dtype):
+-                if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
+-                if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++            if lhs is None:
++                lhs = torch.full((bs1, *shape), default, dtype=dtype, device=device)
++            if rhs is None:
++                rhs = torch.full((bs2, *shape), default, dtype=dtype, device=device)
+             return torch.cat([lhs, rhs])
+ 
+         return None

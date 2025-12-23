@@ -1,0 +1,116 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 30c9eb6a7..4a1a9d644 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -145,7 +145,8 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -331,7 +332,6 @@ def post_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+     topk_weights_ptr = topk_weights_ptr + src_idx * topk
+ 
+-    computed = False
+     store_ptr = output_ptr + src_idx * hidden_size
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+         offset = start_offset + tl.arange(0, BLOCK_SIZE)
+@@ -341,7 +341,6 @@ def post_reorder_triton_kernel(
+         for idx in range(topk):
+             expert_id = tl.load(topk_ids_ptr + idx)
+             if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-                computed = True
+                 dst_idx = tl.load(src2dst_ptr + idx)
+                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+@@ -349,14 +348,6 @@ def post_reorder_triton_kernel(
+                 sum_vec += in_data * weigh_scale
+         tl.store(store_ptr + offset, sum_vec, mask=mask)
+ 
+-    if computed == False:
+-        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-            mask = offset < hidden_size
+-            tl.store(
+-                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+-            )
+-
+ 
+ @triton.jit
+ def compute_m_range(
+@@ -529,7 +520,8 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )
+diff --git a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+index 6b67f6cea..57ac3fbdf 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
++++ b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+@@ -226,9 +226,10 @@ class DeepEPDispatcher:
+             reorder_topk_ids = torch.empty(
+                 (0,), device=hidden_states.device, dtype=torch.int64
+             )
+-            seg_indptr = torch.zeros(
++            seg_indptr = torch.empty(
+                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+             )
++            seg_indptr[:] = 0
+         return hidden_states, reorder_topk_ids, seg_indptr
+ 
+     def dispatch_normal(
+@@ -366,7 +367,7 @@ class DeepEPDispatcher:
+                     BLOCK_SIZE=512,
+                 )
+             else:
+-                output = torch.zeros(
++                output = torch.empty(
+                     (0, hidden_states.shape[1]),
+                     device=hidden_states.device,
+                     dtype=hidden_states.dtype,
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index ab8b81602..2f9770d41 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -921,14 +921,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 37760407b..3fc95484f 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -276,8 +276,8 @@ class DeepseekV2MoE(nn.Module):
+         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+     ) -> torch.Tensor:
+         shared_output = None
+-        topk_idx = torch.full(
+-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++        topk_idx = torch.empty(
++            (0, self.top_k), dtype=torch.int, device=hidden_states.device
+         )
+         topk_weights = torch.empty(
+             (0, self.top_k), dtype=torch.float32, device=hidden_states.device

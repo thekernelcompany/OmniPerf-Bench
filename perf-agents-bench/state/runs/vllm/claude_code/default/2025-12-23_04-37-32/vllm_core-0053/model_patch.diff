@@ -1,0 +1,300 @@
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index 122e2ed86..78f70fb4d 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -553,8 +553,10 @@ class LLM:
+             instances.append(BeamSearchInstance(prompt_tokens))
+ 
+         for _ in range(max_tokens):
+-            all_beams: list[BeamSearchSequence] = list(
+-                sum((instance.beams for instance in instances), []))
++            # Optimize list concatenation using extend instead of sum
++            all_beams: list[BeamSearchSequence] = []
++            for instance in instances:
++                all_beams.extend(instance.beams)
+             pos = [0] + list(
+                 itertools.accumulate(
+                     len(instance.beams) for instance in instances))
+@@ -1383,11 +1385,12 @@ class LLM:
+                             # Calculate tokens only for RequestOutput
+                             assert output.prompt_token_ids is not None
+                             total_in_toks += len(output.prompt_token_ids)
+-                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
++                            # Cache format_dict access
++                            elapsed = pbar.format_dict["elapsed"]
++                            in_spd = total_in_toks / elapsed
+                             total_out_toks += sum(
+                                 len(stp.token_ids) for stp in output.outputs)
+-                            out_spd = (total_out_toks /
+-                                       pbar.format_dict["elapsed"])
++                            out_spd = total_out_toks / elapsed
+                             pbar.postfix = (
+                                 f"est. speed input: {in_spd:.2f} toks/s, "
+                                 f"output: {out_spd:.2f} toks/s")
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 98e9ea0fc..fe88bdc42 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -296,8 +296,10 @@ class OpenAIServingChat(OpenAIServing):
+         num_prompt_tokens = 0
+         num_cached_tokens = None
+ 
+-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
+-            tool_choice_function_name = request.tool_choice.function.name
++        # Cache request attributes for faster access
++        request_tool_choice = request.tool_choice
++        if isinstance(request_tool_choice, ChatCompletionNamedToolChoiceParam):
++            tool_choice_function_name = request_tool_choice.function.name
+         else:
+             tool_choice_function_name = None
+ 
+@@ -316,7 +318,8 @@ class OpenAIServingChat(OpenAIServing):
+         if tool_choice_auto or should_stream_with_reasoning_parsing:
+             # These are only required in "auto" tool choice case
+             previous_texts = [""] * num_choices
+-            all_previous_token_ids = [[]] * num_choices
++            # Fixed: Use list comprehension to avoid shared references
++            all_previous_token_ids = [[] for _ in range(num_choices)]
+         else:
+             previous_texts, all_previous_token_ids = None, None
+ 
+@@ -338,9 +341,10 @@ class OpenAIServingChat(OpenAIServing):
+         # Prepare the tool parser if it's needed
+         try:
+             if tool_choice_auto and self.tool_parser:
++                # Create separate parser instances for each choice
+                 tool_parsers: list[Optional[ToolParser]] = [
+-                    self.tool_parser(tokenizer)
+-                ] * num_choices
++                    self.tool_parser(tokenizer) for _ in range(num_choices)
++                ]
+             else:
+                 tool_parsers = [None] * num_choices
+         except Exception as e:
+@@ -358,6 +362,11 @@ class OpenAIServingChat(OpenAIServing):
+         else:
+             include_usage, include_continuous_usage = False, False
+ 
++        # Cache frequently accessed request attributes
++        request_echo = request.echo
++        request_logprobs = request.logprobs
++        request_top_logprobs = request.top_logprobs
++
+         try:
+             async for res in result_generator:
+                 if res.prompt_token_ids is not None:
+@@ -404,7 +413,7 @@ class OpenAIServingChat(OpenAIServing):
+ 
+                     # Send response to echo the input portion of the
+                     # last message
+-                    if request.echo:
++                    if request_echo:
+                         last_msg_content: Union[str, list[dict[str, str]]] = ""
+                         if conversation and "content" in conversation[
+                                 -1] and conversation[-1].get("role") == role:
+@@ -443,14 +452,14 @@ class OpenAIServingChat(OpenAIServing):
+                     if finish_reason_sent[i]:
+                         continue
+ 
+-                    if request.logprobs and request.top_logprobs is not None:
++                    if request_logprobs and request_top_logprobs is not None:
+                         assert output.logprobs is not None, (
+                             "Did not output logprobs")
+                         logprobs = self._create_chat_logprobs(
+                             token_ids=output.token_ids,
+                             top_logprobs=output.logprobs,
+                             tokenizer=tokenizer,
+-                            num_output_top_logprobs=request.top_logprobs,
++                            num_output_top_logprobs=request_top_logprobs,
+                         )
+                     else:
+                         logprobs = None
+@@ -695,16 +704,24 @@ class OpenAIServingChat(OpenAIServing):
+         choices: list[ChatCompletionResponseChoice] = []
+ 
+         role = self.get_chat_request_role(request)
++
++        # Cache request attributes for performance
++        request_logprobs = request.logprobs
++        request_top_logprobs = request.top_logprobs
++        request_tool_choice = request.tool_choice
++        request_tools = request.tools
++        request_echo = request.echo
++
+         for output in final_res.outputs:
+             token_ids = output.token_ids
+             out_logprobs = output.logprobs
+ 
+-            if request.logprobs and request.top_logprobs is not None:
++            if request_logprobs and request_top_logprobs is not None:
+                 assert out_logprobs is not None, "Did not output logprobs"
+                 logprobs = self._create_chat_logprobs(
+                     token_ids=token_ids,
+                     top_logprobs=out_logprobs,
+-                    num_output_top_logprobs=request.top_logprobs,
++                    num_output_top_logprobs=request_top_logprobs,
+                     tokenizer=tokenizer,
+                 )
+             else:
+@@ -741,12 +758,12 @@ class OpenAIServingChat(OpenAIServing):
+             #   outlines is not being used
+             elif (not self.enable_auto_tools
+                   or not self.tool_parser) and not isinstance(
+-                      request.tool_choice, ChatCompletionNamedToolChoiceParam):
++                      request_tool_choice, ChatCompletionNamedToolChoiceParam):
+                 message = ChatMessage(role=role, content=output.text)
+ 
+             # if the request uses tools and specified a tool choice
+-            elif request.tool_choice and type(
+-                    request.tool_choice) is ChatCompletionNamedToolChoiceParam:
++            elif request_tool_choice and type(
++                    request_tool_choice) is ChatCompletionNamedToolChoiceParam:
+ 
+                 tool_call_class = MistralToolCall if isinstance(
+                     tokenizer, MistralTokenizer) else ToolCall
+@@ -755,20 +772,20 @@ class OpenAIServingChat(OpenAIServing):
+                     content="",
+                     tool_calls=[
+                         tool_call_class(function=FunctionCall(
+-                            name=request.tool_choice.function.name,
++                            name=request_tool_choice.function.name,
+                             arguments=output.text))
+                     ])
+ 
+             # if the request doesn't use tool choice
+             # OR specifies to not use a tool
+-            elif not request.tool_choice or request.tool_choice == "none":
++            elif not request_tool_choice or request_tool_choice == "none":
+ 
+                 message = ChatMessage(role=role, content=output.text)
+ 
+             # handle when there are tools and tool choice is auto
+-            elif request.tools and (
+-                    request.tool_choice == "auto"
+-                    or request.tool_choice is None) and self.enable_auto_tools \
++            elif request_tools and (
++                    request_tool_choice == "auto"
++                    or request_tool_choice is None) and self.enable_auto_tools \
+                     and self.tool_parser:
+ 
+                 try:
+@@ -810,7 +827,7 @@ class OpenAIServingChat(OpenAIServing):
+                 stop_reason=output.stop_reason)
+             choices.append(choice_data)
+ 
+-        if request.echo:
++        if request_echo:
+             last_msg_content: Union[str, list[dict[str, str]]] = ""
+             if conversation and "content" in conversation[-1] and conversation[
+                     -1].get("role") == role:
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index ed09af84f..2e46cc57e 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -246,9 +246,10 @@ class OpenAIServingCompletion(OpenAIServing):
+         request_metadata: RequestResponseMetadata,
+     ) -> AsyncGenerator[str, None]:
+         num_choices = 1 if request.n is None else request.n
+-        previous_text_lens = [0] * num_choices * num_prompts
+-        previous_num_tokens = [0] * num_choices * num_prompts
+-        has_echoed = [False] * num_choices * num_prompts
++        total_size = num_choices * num_prompts
++        previous_text_lens = [0] * total_size
++        previous_num_tokens = [0] * total_size
++        has_echoed = [False] * total_size
+         num_prompt_tokens = [0] * num_prompts
+ 
+         stream_options = request.stream_options
+@@ -259,6 +260,11 @@ class OpenAIServingCompletion(OpenAIServing):
+         else:
+             include_usage, include_continuous_usage = False, False
+ 
++        # Cache request attributes for performance
++        request_max_tokens = request.max_tokens
++        request_echo = request.echo
++        request_logprobs = request.logprobs
++
+         try:
+             async for prompt_idx, res in result_generator:
+                 prompt_token_ids = res.prompt_token_ids
+@@ -276,11 +282,11 @@ class OpenAIServingCompletion(OpenAIServing):
+                 for output in res.outputs:
+                     i = output.index + prompt_idx * num_choices
+ 
+-                    assert request.max_tokens is not None
+-                    if request.echo and not has_echoed[i]:
++                    assert request_max_tokens is not None
++                    if request_echo and not has_echoed[i]:
+                         assert prompt_token_ids is not None
+                         assert prompt_text is not None
+-                        if request.max_tokens == 0:
++                        if request_max_tokens == 0:
+                             # only return the prompt
+                             delta_text = prompt_text
+                             delta_token_ids = prompt_token_ids
+@@ -308,13 +314,13 @@ class OpenAIServingCompletion(OpenAIServing):
+                             # Chunked prefill case, don't return empty chunks
+                             continue
+ 
+-                    if request.logprobs is not None:
++                    if request_logprobs is not None:
+                         assert out_logprobs is not None, (
+                             "Did not output logprobs")
+                         logprobs = self._create_completion_logprobs(
+                             token_ids=delta_token_ids,
+                             top_logprobs=out_logprobs,
+-                            num_output_top_logprobs=request.logprobs,
++                            num_output_top_logprobs=request_logprobs,
+                             tokenizer=tokenizer,
+                             initial_text_offset=previous_text_lens[i],
+                         )
+@@ -393,6 +399,11 @@ class OpenAIServingCompletion(OpenAIServing):
+         num_prompt_tokens = 0
+         num_generated_tokens = 0
+ 
++        # Cache request attributes for performance
++        request_max_tokens = request.max_tokens
++        request_echo = request.echo
++        request_logprobs = request.logprobs
++
+         for final_res in final_res_batch:
+             prompt_token_ids = final_res.prompt_token_ids
+             assert prompt_token_ids is not None
+@@ -410,17 +421,17 @@ class OpenAIServingCompletion(OpenAIServing):
+                                                                  Logprob]]]]
+ 
+             for output in final_res.outputs:
+-                assert request.max_tokens is not None
+-                if request.echo:
++                assert request_max_tokens is not None
++                if request_echo:
+                     assert prompt_text is not None
+-                    if request.max_tokens == 0:
++                    if request_max_tokens == 0:
+                         token_ids = prompt_token_ids
+                         out_logprobs = prompt_logprobs
+                         output_text = prompt_text
+                     else:
+                         token_ids = [*prompt_token_ids, *output.token_ids]
+ 
+-                        if request.logprobs is None:
++                        if request_logprobs is None:
+                             out_logprobs = None
+                         else:
+                             assert prompt_logprobs is not None
+@@ -436,13 +447,13 @@ class OpenAIServingCompletion(OpenAIServing):
+                     out_logprobs = output.logprobs
+                     output_text = output.text
+ 
+-                if request.logprobs is not None:
++                if request_logprobs is not None:
+                     assert out_logprobs is not None, "Did not output logprobs"
+                     logprobs = self._create_completion_logprobs(
+                         token_ids=token_ids,
+                         top_logprobs=out_logprobs,
+                         tokenizer=tokenizer,
+-                        num_output_top_logprobs=request.logprobs,
++                        num_output_top_logprobs=request_logprobs,
+                     )
+                 else:
+                     logprobs = None

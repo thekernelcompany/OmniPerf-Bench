@@ -1,0 +1,89 @@
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index 00ada29..8d5f841 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -199,7 +199,8 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets.fill_(0)
+ 
+         # Alloc mem
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -222,10 +223,12 @@ class Batch:
+             pt += extend_lens[i]
+ 
+         # Handle logit bias
+-        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
++        logit_bias = torch.empty((bs, vocab_size), dtype=torch.float32, device=device)
+         for i in range(bs):
+             if reqs[i].sampling_params.dtype == "int":
+                 logit_bias[i] = int_token_logit_bias
++            else:
++                logit_bias[i].fill_(0)
+ 
+         # Set fields
+         self.input_ids = torch.tensor(
+@@ -437,9 +440,11 @@ class Batch:
+ 
+         has_regex = any(req.regex_fsm is not None for req in self.reqs)
+         if has_regex:
+-            allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
++            allowed_mask = None
+             for i, req in enumerate(self.reqs):
+                 if req.regex_fsm is not None:
++                    if allowed_mask is None:
++                        allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
+                     allowed_mask.zero_()
+                     allowed_mask[
+                         req.regex_fsm.allowed_token_ids(req.regex_fsm_state)
+diff --git a/python/sglang/srt/managers/router/model_runner.py b/python/sglang/srt/managers/router/model_runner.py
+index c85ec53..fdd215b 100644
+--- a/python/sglang/srt/managers/router/model_runner.py
++++ b/python/sglang/srt/managers/router/model_runner.py
+@@ -86,9 +86,10 @@ class InputMetadata:
+     decode_wrapper = None
+ 
+     def init_flashinfer_args(self, tp_size):
+-        self.kv_indptr = torch.zeros(
++        self.kv_indptr = torch.empty(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_indices = torch.cat(
+             [
+@@ -112,9 +113,10 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.zeros(
++            self.qo_indptr = torch.empty(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
++            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+             self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper()
+             self.prefill_wrapper.begin_forward(
+@@ -139,7 +141,8 @@ class InputMetadata:
+ 
+     def init_extend_args(self):
+         self.extend_seq_lens = self.seq_lens - self.prefix_lens
+-        self.extend_start_loc = torch.zeros_like(self.seq_lens)
++        self.extend_start_loc = torch.empty_like(self.seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.max_extend_len = int(torch.max(self.extend_seq_lens))
+ 
+@@ -159,7 +162,8 @@ class InputMetadata:
+         return_logprob=False,
+     ):
+         batch_size = len(req_pool_indices)
+-        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc[0] = 0
+         start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+         total_num_tokens = int(torch.sum(seq_lens))
+         max_seq_len = int(torch.max(seq_lens))
