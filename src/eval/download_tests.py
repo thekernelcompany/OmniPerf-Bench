@@ -16,10 +16,10 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default paths - using Ayushnangia/omniperf_v1 extracted test scripts
-DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "hf_cache" / "omniperf_v1_clone" / "test_scripts"
+# Default paths - using Inferencebench/test-generation-scripts
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "hf_cache" / "test-generation-scripts"
 DEFAULT_INDEX_PATH = DEFAULT_CACHE_DIR / "commit_index.json"
-HF_DATASET_ID = "Ayushnangia/omniperf_v1"
+HF_DATASET_ID = "Inferencebench/test-generation-scripts"
 
 
 def download_and_index_tests(
