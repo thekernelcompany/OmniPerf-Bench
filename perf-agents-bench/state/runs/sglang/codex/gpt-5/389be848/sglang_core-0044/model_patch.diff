@@ -1,0 +1,161 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 62604fe56..d405b6dea 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -1,9 +1,5 @@
+ from __future__ import annotations
+ 
+-import numpy as np
+-
+-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+-
+ """
+ Support different attention backends.
+ Now there are three backends: FlashInfer, Triton and FlashAttention.
+@@ -13,12 +9,14 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional, Union
+ 
++import numpy as np
+ import torch
+ 
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.managers.schedule_batch import global_server_args_dict
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
++from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.radix_attention import RadixAttention
+@@ -720,13 +718,13 @@ class FlashAttentionBackend(AttentionBackend):
+         """
+         self.decode_cuda_graph_metadata = {
+             # Page table for token mapping (batch_size, max_context_len)
+-            "page_table": torch.zeros(
++            "page_table": torch.empty(
+                 max_bs,
+                 (self.max_context_len + self.page_size - 1) // self.page_size,
+                 dtype=torch.int32,
+                 device=self.device,
+             ),
+-            "page_table_draft_decode": torch.zeros(
++            "page_table_draft_decode": torch.empty(
+                 max_bs,
+                 (self.max_context_len + self.page_size - 1) // self.page_size,
+                 dtype=torch.int32,
+@@ -735,27 +733,28 @@ class FlashAttentionBackend(AttentionBackend):
+             "strided_indices": torch.arange(
+                 0, self.max_context_len, self.page_size, device=self.device
+             ),
+-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
++            "cache_seqlens": torch.empty(max_bs, dtype=torch.int32, device=self.device),
+             "cu_seqlens_q": torch.arange(
+                 0, max_bs + 128, dtype=torch.int32, device=self.device
+             ),
+-            "cu_seqlens_k": torch.zeros(
++            "cu_seqlens_k": torch.empty(
+                 max_bs + 128, dtype=torch.int32, device=self.device
+             ),
+         }
+ 
+         self.target_verify_metadata = {
+-            "page_table": torch.zeros(
++            "page_table": torch.empty(
+                 max_bs,
+                 (self.max_context_len + self.page_size - 1) // self.page_size,
+                 dtype=torch.int32,
+                 device=self.device,
+             ),
+-            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+-            "cu_seqlens_q": torch.zeros(
+-                max_bs + 128, dtype=torch.int32, device=self.device
++            "cache_seqlens": torch.empty(max_bs, dtype=torch.int32, device=self.device),
++            # Use arange so capture-time slices are valid and deterministic
++            "cu_seqlens_q": torch.arange(
++                0, max_bs + 128, dtype=torch.int32, device=self.device
+             ),
+-            "cu_seqlens_k": torch.zeros(
++            "cu_seqlens_k": torch.empty(
+                 max_bs + 128, dtype=torch.int32, device=self.device
+             ),
+             "max_seqlen_q": 0,
+@@ -783,6 +782,7 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.cu_seqlens_q = torch.arange(
+                     0, bs + 1, dtype=torch.int32, device=device
+                 )
++                # Reuse preallocated buffers to avoid allocations during capture
+                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                     "cache_seqlens"
+                 ][:bs]
+@@ -790,26 +790,26 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+                     : bs + 1
+                 ]
+-
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                    ),
+-                    (1, 0),
+-                )
++                # Point to a reusable buffer for cu_seqlens_k; contents will be
++                # populated during replay via copy_.
++                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
++                    "cu_seqlens_k"
++                ][: (bs + 1)]
+                 metadata.max_seq_len_k = seq_lens.max().item() + (self.step_id + 1)
+                 metadata.page_table = self.decode_cuda_graph_metadata[
+                     "page_table_draft_decode"
+                 ][req_pool_indices, :]
+             else:
+                 # Normal Decode
+-                # Get sequence information
+-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
++                # Get sequence information; reuse preallocated buffers
++                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
++                    "cache_seqlens"
++                ][:bs]
+                 batch_size = len(seq_lens)
+                 device = seq_lens.device
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+-                )
++                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
++                    "cu_seqlens_k"
++                ][: (bs + 1)]
+                 # Precompute maximum sequence length
+                 metadata.max_seq_len_k = seq_lens.max().item()
+                 # Precompute page table
+@@ -906,14 +906,20 @@ class FlashAttentionBackend(AttentionBackend):
+                 ]
+ 
+                 metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
++                # Ensure the unused region remains zero-initialized
++                metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
+             else:
+                 # Normal Decode
+                 max_len = seq_lens_cpu.max().item()
+                 metadata.max_seq_len_k = max_len
+ 
+-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
++                # Reuse preallocated buffers to avoid rebinds/allocations
++                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
++                metadata.cu_seqlens_k.copy_(
++                    torch.nn.functional.pad(
++                        torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
++                        (1, 0),
++                    )
+                 )
+ 
+                 max_seq_pages = (
+@@ -955,6 +961,8 @@ class FlashAttentionBackend(AttentionBackend):
+             )
+             page_table = self.req_to_token[req_pool_indices, : metadata.max_seq_len_k]
+             metadata.page_table[:, : metadata.max_seq_len_k].copy_(page_table)
++            # Ensure the unused region is zero for safety
++            metadata.page_table[:, metadata.max_seq_len_k :].fill_(0)
+ 
+         self.forward_metadata = metadata
+ 

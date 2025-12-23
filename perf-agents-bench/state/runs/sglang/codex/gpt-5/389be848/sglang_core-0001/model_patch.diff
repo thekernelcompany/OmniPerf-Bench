@@ -1,0 +1,109 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df53..90c38b8d4 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -77,18 +77,33 @@ class LoRAManager:
+         with torch.device("cuda"):
+             self.cuda_graph_batch_info = LoRABatchInfo(
+                 bs=self.max_bs_in_cuda_graph,
+-                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
+-                seg_indptr=torch.zeros(
++                seg_lens=torch.empty(self.max_bs_in_cuda_graph, dtype=torch.int32),
++                seg_indptr=torch.empty(
+                     self.max_bs_in_cuda_graph + 1, dtype=torch.int32
+                 ),
+-                max_len=0,
+-                weight_indices=torch.zeros(
++                max_len=1,
++                weight_indices=torch.empty(
+                     self.max_bs_in_cuda_graph, dtype=torch.int32
+                 ),
++                # Initialize ranks and scalings once; they will be
++                # selectively updated for active adapters per batch.
+                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+             )
+ 
++            # Initialize seg_lens and seg_indptr for CUDA graph once as they
++            # remain constant (all ones with cumulative indices). This avoids
++            # per-batch fill and cumsum overhead when using CUDA graphs.
++            self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph].fill_(1)
++            torch.cumsum(
++                self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph],
++                dim=0,
++                out=self.cuda_graph_batch_info.seg_indptr[
++                    1 : self.max_bs_in_cuda_graph + 1
++                ],
++            )
++            self.cuda_graph_batch_info.seg_indptr[0] = 0
++
+     def init_loras(self):
+         # Config of each LoRA adapter
+         self.configs: Dict[str, LoRAConfig] = {}
+@@ -167,12 +182,8 @@ class LoRAManager:
+             # Do in-place updates when CUDA graph is enabled and the batch forward mode
+             # could use CUDA graph.
+             self.cuda_graph_batch_info.bs = bs
+-            self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
+-            torch.cumsum(
+-                self.cuda_graph_batch_info.seg_lens[:bs],
+-                dim=0,
+-                out=self.cuda_graph_batch_info.seg_indptr[1 : bs + 1],
+-            )
++            # seg_lens and seg_indptr are preinitialized for the CUDA graph.
++            # Only bs and adapter mappings need updates per batch.
+             self.cuda_graph_batch_info.max_len = 1
+ 
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+@@ -194,13 +205,18 @@ class LoRAManager:
+                 if forward_batch.forward_mode.is_extend()
+                 else torch.ones(bs, device=self.device)
+             )
+-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
++            # Avoid unnecessary zero-initialization for seg_indptr; only the
++            # first element needs to be zero, and the rest are written by cumsum.
++            seg_indptr = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
++            seg_indptr[0] = 0
+             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+             max_len = int(torch.max(seg_lens))
+             weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+ 
++            # Use narrower dtype for ranks to reduce memory traffic and align
++            # with CUDA-graph path (int32).
+             lora_ranks = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
++                (self.max_loras_per_batch,), dtype=torch.int32, device="cuda"
+             )
+             scalings = torch.zeros(
+                 (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d21332..7d481f821 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -129,15 +129,17 @@ class LoRAMemoryPool:
+     ):
+ 
+         def get_available_buffer_slot():
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Prioritize empty slots
+-                if self.buffer_id_to_uid[buffer_id] == "":
+-                    return buffer_id, ""
+-
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Evict unneeded lora
+-                if self.buffer_id_to_uid[buffer_id] not in cur_uids:
+-                    return buffer_id, self.buffer_id_to_uid[buffer_id]
++            # Fast path: try to reuse an empty slot if available.
++            try:
++                empty_idx = self.buffer_id_to_uid.index("")
++                return empty_idx, ""
++            except ValueError:
++                pass
++
++            # Otherwise, evict the first slot not used by current batch.
++            for buffer_id, uid in enumerate(self.buffer_id_to_uid):
++                if uid not in cur_uids:
++                    return buffer_id, uid
+ 
+             raise ValueError(
+                 "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."

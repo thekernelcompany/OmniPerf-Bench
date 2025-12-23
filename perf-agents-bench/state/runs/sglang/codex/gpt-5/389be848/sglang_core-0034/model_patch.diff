@@ -1,0 +1,126 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a303b..d5ca35a68 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -509,6 +509,20 @@ class Scheduler(
+         )
+         self.init_disaggregation()
+ 
++        # Cached small tensors to reduce per-step allocations
++        self._coord_spec_local_info: Optional[torch.Tensor] = None  # shape: (1,)
++        self._coord_spec_global_info: Optional[torch.Tensor] = None  # shape: (dp, attn_tp, 1)
++        self._dp_world_local_info6: Optional[torch.Tensor] = None  # shape: (6,)
++        self._dp_world_global_info6: Optional[torch.Tensor] = None  # shape: (dp, attn_tp, 6)
++        self._tp_ready_timeout_info: Optional[torch.Tensor] = None  # shape: (2,)
++
++    def _get_or_alloc_tensor(self, attr_name: str, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
++        t = getattr(self, attr_name, None)
++        if t is None or t.dtype != dtype or tuple(t.shape) != tuple(shape):
++            t = torch.empty(shape, dtype=dtype)
++            setattr(self, attr_name, t)
++        return t
++
+     def maybe_sleep_on_idle(self):
+         if self.idle_sleeper is not None:
+             self.idle_sleeper.maybe_sleep()
+@@ -1401,26 +1415,26 @@ class Scheduler(
+ 
+     def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+         """Coordinate the DP attention batch."""
++        # If we already have a new batch locally, skip coordination.
++        if new_batch is not None:
++            return True
+ 
+-        local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
+-            dtype=torch.int64,
+-        )
+-        global_info = torch.empty(
++        # Reuse cached buffers to avoid frequent allocations.
++        local_info = self._get_or_alloc_tensor("_coord_spec_local_info", (1,), torch.int64)
++        local_info[0] = 0
++
++        global_info = self._get_or_alloc_tensor(
++            "_coord_spec_global_info",
+             (self.server_args.dp_size, self.attn_tp_size, 1),
+-            dtype=torch.int64,
++            torch.int64,
+         )
+         torch.distributed.all_gather_into_tensor(
+             global_info.flatten(),
+             local_info,
+             group=self.tp_cpu_group,
+         )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
+-        return any_new_batch
++        # Any DP worker has forward batch
++        return bool(global_info[:, 0, 0].any().item())
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         # Merge the prefill batch into the running batch
+@@ -1842,32 +1856,31 @@ class Scheduler(
+ 
+         tbo_preparer = TboDPAttentionPreparer()
+ 
+-        local_info = torch.tensor(
+-            [
+-                num_tokens,
+-                can_cuda_graph,
+-                num_tokens_for_logprob,
+-                is_extend_in_batch,
+-                *tbo_preparer.prepare_all_gather(
+-                    local_batch,
+-                    deepep_mode,
+-                    enable_deepep_moe,
+-                    enable_two_batch_overlap,
+-                ),
+-            ],
+-            dtype=torch.int64,
+-        )
+-        global_info = torch.empty(
+-            (dp_size, attn_tp_size, 6),
+-            dtype=torch.int64,
++        # Reuse small local/global buffers to reduce allocations.
++        local_info = self._get_or_alloc_tensor("_dp_world_local_info6", (6,), torch.int64)
++        # Compute two-batch-overlap gather info once.
++        tbo_0, tbo_1 = tbo_preparer.prepare_all_gather(
++            local_batch,
++            deepep_mode,
++            enable_deepep_moe,
++            enable_two_batch_overlap,
+         )
++        local_info[0] = int(num_tokens)
++        local_info[1] = int(can_cuda_graph)
++        local_info[2] = int(num_tokens_for_logprob)
++        local_info[3] = int(is_extend_in_batch)
++        local_info[4] = int(tbo_0)
++        local_info[5] = int(tbo_1)
++
++        global_info = self._get_or_alloc_tensor("_dp_world_global_info6", (dp_size, attn_tp_size, 6), torch.int64)
+         torch.distributed.all_gather_into_tensor(
+             global_info.flatten(),
+             local_info,
+             group=tp_cpu_group,
+         )
+         global_num_tokens = global_info[:, 0, 0].tolist()
+-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
++        # Use tensor min to avoid Python list conversion overhead
++        can_cuda_graph = int(global_info[:, 0, 1].min().item())
+         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+         is_extend_in_batch = global_info[:, 0, 3].tolist()
+ 
+@@ -1947,7 +1960,9 @@ class Scheduler(
+ 
+         if tp_size > 1:
+             # Sync across TP ranks to make sure they have the same number of ready requests
+-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
++            tensor = self._get_or_alloc_tensor("_tp_ready_timeout_info", (2,), torch.int32)
++            tensor[0] = int(num_ready_reqs)
++            tensor[1] = int(num_timeout_reqs)
+             torch.distributed.all_reduce(
+                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+             )

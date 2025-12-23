@@ -1,0 +1,104 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index 9dbc2705d..833f0b3f9 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -54,8 +54,8 @@ PD Disaggregation with Mooncake supports the following environment variables for
+ #### Prefill Server Configuration
+ | Variable | Description | Default |
+ |:--------:|:-----------:|:--------:
+-| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
+-| **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the maximum pending tasks in the parallel transfer queue | `4` |
++| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KVCache transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
++| **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the number of parallel transfer queues. KVCache transfer requests from multiple decode instances will be sharded into these queues so that they can share the threads and the transfer bandwidth at the same time. If it is set to `1`, then we transfer requests one by one according to fcfs strategy | `4` |
+ | **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `30` |
+ 
+ #### Decode Server Configuration
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 940a25d74..c6fb5f00b 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -191,7 +191,8 @@ class MooncakeKVManager(BaseKVManager):
+             self.heartbeat_failures = {}
+             self.session_pool = defaultdict(requests.Session)
+             self.session_pool_lock = threading.Lock()
+-            self.addr_to_rooms_tracker = defaultdict(list)
++            # Track active requests per bootstrap address; use set to avoid duplicates
++            self.addr_to_rooms_tracker = defaultdict(set)
+             self.connection_lock = threading.Lock()
+             # Heartbeat interval should be at least 2 seconds
+             self.heartbeat_interval = max(
+@@ -467,7 +468,7 @@ class MooncakeKVManager(BaseKVManager):
+                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                         self.update_status(room, KVPoll.WaitingForInput)
+ 
+-        threading.Thread(target=bootstrap_thread).start()
++        threading.Thread(target=bootstrap_thread, daemon=True).start()
+ 
+     def start_decode_thread(self):
+         self.rank_port = get_free_port()
+@@ -489,7 +490,8 @@ class MooncakeKVManager(BaseKVManager):
+             while True:
+                 time.sleep(self.heartbeat_interval)
+                 with self.connection_lock:
+-                    addresses = list(self.prefill_dp_size_table.keys())
++                    # Snapshot the current address keys with minimal overhead
++                    addresses = tuple(self.prefill_dp_size_table)
+ 
+                 for bootstrap_addr in addresses:
+                     session = None
+@@ -504,14 +506,16 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            for bootstrap_room in self.addr_to_rooms_tracker[
+-                                bootstrap_addr
+-                            ]:
+-                                # Remove KVPoll.Success requests from the map
+-                                if bootstrap_room not in self.request_status:
+-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+-                                        bootstrap_room
+-                                    )
++                            tracker = self.addr_to_rooms_tracker.get(
++                                bootstrap_addr, set()
++                            )
++                            if tracker:
++                                # Remove completed rooms efficiently without mutating during iteration
++                                to_remove = [
++                                    r for r in tracker if r not in self.request_status
++                                ]
++                                if to_remove:
++                                    tracker.difference_update(to_remove)
+                         else:
+                             logger.info(
+                                 f"Attempting to reconnect to {bootstrap_addr}..."
+@@ -537,8 +541,8 @@ class MooncakeKVManager(BaseKVManager):
+                             if bootstrap_addr in self.session_pool:
+                                 del self.session_pool[bootstrap_addr]
+ 
+-        threading.Thread(target=decode_thread).start()
+-        threading.Thread(target=heartbeat_checker).start()
++        threading.Thread(target=decode_thread, daemon=True).start()
++        threading.Thread(target=heartbeat_checker, daemon=True).start()
+ 
+     def add_transfer_request(
+         self,
+@@ -644,7 +648,7 @@ class MooncakeKVManager(BaseKVManager):
+                 del self.prefill_dp_size_table[failed_bootstrap_addr]
+ 
+             possible_affected_rooms = self.addr_to_rooms_tracker.get(
+-                failed_bootstrap_addr, []
++                failed_bootstrap_addr, set()
+             )
+             if failed_bootstrap_addr in self.addr_to_rooms_tracker:
+                 del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+@@ -879,9 +883,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+ 
+         assert len(self.bootstrap_infos) > 0
+-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
+-            self.bootstrap_room
+-        )
++        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+ 
+     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):

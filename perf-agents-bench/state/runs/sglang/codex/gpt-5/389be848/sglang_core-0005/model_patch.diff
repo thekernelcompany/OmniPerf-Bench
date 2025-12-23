@@ -1,0 +1,58 @@
+diff --git a/docker/Dockerfile.rocm b/docker/Dockerfile.rocm
+index 84ea69cc0..0c0b7e019 100644
+--- a/docker/Dockerfile.rocm
++++ b/docker/Dockerfile.rocm
+@@ -2,7 +2,7 @@
+ #   docker build --build-arg SGL_BRANCH=v0.4.1.post3 -t v0.4.1.post3-rocm620 -f Dockerfile.rocm .
+ 
+ # default base image
+-ARG BASE_IMAGE="rocm/vllm-dev:20241031-tuned"
++ARG BASE_IMAGE="rocmshared/vllm-rocm:20241031-tuned"
+ 
+ FROM $BASE_IMAGE AS base
+ USER root
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index cbacd90c0..464b5012b 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -266,7 +266,6 @@ def moe_align_block_size(
+     sorted_ids = torch.empty(
+         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+     )
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty(
+         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+@@ -291,6 +290,8 @@ def moe_align_block_size(
+             cumsum_buffer,
+         )
+     else:
++        # Initialize padding sentinel only for fallback path
++        sorted_ids.fill_(topk_ids.numel())
+         ops.moe_align_block_size(
+             topk_ids,
+             num_experts,
+@@ -854,11 +855,18 @@ def fused_experts_impl(
+             block_shape=block_shape,
+         )
+ 
+-        torch.sum(
+-            intermediate_cache3.view(*intermediate_cache3.shape),
+-            dim=1,
+-            out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+-        )
++        if not_hip:
++            # Prefer out= on CUDA; faster and avoids extra allocation
++            torch.sum(
++                intermediate_cache3,
++                dim=1,
++                out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
++            )
++        else:
++            # ROCm path: avoid out= to reduce overhead
++            out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
++                torch.sum(intermediate_cache3, dim=1)
++            )
+     return out_hidden_states
+ 
+ 

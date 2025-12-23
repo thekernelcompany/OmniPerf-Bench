@@ -1,0 +1,89 @@
+diff --git a/python/sglang/srt/managers/tp_worker_overlap_thread.py b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+index 5d78b97ce..082222995 100644
+--- a/python/sglang/srt/managers/tp_worker_overlap_thread.py
++++ b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+@@ -54,13 +54,28 @@ class TpModelWorkerClient:
+         self.future_token_ids_map = torch.empty(
+             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
+         )
++        # Preallocate buffer for future next token ids to avoid per-iteration allocations
++        self.future_next_token_ids_buf = torch.empty(
++            (self.max_running_requests,), dtype=torch.int32, device=self.device
++        )
+ 
+-        # Launch a thread
++        # Launch threads
++        # Queue for host->device copy stage
+         self.input_queue = Queue()
++        # Queue for forward stage after copies are done
++        self.forward_queue = Queue()
+         self.output_queue = Queue()
++        # Use separate CUDA streams to overlap copy and compute
++        self.copy_stream = torch.cuda.Stream()
+         self.forward_stream = torch.cuda.Stream()
++        self.copy_thread = threading.Thread(
++            target=self.copy_thread_func,
++            daemon=True,
++        )
++        self.copy_thread.start()
+         self.forward_thread = threading.Thread(
+             target=self.forward_thread_func,
++            daemon=True,
+         )
+         self.forward_thread.start()
+ 
+@@ -86,15 +101,17 @@ class TpModelWorkerClient:
+     @torch.inference_mode()
+     def forward_thread_func_(self):
+         while True:
+-            model_worker_batch, future_token_ids_ct = self.input_queue.get()
++            model_worker_batch, future_token_ids_ct = self.forward_queue.get()
++            # Ensure forward stream waits for pending H2D copies
++            self.forward_stream.wait_stream(self.copy_stream)
+ 
+             # Resolve future tokens in the input
+             input_ids = model_worker_batch.input_ids
+-            input_ids[:] = torch.where(
+-                input_ids < 0,
+-                self.future_token_ids_map[torch.clamp(-input_ids, min=0)],
+-                input_ids,
+-            )
++            # Use masked assignment to reduce temporary allocations
++            neg_mask = input_ids < 0
++            if torch.count_nonzero(neg_mask):
++                idx = (-input_ids[neg_mask]).clamp_min_(0)
++                input_ids[neg_mask] = self.future_token_ids_map[idx]
+ 
+             # Run forward
+             logits_output, next_token_ids = self.worker.forward_batch_generation(
+@@ -103,11 +120,13 @@ class TpModelWorkerClient:
+ 
+             # Update the future token ids map
+             bs = len(model_worker_batch.seq_lens)
+-            future_next_token_ids = torch.arange(
++            future_next_token_ids = self.future_next_token_ids_buf[:bs]
++            torch.arange(
+                 -(future_token_ids_ct + bs),
+                 -(future_token_ids_ct),
+                 dtype=torch.int32,
+                 device=self.device,
++                out=future_next_token_ids,
+             )
+             self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
+                 torch.int32
+@@ -139,6 +158,15 @@ class TpModelWorkerClient:
+         ) % self.future_token_ids_limit
+         return None, future_next_token_ids
+ 
++    def copy_thread_func(self):
++        """Stage 1: move batch tensors to device on a dedicated stream."""
++        with torch.cuda.stream(self.copy_stream):
++            while True:
++                model_worker_batch, future_token_ids_ct = self.input_queue.get()
++                # Non-blocking copies overlap with compute on a different stream
++                model_worker_batch.to(self.device)
++                self.forward_queue.put((model_worker_batch, future_token_ids_ct))
++
+     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+         logits_output = self.model_runner.forward(forward_batch)

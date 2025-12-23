@@ -1,0 +1,78 @@
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index aa10ef6b7..0bfb75cdf 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -137,18 +137,18 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         self.A_buffer_gate_up = A_buffer
+         if self.lora_backend.fuse_stacked_lora_b:
+             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
+-            if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
++            B0, B1 = B_buffer
++            num_lora, output_dim, r = B0.shape
++            target_shape = (num_lora, 2 * output_dim, r)
++            if getattr(self, "B_buffer_gate_up", None) is None or self.B_buffer_gate_up.shape != target_shape:
+                 self.B_buffer_gate_up = torch.empty(
+-                    (
+-                        B_buffer[0].shape[0],
+-                        2 * B_buffer[0].shape[1],
+-                        B_buffer[0].shape[2],
+-                    ),
+-                    dtype=B_buffer[0].dtype,
+-                    device=B_buffer[0].device,
++                    target_shape,
++                    dtype=B0.dtype,
++                    device=B0.device,
+                 )
+-            self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
+-            self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
++            # Copy without creating intermediate tensors
++            self.B_buffer_gate_up[:, :output_dim, :].copy_(B0)
++            self.B_buffer_gate_up[:, output_dim:, :].copy_(B1)
+         else:
+             self.B_buffer_gate_up = (B_buffer[0], B_buffer[1])
+ 
+@@ -202,13 +202,11 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
+ 
+             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+-            if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
++            num_lora, r = B_buffer_q[0].shape[0], B_buffer_q[0].shape[2]
++            target_shape = (num_lora, output_dim_q + 2 * output_dim_kv, r)
++            if getattr(self, "B_buffer_qkv", None) is None or self.B_buffer_qkv.shape != target_shape:
+                 self.B_buffer_qkv = torch.empty(
+-                    (
+-                        B_buffer_q[0].shape[0],
+-                        output_dim_q + 2 * output_dim_kv,
+-                        B_buffer_q[0].shape[2],
+-                    ),
++                    target_shape,
+                     dtype=B_buffer_q[0].dtype,
+                     device=B_buffer_q[0].device,
+                 )
+@@ -221,20 +219,15 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             )
+ 
+             # Offsets of q/k/v in output dimension
+-            if not hasattr(self, "output_offset") or self.output_offset is None:
++            if getattr(self, "output_offset", None) is None:
+                 self.output_offset = torch.empty(
+                     4, dtype=torch.int32, device=B_buffer_q.device
+                 )
+-            self.output_offset[:4] = torch.tensor(
+-                [
+-                    0,
+-                    output_dim_q,
+-                    output_dim_q + output_dim_kv,
+-                    output_dim_q + 2 * output_dim_kv,
+-                ],
+-                dtype=torch.int32,
+-                device=B_buffer_q.device,
+-            )
++            # Avoid creating temporary tensors which may cause stream sync
++            self.output_offset[0] = 0
++            self.output_offset[1] = int(output_dim_q)
++            self.output_offset[2] = int(output_dim_q + output_dim_kv)
++            self.output_offset[3] = int(output_dim_q + 2 * output_dim_kv)
+             # For computing number of launched blocks
+             self.max_qkv_out_dim = max(output_dim_q, output_dim_kv)
+         else:

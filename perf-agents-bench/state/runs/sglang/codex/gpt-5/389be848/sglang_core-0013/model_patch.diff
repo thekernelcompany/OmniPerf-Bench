@@ -1,0 +1,215 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a7af87144..4f5ac1556 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -35,6 +35,35 @@ if _is_cuda or _is_hip:
+ expert_distribution_recorder = ExpertDistributionRecorder()
+ 
+ 
++def _mask_topk_ids_padded_region(
++    topk_ids: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]
++) -> None:
++    """Mask padded tokens' expert ids to -1 in-place.
++
++    Args:
++        topk_ids: Tensor of shape [num_tokens, topk] or flattened, int dtype.
++        num_token_non_padded: Number of valid tokens (scalar tensor or int). If None, do nothing.
++    """
++    if num_token_non_padded is None:
++        return
++    # support both python int and 0-d tensor
++    if isinstance(num_token_non_padded, torch.Tensor):
++        if num_token_non_padded.numel() != 1:
++            return
++        n_valid = int(num_token_non_padded.item())
++    else:
++        n_valid = int(num_token_non_padded)
++    if n_valid < 0:
++        return
++    # Reshape to 2D if needed and set padded part to -1
++    if topk_ids.dim() == 1:
++        if n_valid < topk_ids.shape[0]:
++            topk_ids[n_valid:] = -1
++    else:
++        num_tokens = topk_ids.shape[0]
++        if n_valid < num_tokens:
++            topk_ids[n_valid:, :] = -1
++
+ def fused_topk_native(
+     hidden_states: torch.Tensor,
+     gating_output: torch.Tensor,
+@@ -44,11 +73,7 @@ def fused_topk_native(
+     assert (
+         hidden_states.shape[0] == gating_output.shape[0]
+     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+-    M, _ = hidden_states.shape
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
++    # Directly compute without preallocating unused buffers
+     topk_weights = F.softmax(gating_output.float(), dim=-1)
+     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+     if renormalize:
+@@ -111,14 +136,17 @@ def grouped_topk(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    # build boolean mask to avoid dtype casts
++    group_mask = torch.zeros(
++        group_scores.shape, dtype=torch.bool, device=group_scores.device
++    )  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
++    tmp_scores = scores.masked_fill(~score_mask, 0.0)  # [n, e]
+     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     if n_share_experts_fusion:
+         topk_ids[:, -1] = torch.randint(
+@@ -166,16 +194,16 @@ def biased_grouped_topk_impl(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    group_mask = torch.zeros(
++        group_scores.shape, dtype=torch.bool, device=group_scores.device
++    )  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores_for_choice.masked_fill(
+-        ~score_mask.bool(), float("-inf")
+-    )  # [n, e]
++    tmp_scores = scores_for_choice.masked_fill(~score_mask, float("-inf"))  # [n, e]
+     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     topk_weights = scores.gather(1, topk_ids)
+ 
+@@ -268,6 +296,7 @@ def select_experts(
+     correction_bias: Optional[torch.Tensor] = None,
+     torch_native: bool = False,
+     routed_scaling_factor: Optional[float] = None,
++    num_token_non_padded: Optional[torch.Tensor] = None,
+ ):
+     n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+     # DeepSeek V2/V3/R1 series models use grouped_top_k
+@@ -319,6 +348,9 @@ def select_experts(
+             renormalize=renormalize,
+         )
+ 
++    # Mask padded tokens so dispatchers can skip them efficiently
++    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
++
+     expert_distribution_recorder.record_new_token(topk_ids)
+ 
+     return topk_weights, topk_ids
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index e88022beb..1188223af 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -282,16 +282,14 @@ class CudaGraphRunner:
+                 self.encoder_lens = None
+             if self.enable_dp_attention or self.enable_sp_layernorm:
+                 # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
+-                self.gathered_buffer = torch.zeros(
++                self.gathered_buffer = torch.empty(
+                     (
+                         self.max_bs * self.dp_size * self.num_tokens_per_bs,
+                         self.model_runner.model_config.hidden_size,
+                     ),
+                     dtype=self.model_runner.dtype,
+                 )
+-                self.global_num_tokens_gpu = torch.zeros(
+-                    (self.dp_size,), dtype=torch.int32
+-                )
++                self.global_num_tokens_gpu = torch.empty((self.dp_size,), dtype=torch.int32)
+ 
+         # Capture
+         try:
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 5018f92d5..817c721e4 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -305,7 +305,7 @@ class ForwardBatch:
+             ).to(device, non_blocking=True)
+ 
+             sum_len = sum(batch.global_num_tokens)
+-            ret.gathered_buffer = torch.zeros(
++            ret.gathered_buffer = torch.empty(
+                 (sum_len, model_runner.model_config.hidden_size),
+                 dtype=model_runner.dtype,
+                 device=device,
+@@ -683,7 +683,8 @@ def compute_position_torch(
+         ],
+         axis=0,
+     )
+-    extend_start_loc = torch.zeros_like(extend_seq_lens)
++    extend_start_loc = torch.empty_like(extend_seq_lens)
++    extend_start_loc[0] = 0
+     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+     return positions.to(torch.int64), extend_start_loc
+ 
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 436e966db..ced783421 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -287,12 +287,15 @@ class DeepseekV2MoE(nn.Module):
+             )
+ 
+     def forward(
+-        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
++        self,
++        hidden_states: torch.Tensor,
++        forward_mode: Optional[ForwardMode] = None,
++        num_token_non_padded: Optional[int] = None,
+     ) -> torch.Tensor:
+         if not global_server_args_dict["enable_deepep_moe"]:
+             return self.forward_normal(hidden_states)
+         else:
+-            return self.forward_deepep(hidden_states, forward_mode)
++            return self.forward_deepep(hidden_states, forward_mode, num_token_non_padded)
+ 
+     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         shared_output = self._forward_shared_experts(hidden_states)
+@@ -309,7 +312,10 @@ class DeepseekV2MoE(nn.Module):
+         return final_hidden_states
+ 
+     def forward_deepep(
+-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
++        self,
++        hidden_states: torch.Tensor,
++        forward_mode: ForwardMode,
++        num_token_non_padded: Optional[int] = None,
+     ) -> torch.Tensor:
+         shared_output = None
+         if (
+@@ -330,6 +336,7 @@ class DeepseekV2MoE(nn.Module):
+                 num_expert_group=self.num_expert_group,
+                 correction_bias=self.correction_bias,
+                 routed_scaling_factor=self.routed_scaling_factor,
++                num_token_non_padded=num_token_non_padded,
+             )
+         else:
+             topk_idx = torch.full(
+@@ -1339,7 +1346,11 @@ class DeepseekV2DecoderLayer(nn.Module):
+             and (not self.info.is_sparse)
+             and hidden_states.shape[0] == 0
+         ):
+-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
++            hidden_states = self.mlp(
++                hidden_states,
++                forward_batch.forward_mode,
++                num_token_non_padded=forward_batch.input_ids.shape[0],
++            )
+ 
+         if self.is_last_layer and self.attn_tp_size != 1:
+             hidden_states += residual

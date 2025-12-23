@@ -1,0 +1,52 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 824f76709..44ac41dec 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -553,21 +553,28 @@ class MooncakeKVManager(BaseKVManager):
+         assert self.disaggregation_mode == DisaggregationMode.PREFILL
+         assert not is_last or (is_last and aux_index is not None)
+ 
+-        if (
+-            bootstrap_room not in self.request_status
+-            or self.check_status(bootstrap_room) == KVPoll.Failed
+-        ):
++        # Fast-path: avoid extra lookups and work when request already failed
++        status = self.request_status.get(bootstrap_room)
++        if status is None or status == KVPoll.Failed:
+             logger.debug(
+                 "Request with bootstrap_room=%s already failed", bootstrap_room
+             )
+             return
+ 
+-        # NOTE(shangming): sharding according to the dst_infos to make sure
+-        # requests with the same dst_sessions will be added into the same
+-        # queue, which enables early abort with failed sessions.
+-        dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
+-        shard_idx = session_port_sum % len(self.transfer_queues)
++        # If there is no transfer info for this room, this rank is a dummy rank
++        # and has been marked success already; skip adding to queues.
++        if bootstrap_room not in self.transfer_infos:
++            return
++
++        # Shard according to dst infos to ensure requests with the same
++        # dst sessions land in the same queue for early abort on failures.
++        infos = self.transfer_infos[bootstrap_room]
++        # Use dst_port from TransferInfo directly to avoid parsing from string keys
++        port_sum = 0
++        for req in infos.values():
++            port_sum += int(req.dst_port)
++        num_queues = len(self.transfer_queues)
++        shard_idx = port_sum % num_queues
+ 
+         self.transfer_queues[shard_idx].put(
+             TransferKVChunk(
+@@ -578,7 +585,7 @@ class MooncakeKVManager(BaseKVManager):
+                 prefill_aux_index=aux_index,
+             )
+         )
+-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
++        # No need to update status here; it is already set during bootstrapping
+ 
+     def check_status(self, bootstrap_room: int):
+         return self.request_status[bootstrap_room]

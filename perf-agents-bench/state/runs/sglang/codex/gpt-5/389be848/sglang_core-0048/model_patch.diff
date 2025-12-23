@@ -1,0 +1,138 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8e7..d02f29383 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -39,14 +39,33 @@ def compute_split_seq_index(
+ 
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
++    """Return the split index that best balances the two halves.
++
++    This improves over the simple half-sum threshold by picking the index
++    with the minimal absolute difference between left and right sums and
++    early-exiting once the difference starts to increase. This helps imbalanced
++    extend cases achieve better overlap scheduling.
++    """
+     overall_sum = sum(arr)
+-    accumulator, split_index = 0, 0
+-    for value in arr[:-1]:
+-        accumulator += value
+-        split_index += 1
+-        if accumulator >= overall_sum // 2:
+-            break
+-    return split_index
++    half = overall_sum / 2
++    left_sum = 0
++
++    # Walk until crossing half, then choose the closer side with a constant-time check
++    for i in range(1, len(arr)):
++        left_sum += arr[i - 1]
++        if left_sum >= half:
++            if i == 1:
++                # Do not split at 0; keep at least one element on the left
++                return 1
++            prev_left = left_sum - arr[i - 1]
++            # Compare the two candidates: split before or after current element
++            diff_prev = abs(prev_left - (overall_sum - prev_left))
++            diff_curr = abs(left_sum - (overall_sum - left_sum))
++            return i if diff_curr <= diff_prev else (i - 1)
++
++    # If never crossed half (should not happen unless last element is 0),
++    # fall back to putting everything except the last on the left.
++    return max(1, len(arr) - 1)
+ 
+ 
+ def compute_split_token_index(
+@@ -267,12 +286,19 @@ class TboForwardBatchPreparer:
+ 
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+-            sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
+-                (sum_len, batch.gathered_buffer.shape[1]),
+-                dtype=batch.gathered_buffer.dtype,
+-                device=batch.gathered_buffer.device,
+-            )
++            # Reuse parent's gathered_buffer slice when available to avoid
++            # additional allocations and zero-initialization.
++            if getattr(batch, "gathered_buffer", None) is not None:
++                gathered_buffer = batch.gathered_buffer[
++                    start_token_index:end_token_index
++                ]
++            else:
++                sum_len = end_token_index - start_token_index
++                gathered_buffer = torch.empty(
++                    (sum_len, batch.gathered_buffer.shape[1]),
++                    dtype=batch.gathered_buffer.dtype,
++                    device=batch.gathered_buffer.device,
++                )
+         else:
+             gathered_buffer = None
+ 
+@@ -423,6 +449,11 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
+         assert (value_a is None) == (value_b is None)
+         if value_a is None:
+             return None
++        # Fast paths for imbalanced/empty cases to avoid unnecessary concat
++        if value_a.numel() == 0:
++            return value_b
++        if value_b.numel() == 0:
++            return value_a
+         return torch.concat([value_a, value_b], dim=0)
+ 
+     return _handle_key("hidden_states"), _handle_key("residual")
+diff --git a/test/srt/test_two_batch_overlap.py b/test/srt/test_two_batch_overlap.py
+index 89e793ca6..1758fd8eb 100644
+--- a/test/srt/test_two_batch_overlap.py
++++ b/test/srt/test_two_batch_overlap.py
+@@ -68,5 +68,50 @@ class TestTwoBatchOverlap(unittest.TestCase):
+         self.assertGreater(metrics["score"], 0.5)
+ 
+ 
++class TestTwoBatchOverlapUnit(unittest.TestCase):
++    """Lightweight unit tests to verify split and merge helpers.
++
++    These tests avoid launching servers and only touch pure-Python helpers.
++    If the module cannot be imported due to optional dependencies, they are skipped.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        try:
++            from sglang.srt.two_batch_overlap import (
++                _split_array_by_half_sum,
++                _model_forward_tbo_merge_outputs,
++            )
++            import torch
++        except Exception:
++            cls._available = False
++            return
++        cls._available = True
++        cls.split_fn = _split_array_by_half_sum
++        cls.merge_fn = _model_forward_tbo_merge_outputs
++        cls.torch = torch
++
++    def setUp(self):
++        if not getattr(self, "_available", False):
++            self.skipTest("Optional dependencies not available for unit helpers")
++
++    def test_split_balanced(self):
++        arr = [1] * 10
++        self.assertEqual(self.split_fn(arr), 5)
++
++    def test_split_imbalanced(self):
++        arr = [1, 1, 100, 1, 1]
++        # Best balance is after second element (index 2)
++        self.assertEqual(self.split_fn(arr), 2)
++
++    def test_merge_imbalanced_fastpath(self):
++        torch = self.torch
++        A = {"hidden_states": torch.empty((0, 8)), "residual": torch.empty((0, 8))}
++        B = {"hidden_states": torch.ones((4, 8)), "residual": torch.ones((4, 8))}
++        hs, res = self.merge_fn(A, B)
++        self.assertEqual(hs.shape[0], 4)
++        self.assertEqual(res.shape[0], 4)
++
++
+ if __name__ == "__main__":
+     unittest.main()

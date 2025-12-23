@@ -1,0 +1,130 @@
+diff --git a/sgl-kernel/csrc/cpu/norm.cpp b/sgl-kernel/csrc/cpu/norm.cpp
+index 391a0d4e5..678a30805 100644
+--- a/sgl-kernel/csrc/cpu/norm.cpp
++++ b/sgl-kernel/csrc/cpu/norm.cpp
+@@ -152,7 +152,7 @@ void fused_add_rmsnorm_kernel_impl(
+ #pragma GCC unroll 4
+       for (; d < hidden_size; ++d) {
+         float x_val = buffer_ptr[d] * rsqrt_var * static_cast<float>(weight[d]);
+-        input_ptr[d] = x_val;
++        input_ptr[d] = static_cast<scalar_t>(x_val);
+       }
+     }
+   });
+diff --git a/sgl-kernel/csrc/cpu/rope.cpp b/sgl-kernel/csrc/cpu/rope.cpp
+index 64bc297fe..b9128c345 100644
+--- a/sgl-kernel/csrc/cpu/rope.cpp
++++ b/sgl-kernel/csrc/cpu/rope.cpp
+@@ -22,44 +22,41 @@ void rope_kernel_impl(
+     int64_t k_pe_stride_s,
+     int64_t q_pe_stride_n,
+     int64_t out_stride_qn) {
+-  int64_t COFF = HR / 2;
++  const int64_t COFF = HR / 2;
+   at::parallel_for(0, seq_len * num_head, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
+     int64_t seq{0}, head_id{0};
+     data_index_init(begin, seq, seq_len, head_id, num_head);
+     for (int64_t i = begin; i < end; ++i) {
+-      int64_t in_offset_q = seq * q_pe_stride_s + head_id * q_pe_stride_n;
+-      int64_t out_offset_q = seq * out_stride_qs + head_id * out_stride_qn;
+-      int64_t out_offset_k = seq * out_stride_ks;
+-      int64_t p = 0;
+-      scalar_t* sin_start = nullptr;
+-      scalar_t* cos_start = nullptr;
++      const int64_t in_offset_q = seq * q_pe_stride_s + head_id * q_pe_stride_n;
++      const int64_t out_offset_q = seq * out_stride_qs + head_id * out_stride_qn;
++      const int64_t out_offset_k = seq * out_stride_ks;
++      const int64_t k_pe_offset = seq * k_pe_stride_s;
++
+       // step 0) get the rotary position embedding for the current position
+-      p = t_pos[seq];
+-      sin_start = t_emb_pos + p * HR + COFF;
+-      cos_start = t_emb_pos + p * HR;
+-      // step 1) apply_rotary_pos_emb for the rotary_dim elements in every
+-      // head of query/key
+-      for (int64_t h = 0; h < rotary_dim; h += 2) {
+-        scalar_t cos = cos_start[h >> 1];
+-        scalar_t sin = sin_start[h >> 1];
+-        scalar_t in1 = q_pe[in_offset_q + h];
+-        scalar_t in2 = q_pe[in_offset_q + h + 1];
+-        scalar_t out1 = in1 * cos - in2 * sin;
+-        scalar_t out2 = in2 * cos + in1 * sin;
+-        q_pe_out[out_offset_q + h] = out1;
+-        q_pe_out[out_offset_q + h + 1] = out2;
+-      }
+-      for (int64_t h = 0; h < HK; h += 2) {
+-        scalar_t cos = cos_start[h >> 1];
+-        scalar_t sin = sin_start[h >> 1];
+-        int64_t k_pe_offset = seq * k_pe_stride_s;
+-        scalar_t in1_k = k_pe[k_pe_offset + h];
+-        scalar_t in2_k = k_pe[k_pe_offset + h + 1];
+-        scalar_t out1_k = in1_k * cos - in2_k * sin;
+-        scalar_t out2_k = in2_k * cos + in1_k * sin;
+-        k_pe_out[out_offset_k + h] = out1_k;
+-        k_pe_out[out_offset_k + h + 1] = out2_k;
++      const int64_t p = t_pos[seq];
++      scalar_t* __restrict__ sin_start = t_emb_pos + p * HR + COFF;
++      scalar_t* __restrict__ cos_start = t_emb_pos + p * HR;
++
++      // step 1) apply_rotary_pos_emb for the rotary_dim elements in every head
++#pragma GCC unroll 4
++      for (int64_t pair = 0; pair < rotary_dim / 2; ++pair) {
++        const scalar_t cos = cos_start[pair];
++        const scalar_t sin = sin_start[pair];
++
++        const int64_t h = pair * 2;
++        // query
++        const scalar_t in1 = q_pe[in_offset_q + h];
++        const scalar_t in2 = q_pe[in_offset_q + h + 1];
++        q_pe_out[out_offset_q + h] = in1 * cos - in2 * sin;
++        q_pe_out[out_offset_q + h + 1] = in2 * cos + in1 * sin;
++
++        // key
++        const scalar_t in1_k = k_pe[k_pe_offset + h];
++        const scalar_t in2_k = k_pe[k_pe_offset + h + 1];
++        k_pe_out[out_offset_k + h] = in1_k * cos - in2_k * sin;
++        k_pe_out[out_offset_k + h + 1] = in2_k * cos + in1_k * sin;
+       }
++
+       // move to the next index
+       data_index_step(seq, seq_len, head_id, num_head);
+     }
+diff --git a/sgl-kernel/csrc/cpu/topk.cpp b/sgl-kernel/csrc/cpu/topk.cpp
+index 6a6b64d12..83788b0a7 100644
+--- a/sgl-kernel/csrc/cpu/topk.cpp
++++ b/sgl-kernel/csrc/cpu/topk.cpp
+@@ -88,12 +88,13 @@ void grouped_topk_kernel_impl(
+       // do softmax to get scores
+       softmax<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+ 
+-      // find max score per group
++      // find max score per group (vectorized reduce)
++      using Vec = at::vec::Vectorized<float>;
+       for (int64_t g = 0; g < num_groups; ++g) {
+-        float gmax = -std::numeric_limits<float>::infinity();
+-        for (int64_t e = 0; e < num_experts_per_group; ++e) {
+-          gmax = std::max(gmax, scores[g * num_experts_per_group + e]);
+-        }
++        float gmax = at::vec::reduce_all<float>(
++            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
++            scores + g * num_experts_per_group,
++            num_experts_per_group);
+         queue[g] = {gmax, g};
+       }
+ 
+@@ -111,11 +112,10 @@ void grouped_topk_kernel_impl(
+         }
+       }
+ 
+-      // find global topk
+-      std::partial_sort(
+-          queue2.begin(), queue2.begin() + topk, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
+-            return x.first > y.first;
+-          });
++      // find global topk using nth_element + sort for better scalability
++      auto comp = [](const elem_t& x, const elem_t& y) -> bool { return x.first > y.first; };
++      std::nth_element(queue2.begin(), queue2.begin() + topk, queue2.end(), comp);
++      std::sort(queue2.begin(), queue2.begin() + topk, comp);
+ 
+       for (int64_t j = 0; j < topk; ++j) {
+         topk_weights[i * topk + j] = queue2[j].first;

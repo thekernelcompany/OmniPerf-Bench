@@ -1,0 +1,78 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 42ae9d293..9ede95a08 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -283,12 +283,15 @@ class DeepseekV2MoE(nn.Module):
+         shared_output = self._forward_shared_experts(hidden_states)
+         # router_logits: (num_tokens, n_experts)
+         router_logits = self.gate(hidden_states)
+-        final_hidden_states = (
+-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
+-            * self.routed_scaling_factor
++        # Compute experts output first, then scale in-place to avoid
++        # unnecessary intermediate tensor allocations
++        final_hidden_states = self.experts(
++            hidden_states=hidden_states, router_logits=router_logits
+         )
++        final_hidden_states.mul_(self.routed_scaling_factor)
+         if shared_output is not None:
+-            final_hidden_states = final_hidden_states + shared_output
++            # In-place add to reduce memory traffic
++            final_hidden_states.add_(shared_output)
+         if self.tp_size > 1:
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+         return final_hidden_states
+@@ -297,12 +300,9 @@ class DeepseekV2MoE(nn.Module):
+         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+     ) -> torch.Tensor:
+         shared_output = None
+-        topk_idx = torch.full(
+-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+-        )
+-        topk_weights = torch.empty(
+-            (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+-        )
++        # Use new_* factory functions to avoid redundant dtype/device plumbing
++        topk_idx = hidden_states.new_full((0, self.top_k), -1, dtype=torch.int)
++        topk_weights = hidden_states.new_empty((0, self.top_k), dtype=torch.float32)
+         if (
+             forward_mode is not None
+             and not forward_mode.is_idle()
+@@ -337,16 +337,15 @@ class DeepseekV2MoE(nn.Module):
+                 topk_weights,
+                 forward_mode=forward_mode,
+             )
+-        final_hidden_states = (
+-            self.experts(
+-                hidden_states=hidden_states,
+-                reorder_topk_ids=reorder_topk_ids,
+-                seg_indptr=seg_indptr,
+-                masked_m=masked_m,
+-                expected_m=expected_m,
+-                forward_mode=forward_mode,
+-            )
+-            * self.routed_scaling_factor
++        # Compute experts output first without scaling to minimize the
++        # number of elements multiplied (pre-combine tensor is larger).
++        final_hidden_states = self.experts(
++            hidden_states=hidden_states,
++            reorder_topk_ids=reorder_topk_ids,
++            seg_indptr=seg_indptr,
++            masked_m=masked_m,
++            expected_m=expected_m,
++            forward_mode=forward_mode,
+         )
+         if self.ep_size > 1:
+             final_hidden_states = self.deepep_dispatcher.combine(
+@@ -355,8 +354,10 @@ class DeepseekV2MoE(nn.Module):
+                 topk_weights,
+                 forward_mode,
+             )
++        # Apply routed scaling after combine; same result with fewer ops
++        final_hidden_states.mul_(self.routed_scaling_factor)
+         if shared_output is not None:
+-            final_hidden_states = final_hidden_states + shared_output
++            final_hidden_states.add_(shared_output)
+ 
+         return final_hidden_states
+ 

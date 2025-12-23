@@ -1,0 +1,131 @@
+diff --git a/python/sglang/srt/models/llama4.py b/python/sglang/srt/models/llama4.py
+index 4e4ba9a1e..8015c18a0 100644
+--- a/python/sglang/srt/models/llama4.py
++++ b/python/sglang/srt/models/llama4.py
+@@ -48,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+ from sglang.srt.managers.schedule_batch import global_server_args_dict
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
+-from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
++from sglang.srt.utils import add_prefix, fast_topk, get_compiler_backend, make_layers
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -63,7 +63,7 @@ class Llama4MoE(nn.Module):
+         topk: int,
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        router_scores_aK, router_indices_aK = torch.topk(gating_output, topk, dim=-1)
++        router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
+         router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
+             hidden_states.dtype
+         )
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 19fa1807c..cd4de0495 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import (
+ from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+ from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
+-from sglang.srt.utils import is_cuda_available, is_hip, next_power_of_2
++from sglang.srt.utils import fast_topk, is_cuda_available, is_hip, next_power_of_2
+ 
+ if is_cuda_available():
+     from sgl_kernel import (
+@@ -117,10 +117,13 @@ class EagleDraftInput:
+     ):
+         bs = self.accept_length.numel()
+ 
+-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
++        # Avoid zero-initializing entire buffers; only set required entries.
++        qo_indptr = torch.empty((bs + 1,), dtype=torch.int32, device="cuda")
++        qo_indptr[0] = 0
+         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
+ 
+-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
++        cum_kv_seq_len = torch.empty((bs + 1,), dtype=torch.int32, device="cuda")
++        cum_kv_seq_len[0] = 0
+         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+ 
+         # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
+@@ -278,11 +281,10 @@ class EagleVerifyInput:
+             dtype=torch.int32,
+             device="cuda",
+         )
+-        cum_kv_seq_len = torch.zeros(
+-            (batch_size + 1,), dtype=torch.int32, device="cuda"
+-        )
++        cum_kv_seq_len = torch.empty((batch_size + 1,), dtype=torch.int32, device="cuda")
+ 
+         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
++        cum_kv_seq_len[0] = 0
+         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+ 
+         kv_indices = torch.empty(
+@@ -770,16 +772,7 @@ def select_top_k_tokens(
+         )
+ 
+     return input_ids, hidden_states, scores, tree_info
+-
+-
+-def fast_topk(values, topk, dim):
+-    if topk == 1:
+-        # Use max along the specified dimension to get both value and index
+-        max_value, max_index = torch.max(values, dim=dim)
+-        return max_value.unsqueeze(1), max_index.unsqueeze(1)
+-    else:
+-        # Use topk for efficiency with larger k values
+-        return torch.topk(values, topk, dim=dim)
++ 
+ 
+ 
+ def _generate_simulated_accept_index(
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index 514603424..9967cf6ac 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -31,11 +31,15 @@ from sglang.srt.speculative.eagle_utils import (
+     EagleVerifyInput,
+     EagleVerifyOutput,
+     assign_draft_cache_locs,
+-    fast_topk,
+     select_top_k_tokens,
+ )
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda_available
++from sglang.srt.utils import (
++    empty_context,
++    fast_topk,
++    get_available_gpu_memory,
++    is_cuda_available,
++)
+ 
+ if is_cuda_available():
+     from sgl_kernel import segment_packbits
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index b43fe4273..6f29acee1 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -257,6 +257,21 @@ def calculate_time(show=False, min_cost_ms=0.0):
+     return wrapper
+ 
+ 
++def fast_topk(values: torch.Tensor, topk: int, dim: int = -1):
++    """Fast top-k utility.
++
++    Optimized for the common case topk == 1 by using torch.max with keepdim=True
++    to avoid allocating/sorting unnecessary buffers. Falls back to torch.topk
++    otherwise.
++
++    Returns a (values, indices) tuple consistent with torch.topk.
++    """
++    if topk == 1:
++        max_value, max_index = torch.max(values, dim=dim, keepdim=True)
++        return max_value, max_index
++    return torch.topk(values, topk, dim=dim)
++
++
+ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
+     """
+     Get available memory for cuda:gpu_id device.

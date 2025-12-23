@@ -1,0 +1,334 @@
+diff --git a/benchmark/benchmark_batch/benchmark_batch.py b/benchmark/benchmark_batch/benchmark_batch.py
+new file mode 100644
+index 000000000..2a748ceca
+--- /dev/null
++++ b/benchmark/benchmark_batch/benchmark_batch.py
+@@ -0,0 +1,59 @@
++import concurrent.futures
++import os
++import random
++import time
++from concurrent.futures import ThreadPoolExecutor
++from statistics import mean
++
++import requests
++
++# Simple HTTP benchmark that sends batched prompts to a running server.
++# This does NOT run as part of unit tests, but is helpful to quickly
++# validate end-to-end throughput improvements when batch tokenization
++# is enabled in the server.
++
++
++ENDPOINT_URL = os.environ.get("SGLANG_ENDPOINT", "http://127.0.0.1:30000")
++
++
++def _mk_prompt(n_tokens: int) -> str:
++    word = "lorem"
++    return (word + " ") * n_tokens
++
++
++def _post_batch(batch):
++    payload = {
++        "text": batch,
++        "sampling_params": {"max_new_tokens": 0},
++        "stream": False,
++    }
++    r = requests.post(f"{ENDPOINT_URL}/v1/generate", json=payload, timeout=60)
++    r.raise_for_status()
++    return r.json()
++
++
++def bench(num_requests=10, batch_size=8, num_tokens=512):
++    prompts = [[_mk_prompt(num_tokens) for _ in range(batch_size)] for _ in range(num_requests)]
++
++    latencies = []
++    start = time.time()
++    with ThreadPoolExecutor(max_workers=min(8, num_requests)) as ex:
++        futs = [ex.submit(_post_batch, b) for b in prompts]
++        for f in futs:
++            t0 = time.time()
++            f.result()
++            latencies.append(time.time() - t0)
++    elapsed = time.time() - start
++
++    print(
++        f"Sent {num_requests} batches x {batch_size} prompts; total {num_requests*batch_size} requests"
++    )
++    print(f"Total time: {elapsed:.3f}s, avg per request: {mean(latencies):.4f}s")
++
++
++if __name__ == "__main__":
++    nr = int(os.environ.get("NUM_REQUESTS", 5))
++    bs = int(os.environ.get("BATCH_SIZE", 4))
++    nt = int(os.environ.get("NUM_TOKENS", 256))
++    bench(nr, bs, nt)
++
+diff --git a/benchmark/benchmark_batch/benchmark_tokenizer.py b/benchmark/benchmark_batch/benchmark_tokenizer.py
+new file mode 100644
+index 000000000..b860845e4
+--- /dev/null
++++ b/benchmark/benchmark_batch/benchmark_tokenizer.py
+@@ -0,0 +1,32 @@
++import os
++import time
++from statistics import mean
++
++from transformers import AutoTokenizer
++
++
++def bench_tokenizer(tokenizer_id: str, num_items=5000):
++    tok = AutoTokenizer.from_pretrained(tokenizer_id)
++    texts = ["Hello world! This is a quick test." for _ in range(num_items)]
++
++    t0 = time.time()
++    _ = [tok.encode(t) for t in texts]
++    t_item = time.time() - t0
++
++    t0 = time.time()
++    enc = tok(texts, add_special_tokens=False, padding=False)
++    _ = enc["input_ids"]
++    t_batch = time.time() - t0
++
++    print(f"Tokenizer: {tokenizer_id}")
++    print(f"Per-item: {t_item:.4f}s for {num_items}")
++    print(f"Batch:    {t_batch:.4f}s for {num_items}")
++    if t_batch > 0:
++        print("Speedup x", round(t_item / t_batch, 2))
++
++
++if __name__ == "__main__":
++    model = os.environ.get("TOKENIZER_ID", "gpt2")
++    n = int(os.environ.get("NUM_ITEMS", 5000))
++    bench_tokenizer(model, n)
++
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index a391dd719..3d4f7b7e6 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -212,6 +212,8 @@ class TokenizerManager:
+                     trust_remote_code=server_args.trust_remote_code,
+                     revision=server_args.revision,
+                 )
++                # Reduce contention from HF tokenizers' internal thread pools
++                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+ 
+         # Store states
+         self.no_create_loop = False
+@@ -483,6 +485,144 @@ class TokenizerManager:
+ 
+         return tokenized_obj
+ 
++    async def _batch_tokenize_requests(
++        self, objs: List[Union[GenerateReqInput, EmbeddingReqInput]]
++    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
++        """Batch tokenize a list of requests.
++
++        Uses fast tokenizer batch APIs to reduce per-request overhead.
++        Falls back to pre-provided input_ids or input_embeds when present.
++        """
++        # Preprocess multimodal data concurrently (may inject input ids)
++        mm_tasks = [
++            self.mm_processor.process_mm_data_async(
++                obj.image_data,
++                obj.text if obj.text is not None else obj.input_ids,
++                obj,
++                self.max_req_input_len,
++            )
++            for obj in objs
++        ]
++        image_inputs_list: List[Dict] = await asyncio.gather(*mm_tasks)
++
++        # Collect plain-text requests that need tokenization
++        idxs_to_tokenize: List[int] = []
++        texts: List[str] = []
++        for i, (obj, mm_inp) in enumerate(zip(objs, image_inputs_list)):
++            if obj.input_embeds is not None:
++                continue
++            if obj.input_ids is not None:
++                continue
++            if mm_inp and "input_ids" in mm_inp:
++                continue
++            if self.tokenizer is None:
++                raise ValueError(
++                    "The engine initialized with skip_tokenizer_init=True cannot accept text prompts."
++                )
++            texts.append(obj.text)
++            idxs_to_tokenize.append(i)
++
++        # Execute a single batch tokenization for all pending texts
++        if texts:
++            enc = self.tokenizer(texts, add_special_tokens=False, padding=False)
++            tok_ids = enc["input_ids"]
++            for j, i in enumerate(idxs_to_tokenize):
++                objs[i].input_ids = tok_ids[j]
++
++        # Build tokenized objects and validate
++        out: List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]] = []
++        for obj, mm_inp in zip(objs, image_inputs_list):
++            input_text = obj.text
++            input_embeds = None
++            input_ids = None
++
++            if obj.input_embeds is not None:
++                if self.is_generation:
++                    raise ValueError(
++                        "The generation server does not work with input_embeds. Please use the embedding server."
++                    )
++                input_embeds = obj.input_embeds
++                input_ids = obj.input_ids
++            elif obj.input_ids is not None:
++                input_ids = obj.input_ids
++            else:
++                # If multimodal processor provided ids, use them
++                if mm_inp and "input_ids" in mm_inp:
++                    input_ids = mm_inp["input_ids"]
++                else:
++                    input_ids = obj.input_ids
++
++            # Merge multimodal inputs
++            image_inputs: Dict = mm_inp
++            if image_inputs and "input_ids" in image_inputs:
++                input_ids = image_inputs["input_ids"]
++
++            # Generation-specific
++            if self.is_generation:
++                return_logprob = obj.return_logprob
++                logprob_start_len = obj.logprob_start_len
++                top_logprobs_num = obj.top_logprobs_num
++                token_ids_logprob = obj.token_ids_logprob
++                session_params = (
++                    SessionParams(**obj.session_params)
++                    if obj.session_params
++                    else None
++                )
++
++            # Context length check
++            input_token_num = len(input_ids) if input_ids is not None else 0
++            if input_token_num >= self.context_len:
++                raise ValueError(
++                    f"The input ({input_token_num} tokens) is longer than the model's context length ({self.context_len} tokens)."
++                )
++
++            if (
++                obj.sampling_params.get("max_new_tokens") is not None
++                and obj.sampling_params.get("max_new_tokens") + input_token_num
++                >= self.context_len
++            ):
++                raise ValueError(
++                    "Requested token count exceeds the model's maximum context length"
++                )
++
++            # Sampling params
++            sampling_params = SamplingParams(**obj.sampling_params)
++            sampling_params.normalize(self.tokenizer)
++            sampling_params.verify()
++
++            if isinstance(obj, GenerateReqInput):
++                tokenized_obj = TokenizedGenerateReqInput(
++                    obj.rid,
++                    input_text,
++                    input_ids,
++                    image_inputs,
++                    sampling_params,
++                    return_logprob,
++                    logprob_start_len,
++                    top_logprobs_num,
++                    token_ids_logprob,
++                    obj.stream,
++                    bootstrap_host=obj.bootstrap_host,
++                    bootstrap_room=obj.bootstrap_room,
++                    lora_path=obj.lora_path,
++                    input_embeds=input_embeds,
++                    session_params=session_params,
++                    custom_logit_processor=obj.custom_logit_processor,
++                    return_hidden_states=obj.return_hidden_states,
++                )
++            else:
++                tokenized_obj = TokenizedEmbeddingReqInput(
++                    obj.rid,
++                    input_text,
++                    input_ids,
++                    image_inputs,
++                    sampling_params,
++                )
++
++            out.append(tokenized_obj)
++
++        return out
++
+     def _send_one_request(
+         self,
+         obj: Union[GenerateReqInput, EmbeddingReqInput],
+@@ -561,13 +701,22 @@ class TokenizerManager:
+         generators = []
+         rids = []
+         if getattr(obj, "parallel_sample_num", 1) == 1:
+-            # Send all requests
+-            for i in range(batch_size):
+-                tmp_obj = obj[i]
+-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
+-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
+-                generators.append(self._wait_one_response(tmp_obj, request))
+-                rids.append(tmp_obj.rid)
++            if getattr(self.server_args, "disable_batch_tokenization", False):
++                # Send all requests one by one (legacy behavior)
++                for i in range(batch_size):
++                    tmp_obj = obj[i]
++                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
++                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
++                    generators.append(self._wait_one_response(tmp_obj, request))
++                    rids.append(tmp_obj.rid)
++            else:
++                # Fast path: batch tokenization to reduce overhead per request
++                tmp_objs = [obj[i] for i in range(batch_size)]
++                tokenized_list = await self._batch_tokenize_requests(tmp_objs)
++                for tmp_obj, tokenized_obj in zip(tmp_objs, tokenized_list):
++                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
++                    generators.append(self._wait_one_response(tmp_obj, request))
++                    rids.append(tmp_obj.rid)
+         else:
+             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+             if batch_size > 128:
+@@ -577,10 +726,14 @@ class TokenizerManager:
+                     "many threads to send them one by one with parallel sampling (n > 1)."
+                 )
+ 
+-            # Tokenize all requests
++            # Tokenize all requests (use batched path when possible)
+             objs = [obj[i] for i in range(batch_size)]
+-            tokenized_objs = await asyncio.gather(
+-                *(self._tokenize_one_request(obj) for obj in objs)
++            tokenized_objs = (
++                await self._batch_tokenize_requests(objs)
++                if not getattr(self.server_args, "disable_batch_tokenization", False)
++                else await asyncio.gather(
++                    *(self._tokenize_one_request(o) for o in objs)
++                )
+             )
+ 
+             # Cache the common prefix for parallel sampling
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index e1768b52e..f2f6f0947 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -185,6 +185,8 @@ class ServerArgs:
+     n_share_experts_fusion: int = 0
+     disable_chunked_prefix_cache: bool = False
+     disable_fast_image_processor: bool = False
++    # Tokenizer optimizations
++    disable_batch_tokenization: bool = False
+ 
+     # Debug tensor dumps
+     debug_tensor_dump_output_folder: Optional[str] = None
+@@ -1139,6 +1141,11 @@ class ServerArgs:
+             action="store_true",
+             help="Adopt base image processor instead of fast image processor.",
+         )
++        parser.add_argument(
++            "--disable-batch-tokenization",
++            action="store_true",
++            help="Disable batched tokenization in the tokenizer manager.",
++        )
+ 
+         # Server warmups
+         parser.add_argument(

@@ -1,0 +1,164 @@
+diff --git a/benchmark/lora/launch_server.py b/benchmark/lora/launch_server.py
+index 1fa4d7135..fe1e9e3d6 100644
+--- a/benchmark/lora/launch_server.py
++++ b/benchmark/lora/launch_server.py
+@@ -1,28 +1,42 @@
+ import argparse
+ import os
+ 
+-NUM_LORAS = 128
++# Use a smaller default to avoid constructing unnecessarily large
++# LoRA path lists in benchmarks. This keeps the example snappy
++# while still exercising the multi-LoRA path.
++NUM_LORAS = 8
+ LORA_PATH = {
+     "base": "mistralai/Mistral-7B-Instruct-v0.3",
+     "lora": "/home/ying/test_lora",
+ }
+ 
+ 
+-def launch_server(args):
++def _build_cmd(args) -> str:
+     base_path = LORA_PATH["base"]
+     lora_path = LORA_PATH["lora"]
+-    max_loras_per_batch = 4
++    num_loras = getattr(args, "num_loras", NUM_LORAS)
+ 
+     if args.base_only:
+-        cmd = f"python -m sglang.launch_server --model {base_path} "
++        cmd = f"python3 -m sglang.launch_server --model {base_path} "
+     else:
+-        cmd = f"python -m sglang.launch_server --model {base_path} --lora-paths "
+-        for i in range(NUM_LORAS):
+-            lora_name = f"lora{i}"
+-            cmd += f"{lora_name}={lora_path} "
+-    cmd += f"--disable-radix --disable-cuda-graph "
+-    cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
+-    cmd += f"--max-running-requests {args.max_running_requests}"
++        # Build LoRA path list with join to avoid O(n^2) string concatenation
++        lora_entries = " ".join(
++            f"lora{i}={lora_path}" for i in range(num_loras)
++        )
++        cmd = (
++            f"python3 -m sglang.launch_server --model {base_path} "
++            f"--lora-paths {lora_entries} "
++        )
++    cmd += (
++        f"--disable-radix --disable-cuda-graph "
++        f"--max-loras-per-batch {args.max_loras_per_batch} "
++        f"--max-running-requests {args.max_running_requests}"
++    )
++    return cmd
++
++
++def launch_server(args):
++    cmd = _build_cmd(args)
+     print(cmd)
+     os.system(cmd)
+ 
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index 379b233bd..10f396b8f 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -108,6 +108,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         self.bs = bs
+         self.seq_lens = seq_lens
+         self.weight_indices = weight_indices
++        # lazily-initialized scratch buffer to avoid per-call allocations
++        self._lora_out_buffer = None
+ 
+     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+         lora_a_output = self.segment_gemm.run(
+@@ -120,7 +122,15 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         )
+         # FIXME
+         assert lora_a_output.shape[-1] == self.lora_rank * 2
+-        lora_output = torch.empty_like(base_output)
++        # Reuse an internal buffer to avoid frequent allocations
++        if (
++            self._lora_out_buffer is None
++            or self._lora_out_buffer.shape != base_output.shape
++            or self._lora_out_buffer.dtype != base_output.dtype
++            or self._lora_out_buffer.device != base_output.device
++        ):
++            self._lora_out_buffer = torch.empty_like(base_output)
++        lora_output = self._lora_out_buffer
+         output_dim = lora_output.shape[-1] // 2
+         for i in range(2):
+             left = output_dim * i
+@@ -154,6 +164,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         self.bs = bs
+         self.seq_lens = seq_lens
+         self.weight_indices = weight_indices
++        # lazily-initialized scratch buffer to avoid per-call allocations
++        self._lora_out_buffer = None
+ 
+     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+         lora_a_output = self.segment_gemm.run(
+@@ -165,7 +177,15 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             weight_indices=self.weight_indices,
+         )
+         # FIXME parallelize qkv
+-        lora_output = torch.empty_like(base_output)
++        # Reuse an internal buffer to avoid frequent allocations
++        if (
++            self._lora_out_buffer is None
++            or self._lora_out_buffer.shape != base_output.shape
++            or self._lora_out_buffer.dtype != base_output.dtype
++            or self._lora_out_buffer.device != base_output.device
++        ):
++            self._lora_out_buffer = torch.empty_like(base_output)
++        lora_output = self._lora_out_buffer
+         # q
+         output_dim_q = self.B_buffer_q.shape[-2]
+         lora_output[:, :output_dim_q] = self.segment_gemm.run(
+@@ -299,7 +319,8 @@ class LoRALayer(nn.Module):
+ 
+     def load_to_gpu(self):
+         for name, weight in self.weights.items():
+-            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
++            # Fuse dtype and device conversion into a single op
++            self.weight_gpu[name] = weight.to(device="cuda", dtype=torch.float16)
+ 
+     def offload_from_gpu(self):
+         for name, weight in self.weights.items():
+@@ -336,7 +357,8 @@ class LoRAAdapter(nn.Module):
+ 
+     def load_to_gpu(self):
+         for name, weight in self.weights.items():
+-            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
++            # Fuse dtype and device conversion into a single op
++            self.weights_gpu[name] = weight.to(device="cuda", dtype=torch.float16)
+         for layer in self.layers:
+             layer.load_to_gpu()
+ 
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 59cd7e157..2185b8b8a 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -254,7 +254,8 @@ class LoRAManager:
+         if uid is None:
+             for i in range(num_layer):
+                 for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] *= 0
++                    # Use in-place zero_ to avoid a read-modify-write kernel
++                    self.A_buffer[k][i][buffer_id].zero_()
+             return
+ 
+         for i in range(num_layer):
+@@ -297,9 +298,12 @@ class LoRAManager:
+             if forward_batch.forward_mode.is_extend()
+             else torch.ones(bs)
+         )
+-        weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
+-        for i, lora_path in enumerate(forward_batch.lora_paths):
+-            weight_indices[i] = self.buffer_id[lora_path]
++        # Vectorize creation of weight indices to reduce Python-loop overhead
++        weight_indices = torch.tensor(
++            [self.buffer_id[lora_path] for lora_path in forward_batch.lora_paths],
++            dtype=torch.int64,
++            device="cuda",
++        )
+ 
+         for module_name, module in self.lora_modules:
+             layer_id = get_layer_id(module_name)

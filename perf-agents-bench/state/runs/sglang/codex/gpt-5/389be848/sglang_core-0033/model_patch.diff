@@ -1,0 +1,481 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 4e8543213..38d157a03 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -354,12 +354,17 @@ class FlashAttentionBackend(AttentionBackend):
+                     metadata.cu_seqlens_q = torch.arange(
+                         0, batch_size + 1, dtype=torch.int32, device=device
+                     )
+-                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                        ),
+-                        (1, 0),
++                    # Avoid pad allocation: write cumsum into pre-sized buffer
++                    _tmp_cum = torch.cumsum(
++                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                     )
++                    metadata.cu_seqlens_k = torch.empty(
++                        _tmp_cum.numel() + 1,
++                        dtype=torch.int32,
++                        device=_tmp_cum.device,
++                    )
++                    metadata.cu_seqlens_k[0] = 0
++                    metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                     metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                     ]
+@@ -374,12 +379,17 @@ class FlashAttentionBackend(AttentionBackend):
+                         dtype=torch.int32,
+                         device=device,
+                     )
+-                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                        ),
+-                        (1, 0),
++                    # Avoid extra pad: build prefix sums directly
++                    _tmp_cum = torch.cumsum(
++                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
++                    )
++                    metadata.cu_seqlens_k = torch.empty(
++                        _tmp_cum.numel() + 1,
++                        dtype=torch.int32,
++                        device=_tmp_cum.device,
+                     )
++                    metadata.cu_seqlens_k[0] = 0
++                    metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                     metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                         forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                     ]
+@@ -421,9 +431,12 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.cu_seqlens_q = torch.arange(
+                     0, batch_size + 1, dtype=torch.int32, device=device
+                 )
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
++                _tmp_cum = torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32)
++                metadata.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+                 )
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                 ]
+@@ -446,12 +459,14 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=device,
+                 )
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                    ),
+-                    (1, 0),
++                _tmp_cum = torch.cumsum(
++                    metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                 )
++                metadata.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
++                )
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                 ]
+@@ -468,12 +483,14 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=device,
+                 )
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                    ),
+-                    (1, 0),
++                _tmp_cum = torch.cumsum(
++                    metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                 )
++                metadata.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
++                )
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                 ]
+@@ -498,15 +515,13 @@ class FlashAttentionBackend(AttentionBackend):
+                 cols = offsets.expand(
+                     forward_batch.seq_lens.numel(), -1
+                 ) + forward_batch.seq_lens.unsqueeze(1)
+-                cum_len = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        (
+-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
+-                        ).repeat_interleave(self.speculative_num_draft_tokens),
+-                        dim=0,
+-                    ),
+-                    (1, 0),
+-                )[:-1]
++                _x = (
++                    forward_batch.seq_lens + self.speculative_num_draft_tokens
++                ).repeat_interleave(self.speculative_num_draft_tokens)
++                _tmp_cum = torch.cumsum(_x, dim=0)
++                cum_len = torch.empty_like(_tmp_cum)
++                cum_len[0] = 0
++                cum_len[1:] = _tmp_cum[:-1]
+                 mask_extraction_indices = (
+                     cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                     + cum_len[:, None]
+@@ -543,12 +558,16 @@ class FlashAttentionBackend(AttentionBackend):
+                 )  # (bsz, draft_num)
+                 metadata_expand.page_table = non_masked_page_table.gather(1, sort_order)
+                 metadata_expand.cache_seqlens_int32 = mask.sum(dim=1).to(torch.int32)
+-                metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                    ),
+-                    (1, 0),
++                _tmp_cum = torch.cumsum(
++                    metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
+                 )
++                metadata_expand.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1,
++                    dtype=torch.int32,
++                    device=_tmp_cum.device,
++                )
++                metadata_expand.cu_seqlens_k[0] = 0
++                metadata_expand.cu_seqlens_k[1:].copy_(_tmp_cum)
+                 metadata_expand.max_seq_len_k = (
+                     metadata_expand.cache_seqlens_int32.max().item()
+                 )
+@@ -556,9 +575,12 @@ class FlashAttentionBackend(AttentionBackend):
+         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+-            metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
++            _tmp_cum = torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32)
++            metadata.cu_seqlens_k = torch.empty(
++                _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+             )
++            metadata.cu_seqlens_k[0] = 0
++            metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
+             ]
+@@ -569,9 +591,12 @@ class FlashAttentionBackend(AttentionBackend):
+             ):
+                 extend_seq_lens = forward_batch.extend_seq_lens
+                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+-                metadata.cu_seqlens_q = torch.nn.functional.pad(
+-                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
++                _tmp_cum = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
++                metadata.cu_seqlens_q = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+                 )
++                metadata.cu_seqlens_q[0] = 0
++                metadata.cu_seqlens_q[1:].copy_(_tmp_cum)
+             else:
+                 metadata.max_seq_len_q = metadata.max_seq_len_k
+                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+@@ -587,10 +612,14 @@ class FlashAttentionBackend(AttentionBackend):
+             ), "Only encoder size 1 is supported for now"
+ 
+             metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
+-            metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
+-                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
+-                (1, 0),
++            _tmp_cum = torch.cumsum(
++                metadata.encoder_lens_int32, dim=0, dtype=torch.int32
++            )
++            metadata.encoder_cu_seqlens_k = torch.empty(
++                _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+             )
++            metadata.encoder_cu_seqlens_k[0] = 0
++            metadata.encoder_cu_seqlens_k[1:].copy_(_tmp_cum)
+             metadata.encoder_max_seq_len_k = metadata.encoder_lens_int32.max().item()
+             metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
+                 forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
+@@ -1134,16 +1163,16 @@ class FlashAttentionBackend(AttentionBackend):
+             "cu_seqlens_q": torch.arange(
+                 0, max_bs + 1, dtype=torch.int32, device=self.device
+             ),
+-            "cu_seqlens_k": torch.zeros(
++            "cu_seqlens_k": torch.empty(
+                 max_bs + 1, dtype=torch.int32, device=self.device
+             ),
+-            "page_table": torch.zeros(
++            "page_table": torch.empty(
+                 max_bs,
+                 (self.max_context_len + self.page_size - 1) // self.page_size,
+                 dtype=torch.int32,
+                 device=self.device,
+             ),
+-            "page_table_draft_decode": torch.zeros(
++            "page_table_draft_decode": torch.empty(
+                 max_bs,
+                 (self.max_context_len + self.page_size - 1) // self.page_size,
+                 dtype=torch.int32,
+@@ -1167,10 +1196,10 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "cu_seqlens_k": torch.zeros(
++                "cu_seqlens_k": torch.empty(
+                     max_bs + 1, dtype=torch.int32, device=self.device
+                 ),
+-                "page_table": torch.zeros(
++                "page_table": torch.empty(
+                     max_bs,
+                     self.max_context_len,
+                     dtype=torch.int32,
+@@ -1200,7 +1229,7 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "page_table": torch.zeros(
++                "page_table": torch.empty(
+                     max_bs * self.topk,
+                     decode_length,
+                     dtype=torch.int32,
+@@ -1223,10 +1252,10 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "cu_seqlens_k": torch.zeros(
++                "cu_seqlens_k": torch.empty(
+                     max_bs + 1, dtype=torch.int32, device=self.device
+                 ),
+-                "page_table": torch.zeros(
++                "page_table": torch.empty(
+                     max_bs,
+                     (self.max_context_len + self.page_size - 1) // self.page_size,
+                     dtype=torch.int32,
+@@ -1249,10 +1278,10 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "cu_seqlens_k": torch.zeros(
++                "cu_seqlens_k": torch.empty(
+                     max_bs + 1, dtype=torch.int32, device=self.device
+                 ),
+-                "page_table": torch.zeros(
++                "page_table": torch.empty(
+                     max_bs,
+                     self.max_context_len,
+                     dtype=torch.int32,
+@@ -1266,7 +1295,7 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "cu_seqlens_k": torch.zeros(
++                "cu_seqlens_k": torch.empty(
+                     max_bs * self.speculative_num_draft_tokens + 1,
+                     dtype=torch.int32,
+                     device=self.device,
+@@ -1277,7 +1306,7 @@ class FlashAttentionBackend(AttentionBackend):
+                     dtype=torch.int32,
+                     device=self.device,
+                 ),
+-                "page_table": torch.zeros(
++                "page_table": torch.empty(
+                     max_bs * self.speculative_num_draft_tokens,
+                     self.speculative_num_draft_tokens,
+                     dtype=torch.int32,
+@@ -1286,16 +1315,16 @@ class FlashAttentionBackend(AttentionBackend):
+             }
+ 
+         self.encoder_metadata = {
+-            "encoder_page_table": torch.zeros(
++            "encoder_page_table": torch.empty(
+                 max_bs,
+                 self.max_context_len,
+                 dtype=torch.int32,
+                 device=self.device,
+             ),
+-            "encoder_lens_int32": torch.zeros(
++            "encoder_lens_int32": torch.empty(
+                 max_bs, dtype=torch.int32, device=self.device
+             ),
+-            "encoder_cu_seqlens_k": torch.zeros(
++            "encoder_cu_seqlens_k": torch.empty(
+                 max_bs + 1, dtype=torch.int32, device=self.device
+             ),
+         }
+@@ -1331,12 +1360,16 @@ class FlashAttentionBackend(AttentionBackend):
+                     metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
+                         "cu_seqlens_q"
+                     ][: bs + 1]
+-                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                        ),
+-                        (1, 0),
++                    _tmp_cum = torch.cumsum(
++                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                     )
++                    metadata.cu_seqlens_k = torch.empty(
++                        _tmp_cum.numel() + 1,
++                        dtype=torch.int32,
++                        device=_tmp_cum.device,
++                    )
++                    metadata.cu_seqlens_k[0] = 0
++                    metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                     metadata.page_table = self.decode_cuda_graph_metadata[
+                         "page_table_draft_decode"
+                     ][req_pool_indices, :]
+@@ -1390,9 +1423,12 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+                 batch_size = len(seq_lens)
+                 device = seq_lens.device
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
++                _tmp_cum = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
++                metadata.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+                 )
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+                 # Precompute maximum sequence length
+                 metadata.max_seq_len_k = seq_lens.max().item()
+                 # Precompute page table
+@@ -1525,12 +1561,10 @@ class FlashAttentionBackend(AttentionBackend):
+                     metadata.max_seq_len_k = seq_lens_cpu.max().item() + (
+                         self.speculative_step_id + 1
+                     )
+-                    metadata.cu_seqlens_k.copy_(
+-                        torch.nn.functional.pad(
+-                            torch.cumsum(
+-                                metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                            ),
+-                            (1, 0),
++                    metadata.cu_seqlens_k[0] = 0
++                    metadata.cu_seqlens_k[1:].copy_(
++                        torch.cumsum(
++                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                         )
+                     )
+ 
+@@ -1554,12 +1588,10 @@ class FlashAttentionBackend(AttentionBackend):
+                     # metadata.max_seq_len_q = self.topk, already set in capture
+                     metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                     # metadata.cu_seqlens_q already set in capture
+-                    metadata.cu_seqlens_k.copy_(
+-                        torch.nn.functional.pad(
+-                            torch.cumsum(
+-                                metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                            ),
+-                            (1, 0),
++                    metadata.cu_seqlens_k[0] = 0
++                    metadata.cu_seqlens_k[1:].copy_(
++                        torch.cumsum(
++                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                         )
+                     )
+ 
+@@ -1587,9 +1619,12 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.max_seq_len_k = max_len
+ 
+                 metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
++                _tmp_cum = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
++                metadata.cu_seqlens_k = torch.empty(
++                    _tmp_cum.numel() + 1, dtype=torch.int32, device=_tmp_cum.device
+                 )
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(_tmp_cum)
+ 
+                 max_seq_pages = (
+                     metadata.max_seq_len_k + self.page_size - 1
+@@ -1615,12 +1650,10 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata.max_seq_len_k = (
+                     seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                 )
+-                metadata.cu_seqlens_k.copy_(
+-                    torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                        ),
+-                        (1, 0),
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(
++                    torch.cumsum(
++                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                     )
+                 )
+                 max_seq_pages = (
+@@ -1640,12 +1673,10 @@ class FlashAttentionBackend(AttentionBackend):
+                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
+                 metadata.max_seq_len_k = seq_lens_cpu.max().item()
+                 # metadata.cu_seqlens_q already set in capture
+-                metadata.cu_seqlens_k.copy_(
+-                    torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+-                        ),
+-                        (1, 0),
++                metadata.cu_seqlens_k[0] = 0
++                metadata.cu_seqlens_k[1:].copy_(
++                    torch.cumsum(
++                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                     )
+                 )
+                 page_table = self.req_to_token[
+@@ -1664,15 +1695,13 @@ class FlashAttentionBackend(AttentionBackend):
+                     0
+                 )  # shape: (1, self.speculative_num_draft_tokens)
+                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
+-                cum_len = torch.nn.functional.pad(
+-                    torch.cumsum(
+-                        (
+-                            seq_lens + self.speculative_num_draft_tokens
+-                        ).repeat_interleave(self.speculative_num_draft_tokens),
+-                        dim=0,
+-                    ),
+-                    (1, 0),
+-                )[:-1]
++                _x = (
++                    seq_lens + self.speculative_num_draft_tokens
++                ).repeat_interleave(self.speculative_num_draft_tokens)
++                _tmp_cum = torch.cumsum(_x, dim=0)
++                cum_len = torch.empty_like(_tmp_cum)
++                cum_len[0] = 0
++                cum_len[1:] = _tmp_cum[:-1]
+                 mask_extraction_indices = (
+                     cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                     + cum_len[:, None]
+@@ -1704,14 +1733,10 @@ class FlashAttentionBackend(AttentionBackend):
+                 metadata_expand.cache_seqlens_int32.copy_(
+                     mask.sum(dim=1).to(torch.int32)
+                 )
+-                metadata_expand.cu_seqlens_k.copy_(
+-                    torch.nn.functional.pad(
+-                        torch.cumsum(
+-                            metadata_expand.cache_seqlens_int32,
+-                            dim=0,
+-                            dtype=torch.int32,
+-                        ),
+-                        (1, 0),
++                metadata_expand.cu_seqlens_k[0] = 0
++                metadata_expand.cu_seqlens_k[1:].copy_(
++                    torch.cumsum(
++                        metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
+                     )
+                 )
+                 metadata_expand.max_seq_len_k = (
+@@ -1722,11 +1747,9 @@ class FlashAttentionBackend(AttentionBackend):
+             # Only support encoder size 1 for now
+             metadata.encoder_max_seq_len_k = encoder_lens[0]
+             metadata.encoder_lens_int32.copy_(encoder_lens[:1])
+-            metadata.encoder_cu_seqlens_k.copy_(
+-                torch.nn.functional.pad(
+-                    torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
+-                    (1, 0),
+-                )
++            metadata.encoder_cu_seqlens_k[0] = 0
++            metadata.encoder_cu_seqlens_k[1:].copy_(
++                torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32)
+             )
+ 
+             metadata.encoder_page_table[:, : metadata.encoder_max_seq_len_k].copy_(

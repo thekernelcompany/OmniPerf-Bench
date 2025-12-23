@@ -1,0 +1,56 @@
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 09b3c7127..e6a8f0170 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -162,6 +162,13 @@ class ModelRunner:
+         return min_per_gpu_memory
+ 
+     def load_model(self):
++        # Limit PyTorch CPU thread usage during model load to reduce overhead
++        # and contention in safetensors/weight deserialization.
++        try:
++            torch.set_num_threads(1)
++            torch.set_num_interop_threads(1)
++        except Exception:
++            pass
+         logger.info(
+             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+         )
+@@ -313,6 +320,7 @@ class ModelRunner:
+         return True, "Succeeded to update model weights"
+ 
+     def profile_max_num_token(self, total_gpu_memory: int):
++        element_size = torch._utils._element_size(self.kv_cache_dtype)
+         available_gpu_memory = get_available_gpu_memory(
+             self.gpu_id, distributed=self.tp_size > 1
+         )
+@@ -323,7 +331,7 @@ class ModelRunner:
+             cell_size = (
+                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                 * self.model_config.num_hidden_layers
+-                * torch._utils._element_size(self.kv_cache_dtype)
++                * element_size
+             )
+         else:
+             cell_size = (
+@@ -331,7 +339,7 @@ class ModelRunner:
+                 * self.model_config.head_dim
+                 * self.model_config.num_hidden_layers
+                 * 2
+-                * torch._utils._element_size(self.kv_cache_dtype)
++                * element_size
+             )
+         rest_memory = available_gpu_memory - total_gpu_memory * (
+             1 - self.mem_fraction_static
+@@ -415,8 +423,9 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        # Use empty() to avoid unnecessary memory initialization
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 

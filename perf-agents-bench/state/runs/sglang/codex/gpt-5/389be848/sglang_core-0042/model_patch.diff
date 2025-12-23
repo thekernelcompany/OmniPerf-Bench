@@ -1,0 +1,149 @@
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 13eb233bd..1aae28b00 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -426,8 +426,7 @@ class UpdateWeightsFromDistributedReqOutput:
+ 
+ @dataclass
+ class UpdateWeightsFromTensorReqInput:
+-    name: str
+-    tensor: torch.Tensor
++    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+ 
+ 
+ @dataclass
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index c8e14a746..c7500f1d2 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -30,7 +30,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_a
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.server_args import ServerArgs
+-from sglang.srt.utils import broadcast_pyobj, set_random_seed
++from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -196,10 +196,19 @@ class TpModelWorker:
+         return success, message
+ 
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+-        success, message = self.model_runner.update_weights_from_tensor(
+-            recv_req.name, recv_req.tensor
++        named_tensors = MultiprocessingSerializer.loads_named_tensors(
++            recv_req.serialized_named_tensors
+         )
+-        return success, message
++        # Support updating one or multiple tensors in a single request
++        last_success, last_message = True, "Success"
++        for name, tensor in named_tensors.items():
++            success, message = self.model_runner.update_weights_from_tensor(
++                name, tensor
++            )
++            if not success:
++                return success, message
++            last_success, last_message = success, message
++        return last_success, last_message
+ 
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+         parameter = self.model_runner.get_weights_by_name(
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 786f654de..453a64ee1 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -404,16 +404,14 @@ class ModelRunner:
+             dtype: the data type of the parameter to be updated.
+             shape: the shape of the parameter to be updated.
+         """
+-        target_dtype = (
+-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+-        )
+-        current_dtype = self.dtype if isinstance(self.dtype, str) else self.dtype
++        target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+ 
+         assert (
+             self._model_update_group is not None
+         ), "model update group must be initialized"
+ 
+         try:
++            # Allocate directly on target device to avoid an extra copy
+             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
+             torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
+             self.model.load_weights([(name, weights)])
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index d95ce5931..a98b1f494 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -875,8 +875,10 @@ class Engine:
+         )
+ 
+     def update_weights_from_tensor(self, name, tensor):
+-        """Update weights from distributed source."""
+-        obj = UpdateWeightsFromTensorReqInput(name=name, tensor=tensor)
++        """Update weights from tensor in current process via fast serialization."""
++        from sglang.srt.utils import MultiprocessingSerializer
++        payload = MultiprocessingSerializer.dumps_named_tensors({name: tensor})
++        obj = UpdateWeightsFromTensorReqInput(serialized_named_tensors=payload)
+         loop = asyncio.get_event_loop()
+         return loop.run_until_complete(
+             tokenizer_manager.update_weights_from_tensor(obj, None)
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 7c3efa9a2..be016b601 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -718,9 +718,8 @@ def broadcast_pyobj(
+         else:
+             serialized_data = pickle.dumps(data)
+             size = len(serialized_data)
+-            tensor_data = torch.ByteTensor(
+-                np.frombuffer(serialized_data, dtype=np.uint8)
+-            )
++            # Avoid intermediate NumPy copy by leveraging buffer protocol
++            tensor_data = torch.frombuffer(memoryview(serialized_data), dtype=torch.uint8).clone()
+             tensor_size = torch.tensor([size], dtype=torch.long)
+ 
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+@@ -737,10 +736,41 @@ def broadcast_pyobj(
+         tensor_data = torch.empty(size, dtype=torch.uint8)
+         dist.broadcast(tensor_data, src=0, group=dist_group)
+ 
+-        serialized_data = bytes(tensor_data.cpu().numpy())
++        # Convert tensor to bytes without routing through NumPy
++        serialized_data = memoryview(tensor_data.cpu()).tobytes()
+         data = pickle.loads(serialized_data)
+         return data
+ 
++class MultiprocessingSerializer:
++    """Fast serializer for cross-process transfer of named tensors.
++
++    This avoids pickling Torch tensors directly across processes and instead
++    serializes a Dict[str, torch.Tensor] to bytes via torch.save/torch.load.
++    Tensors are moved to CPU and made contiguous before serialization to
++    reduce device sync and copy overhead.
++    """
++
++    @staticmethod
++    def dumps_named_tensors(named_tensors: Dict[str, torch.Tensor]) -> bytes:
++        cpu_named: Dict[str, torch.Tensor] = {}
++        for k, v in named_tensors.items():
++            t = v.detach()
++            if t.device.type != "cpu":
++                t = t.to("cpu")
++            if not t.is_contiguous():
++                t = t.contiguous()
++            cpu_named[k] = t
++        buf = BytesIO()
++        torch.save(cpu_named, buf)
++        return buf.getvalue()
++
++    @staticmethod
++    def loads_named_tensors(data: bytes) -> Dict[str, torch.Tensor]:
++        buf = BytesIO(data)
++        named = torch.load(buf)
++        assert isinstance(named, dict), "Deserialized object must be a dict[str, Tensor]"
++        return named
++
+ 
+ step_counter = 0
+ 

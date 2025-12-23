@@ -1,0 +1,157 @@
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index 88f6031f7..42e3bef2a 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -31,6 +31,9 @@ class Req:
+         self.pixel_values = None
+         self.image_size = None
+         self.image_offset = 0
++        # For multimodal padding reapplication (e.g., llava)
++        self.pad_value = None
++        self.needs_pad_recalc = False
+ 
+         self.sampling_params = None
+         self.return_logprob = False
+@@ -58,30 +61,26 @@ class Req:
+     def max_new_tokens(self):
+         return self.sampling_params.max_new_tokens
+ 
+-    def tokenize_fast_forward(self, fast_forward_str, next_state):
++    def fast_forward_and_retokenize(self, fast_forward_str, next_state):
++        """Fast-forward the constrained path and re-tokenize the entire prefix.
++
++        This implementation avoids relying on previous input length accounting,
++        which may be incorrect for multimodal (e.g., llava) where image padding
++        expands input_ids. Instead, compute the delta via encode-length diff.
++        """
+         old_output_str = self.tokenizer.decode(self.output_ids)
+-        # FIXME: This logic does not really solve the problem of determining whether
+-        # there should be a leading space.
+         first_token = self.tokenizer.convert_ids_to_tokens(self.output_ids[0])
+         first_token = (
+             first_token.decode() if isinstance(first_token, bytes) else first_token
+         )
+         if first_token.startswith("▁"):
+             old_output_str = " " + old_output_str
+-        new_input_string = (
+-            self.input_text
+-            + self.output_and_fast_forward_str
+-            + old_output_str
+-            + fast_forward_str
+-        )
++
++        base_str = self.input_text + self.output_and_fast_forward_str + old_output_str
++        prefix_len = len(self.tokenizer.encode(base_str))
++        new_input_string = base_str + fast_forward_str
+         new_input_ids = self.tokenizer.encode(new_input_string)
+-        fast_forward_tokens_len = (
+-            len(new_input_ids) - len(self.input_ids) - len(self.output_ids)
+-        )
+-        # print("=" * 100)
+-        # print(f"Catch fast forward:\n{fast_forward_str}")
+-        # print(self.tokenizer.convert_ids_to_tokens(self.input_ids))
+-        # print(self.tokenizer.convert_ids_to_tokens(new_input_ids))
++        fast_forward_tokens_len = len(new_input_ids) - prefix_len
+ 
+         self.input_ids = new_input_ids
+         self.output_ids = []
+@@ -93,8 +92,9 @@ class Req:
+             self.output_and_fast_forward_str + old_output_str + fast_forward_str
+         )
+ 
+-        # print(f"Output and fast forward str:\n{self.output_and_fast_forward_str}")
+-        # print("*" * 100)
++        # Mark to recompute image padding at the next scheduling step
++        if self.pixel_values is not None:
++            self.needs_pad_recalc = True
+ 
+     def check_finished(self):
+         if self.finished:
+@@ -193,7 +193,8 @@ class Batch:
+         seq_lens = []
+ 
+         req_pool_indices = self.req_to_token_pool.alloc(bs)
+-        req_pool_indices_cpu = req_pool_indices.cpu().numpy()
++        # Avoid numpy conversion overhead here
++        req_pool_indices_cpu = req_pool_indices.cpu().tolist()
+         for i in range(bs):
+             flatten_input_ids.extend(input_ids[i])
+             extend_lens.append(len(input_ids[i]))
+@@ -208,11 +209,12 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
++        # Keep zeros for correctness; kept allocation explicit
+         position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
+ 
+         # Alloc mem
+-        seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+-        extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
++        # Avoid numpy conversions; compute sums directly
++        extend_num_tokens = sum(seq_lens) - sum(prefix_lens)
+         out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+         if out_cache_loc is None:
+             if not self.tree_cache.disable:
+@@ -232,10 +234,17 @@ class Batch:
+             pt += extend_lens[i]
+ 
+         # Handle logit bias
+-        logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
+-        for i in range(bs):
+-            if reqs[i].sampling_params.dtype == "int":
+-                logit_bias[i] = int_token_logit_bias
++        # Optimize logit_bias allocation: broadcast a single zero row when possible
++        need_bias_rows = [i for i, r in enumerate(reqs) if r.sampling_params.dtype == "int"]
++        if len(need_bias_rows) == 0:
++            logit_bias = torch.zeros((1, vocab_size), dtype=torch.float32, device=device)
++        else:
++            logit_bias = torch.zeros((bs, vocab_size), dtype=torch.float32, device=device)
++            if isinstance(int_token_logit_bias, torch.Tensor) and int_token_logit_bias.device != logit_bias.device:
++                bias_row = int_token_logit_bias.to(logit_bias.device)
++            else:
++                bias_row = int_token_logit_bias
++            logit_bias[need_bias_rows] = bias_row
+ 
+         # Set fields
+         self.input_ids = torch.tensor(
+@@ -350,8 +359,8 @@ class Batch:
+                     self.req_to_token_pool.free(req_pool_idx)
+                     self.tree_cache.dec_ref_counter(req.last_node)
+ 
+-                    # fast forward
+-                    req.tokenize_fast_forward(fast_forward_str, next_state)
++                    # fast forward with robust re-tokenization
++                    req.fast_forward_and_retokenize(fast_forward_str, next_state)
+ 
+                     fast_forward_reqs.append(req)
+                     filter_indices.remove(i)
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 8b7adf944..472ea8704 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -243,6 +243,8 @@ class ModelRpcServer(rpyc.Service):
+             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
+                 req.input_ids, pad_value, req.pixel_values.shape, req.image_size
+             )
++            # Save for future fast-forward re-padding
++            req.pad_value = pad_value
+         req.sampling_params = recv_req.sampling_params
+         req.return_logprob = recv_req.return_logprob
+         req.logprob_start_len = recv_req.logprob_start_len
+@@ -274,6 +276,16 @@ class ModelRpcServer(rpyc.Service):
+             return None
+ 
+         for req in self.forward_queue:
++            # If a multimodal request was retokenized via fast-forward, re-apply padding
++            if (
++                req.pixel_values is not None
++                and getattr(req, "needs_pad_recalc", False)
++                and getattr(req, "pad_value", None) is not None
++            ):
++                req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
++                    req.input_ids, req.pad_value, req.pixel_values.shape, req.image_size
++                )
++                req.needs_pad_recalc = False
+             prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
+             if req.return_logprob:
+                 prefix_indices = prefix_indices[: req.logprob_start_len]
