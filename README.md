@@ -690,6 +690,31 @@ python -m bench.cli prepare \
            parallel_tool_calls: true
    ```
 
+4. **Configure TRAE for AWS Bedrock (Claude 4.5):**
+   
+   If you want the TRAE agent to call Claude 4.5 through AWS Bedrock, update the same file to reference the Bedrock provider. Ensure your AWS CLI credentials (keys or SSO) are already configured.
+   ```yaml
+   model_providers:
+       bedrock:
+           provider: bedrock
+           aws_region: ${AWS_REGION:-us-east-1}
+           aws_profile: ${AWS_PROFILE:-}
+       anthropic:
+           provider: anthropic
+           api_key: ${ANTHROPIC_API_KEY:-}
+   
+   models:
+       trae_agent_model:
+           model_provider: bedrock
+           model: us.anthropic.claude-sonnet-4-20250514-v1:0  # Claude 4.5 access via Bedrock
+           max_tokens: 4096
+           temperature: 0.5
+           top_p: 1
+           top_k: 0
+           parallel_tool_calls: true
+   ```
+   Then export your AWS variables (or run `aws sso login`) alongside `TRAE_PYTHON`/`TRAE_CONFIG` before invoking `bench.cli prepare`.
+
 4. **Update bench.yaml paths:**
    
    Edit `perf-agents-bench/bench.yaml`:
