@@ -730,7 +730,13 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             def _watch_first_edit():
                 while not stop_watch.is_set():
                     try:
-                        commits = subprocess.check_output(["git", "log", "--oneline", f"{pre}..HEAD"], cwd=wt_dir, text=True).strip()
+                        commits = subprocess.check_output(
+                            ["git", "log", "--oneline", f"{pre}..HEAD"],
+                            cwd=wt_dir,
+                            text=True,
+                            timeout=5,
+                            stderr=subprocess.DEVNULL
+                        ).strip()
                         if commits and first_edit_time_holder.get("val") is None:
                             first_edit_time_holder["val"] = time.time() - t0
                             break
@@ -1086,11 +1092,36 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     except Exception:
                         logger.warning("Failed to write agent logs")
 
+                    # Check if agent exceeded 120 steps and should be skipped
+                    exceeded_step_limit = False
+                    if default_agent in {"trae", "codex", "claude_code"}:
+                        trajectory_path = jw.dir / "trajectory.json"
+                        if trajectory_path.exists():
+                            try:
+                                trajectory_data = json.loads(trajectory_path.read_text())
+                                # Count steps in trajectory
+                                steps = trajectory_data.get("steps", [])
+                                step_count = len(steps)
+
+                                # Check for exceeded max steps message
+                                final_result = trajectory_data.get("final_result", "")
+                                if step_count > 120 or "exceeded maximum steps" in final_result.lower():
+                                    logger.warning(f"{agent_label} agent exceeded 120 step limit (actual: {step_count} steps)")
+                                    logger.warning("Marking as complete to allow pipeline to proceed to next commit")
+                                    exceeded_step_limit = True
+                            except Exception as e:
+                                logger.debug(f"Could not check trajectory steps: {e}")
+
                     # Determine success based on task completion, not just return code
                     # Agents may have internal API errors but still complete the task successfully
                     task_completed = False
                     if returncode == 0:
                         task_completed = True
+                    elif exceeded_step_limit:
+                        # Agent exceeded step limit - treat as completed so pipeline can continue
+                        task_completed = True
+                        returncode = 0  # Override return code
+                        logger.info(f"{agent_label} agent exceeded step limit but treating as complete to continue pipeline")
                     else:
                         # Check if agent made commits despite API errors
                         try:
@@ -1102,77 +1133,94 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                                 task_completed = True
                         except Exception:
                             pass
-                    
-                    if not task_completed:
+
+                    if not task_completed and not exceeded_step_limit:
                         logger.error(f"{agent_label} agent failed with return code {returncode}")
                         logger.error(f"Stdout: {stdout_content}")
                         logger.error(f"Stderr: {stderr_content}")
                 
                 # Determine status based on actual task completion, not just return code
-                if default_agent in {"trae", "codex", "claude_code"}:
+                if exceeded_step_limit:
+                    # Special status for exceeded step limit - mark as error to skip in analysis
+                    # but still create journal so pipeline continues
+                    status = "max_steps_exceeded"
+                    logger.info(f"Task status: {status} (exceeded 120 step limit)")
+                elif default_agent in {"trae", "codex", "claude_code"}:
                     # For Trae/Codex/Claude Code, check if commits were made or files changed
                     status = "success" if task_completed else "error"
                 else:
                     # For OpenHands, use return code
                     status = "success" if returncode == 0 else "error"
                 logger.info(f"Task status determined as: {status}")
-                
-                # Enforce targets
-                logger.info("Analyzing file changes made by agent")
-                changed: list[str] = []
-                if default_agent == "openhands":
-                    changed = get_changed_files(wt_dir, pre, "HEAD")
+
+                # Skip file change analysis for commits that exceeded step limit
+                # to avoid git operations that may fail in detached worktrees
+                if exceeded_step_limit:
+                    logger.info("Skipping file change analysis for commit that exceeded step limit")
+                    changed: list[str] = []
+                    targets = set(target_files)
+                    disallowed: list[str] = []
+                    ok = True
                 else:
-                    # For Trae/Codex, get changed files from git commit in worktree
-                    try:
-                        # Get files changed in the latest commit made by agent
-                        changed = subprocess.check_output([
-                            "git", "diff", "--name-only", pre, "HEAD"
-                        ], cwd=wt_dir, text=True).strip().splitlines()
-                        changed = [f for f in changed if f.strip()]  # Filter empty lines
-                        logger.debug(f"Git diff detected {len(changed)} changed files")
-                    except Exception as e:
-                        logger.warning(f"Failed to get changed files from git: {e}")
-                        # Fallback: try to derive from patch file in worktree
-                        patch_path_wt = wt_dir / "model_patch.diff"
-                        patch_path_run = jw.dir / "model_patch.diff"
-                        
-                        # First check worktree patch
-                        if patch_path_wt.exists():
-                            try:
-                                for line in patch_path_wt.read_text().splitlines():
-                                    if line.startswith("diff --git a/"):
-                                        parts = line.split()
-                                        if len(parts) >= 4:
-                                            b_path = parts[3]
-                                            if b_path.startswith("b/"):
-                                                rel = b_path[2:]
-                                                if rel and rel not in changed:
-                                                    changed.append(rel)
-                                logger.debug(f"Worktree patch detected {len(changed)} changed files")
-                            except Exception as e2:
-                                logger.warning(f"Failed to parse worktree patch: {e2}")
-                        
-                        # Then check run directory patch as fallback
-                        if not changed and patch_path_run.exists():
-                            try:
-                                for line in patch_path_run.read_text().splitlines():
-                                    if line.startswith("diff --git a/"):
-                                        parts = line.split()
-                                        if len(parts) >= 4:
-                                            b_path = parts[3]
-                                            if b_path.startswith("b/"):
-                                                rel = b_path[2:]
-                                                if rel and rel not in changed:
-                                                    changed.append(rel)
-                                logger.debug(f"Run directory patch detected {len(changed)} changed files")
-                            except Exception as e3:
-                                logger.warning(f"Failed to parse run directory patch: {e3}")
-                # Exclude hidden scratch directory changes from enforcement
-                changed = [p for p in changed if not (p.startswith(f"{scratch_rel_dir}/") or p == scratch_rel_dir)]
-                targets = set(target_files)
-                disallowed = [p for p in changed if p not in targets]
-                ok = len(disallowed) == 0
+                    # Enforce targets
+                    logger.info("Analyzing file changes made by agent")
+                    changed: list[str] = []
+                    if default_agent == "openhands":
+                        changed = get_changed_files(wt_dir, pre, "HEAD")
+                    else:
+                        # For Trae/Codex, get changed files from git commit in worktree
+                        try:
+                            # Get files changed in the latest commit made by agent
+                            changed = subprocess.check_output([
+                                "git", "diff", "--name-only", pre, "HEAD"
+                            ], cwd=wt_dir, text=True, timeout=30).strip().splitlines()
+                            changed = [f for f in changed if f.strip()]  # Filter empty lines
+                            logger.debug(f"Git diff detected {len(changed)} changed files")
+                        except subprocess.TimeoutExpired:
+                            logger.warning(f"Git diff timed out after 30s, using patch file fallback")
+                            changed = []
+                        except Exception as e:
+                            logger.warning(f"Failed to get changed files from git: {e}")
+                            # Fallback: try to derive from patch file in worktree
+                            patch_path_wt = wt_dir / "model_patch.diff"
+                            patch_path_run = jw.dir / "model_patch.diff"
+
+                            # First check worktree patch
+                            if patch_path_wt.exists():
+                                try:
+                                    for line in patch_path_wt.read_text().splitlines():
+                                        if line.startswith("diff --git a/"):
+                                            parts = line.split()
+                                            if len(parts) >= 4:
+                                                b_path = parts[3]
+                                                if b_path.startswith("b/"):
+                                                    rel = b_path[2:]
+                                                    if rel and rel not in changed:
+                                                        changed.append(rel)
+                                    logger.debug(f"Worktree patch detected {len(changed)} changed files")
+                                except Exception as e2:
+                                    logger.warning(f"Failed to parse worktree patch: {e2}")
+
+                            # Then check run directory patch as fallback
+                            if not changed and patch_path_run.exists():
+                                try:
+                                    for line in patch_path_run.read_text().splitlines():
+                                        if line.startswith("diff --git a/"):
+                                            parts = line.split()
+                                            if len(parts) >= 4:
+                                                b_path = parts[3]
+                                                if b_path.startswith("b/"):
+                                                    rel = b_path[2:]
+                                                    if rel and rel not in changed:
+                                                        changed.append(rel)
+                                    logger.debug(f"Run directory patch detected {len(changed)} changed files")
+                                except Exception as e3:
+                                    logger.warning(f"Failed to parse run directory patch: {e3}")
+                    # Exclude hidden scratch directory changes from enforcement
+                    changed = [p for p in changed if not (p.startswith(f"{scratch_rel_dir}/") or p == scratch_rel_dir)]
+                    targets = set(target_files)
+                    disallowed = [p for p in changed if p not in targets]
+                    ok = len(disallowed) == 0
                 
                 logger.info(f"Files changed by agent: {len(changed)}")
                 for file in changed:
@@ -1193,19 +1241,24 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 jw.write_diff_targets({"changed": changed, "allowed": list(targets), "disallowed": disallowed, "ok": ok})
                 if len(changed) == 0:
                     logger.warning("No file changes detected.")
+                    # Skip commit check for exceeded step limit to avoid hanging git operations
+                    if exceeded_step_limit:
+                        logger.info("Skipping commit check for exceeded step limit commit")
                     # For Trae/Codex/Claude Code agent, check if this is due to detection bug vs actual no changes
-                    if default_agent in {"trae", "codex", "claude_code"}:
+                    elif default_agent in {"trae", "codex", "claude_code"}:
                         # Check if there are any commits made by agent
                         try:
                             commits = subprocess.check_output([
                                 "git", "log", "--oneline", f"{pre}..HEAD"
-                            ], cwd=wt_dir, text=True).strip()
+                            ], cwd=wt_dir, text=True, timeout=10).strip()
                             if commits:
                                 logger.warning(f"Agent made {len(commits.splitlines())} commits but file detection failed. This may be a detection bug.")
                                 # Don't mark as error if commits exist - likely a detection issue
                             else:
                                 logger.warning("No commits found. Agent likely made no changes. Marking as error to avoid analysis loops.")
                                 status = "error"
+                        except subprocess.TimeoutExpired:
+                            logger.warning("Git log timed out checking commits. Skipping check.")
                         except Exception:
                             logger.warning("Could not check git commits. Marking task as error to avoid analysis loops.")
                             status = "error"
@@ -1291,25 +1344,39 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 except Exception as _e:
                     logger.warning(f"Failed to write prediction artifacts: {_e}")
                 logger.info(f"Writing journal with final status: {status}")
-                # Compute metrics
-                try:
-                    # commit count
-                    _commits_txt = subprocess.check_output(["git", "log", "--oneline", f"{pre}..HEAD"], cwd=wt_dir, text=True).strip()
-                    commit_count = len([ln for ln in _commits_txt.splitlines() if ln.strip()])
-                except Exception:
+                # Compute metrics (skip git operations if exceeded step limit to avoid hangs)
+                if exceeded_step_limit:
+                    logger.info("Skipping git metrics computation for exceeded step limit commit")
                     commit_count = None
-                # patch size (added+removed lines)
-                def _patch_size_loc(txt: str) -> int:
-                    add = sum(1 for l in txt.splitlines() if l.startswith("+") and not l.startswith("+++"))
-                    rem = sum(1 for l in txt.splitlines() if l.startswith("-") and not l.startswith("---"))
-                    return add + rem
-                diff_for_metrics = diff_text
-                if not diff_for_metrics:
+                    patch_size = None
+                else:
                     try:
-                        diff_for_metrics = subprocess.check_output(["git", "diff", pre, "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"], cwd=wt_dir).decode()
+                        # commit count
+                        _commits_txt = subprocess.check_output(
+                            ["git", "log", "--oneline", f"{pre}..HEAD"],
+                            cwd=wt_dir,
+                            text=True,
+                            timeout=10
+                        ).strip()
+                        commit_count = len([ln for ln in _commits_txt.splitlines() if ln.strip()])
                     except Exception:
-                        diff_for_metrics = ""
-                patch_size = _patch_size_loc(diff_for_metrics) if diff_for_metrics else None
+                        commit_count = None
+                    # patch size (added+removed lines)
+                    def _patch_size_loc(txt: str) -> int:
+                        add = sum(1 for l in txt.splitlines() if l.startswith("+") and not l.startswith("+++"))
+                        rem = sum(1 for l in txt.splitlines() if l.startswith("-") and not l.startswith("---"))
+                        return add + rem
+                    diff_for_metrics = diff_text
+                    if not diff_for_metrics:
+                        try:
+                            diff_for_metrics = subprocess.check_output(
+                                ["git", "diff", pre, "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"],
+                                cwd=wt_dir,
+                                timeout=10
+                            ).decode()
+                        except Exception:
+                            diff_for_metrics = ""
+                    patch_size = _patch_size_loc(diff_for_metrics) if diff_for_metrics else None
 
                 metrics_payload = {
                     "time_to_first_edit_s": first_edit_time_holder.get("val"),
