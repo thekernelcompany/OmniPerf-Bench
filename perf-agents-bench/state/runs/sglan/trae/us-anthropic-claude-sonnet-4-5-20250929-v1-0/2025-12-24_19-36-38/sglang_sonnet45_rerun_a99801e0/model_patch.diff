@@ -1,0 +1,66 @@
+diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
+index 7dd488e..5d08b23 100644
+--- a/python/sglang/srt/mem_cache/allocator.py
++++ b/python/sglang/srt/mem_cache/allocator.py
+@@ -175,7 +175,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+             device,
+             kvcache.swa_kv_pool,
+         )
+-        self.full_to_swa_index_mapping = torch.empty(
++        self.full_to_swa_index_mapping = torch.zeros(
+             size + size_swa + 1,
+             dtype=torch.int64,
+             device=device,
+@@ -411,6 +411,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+         self.num_pages = size // page_size
+         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
++        # Cache page offset tensor to avoid recreating it in alloc()
++        self._page_offsets = torch.arange(self.page_size, device=self.device)
+         self.clear()
+ 
+     def alloc(self, need_size: int):
+@@ -429,7 +431,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+ 
+         out_indices = (
+             out_pages[:, None] * self.page_size
+-            + torch.arange(self.page_size, device=self.device)
++            + self._page_offsets
+         ).reshape(-1)
+ 
+         return out_indices
+@@ -541,6 +543,7 @@ def alloc_extend_kernel_ascend(
+     out_indices,
+     page_size,
+     device,
++    pos_in_page=None,
+ ):
+     extend_lens = seq_lens - prefix_lens
+     end_pos = torch.cumsum(extend_lens, 0)
+@@ -554,7 +557,8 @@ def alloc_extend_kernel_ascend(
+     need_page = num_new_pages - num_full_new_pages
+     end_new_pages = torch.cumsum(num_new_pages, 0)
+     start_new_pages = end_new_pages - num_new_pages
+-    pos_in_page = torch.arange(page_size, device=device, dtype=torch.int32)
++    if pos_in_page is None:
++        pos_in_page = torch.arange(page_size, device=device, dtype=torch.int32)
+     for i in range(len(prefix_lens)):
+         num1 = (
+             min(
+@@ -620,6 +624,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+     ):
+         super().__init__(size, page_size, dtype, device, kvcache)
+         self.ret_values = torch.empty((), dtype=torch.int32, device=self.device)
++        # Cache int32 version of page offsets for Ascend
++        self._page_offsets_int32 = self._page_offsets.to(torch.int32)
+ 
+     def alloc_extend(
+         self,
+@@ -646,6 +652,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+             out_indices,
+             self.page_size,
+             self.device,
++            self._page_offsets_int32,
+         )
+ 
+         if self.debug_mode:

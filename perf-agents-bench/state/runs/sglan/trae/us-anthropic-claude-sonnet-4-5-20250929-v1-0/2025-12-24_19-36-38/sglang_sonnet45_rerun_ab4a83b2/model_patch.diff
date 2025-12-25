@@ -1,0 +1,113 @@
+diff --git a/python/sglang/srt/managers/policy_scheduler.py b/python/sglang/srt/managers/policy_scheduler.py
+index 04169e8..696c909 100644
+--- a/python/sglang/srt/managers/policy_scheduler.py
++++ b/python/sglang/srt/managers/policy_scheduler.py
+@@ -64,31 +64,34 @@ class PolicyScheduler:
+         elif self.policy == "random":
+             random.shuffle(waiting_queue)
+         elif self.policy == "dfs-weight":
+-            last_node_to_reqs = defaultdict(list)
++            # Optimize: Use dict comprehension with setdefault for better performance
++            last_node_to_reqs = {}
+             for req in waiting_queue:
+-                last_node_to_reqs[req.last_node].append(req)
++                last_node_to_reqs.setdefault(req.last_node, []).append(req)
+ 
+-            node_to_weight = defaultdict(int)
+-            for node in last_node_to_reqs:
+-                node_to_weight[node] = len(last_node_to_reqs[node])
++            # Optimize: Direct dict comprehension instead of defaultdict + loop
++            node_to_weight = {node: len(reqs) for node, reqs in last_node_to_reqs.items()}
+             self.calc_weight(self.tree_cache.root_node, node_to_weight)
+ 
+-            waiting_queue.clear()
++            # Optimize: Use list comprehension instead of clear() + extend()
++            new_queue = []
+             self.get_dfs_priority(
+                 self.tree_cache.root_node,
+                 node_to_weight,
+                 last_node_to_reqs,
+-                waiting_queue,
++                new_queue,
+             )
++            waiting_queue[:] = new_queue
+         else:
+             raise ValueError(f"Unknown schedule_policy: {self.policy}")
+ 
+         return prefix_computed
+ 
+     def calc_weight(self, cur_node: TreeNode, node_to_weight: Dict):
++        # Optimize: Use get() with default 0 to avoid KeyError and improve performance
+         for child in cur_node.children.values():
+             self.calc_weight(child, node_to_weight)
+-            node_to_weight[cur_node] += node_to_weight[child]
++            node_to_weight[cur_node] = node_to_weight.get(cur_node, 0) + node_to_weight.get(child, 0)
+ 
+     def get_dfs_priority(
+         self,
+@@ -97,11 +100,12 @@ class PolicyScheduler:
+         last_node_to_reqs: Dict,
+         q: List,
+     ):
+-        childs = [child for child in cur_node.children.values()]
+-        childs.sort(key=lambda x: -node_to_priority[x])
++        # Optimize: Use sorted() directly instead of list + sort for better performance
++        childs = sorted(cur_node.children.values(), key=lambda x: -node_to_priority.get(x, 0))
+         for child in childs:
+             self.get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
+-        q.extend(last_node_to_reqs[cur_node])
++        # Optimize: Use get() with default empty list to avoid KeyError
++        q.extend(last_node_to_reqs.get(cur_node, []))
+ 
+ 
+ class PrefillAdder:
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 8fc03b8..f0c4f81 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -487,7 +487,9 @@ class ModelTpServer:
+             self.token_to_kv_pool,
+             self.tree_cache,
+         )
+-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_list]
++        # Optimize: Use set for O(1) lookup instead of O(n) for each item
++        can_run_set = set(can_run_list)
++        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+         return new_batch
+ 
+     def forward_prefill_batch(self, batch: ScheduleBatch):
+@@ -532,11 +534,11 @@ class ModelTpServer:
+                 next_token_ids = next_token_ids.tolist()
+             else:
+                 if self.tokenizer is None:
+-                    next_token_ids = []
+-                    for req in batch.reqs:
+-                        next_token_ids.append(
+-                            next(iter(req.sampling_params.stop_token_ids))
+-                        )
++                    # Optimize: Use list comprehension instead of loop with append
++                    next_token_ids = [
++                        next(iter(req.sampling_params.stop_token_ids))
++                        for req in batch.reqs
++                    ]
+                 else:
+                     next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
+ 
+@@ -844,15 +846,8 @@ class ModelTpServer:
+         return if_success
+ 
+     def abort_request(self, recv_req):
+-        # Delete requests in the waiting queue
+-        to_del = None
+-        for i, req in enumerate(self.waiting_queue):
+-            if req.rid == recv_req.rid:
+-                to_del = i
+-                break
+-
+-        if to_del is not None:
+-            del self.waiting_queue[to_del]
++        # Optimize: Use list comprehension to filter out request instead of del
++        self.waiting_queue = [req for req in self.waiting_queue if req.rid != recv_req.rid]
+ 
+         # Delete requests in the running batch
+         if self.running_batch:

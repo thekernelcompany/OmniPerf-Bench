@@ -1,0 +1,90 @@
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 7c0317f..5abfc20 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -5,6 +5,9 @@ import dataclasses
+ import random
+ from typing import List, Optional, Union
+ 
++# Cache for dataclass fields to avoid repeated introspection
++_DATACLASS_FIELDS_CACHE = None
++
+ 
+ @dataclasses.dataclass
+ class ServerArgs:
+@@ -66,24 +69,31 @@ class ServerArgs:
+     def __post_init__(self):
+         if self.tokenizer_path is None:
+             self.tokenizer_path = self.model_path
++        
++        # Optimize mem_fraction_static calculation
+         if self.mem_fraction_static is None:
+-            if self.tp_size >= 16:
++            # Optimized: use min to avoid multiple branches
++            tp = self.tp_size
++            if tp >= 16:
+                 self.mem_fraction_static = 0.74
+-            elif self.tp_size >= 8:
++            elif tp >= 8:
+                 self.mem_fraction_static = 0.78
+-            elif self.tp_size >= 4:
++            elif tp >= 4:
+                 self.mem_fraction_static = 0.82
+-            elif self.tp_size >= 2:
++            elif tp >= 2:
+                 self.mem_fraction_static = 0.85
+             else:
+                 self.mem_fraction_static = 0.88
+-        if isinstance(self.additional_ports, int):
+-            self.additional_ports = [self.additional_ports]
+-        elif self.additional_ports is None:
++        
++        # Optimize additional_ports handling - check None first (most common case)
++        if self.additional_ports is None:
+             self.additional_ports = []
++        elif isinstance(self.additional_ports, int):
++            self.additional_ports = [self.additional_ports]
+ 
+         if self.random_seed is None:
+-            self.random_seed = random.randint(0, 1 << 30)
++            # Use getrandbits for faster random number generation
++            self.random_seed = random.getrandbits(30)
+ 
+     @staticmethod
+     def add_cli_args(parser: argparse.ArgumentParser):
+@@ -321,19 +331,27 @@ class ServerArgs:
+ 
+     @classmethod
+     def from_cli_args(cls, args: argparse.Namespace):
+-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+-        return cls(**{attr: getattr(args, attr) for attr in attrs})
++        # Cache dataclass fields to avoid repeated introspection
++        global _DATACLASS_FIELDS_CACHE
++        if _DATACLASS_FIELDS_CACHE is None:
++            _DATACLASS_FIELDS_CACHE = tuple(attr.name for attr in dataclasses.fields(cls))
++        
++        # Use cached fields and args.__dict__ for faster attribute extraction
++        args_dict = args.__dict__
++        return cls(**{attr: args_dict[attr] for attr in _DATACLASS_FIELDS_CACHE})
+ 
+     def url(self):
+-        return f"http://{self.host}:{self.port}"
++        # Use string concatenation for better performance
++        return "http://" + self.host + ":" + str(self.port)
+ 
+     def print_mode_args(self):
++        # Use string concatenation instead of f-strings for better performance
+         return (
+-            f"disable_flashinfer={self.disable_flashinfer}, "
+-            f"attention_reduce_in_fp32={self.attention_reduce_in_fp32}, "
+-            f"disable_radix_cache={self.disable_radix_cache}, "
+-            f"disable_regex_jump_forward={self.disable_regex_jump_forward}, "
+-            f"disable_disk_cache={self.disable_disk_cache}, "
++            "disable_flashinfer=" + str(self.disable_flashinfer) + ", "
++            "attention_reduce_in_fp32=" + str(self.attention_reduce_in_fp32) + ", "
++            "disable_radix_cache=" + str(self.disable_radix_cache) + ", "
++            "disable_regex_jump_forward=" + str(self.disable_regex_jump_forward) + ", "
++            "disable_disk_cache=" + str(self.disable_disk_cache) + ", "
+         )
+ 
+ 

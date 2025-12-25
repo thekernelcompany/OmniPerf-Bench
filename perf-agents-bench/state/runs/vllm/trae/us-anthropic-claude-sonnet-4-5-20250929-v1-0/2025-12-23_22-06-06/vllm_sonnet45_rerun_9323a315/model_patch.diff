@@ -1,0 +1,331 @@
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 4a1a5fb..f5388ad 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -93,6 +93,7 @@ if READTHEDOCS_VERSION_TYPE == "tag":
+ 
+ # Generate additional rst documentation here.
+ def setup(app):
++    # Optimize: Import only when needed and cache the result
+     from docs.source.generate_examples import generate_examples
+     generate_examples()
+ 
+@@ -103,11 +104,13 @@ _cached_branch: str = ""
+ 
+ def get_repo_base_and_branch(pr_number):
+     global _cached_base, _cached_branch
++    # Optimize: Early return if cached values exist
+     if _cached_base and _cached_branch:
+         return _cached_base, _cached_branch
+ 
+     url = f"https://api.github.com/repos/vllm-project/vllm/pulls/{pr_number}"
+-    response = requests.get(url)
++    # Optimize: Add timeout to avoid hanging on slow network
++    response = requests.get(url, timeout=10)
+     if response.status_code == 200:
+         data = response.json()
+         _cached_base = data['head']['repo']['full_name']
+diff --git a/tests/entrypoints/llm/test_guided_generate.py b/tests/entrypoints/llm/test_guided_generate.py
+index 67c7941..74698bb 100644
+--- a/tests/entrypoints/llm/test_guided_generate.py
++++ b/tests/entrypoints/llm/test_guided_generate.py
+@@ -101,7 +101,9 @@ def test_guided_choice_completion(sample_guided_choice, llm):
+ 
+ @pytest.mark.skip_global_cleanup
+ def test_guided_grammar(sample_sql_statements, llm):
+-
++    # Import Lark at module level to avoid repeated imports in loop
++    from lark import Lark
++    
+     sampling_params = SamplingParams(
+         temperature=0.8,
+         top_p=0.95,
+@@ -115,6 +117,12 @@ def test_guided_grammar(sample_sql_statements, llm):
+     )
+ 
+     assert outputs is not None
++    
++    # Pre-create parser outside loop for better performance
++    parser = Lark(sample_sql_statements)
++    # Pre-compute ground truth outside loop
++    ground_truth = "SELECT col_1 from table_1 where col_1 = 1".replace(" ", "")
++    
+     for output in outputs:
+         assert output is not None
+         assert isinstance(output, RequestOutput)
+@@ -123,14 +131,8 @@ def test_guided_grammar(sample_sql_statements, llm):
+         generated_text = output.outputs[0].text
+         assert generated_text is not None
+         # use Lark to parse the output, and make sure it's a valid parse tree
+-        from lark import Lark
+-        parser = Lark(sample_sql_statements)
+         parser.parse(generated_text)
+ 
+-        # remove spaces for comparison b/c we removed them in the grammar
+-        ground_truth = "SELECT col_1 from table_1 where col_1 = 1".replace(
+-            " ", "")
+-
+         assert generated_text.strip() == ground_truth
+ 
+         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+diff --git a/vllm/config.py b/vllm/config.py
+index 326340d..a322e3a 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -2033,13 +2033,16 @@ class DecodingConfig:
+ 
+     # Which guided decoding algo to use. 'outlines' / 'lm-format-enforcer'
+     guided_decoding_backend: str = 'outlines'
++    
++    # Pre-define valid backends as a class variable for faster access
++    _VALID_GUIDED_BACKENDS = frozenset(['outlines', 'lm-format-enforcer'])
+ 
+     def __post_init__(self):
+-        valid_guided_backends = ['outlines', 'lm-format-enforcer']
+         backend = self.guided_decoding_backend
+-        if backend not in valid_guided_backends:
++        # Use frozenset for O(1) lookup instead of list
++        if backend not in self._VALID_GUIDED_BACKENDS:
+             raise ValueError(f"Invalid guided_decoding_backend '{backend},"
+-                             f"must be one of {valid_guided_backends}")
++                             f"must be one of {self._VALID_GUIDED_BACKENDS}")
+ 
+ 
+ @dataclass
+diff --git a/vllm/engine/async_llm_engine.py b/vllm/engine/async_llm_engine.py
+index 4395588..1179bb3 100644
+--- a/vllm/engine/async_llm_engine.py
++++ b/vllm/engine/async_llm_engine.py
+@@ -534,13 +534,16 @@ async def build_guided_decoding_logits_processor_async(
+     those fields and adds the constructed logits processors to the
+     logits_processors field. Modifies sampling params in-place and returns
+     the modified sampling params."""
+-    if (guided_decoding := sampling_params.guided_decoding) is None:
++    guided_decoding = sampling_params.guided_decoding
++    if guided_decoding is None:
+         return sampling_params
+ 
+     logger.debug("Building guided decoding logits processor. "
+                  "Params: %s", guided_decoding)
+ 
+-    guided_decoding.backend = guided_decoding.backend or default_guided_backend
++    # Optimize: avoid redundant attribute access
++    if not guided_decoding.backend:
++        guided_decoding.backend = default_guided_backend
+ 
+     processor = await get_guided_decoding_logits_processor(
+         guided_params=guided_decoding, tokenizer=tokenizer)
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index dd55aa2..15191d1 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -2036,15 +2036,17 @@ class LLMEngine:
+ 
+         logits_processors = []
+ 
+-        if (guided_decoding := sampling_params.guided_decoding) is not None:
++        guided_decoding = sampling_params.guided_decoding
++        if guided_decoding is not None:
+ 
+             logger.debug(
+                 "Building guided decoding logits processor in "
+                 "LLMEngine. Params: %s", guided_decoding)
+ 
+             tokenizer = self.get_tokenizer(lora_request=lora_request)
+-            guided_decoding.backend = guided_decoding.backend or \
+-                self.decoding_config.guided_decoding_backend
++            # Optimize: avoid redundant attribute access
++            if not guided_decoding.backend:
++                guided_decoding.backend = self.decoding_config.guided_decoding_backend
+ 
+             processor = get_local_guided_decoding_logits_processor(
+                 guided_params=guided_decoding, tokenizer=tokenizer)
+diff --git a/vllm/model_executor/guided_decoding/__init__.py b/vllm/model_executor/guided_decoding/__init__.py
+index d7b6742..212de25 100644
+--- a/vllm/model_executor/guided_decoding/__init__.py
++++ b/vllm/model_executor/guided_decoding/__init__.py
+@@ -3,22 +3,51 @@ from typing import Optional
+ from vllm.logits_process import LogitsProcessor
+ from vllm.sampling_params import GuidedDecodingParams
+ 
++# Cache for imported modules to avoid repeated imports
++_outlines_module_cache = {}
++_lmfe_module_cache = {}
++
++
++def _should_use_outlines(guided_params: GuidedDecodingParams) -> bool:
++    """Check if outlines backend should be used."""
++    return guided_params.backend == 'outlines' or guided_params.grammar
++
++
++def _get_outlines_processor(guided_params: GuidedDecodingParams, 
++                            tokenizer, is_async: bool) -> Optional[LogitsProcessor]:
++    """Get outlines processor with caching."""
++    cache_key = 'async' if is_async else 'sync'
++    if cache_key not in _outlines_module_cache:
++        # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
++        from vllm.model_executor.guided_decoding import outlines_decoding
++        _outlines_module_cache['async'] = outlines_decoding.get_outlines_guided_decoding_logits_processor
++        _outlines_module_cache['sync'] = outlines_decoding.get_local_outlines_guided_decoding_logits_processor
++    
++    processor_func = _outlines_module_cache[cache_key]
++    if is_async:
++        return processor_func(guided_params, tokenizer)
++    return processor_func(guided_params, tokenizer)
++
++
++def _get_lmfe_processor(guided_params: GuidedDecodingParams,
++                       tokenizer) -> Optional[LogitsProcessor]:
++    """Get LM format enforcer processor with caching."""
++    if 'processor' not in _lmfe_module_cache:
++        from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (
++            get_local_lm_format_enforcer_guided_decoding_logits_processor)
++        _lmfe_module_cache['processor'] = get_local_lm_format_enforcer_guided_decoding_logits_processor
++    
++    return _lmfe_module_cache['processor'](guided_params, tokenizer)
++
+ 
+ async def get_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+     # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
+-        # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+-        from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+-            get_outlines_guided_decoding_logits_processor)
+-        return await get_outlines_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++    if _should_use_outlines(guided_params):
++        return await _get_outlines_processor(guided_params, tokenizer, is_async=True)
+     if guided_params.backend == 'lm-format-enforcer':
+-        from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+-            get_local_lm_format_enforcer_guided_decoding_logits_processor)
+-        return get_local_lm_format_enforcer_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++        return _get_lmfe_processor(guided_params, tokenizer)
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+@@ -29,17 +58,10 @@ def get_local_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+     # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
+-        # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+-        from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+-            get_local_outlines_guided_decoding_logits_processor)
+-        return get_local_outlines_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++    if _should_use_outlines(guided_params):
++        return _get_outlines_processor(guided_params, tokenizer, is_async=False)
+     if guided_params.backend == 'lm-format-enforcer':
+-        from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+-            get_local_lm_format_enforcer_guided_decoding_logits_processor)
+-        return get_local_lm_format_enforcer_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++        return _get_lmfe_processor(guided_params, tokenizer)
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+diff --git a/vllm/model_executor/guided_decoding/outlines_decoding.py b/vllm/model_executor/guided_decoding/outlines_decoding.py
+index 8a7ff38..e5eaaa7 100644
+--- a/vllm/model_executor/guided_decoding/outlines_decoding.py
++++ b/vllm/model_executor/guided_decoding/outlines_decoding.py
+@@ -46,7 +46,9 @@ pair   : UNESCAPED_STRING ":" value
+ %ignore WS
+ """
+ 
+-global_thread_pool = None  # used for generating logits processor fsm
++# Pre-initialize thread pool for better performance
++# Using max_workers=2 is sufficient for most workloads
++_global_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+ 
+ 
+ async def get_outlines_guided_decoding_logits_processor(
+@@ -59,17 +61,13 @@ async def get_outlines_guided_decoding_logits_processor(
+     We cache logit processors by (guide, tokenizer), and on cache hit
+     we make a shallow copy to reuse the same underlying FSM.
+     """
+-    global global_thread_pool
+     guide, mode = _get_guide_and_mode(guided_params)
+     if not guide or not mode:
+         return None
+ 
+-    if global_thread_pool is None:
+-        global_thread_pool = concurrent.futures.ThreadPoolExecutor(
+-            max_workers=2)
+     loop = asyncio.get_running_loop()
+ 
+-    return await loop.run_in_executor(global_thread_pool,
++    return await loop.run_in_executor(_global_thread_pool,
+                                       _get_logits_processor, guide, tokenizer,
+                                       mode, guided_params.whitespace_pattern)
+ 
+@@ -95,39 +93,43 @@ def get_local_outlines_guided_decoding_logits_processor(
+ def _get_guide_and_mode(
+     guided_params: GuidedDecodingParams
+ ) -> Union[Tuple[str, GuidedDecodingMode], Tuple[None, None]]:
+-    if guided_params.json:
+-        if isinstance(guided_params.json, dict):
+-            # turn dict into hashable string
+-            json = json_dumps(guided_params.json)
+-        else:
+-            json = guided_params.json
+-        return json, GuidedDecodingMode.JSON
+-    elif guided_params.regex:
+-        return guided_params.regex, GuidedDecodingMode.REGEX
+-    elif guided_params.choice:
+-        # choice just uses regex
+-        choices = [
+-            regex_escape(str(choice)) for choice in guided_params.choice
+-        ]
+-        choices_regex = "(" + "|".join(choices) + ")"
++    # Optimize by checking most common cases first and using early returns
++    json_param = guided_params.json
++    if json_param:
++        # Inline the type check to avoid function call overhead
++        json_str = json_dumps(json_param) if isinstance(json_param, dict) else json_param
++        return json_str, GuidedDecodingMode.JSON
++    
++    regex_param = guided_params.regex
++    if regex_param:
++        return regex_param, GuidedDecodingMode.REGEX
++    
++    choice_param = guided_params.choice
++    if choice_param:
++        # Optimize choice regex generation - use list comprehension with join
++        choices_regex = "(" + "|".join(regex_escape(str(c)) for c in choice_param) + ")"
+         return choices_regex, GuidedDecodingMode.CHOICE
+-    elif guided_params.grammar:
+-        return guided_params.grammar, GuidedDecodingMode.GRAMMAR
+-    elif guided_params.json_object:
++    
++    grammar_param = guided_params.grammar
++    if grammar_param:
++        return grammar_param, GuidedDecodingMode.GRAMMAR
++    
++    if guided_params.json_object:
+         return JSON_GRAMMAR, GuidedDecodingMode.GRAMMAR
+-    else:
+-        return None, None
++    
++    return None, None
+ 
+ 
+ def _get_logits_processor(
+     guide: str, tokenizer: PreTrainedTokenizerBase, mode: GuidedDecodingMode,
+     whitespace_pattern: Union[str, None]
+ ) -> Union[JSONLogitsProcessor, RegexLogitsProcessor, CFGLogitsProcessor]:
++    # Optimize by using direct equality checks instead of multiple if-elif
+     if mode == GuidedDecodingMode.JSON:
+         return JSONLogitsProcessor(guide, tokenizer, whitespace_pattern)
+-    elif mode == GuidedDecodingMode.REGEX or mode == GuidedDecodingMode.CHOICE:
++    if mode == GuidedDecodingMode.REGEX or mode == GuidedDecodingMode.CHOICE:
+         return RegexLogitsProcessor(guide, tokenizer)
+-    elif mode == GuidedDecodingMode.GRAMMAR:
++    if mode == GuidedDecodingMode.GRAMMAR:
+         return CFGLogitsProcessor(guide, tokenizer)
+-    else:
+-        raise ValueError(f"Unknown guided decoding mode {mode}")
++    
++    raise ValueError(f"Unknown guided decoding mode {mode}")

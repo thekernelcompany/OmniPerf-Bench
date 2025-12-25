@@ -1,0 +1,70 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 30c9eb6..2998f1a 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -145,7 +145,8 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -529,7 +530,8 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )
+diff --git a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+index 6b67f6c..425ff5d 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
++++ b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+@@ -226,9 +226,10 @@ class DeepEPDispatcher:
+             reorder_topk_ids = torch.empty(
+                 (0,), device=hidden_states.device, dtype=torch.int64
+             )
+-            seg_indptr = torch.zeros(
++            seg_indptr = torch.empty(
+                 (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
+             )
++            seg_indptr.zero_()
+         return hidden_states, reorder_topk_ids, seg_indptr
+ 
+     def dispatch_normal(
+@@ -366,7 +367,7 @@ class DeepEPDispatcher:
+                     BLOCK_SIZE=512,
+                 )
+             else:
+-                output = torch.zeros(
++                output = torch.empty(
+                     (0, hidden_states.shape[1]),
+                     device=hidden_states.device,
+                     dtype=hidden_states.dtype,
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index ab8b816..2f9770d 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -921,14 +921,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:

@@ -1,0 +1,174 @@
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 3a4c259..16ceab1 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -229,7 +229,7 @@ class MinPLogitsProcessor(LogitsProcessor):
+         super().__init__()
+         self.min_p_count: int = 0
+ 
+-        self.min_p_cpu_tensor = torch.zeros((max_num_reqs, ),
++        self.min_p_cpu_tensor = torch.empty((max_num_reqs, ),
+                                             dtype=torch.float32,
+                                             device="cpu",
+                                             pin_memory=pin_memory)
+@@ -259,32 +259,34 @@ class MinPLogitsProcessor(LogitsProcessor):
+             return
+ 
+         needs_update = False
++        min_p_cpu = self.min_p_cpu  # Cache attribute access
++        
+         # Process added requests.
+         for index, params, _ in batch_update.added:
+             min_p = params.min_p if isinstance(params, SamplingParams) else 0.0
+-            if self.min_p_cpu[index] != min_p:
++            if min_p_cpu[index] != min_p:
+                 needs_update = True
+-                self.min_p_cpu[index] = min_p
++                min_p_cpu[index] = min_p
+             if min_p:
+                 self.min_p_count += 1
+ 
+         if self.min_p_count:
+             # Process removed requests.
+-            needs_update |= bool(batch_update.removed)
+-            for index in batch_update.removed:
+-                if self.min_p_cpu[index]:
+-                    self.min_p_count -= 1
++            if batch_update.removed:
++                needs_update = True
++                for index in batch_update.removed:
++                    if min_p_cpu[index]:
++                        self.min_p_count -= 1
+ 
+             # Process moved requests, unidirectional (a->b) and swap (a<->b)
+             for adx, bdx, direct in batch_update.moved:
+-                change = (min_p_a :=
+-                          self.min_p_cpu[adx]) != (min_p_b :=
+-                                                   self.min_p_cpu[bdx])
+-                needs_update |= change
+-                if change:
+-                    self.min_p_cpu[bdx] = min_p_a
++                min_p_a = min_p_cpu[adx]
++                min_p_b = min_p_cpu[bdx]
++                if min_p_a != min_p_b:
++                    needs_update = True
++                    min_p_cpu[bdx] = min_p_a
+                     if direct == MoveDirectionality.SWAP:
+-                        self.min_p_cpu[adx] = min_p_b
++                        min_p_cpu[adx] = min_p_b
+ 
+         # Update tensors if needed.
+         size = batch_update.batch_size
+@@ -305,12 +307,10 @@ class MinPLogitsProcessor(LogitsProcessor):
+         max_probabilities = torch.amax(probability_values,
+                                        dim=-1,
+                                        keepdim=True)
+-        # Adjust min_p
+-        adjusted_min_p = max_probabilities.mul_(self.min_p)
+-        # Identify valid tokens using threshold comparison
+-        invalid_token_mask = probability_values < adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[invalid_token_mask] = -float('inf')
++        # Adjust min_p and identify invalid tokens in one step
++        adjusted_min_p = max_probabilities * self.min_p
++        # Apply mask using boolean indexing - avoid creating intermediate mask
++        logits.masked_fill_(probability_values < adjusted_min_p, -float('inf'))
+         return logits
+ 
+ 
+@@ -322,7 +322,7 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+         self.device = device
+         self.pin_memory = pin_memory
+ 
+-        self.bias_tensor: torch.Tensor = torch.tensor(())
++        self.bias_tensor: torch.Tensor = torch.empty(0, dtype=torch.float32, device=device)
+         self.logits_slice = (self._device_tensor([], torch.int32),
+                              self._device_tensor([], torch.int32))
+ 
+@@ -370,22 +370,30 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+ 
+         # Update tensors if needed.
+         if needs_update:
+-            reqs, tok_ids, biases = [], [], []
+-            for req, lb in self.biases.items():
+-                reqs.extend([req] * len(lb))
+-                tok_ids.extend(lb.keys())
+-                biases.extend(lb.values())
+-
+-            self.bias_tensor = self._device_tensor(biases, torch.float32)
+-            self.logits_slice = (self._device_tensor(reqs, torch.int32),
+-                                 self._device_tensor(tok_ids, torch.int32))
++            # Use list comprehensions for better performance
++            items = [(req, tok_id, bias) 
++                    for req, lb in self.biases.items() 
++                    for tok_id, bias in lb.items()]
++            if items:
++                reqs, tok_ids, biases = zip(*items)
++                self.bias_tensor = self._device_tensor(list(biases), torch.float32)
++                self.logits_slice = (self._device_tensor(list(reqs), torch.int32),
++                                     self._device_tensor(list(tok_ids), torch.int32))
++            else:
++                self.bias_tensor = torch.empty(0, dtype=torch.float32, device=self.device)
++                self.logits_slice = (torch.empty(0, dtype=torch.int32, device=self.device),
++                                    torch.empty(0, dtype=torch.int32, device=self.device))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
+-        return (torch.tensor(data,
+-                             device="cpu",
+-                             dtype=dtype,
+-                             pin_memory=self.pin_memory).to(device=self.device,
+-                                                            non_blocking=True))
++        if self.device.type == "cpu":
++            return torch.tensor(data, device="cpu", dtype=dtype)
++        if self.pin_memory:
++            return torch.tensor(data,
++                               device="cpu",
++                               dtype=dtype,
++                               pin_memory=True).to(device=self.device,
++                                                   non_blocking=True)
++        return torch.tensor(data, device=self.device, dtype=dtype)
+ 
+     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+         if self.biases:
+@@ -470,21 +478,28 @@ class MinTokensLogitsProcessor(LogitsProcessor):
+ 
+         # Update tensors if needed.
+         if needs_update:
+-            reqs: list[int] = []
+-            tok_ids: list[int] = []
+-            for req, (_, _, stop_tok_ids) in self.min_toks.items():
+-                reqs.extend([req] * len(stop_tok_ids))
+-                tok_ids.extend(stop_tok_ids)
+-
+-            self.logits_slice = (self._device_tensor(reqs, torch.int32),
+-                                 self._device_tensor(tok_ids, torch.int32))
++            # Use list comprehensions for better performance
++            items = [(req, tok_id) 
++                    for req, (_, _, stop_tok_ids) in self.min_toks.items()
++                    for tok_id in stop_tok_ids]
++            if items:
++                reqs, tok_ids = zip(*items)
++                self.logits_slice = (self._device_tensor(list(reqs), torch.int32),
++                                     self._device_tensor(list(tok_ids), torch.int32))
++            else:
++                self.logits_slice = (torch.empty(0, dtype=torch.int32, device=self.device),
++                                    torch.empty(0, dtype=torch.int32, device=self.device))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
+-        return (torch.tensor(data,
+-                             device="cpu",
+-                             dtype=dtype,
+-                             pin_memory=self.pin_memory).to(device=self.device,
+-                                                            non_blocking=True))
++        if self.device.type == "cpu":
++            return torch.tensor(data, device="cpu", dtype=dtype)
++        if self.pin_memory:
++            return torch.tensor(data,
++                               device="cpu",
++                               dtype=dtype,
++                               pin_memory=True).to(device=self.device,
++                                                   non_blocking=True)
++        return torch.tensor(data, device=self.device, dtype=dtype)
+ 
+     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+         if self.min_toks:

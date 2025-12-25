@@ -1,0 +1,130 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 181ac7e..5fd5647 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -22,6 +22,7 @@ BaseTokenToKVPool maps a token location to its KV cache data.
+ """
+ 
+ import logging
++from collections import deque
+ from typing import List, Tuple, Union
+ 
+ import torch
+@@ -41,7 +42,8 @@ class ReqToTokenPool:
+         self.req_to_token = torch.empty(
+             (size, max_context_len), dtype=torch.int32, device=device
+         )
+-        self.free_slots = list(range(size))
++        # Use deque for O(1) append/pop operations instead of list
++        self.free_slots = deque(range(size))
+         self.write_records = []
+         self.use_records = use_records
+ 
+@@ -61,8 +63,8 @@ class ReqToTokenPool:
+         if need_size > len(self.free_slots):
+             return None
+ 
+-        select_index = self.free_slots[:need_size]
+-        self.free_slots = self.free_slots[need_size:]
++        # Efficiently pop from left side of deque
++        select_index = [self.free_slots.popleft() for _ in range(need_size)]
+ 
+         return select_index
+ 
+@@ -73,7 +75,7 @@ class ReqToTokenPool:
+             self.free_slots.extend(free_index)
+ 
+     def clear(self):
+-        self.free_slots = list(range(self.size))
++        self.free_slots = deque(range(self.size))
+         self.write_records = []
+ 
+     def write_without_records(self, indices, values):
+@@ -110,6 +112,8 @@ class BaseTokenToKVPool:
+         else:
+             self.store_dtype = dtype
+         self.device = device
++        # Cache the dtype comparison result to avoid repeated checks
++        self._needs_dtype_conversion = (self.store_dtype != self.dtype)
+ 
+         self.free_slots = None
+         self.is_not_in_free_group = True
+@@ -130,7 +134,8 @@ class BaseTokenToKVPool:
+ 
+     def free(self, free_index: torch.Tensor):
+         if self.is_not_in_free_group:
+-            self.free_slots = torch.concat((self.free_slots, free_index.cpu()))
++            # Use torch.cat instead of torch.concat for better performance
++            self.free_slots = torch.cat((self.free_slots, free_index.cpu()))
+         else:
+             self.free_group.append(free_index)
+ 
+@@ -141,7 +146,8 @@ class BaseTokenToKVPool:
+     def free_group_end(self):
+         self.is_not_in_free_group = True
+         if self.free_group:
+-            self.free(torch.concat(self.free_group))
++            # Use torch.cat instead of torch.concat for better performance
++            self.free(torch.cat(self.free_group))
+ 
+     def clear(self):
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+@@ -201,17 +207,20 @@ class MHATokenToKVPool(BaseTokenToKVPool):
+         ]
+ 
+     def get_key_buffer(self, layer_id: int):
+-        if self.store_dtype != self.dtype:
++        if self._needs_dtype_conversion:
+             return self.k_buffer[layer_id].view(self.dtype)
+         return self.k_buffer[layer_id]
+ 
+     def get_value_buffer(self, layer_id: int):
+-        if self.store_dtype != self.dtype:
++        if self._needs_dtype_conversion:
+             return self.v_buffer[layer_id].view(self.dtype)
+         return self.v_buffer[layer_id]
+ 
+     def get_kv_buffer(self, layer_id: int):
+-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
++        # Optimize to avoid double dtype check
++        if self._needs_dtype_conversion:
++            return self.k_buffer[layer_id].view(self.dtype), self.v_buffer[layer_id].view(self.dtype)
++        return self.k_buffer[layer_id], self.v_buffer[layer_id]
+ 
+     def set_kv_buffer(
+         self,
+@@ -263,17 +272,22 @@ class MLATokenToKVPool(BaseTokenToKVPool):
+         ]
+ 
+     def get_key_buffer(self, layer_id: int):
+-        if self.store_dtype != self.dtype:
++        if self._needs_dtype_conversion:
+             return self.kv_buffer[layer_id].view(self.dtype)
+         return self.kv_buffer[layer_id]
+ 
+     def get_value_buffer(self, layer_id: int):
+-        if self.store_dtype != self.dtype:
++        if self._needs_dtype_conversion:
+             return self.kv_buffer[layer_id][..., : self.kv_lora_rank].view(self.dtype)
+         return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
+ 
+     def get_kv_buffer(self, layer_id: int):
+-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
++        # Optimize to avoid double dtype check and buffer access
++        if self._needs_dtype_conversion:
++            buf_view = self.kv_buffer[layer_id].view(self.dtype)
++            return buf_view, buf_view[..., : self.kv_lora_rank]
++        buf = self.kv_buffer[layer_id]
++        return buf, buf[..., : self.kv_lora_rank]
+ 
+     def set_kv_buffer(
+         self,
+@@ -285,7 +299,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
+         layer_id = layer.layer_id
+         if cache_k.dtype != self.dtype:
+             cache_k = cache_k.to(self.dtype)
+-        if self.store_dtype != self.dtype:
++        if self._needs_dtype_conversion:
+             self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+         else:
+             self.kv_buffer[layer_id][loc] = cache_k

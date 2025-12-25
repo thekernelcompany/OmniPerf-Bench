@@ -1,0 +1,126 @@
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index 88f6031..97bf301 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -7,6 +7,9 @@ import torch
+ from sglang.srt.managers.router.radix_cache import RadixCache
+ from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
+ 
++# Cache for arange tensors to avoid repeated allocations
++_arange_cache = {}
++
+ 
+ class ForwardMode(Enum):
+     PREFILL = auto()
+@@ -208,7 +211,8 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets.fill_(0)
+ 
+         # Alloc mem
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -247,8 +251,8 @@ class Batch:
+             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+         ]
+         self.req_pool_indices = req_pool_indices
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
++        self.seq_lens = torch.from_numpy(seq_lens).to(dtype=torch.int32, device=device)
++        self.prefix_lens = torch.from_numpy(prefix_lens).to(dtype=torch.int32, device=device)
+         self.position_ids_offsets = position_ids_offsets
+         self.extend_num_tokens = extend_num_tokens
+         self.out_cache_loc = out_cache_loc
+@@ -482,8 +486,14 @@ def _top_p_top_k(probs: torch.Tensor, top_ps: torch.Tensor, top_ks: torch.Tensor
+     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+     probs_sum = torch.cumsum(probs_sort, dim=-1)
+     probs_sort[(probs_sum - probs_sort) > top_ps] = 0.0
+-    probs_sort[
+-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1) >= top_ks
+-    ] = 0.0
++    
++    # Cache arange tensor to avoid repeated allocations
++    vocab_size = probs.shape[-1]
++    cache_key = (vocab_size, probs.device)
++    if cache_key not in _arange_cache:
++        _arange_cache[cache_key] = torch.arange(0, vocab_size, device=probs.device).view(1, -1)
++    arange_tensor = _arange_cache[cache_key]
++    
++    probs_sort[arange_tensor >= top_ks] = 0.0
+     probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+     return probs_sort, probs_idx
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 8b7adf9..301d6e1 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -293,11 +293,10 @@ class ModelRpcServer(rpyc.Service):
+             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+         )
+         if self.running_batch:
++            # Optimize by avoiding repeated method calls
+             available_size -= sum(
+-                [
+-                    (r.max_new_tokens() - len(r.output_ids)) * self.new_token_ratio
+-                    for r in self.running_batch.reqs
+-                ]
++                (r.max_new_tokens() - len(r.output_ids)) * self.new_token_ratio
++                for r in self.running_batch.reqs
+             )
+ 
+         for req in self.forward_queue:
+@@ -309,7 +308,10 @@ class ModelRpcServer(rpyc.Service):
+                     req.prefix_indices = req.prefix_indices[:-delta]
+                     if req.image_offset is not None:
+                         req.image_offset += delta
+-            if req.extend_input_len == 0 and req.max_new_tokens() > 0:
++            
++            # Cache max_new_tokens to avoid repeated method calls
++            max_new_tokens = req.max_new_tokens()
++            if req.extend_input_len == 0 and max_new_tokens > 0:
+                 # Need at least one token to compute logits
+                 req.extend_input_len = 1
+                 req.prefix_indices = req.prefix_indices[:-1]
+@@ -317,7 +319,7 @@ class ModelRpcServer(rpyc.Service):
+                     req.image_offset += 1
+ 
+             if (
+-                req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
++                req.extend_input_len + max_new_tokens + new_batch_total_tokens
+                 < available_size
+                 and req.extend_input_len + new_batch_input_tokens
+                 < self.max_prefill_num_token
+@@ -326,7 +328,7 @@ class ModelRpcServer(rpyc.Service):
+                 available_size += delta
+ 
+                 if not (
+-                    req.extend_input_len + req.max_new_tokens() + new_batch_total_tokens
++                    req.extend_input_len + max_new_tokens + new_batch_total_tokens
+                     < available_size
+                 ):
+                     # Undo the insertion
+@@ -336,9 +338,7 @@ class ModelRpcServer(rpyc.Service):
+                     # Add this request to the running batch
+                     self.token_to_kv_pool.add_refs(req.prefix_indices)
+                     can_run_list.append(req)
+-                    new_batch_total_tokens += (
+-                        req.extend_input_len + req.max_new_tokens()
+-                    )
++                    new_batch_total_tokens += req.extend_input_len + max_new_tokens
+                     new_batch_input_tokens += req.extend_input_len
+ 
+         if len(can_run_list) == 0:
+@@ -453,9 +453,9 @@ class ModelRpcServer(rpyc.Service):
+ 
+         # Check finish condition
+         reqs = batch.reqs
+-        for i in range(len(reqs)):
+-            reqs[i].output_ids.append(next_token_ids[i])
+-            reqs[i].check_finished()
++        for i, req in enumerate(reqs):
++            req.output_ids.append(next_token_ids[i])
++            req.check_finished()
+ 
+         self.handle_finished_requests(batch)
+ 

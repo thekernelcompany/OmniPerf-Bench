@@ -1,0 +1,170 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 53d6620..c3177ef 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -49,8 +49,8 @@ class LogitsProcessor(nn.Module):
+         else:
+             prefill_top_logprobs, decode_top_logprobs = [], []
+             pt = 0
+-            # NOTE: the GPU-CPU overhead can be reduced
+-            extend_seq_lens_cpu = input_metadata.extend_seq_lens.cpu().numpy()
++            # Optimize: use tolist() instead of cpu().numpy() for better performance
++            extend_seq_lens_cpu = input_metadata.extend_seq_lens.tolist()
+             for i in range(len(extend_seq_lens_cpu)):
+                 if extend_seq_lens_cpu[i] == 0:
+                     prefill_top_logprobs.append([])
+@@ -101,9 +101,9 @@ class LogitsProcessor(nn.Module):
+                     all_logits = tensor_model_parallel_all_gather(all_logits)
+                 all_logits = all_logits[:, : self.config.vocab_size]
+ 
+-            all_logprobs = all_logits.float()
++            # Optimize: compute log_softmax directly without intermediate copy
++            all_logprobs = torch.nn.functional.log_softmax(all_logits.float(), dim=-1)
+             del all_logits
+-            all_logprobs[:] = torch.nn.functional.log_softmax(all_logprobs, dim=-1)
+ 
+             return_top_logprob = any(x > 0 for x in input_metadata.top_logprobs_nums)
+             if return_top_logprob:
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index eeefbe0..8d42217 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -50,24 +50,25 @@ class DetokenizerManager:
+ 
+                 # Trim stop str
+                 # TODO(lmzheng): handle the case where multiple stop strs are hit
+-                for i in range(len(output_strs)):
+-                    if recv_obj.hit_stop_str[i] is not None:
+-                        pos = output_strs[i].find(recv_obj.hit_stop_str[i])
++                # Optimize: use enumerate and reduce list indexing overhead
++                for i, output_str in enumerate(output_strs):
++                    hit_stop = recv_obj.hit_stop_str[i]
++                    if hit_stop is not None:
++                        pos = output_str.find(hit_stop)
+                         if pos != -1:
+-                            output_strs[i] = output_strs[i][:pos]
++                            output_str = output_str[:pos]
+ 
+-                    if len(output_tokens[i]) > 0:
++                    tokens_i = output_tokens[i]
++                    if len(tokens_i) > 0:
+                         first_token = self.tokenizer.convert_ids_to_tokens(
+-                            int(output_tokens[i][0])
++                            int(tokens_i[0])
+                         )
+                         if not isinstance(first_token, str):
+                             first_token = first_token.decode("utf-8", errors="ignore")
+                         if first_token.startswith("▁"):
+-                            output_strs[i] = " " + output_strs[i]
++                            output_str = " " + output_str
+ 
+-                    output_strs[i] = (
+-                        recv_obj.output_and_jump_forward_strs[i] + output_strs[i]
+-                    )
++                    output_strs[i] = recv_obj.output_and_jump_forward_strs[i] + output_str
+ 
+                 self.send_to_tokenizer.send_pyobj(
+                     BatchStrOut(
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index dbe9437..ae4f618 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -250,7 +250,8 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets.fill_(0)
+ 
+         # Alloc mem
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -277,9 +278,10 @@ class Batch:
+         for i in range(bs):
+             if reqs[i].sampling_params.dtype == "int":
+                 if logit_bias is None:
+-                    logit_bias = torch.zeros(
++                    logit_bias = torch.empty(
+                         (bs, vocab_size), dtype=torch.float32, device=device
+                     )
++                    logit_bias.fill_(0)
+                 logit_bias[i] = int_token_logit_bias
+ 
+         # Set fields
+@@ -292,8 +294,9 @@ class Batch:
+             r.image_offset - p_len for r, p_len in zip(reqs, prefix_lens)
+         ]
+         self.req_pool_indices = req_pool_indices
+-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+-        self.prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
++        # Optimize: use torch.from_numpy for better performance with numpy arrays
++        self.seq_lens = torch.from_numpy(seq_lens).to(device=device, dtype=torch.int32)
++        self.prefix_lens = torch.from_numpy(prefix_lens).to(device=device, dtype=torch.int32)
+         self.position_ids_offsets = position_ids_offsets
+         self.extend_num_tokens = extend_num_tokens
+         self.out_cache_loc = out_cache_loc
+@@ -495,13 +498,15 @@ class Batch:
+                 else other.logit_bias.shape[1]
+             )
+             if self.logit_bias is None:
+-                self.logit_bias = torch.zeros(
++                self.logit_bias = torch.empty(
+                     (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
++                self.logit_bias.fill_(0)
+             if other.logit_bias is None:
+-                other.logit_bias = torch.zeros(
++                other.logit_bias = torch.empty(
+                     (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
++                other.logit_bias.fill_(0)
+             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
+ 
+     def sample(self, logits: torch.Tensor):
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index 6abb20b..55b007a 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -566,30 +566,37 @@ class ModelRpcServer:
+         output_finished = []
+         finished_indices = []
+         unfinished_indices = []
++        
++        # Optimize: cache frequently accessed attributes
++        decode_forward_ct = self.decode_forward_ct
++        stream_interval = self.stream_interval
++        
+         for i, req in enumerate(batch.reqs):
+-            if req.finished:
++            req_finished = req.finished
++            if req_finished:
+                 finished_indices.append(i)
+             else:
+                 unfinished_indices.append(i)
+ 
+-            if req.finished or (
++            if req_finished or (
+                 (
+                     req.stream
+                     and (
+-                        self.decode_forward_ct % self.stream_interval == 0
++                        decode_forward_ct % stream_interval == 0
+                         or len(req.output_ids) == 1
+                     )
+                 )
+             ):
++                sampling_params = req.sampling_params
+                 output_rids.append(req.rid)
+                 output_tokens.append(req.output_ids)
+                 output_and_jump_forward_strs.append(req.output_and_jump_forward_str)
+                 output_hit_stop_str.append(req.hit_stop_str)
+                 output_skip_special_tokens.append(
+-                    req.sampling_params.skip_special_tokens
++                    sampling_params.skip_special_tokens
+                 )
+                 output_spaces_between_special_tokens.append(
+-                    req.sampling_params.spaces_between_special_tokens
++                    sampling_params.spaces_between_special_tokens
+                 )
+ 
+                 meta_info = {

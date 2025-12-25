@@ -1,0 +1,242 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 824f767..896bfce 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -81,7 +81,7 @@ class TransferInfo:
+     def from_zmq(cls, msg: List[bytes]):
+         if msg[4] == b"" and msg[5] == b"":
+             is_dummy = True
+-            dst_kv_indices = np.array([], dtype=np.int64)
++            dst_kv_indices = np.empty(0, dtype=np.int64)
+             dst_aux_index = None
+         else:
+             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+@@ -130,8 +130,10 @@ class MooncakeKVManager(BaseKVManager):
+         is_mla_backend: Optional[bool] = False,
+     ):
+         self.kv_args = args
++        # Cache local IP to avoid repeated calls
++        self.local_ip = get_local_ip_by_remote()
+         self.engine = MooncakeTransferEngine(
+-            hostname=get_local_ip_by_remote(),
++            hostname=self.local_ip,
+             gpu_id=self.kv_args.gpu_id,
+             ib_device=self.kv_args.ib_device,
+         )
+@@ -188,7 +190,7 @@ class MooncakeKVManager(BaseKVManager):
+                 "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 30
+             )
+         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+-            self.heartbeat_failures = {}
++            self.heartbeat_failures = defaultdict(int)
+             self.session_pool = defaultdict(requests.Session)
+             self.session_pool_lock = threading.Lock()
+             self.addr_to_rooms_tracker = defaultdict(set)
+@@ -244,15 +246,7 @@ class MooncakeKVManager(BaseKVManager):
+         )
+ 
+         num_layers = len(self.kv_args.kv_data_ptrs)
+-        layers_params = [
+-            (
+-                self.kv_args.kv_data_ptrs[layer_id],
+-                dst_kv_ptrs[layer_id],
+-                self.kv_args.kv_item_lens[layer_id],
+-            )
+-            for layer_id in range(num_layers)
+-        ]
+-
++        
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+@@ -270,11 +264,11 @@ class MooncakeKVManager(BaseKVManager):
+         futures = [
+             executor.submit(
+                 process_layer,
+-                src_ptr,
+-                dst_ptr,
+-                item_len,
++                self.kv_args.kv_data_ptrs[layer_id],
++                dst_kv_ptrs[layer_id],
++                self.kv_args.kv_item_lens[layer_id],
+             )
+-            for (src_ptr, dst_ptr, item_len) in layers_params
++            for layer_id in range(num_layers)
+         ]
+ 
+         for future in concurrent.futures.as_completed(futures):
+@@ -307,8 +301,9 @@ class MooncakeKVManager(BaseKVManager):
+         self, remote: str, dst_port: int, room: int, status: int
+     ):
+         if ":" in remote:
+-            remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++            remote = remote.split(":", 1)[0]
++        endpoint = f"tcp://{remote}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -432,7 +427,7 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     def start_prefill_thread(self):
+         self.rank_port = get_free_port()
+-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
++        self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
+ 
+         def bootstrap_thread():
+             """This thread recvs pre-alloc notification from the decode engine"""
+@@ -471,7 +466,7 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     def start_decode_thread(self):
+         self.rank_port = get_free_port()
+-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
++        self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
+ 
+         def decode_thread():
+             while True:
+@@ -489,7 +484,7 @@ class MooncakeKVManager(BaseKVManager):
+             while True:
+                 time.sleep(self.heartbeat_interval)
+                 with self.connection_lock:
+-                    addresses = list(self.prefill_dp_size_table.keys())
++                    addresses = tuple(self.prefill_dp_size_table.keys())
+ 
+                 for bootstrap_addr in addresses:
+                     session = None
+@@ -504,9 +499,9 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            current_rooms = self.addr_to_rooms_tracker[
++                            current_rooms = tuple(self.addr_to_rooms_tracker[
+                                 bootstrap_addr
+-                            ].copy()
++                            ])
+ 
+                             for bootstrap_room in current_rooms:
+                                 # Remove KVPoll.Success requests from the tracker
+@@ -518,20 +513,16 @@ class MooncakeKVManager(BaseKVManager):
+                             logger.info(
+                                 f"Attempting to reconnect to {bootstrap_addr}..."
+                             )
+-                            self.heartbeat_failures[bootstrap_addr] = (
+-                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+-                            )
++                            self.heartbeat_failures[bootstrap_addr] += 1
+                             with self.session_pool_lock:
+                                 if bootstrap_addr in self.session_pool:
+                                     del self.session_pool[bootstrap_addr]
+                     except Exception:
+                         logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+-                        self.heartbeat_failures[bootstrap_addr] = (
+-                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+-                        )
++                        self.heartbeat_failures[bootstrap_addr] += 1
+ 
+                     if (
+-                        self.heartbeat_failures.get(bootstrap_addr, 0)
++                        self.heartbeat_failures[bootstrap_addr]
+                         >= self.max_failures
+                     ):
+                         self._handle_node_failure(bootstrap_addr)
+@@ -615,7 +606,7 @@ class MooncakeKVManager(BaseKVManager):
+             "role": "Prefill",
+             "tp_size": self.tp_size,
+             "dp_size": self.dp_size,
+-            "rank_ip": get_local_ip_by_remote(),
++            "rank_ip": self.local_ip,
+             "rank_port": self.rank_port,
+             "engine_rank": self.kv_args.engine_rank,
+         }
+@@ -635,9 +626,9 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     def _handle_node_failure(self, failed_bootstrap_addr):
+         with self.connection_lock:
+-            keys_to_remove = [
++            keys_to_remove = tuple(
+                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+-            ]
++            )
+             for k in keys_to_remove:
+                 del self.connection_pool[k]
+             if failed_bootstrap_addr in self.prefill_tp_size_table:
+@@ -921,25 +912,33 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return None, None
+ 
+     def _register_kv_args(self):
++        # Pre-pack data pointers once outside the loop
++        packed_kv_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
++        )
++        packed_aux_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
++        )
++        
++        # Cache encoded values
++        local_ip_encoded = self.kv_mgr.local_ip.encode("ascii")
++        rank_port_encoded = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_encoded = self.session_id.encode("ascii")
++        none_encoded = b"None"
++        
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        "None".encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
++                        none_encoded,
++                        local_ip_encoded,
++                        rank_port_encoded,
++                        session_id_encoded,
+                         packed_kv_data_ptrs,
+                         packed_aux_data_ptrs,
+                     ]
+@@ -956,6 +955,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+ 
+     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
++        # Cache encoded values
++        bootstrap_room_encoded = str(self.bootstrap_room).encode("ascii")
++        local_ip_encoded = self.kv_mgr.local_ip.encode("ascii")
++        rank_port_encoded = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_encoded = self.session_id.encode("ascii")
++        required_dst_info_num_encoded = str(self.required_dst_info_num).encode("ascii")
++        aux_index_encoded = str(aux_index).encode("ascii") if aux_index is not None else b""
++        
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+@@ -966,13 +973,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        str(self.bootstrap_room).encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
++                        bootstrap_room_encoded,
++                        local_ip_encoded,
++                        rank_port_encoded,
++                        session_id_encoded,
+                         kv_indices.tobytes() if not is_dummy else b"",
+-                        str(aux_index).encode("ascii") if not is_dummy else b"",
+-                        str(self.required_dst_info_num).encode("ascii"),
++                        aux_index_encoded if not is_dummy else b"",
++                        required_dst_info_num_encoded,
+                     ]
+                 )
+ 

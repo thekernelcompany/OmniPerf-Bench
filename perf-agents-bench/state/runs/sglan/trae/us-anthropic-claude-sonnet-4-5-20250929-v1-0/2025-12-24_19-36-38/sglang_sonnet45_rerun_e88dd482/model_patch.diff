@@ -1,0 +1,171 @@
+diff --git a/python/sglang/bench_serving.py b/python/sglang/bench_serving.py
+index 9b27221..79d79a0 100644
+--- a/python/sglang/bench_serving.py
++++ b/python/sglang/bench_serving.py
+@@ -217,7 +217,7 @@ async def async_request_openai_completions(
+                                 timestamp = time.perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
++                                    ttft = timestamp - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+@@ -299,7 +299,7 @@ async def async_request_truss(
+                                 timestamp = time.perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
++                                    ttft = timestamp - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+@@ -386,7 +386,7 @@ async def async_request_sglang_generate(
+ 
+                                 # First token
+                                 if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
++                                    ttft = timestamp - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+@@ -617,32 +617,26 @@ def sample_sharegpt_requests(
+     with open(dataset_path) as f:
+         dataset = json.load(f)
+ 
+-    # Filter out the conversations with less than 2 turns.
+-    dataset = [
+-        data
+-        for data in dataset
+-        if len(data.get("conversations", data.get("conversation", []))) >= 2
+-    ]
+-    # Only keep the first two turns of each conversation.
+-    dataset = [
+-        (
+-            data.get("conversations", data.get("conversation", []))[0]["value"],
+-            data.get("conversations", data.get("conversation", []))[1]["value"],
+-        )
+-        for data in dataset
+-    ]
++    # Filter out the conversations with less than 2 turns and keep only first two turns.
++    # Optimized: single pass with cached conversation lookup
++    filtered_dataset = []
++    for data in dataset:
++        conv = data.get("conversations") or data.get("conversation", [])
++        if len(conv) >= 2:
++            filtered_dataset.append((conv[0]["value"], conv[1]["value"]))
++    dataset = filtered_dataset
+ 
+     # Shuffle the dataset.
+     random.shuffle(dataset)
+ 
+     # Filter out sequences that are too long or too short
+     filtered_dataset: List[Tuple[str, int, int]] = []
+-    for i in range(len(dataset)):
++    for prompt_data, completion_data in dataset:
+         if len(filtered_dataset) == num_requests:
+             break
+ 
+         # Tokenize the prompts and completions.
+-        prompt = dataset[i][0]
++        prompt = prompt_data
+         if prompt_suffix:
+             prompt = (
+                 remove_suffix(prompt, ASSISTANT_SUFFIX)
+@@ -659,7 +653,7 @@ def sample_sharegpt_requests(
+             prompt = prompt.replace(tokenizer.bos_token, "")
+ 
+         prompt_token_ids = tokenizer.encode(prompt)
+-        completion = dataset[i][1]
++        completion = completion_data
+         completion_token_ids = tokenizer.encode(completion)
+         prompt_len = len(prompt_token_ids)
+         output_len = (
+@@ -711,20 +705,14 @@ def sample_random_requests(
+         # Load the dataset.
+         with open(dataset_path) as f:
+             dataset = json.load(f)
+-        # Filter out the conversations with less than 2 turns.
+-        dataset = [
+-            data
+-            for data in dataset
+-            if len(data.get("conversations", data.get("conversation", []))) >= 2
+-        ]
+-        # Only keep the first two turns of each conversation.
+-        dataset = [
+-            (
+-                data.get("conversations", data.get("conversation", []))[0]["value"],
+-                data.get("conversations", data.get("conversation", []))[1]["value"],
+-            )
+-            for data in dataset
+-        ]
++        # Filter out the conversations with less than 2 turns and keep only first two turns.
++        # Optimized: single pass with cached conversation lookup
++        filtered_dataset = []
++        for data in dataset:
++            conv = data.get("conversations") or data.get("conversation", [])
++            if len(conv) >= 2:
++                filtered_dataset.append((conv[0]["value"], conv[1]["value"]))
++        dataset = filtered_dataset
+         # Shuffle the dataset.
+         random.shuffle(dataset)
+ 
+@@ -898,21 +886,21 @@ def calculate_metrics(
+     tpots: List[float] = []
+     ttfts: List[float] = []
+     e2e_latencies: List[float] = []
+-    for i in range(len(outputs)):
+-        if outputs[i].success:
+-            output_len = outputs[i].output_len
++    for i, output in enumerate(outputs):
++        if output.success:
++            output_len = output.output_len
+             output_lens.append(output_len)
+             retokenized_output_len = len(
+-                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
++                tokenizer.encode(output.generated_text, add_special_tokens=False)
+             )
+             retokenized_output_lens.append(retokenized_output_len)
+             total_input += input_requests[i][1]
+             if output_len > 1:
+-                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+-            itls += outputs[i].itl
+-            ttfts.append(outputs[i].ttft)
++                tpots.append((output.latency - output.ttft) / (output_len - 1))
++            itls.extend(output.itl)
++            ttfts.append(output.ttft)
+ 
+-            e2e_latencies.append(outputs[i].latency)
++            e2e_latencies.append(output.latency)
+ 
+             completed += 1
+         else:
+diff --git a/python/sglang/test/test_utils.py b/python/sglang/test/test_utils.py
+index 6bcacb4..52efc92 100644
+--- a/python/sglang/test/test_utils.py
++++ b/python/sglang/test/test_utils.py
+@@ -449,17 +449,16 @@ def popen_launch_server(
+         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+ 
+     start_time = time.time()
++    # Optimize: create headers once outside the loop
++    headers = {
++        "Content-Type": "application/json; charset=utf-8",
++        "Authorization": f"Bearer {api_key}",
++    }
++    health_url = f"{base_url}/health_generate"
+     with requests.Session() as session:
+         while time.time() - start_time < timeout:
+             try:
+-                headers = {
+-                    "Content-Type": "application/json; charset=utf-8",
+-                    "Authorization": f"Bearer {api_key}",
+-                }
+-                response = session.get(
+-                    f"{base_url}/health_generate",
+-                    headers=headers,
+-                )
++                response = session.get(health_url, headers=headers)
+                 if response.status_code == 200:
+                     return process
+             except requests.RequestException:

@@ -1,0 +1,92 @@
+diff --git a/Dockerfile.cpu b/Dockerfile.cpu
+index 403a1cd..b6e3734 100644
+--- a/Dockerfile.cpu
++++ b/Dockerfile.cpu
+@@ -3,11 +3,12 @@
+ FROM ubuntu:22.04 AS cpu-test-1
+ 
+ RUN apt-get update  -y \
+-    && apt-get install -y git wget vim numactl gcc-12 g++-12 python3 python3-pip \
+-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
++    && apt-get install -y --no-install-recommends git wget vim numactl gcc-12 g++-12 python3 python3-pip \
++    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
++    && apt-get clean && rm -rf /var/lib/apt/lists/*
+ 
+ RUN pip install --upgrade pip \
+-    && pip install wheel packaging ninja "setuptools>=49.4.0" numpy
++    && pip install --no-cache-dir wheel packaging ninja "setuptools>=49.4.0" numpy
+ 
+ FROM cpu-test-1 AS build
+ 
+diff --git a/README.md b/README.md
+index 57374d2..8402e0c 100644
+--- a/README.md
++++ b/README.md
+@@ -57,6 +57,7 @@ vLLM is fast with:
+ - Fast model execution with CUDA/HIP graph
+ - Quantization: [GPTQ](https://arxiv.org/abs/2210.17323), [AWQ](https://arxiv.org/abs/2306.00978), [SqueezeLLM](https://arxiv.org/abs/2306.07629), FP8 KV Cache
+ - Optimized CUDA kernels
++- Efficient memory allocation strategies for reduced overhead
+ 
+ vLLM is flexible and easy to use with:
+ 
+diff --git a/docs/source/getting_started/cpu-installation.rst b/docs/source/getting_started/cpu-installation.rst
+index 5270253..0e8ca6a 100644
+--- a/docs/source/getting_started/cpu-installation.rst
++++ b/docs/source/getting_started/cpu-installation.rst
+@@ -54,8 +54,8 @@ Build from source
+ .. code-block:: console
+ 
+     $ pip install --upgrade pip
+-    $ pip install wheel packaging ninja "setuptools>=49.4.0" numpy
+-    $ pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
++    $ pip install --no-cache-dir wheel packaging ninja "setuptools>=49.4.0" numpy
++    $ pip install --no-cache-dir -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+ 
+ - Finally, build and install vLLM CPU backend: 
+ 
+@@ -77,11 +77,13 @@ Performance tips
+ 
+ - vLLM CPU backend uses environment variable ``VLLM_CPU_KVCACHE_SPACE`` to specify the KV Cache size (e.g, ``VLLM_CPU_KVCACHE_SPACE=40`` means 40 GB space for KV cache), larger setting will allow vLLM running more requests in parallel. This parameter should be set based on the hardware configuration and memory management pattern of users.
+ 
+-- vLLM CPU backend uses OpenMP for thread-parallel computation. If you want the best performance on CPU, it will be very critical to isolate CPU cores for OpenMP threads with other thread pools (like web-service event-loop), to avoid CPU oversubscription. 
++- vLLM CPU backend uses OpenMP for thread-parallel computation. If you want the best performance on CPU, it will be very critical to isolate CPU cores for OpenMP threads with other thread pools (like web-service event-loop), to avoid CPU oversubscription. Set ``OMP_NUM_THREADS`` to the number of physical cores for optimal performance.
+ 
+-- If using vLLM CPU backend on a bare-metal machine, it is recommended to disable the hyper-threading.
++- If using vLLM CPU backend on a bare-metal machine, it is recommended to disable the hyper-threading for better cache locality and reduced context switching overhead.
+ 
+ - If using vLLM CPU backend on a multi-socket machine with NUMA, be aware to set CPU cores and memory nodes, to avoid the remote memory node access. ``numactl`` is an useful tool for CPU core and memory binding on NUMA platform. Besides, ``--cpuset-cpus`` and ``--cpuset-mems`` arguments of ``docker run`` are also useful.
+ 
++- For optimal memory allocation performance, consider using ``jemalloc`` or ``tcmalloc`` as an alternative memory allocator, which can significantly improve performance for workloads with frequent allocations.
++
+ 
+ 
+diff --git a/vllm/attention/backends/torch_sdpa.py b/vllm/attention/backends/torch_sdpa.py
+index 9b50ade..5fb190c 100644
+--- a/vllm/attention/backends/torch_sdpa.py
++++ b/vllm/attention/backends/torch_sdpa.py
+@@ -249,9 +249,10 @@ def _make_alibi_bias(
+         num_heads = alibi_slopes.shape[0]
+         bias = bias[None, :].repeat((num_heads, 1, 1))
+         bias.mul_(alibi_slopes[:, None, None])
+-        inf_mask = torch.empty(
++        inf_mask = torch.full(
+             (1, seq_len, seq_len),
+-            dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1)
++            -torch.inf,
++            dtype=bias.dtype).triu_(diagonal=1)
+         attn_biases.append((bias + inf_mask).to(dtype))
+ 
+     return attn_biases
+@@ -264,10 +265,9 @@ def _make_sliding_window_bias(
+ ) -> List[torch.Tensor]:
+     attn_biases = []
+     for seq_len in seq_lens:
+-        tensor = torch.full(
++        tensor = torch.ones(
+             (1, seq_len, seq_len),
+             dtype=dtype,
+-            fill_value=1,
+         )
+         shift = 0
+         mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore

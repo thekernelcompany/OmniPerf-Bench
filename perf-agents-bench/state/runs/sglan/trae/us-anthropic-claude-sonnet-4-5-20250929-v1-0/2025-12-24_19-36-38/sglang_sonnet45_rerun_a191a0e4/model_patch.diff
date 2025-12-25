@@ -1,0 +1,98 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..5e876e1 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -40,13 +40,13 @@ def compute_split_seq_index(
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+     overall_sum = sum(arr)
+-    accumulator, split_index = 0, 0
+-    for value in arr[:-1]:
++    half_sum = overall_sum >> 1  # Use bit shift instead of division
++    accumulator = 0
++    for split_index, value in enumerate(arr[:-1]):
+         accumulator += value
+-        split_index += 1
+-        if accumulator >= overall_sum // 2:
+-            break
+-    return split_index
++        if accumulator >= half_sum:
++            return split_index + 1
++    return len(arr) - 1
+ 
+ 
+ def compute_split_token_index(
+@@ -56,7 +56,11 @@ def compute_split_token_index(
+ ) -> int:
+     if forward_mode.is_extend():
+         assert extend_seq_lens is not None
+-        return sum(extend_seq_lens[:split_seq_index])
++        # Avoid slice allocation by manually summing
++        result = 0
++        for i in range(split_seq_index):
++            result += extend_seq_lens[i]
++        return result
+     elif forward_mode.is_decode():
+         return split_seq_index
+     elif forward_mode.is_idle():
+@@ -209,20 +213,20 @@ class TboForwardBatchPreparer:
+         num_tokens = batch.input_ids.shape[0]
+         num_seqs = batch.batch_size
+ 
+-        output_dict = dict()
++        output_dict = {}
+ 
+-        for key in [
++        for key in (
+             "input_ids",
+             "positions",
+             "out_cache_loc",
+-        ]:
++        ):
+             old_value = getattr(batch, key)
+             assert (
+                 old_value.shape[0] == num_tokens
+             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+             output_dict[key] = old_value[start_token_index:end_token_index]
+ 
+-        for key in [
++        for key in (
+             "req_pool_indices",
+             "seq_lens",
+             "seq_lens_cpu",
+@@ -233,7 +237,7 @@ class TboForwardBatchPreparer:
+             "extend_seq_lens_cpu",
+             "extend_logprob_start_lens_cpu",
+             "lora_paths",
+-        ]:
++        ):
+             old_value = getattr(batch, key)
+             if old_value is None:
+                 continue
+@@ -242,7 +246,7 @@ class TboForwardBatchPreparer:
+             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+             output_dict[key] = old_value[start_seq_index:end_seq_index]
+ 
+-        for key in [
++        for key in (
+             "forward_mode",
+             "return_logprob",
+             "req_to_token_pool",
+@@ -254,7 +258,7 @@ class TboForwardBatchPreparer:
+             "capture_hidden_mode",
+             "padded_static_len",
+             "mrope_positions",  # only used by qwen2-vl, thus not care
+-        ]:
++        ):
+             output_dict[key] = getattr(batch, key)
+ 
+         assert (
+@@ -268,7 +272,7 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,

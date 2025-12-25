@@ -1,0 +1,77 @@
+diff --git a/tests/tokenization/test_detokenize.py b/tests/tokenization/test_detokenize.py
+index 4421739..b1a80a9 100644
+--- a/tests/tokenization/test_detokenize.py
++++ b/tests/tokenization/test_detokenize.py
+@@ -25,7 +25,7 @@ TOKENIZERS = [
+ 
+ def _run_incremental_decode(tokenizer, all_input_ids,
+                             skip_special_tokens: bool):
+-    decoded_text = ""
++    decoded_texts = []
+     offset = 0
+     token_offset = 0
+     prev_tokens = None
+@@ -37,12 +37,12 @@ def _run_incremental_decode(tokenizer, all_input_ids,
+             offset,
+             token_offset,
+             skip_special_tokens=skip_special_tokens)
+-        decoded_text += text
++        decoded_texts.append(text)
+         if prev_tokens is None:
+             prev_tokens = new_tokens
+         else:
+-            prev_tokens += new_tokens
+-    return decoded_text
++            prev_tokens.extend(new_tokens)
++    return "".join(decoded_texts)
+ 
+ 
+ @pytest.mark.parametrize("truth", TRUTH)
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index f7a1a19..f540cff 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -26,6 +26,8 @@ def get_cached_tokenizer(
+     tokenizer_all_special_tokens_extended = (
+         tokenizer.all_special_tokens_extended)
+     tokenizer_all_special_tokens = set(tokenizer.all_special_tokens)
++    tokenizer_added_vocab = tokenizer.get_added_vocab()
++    tokenizer_is_fast = tokenizer.is_fast
+ 
+     class CachedTokenizer(tokenizer.__class__):
+ 
+@@ -41,6 +43,13 @@ def get_cached_tokenizer(
+         def all_special_tokens_extended(self):
+             return tokenizer_all_special_tokens_extended
+ 
++        def get_added_vocab(self):
++            return tokenizer_added_vocab
++
++        @property
++        def is_fast(self):
++            return tokenizer_is_fast
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     tokenizer.__class__ = CachedTokenizer
+@@ -137,7 +146,8 @@ def _convert_tokens_to_string_with_added_encoders(
+     # even when the loop body is very simple.
+     sub_texts = []
+     current_sub_text = []
+-    all_special_tokens = set(tokenizer.all_special_tokens)
++    # Optimization: tokenizer.all_special_tokens is already a set from get_cached_tokenizer
++    all_special_tokens = tokenizer.all_special_tokens
+     for token in output_tokens:
+         if skip_special_tokens and token in all_special_tokens:
+             continue
+@@ -189,7 +199,9 @@ def detokenize_incrementally(
+         # Put new_token_id in a list so skip_special_tokens is respected
+         new_tokens = tokenizer.convert_ids_to_tokens(
+             [new_token_id], skip_special_tokens=skip_special_tokens)
+-        output_tokens = prev_tokens + new_tokens
++        # Optimization: Use list copy and extend instead of concatenation
++        output_tokens = prev_tokens.copy()
++        output_tokens.extend(new_tokens)
+ 
+     # The prefix text is necessary only to defeat cleanup algorithms in
+     # the decode which decide to add a space or not depending on the

@@ -1,0 +1,94 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index d3ec90a..e5d28c6 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -148,7 +148,8 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+ 
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -759,7 +760,8 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )
+@@ -1253,9 +1255,10 @@ def moe_ep_deepgemm_preprocess(
+     output_dtype: torch.dtype = torch.float8_e4m3fn,
+ ):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+-    masked_m = torch.zeros(num_experts, device=topk_ids.device, dtype=torch.int32)
++    masked_m = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+         reorder_topk_ids, seg_indptr, topk_ids.numel()
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index 66fbb36..33dc094 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -351,13 +351,13 @@ class DeepEPMoE(EPMoE):
+             # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
+             #     self.expert_mask = [1, 1, 1, 1, 0]
+             # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
+-            self.expert_mask = torch.zeros(
++            self.expert_mask = torch.ones(
+                 (self.num_local_experts + 1),
+                 device=torch.cuda.current_device(),
+                 dtype=torch.int,
+             )
+             # the last one is invalid rank_id
+-            self.expert_mask[:-1] = 1
++            self.expert_mask[-1] = 0
+         else:
+             self.w13_weight_fp8 = (
+                 self.w13_weight,
+@@ -502,12 +502,11 @@ class DeepEPMoE(EPMoE):
+                 dtype=hidden_states_fp8.dtype,
+             ),
+             (
+-                # TODO check whether need `zeros`
+-                torch.zeros(
+-                    (ceil_div(K // 128, 4), all_tokens),
++                torch.empty(
++                    (all_tokens, ceil_div(K // 128, 4)),
+                     device=hidden_states_fp8.device,
+                     dtype=torch.int,
+-                ).transpose(0, 1)
++                )
+                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                 else torch.empty(
+                     (all_tokens, K // 128),
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 03faea6..bf0d041 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1099,14 +1099,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:

@@ -1,0 +1,45 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index a9ef973..a56dad3 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -45,14 +45,32 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++    
++    # Compute combined mask once to avoid redundant OR operations
++    combined_mask = prompt_mask | output_mask
++    
++    # Use unsqueezed version for broadcasting (avoids .repeat memory allocation)
++    repetition_penalties_unsq = repetition_penalties.unsqueeze(dim=1)
++    
++    # Compute positive mask once
++    positive_mask = logits > 0
++    
++    # Apply penalties only where combined_mask is True
++    # This avoids creating large intermediate tensors with torch.where
++    penalty_mask_pos = combined_mask & positive_mask
++    penalty_mask_neg = combined_mask & ~positive_mask
++    
++    # Apply repetition penalties using broadcasting (avoids .repeat memory allocation)
++    # Use expand instead of expand_as for slightly better performance
++    rep_pen_expanded = repetition_penalties_unsq.expand(num_seqs, vocab_size)
++    logits[penalty_mask_pos] /= rep_pen_expanded[penalty_mask_pos]
++    logits[penalty_mask_neg] *= rep_pen_expanded[penalty_mask_neg]
++    
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
++    # Use in-place operations and cache unsqueeze for better performance
++    frequency_penalties_unsq = frequency_penalties.unsqueeze(dim=1)
++    presence_penalties_unsq = presence_penalties.unsqueeze(dim=1)
++    logits -= frequency_penalties_unsq * output_bin_counts
++    logits -= presence_penalties_unsq * output_mask
+     return logits

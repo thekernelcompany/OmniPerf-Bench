@@ -1,0 +1,162 @@
+diff --git a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+index 608f9ba..4e754f8 100644
+--- a/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
++++ b/python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+@@ -93,15 +93,19 @@ def _fwd_kernel(
+     offs_d = tl.arange(0, BLOCK_DMODEL)
+     offs_dv = tl.arange(0, BLOCK_DV)
+     offs_m = tl.arange(0, BLOCK_M)
+-    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
++    # Optimization: Pre-compute block offset
++    cur_block_m_offs = cur_block_m * BLOCK_M
++    mask_m = (cur_block_m_offs + offs_m) < cur_seq_len_extend
+ 
+     mask_d = offs_d < Lq
+     mask_dv = offs_dv < Lv
+ 
++    # Optimization: Pre-compute head offset for q
++    q_head_offset = cur_head * stride_qh
+     offs_q = (
+-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
++        (cur_seq_extend_start_idx + cur_block_m_offs + offs_m[:, None])
+         * stride_qbs
+-        + cur_head * stride_qh
++        + q_head_offset
+         + offs_d[None, :]
+     )
+     q = tl.load(
+@@ -111,9 +115,9 @@ def _fwd_kernel(
+     if BLOCK_DPE > 0:
+         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+         offs_qpe = (
+-            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
++            (cur_seq_extend_start_idx + cur_block_m_offs + offs_m[:, None])
+             * stride_qbs
+-            + cur_head * stride_qh
++            + q_head_offset
+             + offs_dpe[None, :]
+         )
+         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+@@ -121,9 +125,15 @@ def _fwd_kernel(
+     # stage 1: compute scores with prefix
+     offs_n = tl.arange(0, BLOCK_N)
+ 
++    # Optimization: Initialize accumulators more efficiently
+     acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+-    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
++    # Directly set e_max to -inf without creating zeros first
++    e_max = tl.full([BLOCK_M], value=float("-inf"), dtype=tl.float32)
++
++    # Optimization: Pre-compute head offsets to avoid redundant computation in loops
++    kv_head_offset_k = cur_kv_head * stride_buf_kh
++    kv_head_offset_v = cur_kv_head * stride_buf_vh
+ 
+     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+         start_n = tl.multiple_of(start_n, BLOCK_N)
+@@ -135,7 +145,7 @@ def _fwd_kernel(
+         # load k in transposed way
+         offs_buf_k = (
+             offs_kv_loc[None, :] * stride_buf_kbs
+-            + cur_kv_head * stride_buf_kh
++            + kv_head_offset_k
+             + offs_d[:, None]
+         )
+         k = tl.load(
+@@ -146,7 +156,7 @@ def _fwd_kernel(
+         if BLOCK_DPE > 0:
+             offs_kpe = (
+                 offs_kv_loc[None, :] * stride_buf_kbs
+-                + cur_kv_head * stride_buf_kh
++                + kv_head_offset_k
+                 + offs_dpe[:, None]
+             )
+             kpe = tl.load(
+@@ -164,7 +174,7 @@ def _fwd_kernel(
+             custom_mask = tl.load(
+                 mask_ptr
+                 + cur_seq_mask_start_idx
+-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
++                + (cur_block_m_offs + offs_m[:, None]) * cur_seq_len
+                 + start_n
+                 + offs_n[None, :],
+                 mask=(mask_m[:, None] & mask_n[None, :]),
+@@ -182,7 +192,7 @@ def _fwd_kernel(
+ 
+         offs_buf_v = (
+             offs_kv_loc[:, None] * stride_buf_vbs
+-            + cur_kv_head * stride_buf_vh
++            + kv_head_offset_v
+             + offs_dv[None, :]
+         )
+         v = tl.load(
+@@ -194,6 +204,9 @@ def _fwd_kernel(
+         e_max = n_e_max
+ 
+     # stage 2: compute the triangle part
++    # Optimization: Pre-compute head offsets for extend stage
++    kv_head_offset_k_extend = cur_kv_head * stride_kh
++    kv_head_offset_v_extend = cur_kv_head * stride_vh
+ 
+     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
+     for start_n in range(0, cur_block_m_end, BLOCK_N):
+@@ -203,7 +216,7 @@ def _fwd_kernel(
+         # load k in transposed way
+         offs_k = (
+             (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+-            + cur_kv_head * stride_kh
++            + kv_head_offset_k_extend
+             + offs_d[:, None]
+         )
+         k = tl.load(
+@@ -214,7 +227,7 @@ def _fwd_kernel(
+         if BLOCK_DPE > 0:
+             offs_kpe = (
+                 (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+-                + cur_kv_head * stride_kh
++                + kv_head_offset_k_extend
+                 + offs_dpe[:, None]
+             )
+             kpe = tl.load(
+@@ -233,7 +246,7 @@ def _fwd_kernel(
+             custom_mask = tl.load(
+                 mask_ptr
+                 + cur_seq_mask_start_idx
+-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_len
++                + (cur_block_m_offs + offs_m[:, None]) * cur_seq_len
+                 + cur_seq_len_prefix
+                 + start_n
+                 + offs_n[None, :],
+@@ -243,7 +256,7 @@ def _fwd_kernel(
+             custom_mask &= mask_m[:, None] & mask_n[None, :]
+             qk = tl.where(custom_mask, qk, float("-inf"))
+         else:
+-            mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
++            mask_causual = (cur_block_m_offs + offs_m[:, None]) >= (
+                 start_n + offs_n[None, :]
+             )
+             mask_causual &= mask_m[:, None] & mask_n[None, :]
+@@ -256,7 +269,7 @@ def _fwd_kernel(
+ 
+         offs_v = (
+             (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+-            + cur_kv_head * stride_vh
++            + kv_head_offset_v_extend
+             + offs_dv[None, :]
+         )
+         v = tl.load(
+@@ -267,10 +280,12 @@ def _fwd_kernel(
+ 
+         e_max = n_e_max
+ 
++    # Optimization: Pre-compute output head offset
++    o_head_offset = cur_head * stride_oh
+     offs_o = (
+-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
++        (cur_seq_extend_start_idx + cur_block_m_offs + offs_m[:, None])
+         * stride_obs
+-        + cur_head * stride_oh
++        + o_head_offset
+         + offs_dv[None, :]
+     )
+     if STORE_TRANSPOSE:

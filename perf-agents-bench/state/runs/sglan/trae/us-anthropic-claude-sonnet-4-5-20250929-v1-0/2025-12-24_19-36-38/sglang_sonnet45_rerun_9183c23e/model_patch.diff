@@ -1,0 +1,84 @@
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 13eb233..3ae80fd 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -148,8 +148,6 @@ class GenerateReqInput:
+                 self.image_data = [None] * num
+             elif not isinstance(self.image_data, list):
+                 self.image_data = [self.image_data] * num
+-            elif isinstance(self.image_data, list):
+-                pass
+ 
+             if self.sampling_params is None:
+                 self.sampling_params = [{}] * num
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 786f654..3e1ea95 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -577,8 +577,10 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        # Use torch.empty instead of torch.ones for faster initialization
++        # The actual values don't matter, we just need to trigger cublas initialization
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+@@ -609,20 +611,19 @@ class ModelRunner:
+     def init_double_sparsity_channel_config(self, selected_channel):
+ 
+         selected_channel = "." + selected_channel + "_proj"
+-        self.sorted_channels = []
+         # load channel config
+         with open(self.server_args.ds_channel_config_path, "r") as f:
+             channel_config = json.load(f)
+ 
+-        for i in range(self.model_config.num_hidden_layers):
+-            key = "model.layers." + str(i) + ".self_attn" + selected_channel
+-            self.sorted_channels.append(
+-                torch.tensor(channel_config[key])[
+-                    :, : self.server_args.ds_heavy_channel_num
+-                ]
+-                .contiguous()
+-                .cuda()
+-            )
++        # Use list comprehension instead of repeated append for better performance
++        self.sorted_channels = [
++            torch.tensor(channel_config[f"model.layers.{i}.self_attn{selected_channel}"])[
++                :, : self.server_args.ds_heavy_channel_num
++            ]
++            .contiguous()
++            .cuda()
++            for i in range(self.model_config.num_hidden_layers)
++        ]
+ 
+     def init_cuda_graphs(self):
+         """Capture cuda graphs."""
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 7c3efa9..0eb638b 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -1179,13 +1179,13 @@ def set_gpu_proc_affinity(
+     end_cpu_id = start_cpu_id + num_cores_bind
+ 
+     if psutil.cpu_count() != psutil.cpu_count(logical=False):
+-        # HT on
+-        upper_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+-        lower_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+-        bind_cpu_ids = list(itertools.chain(upper_cpu_ids, lower_cpu_ids))
++        # HT on - use list() with range for better performance
++        upper_cpu_ids = list(range(start_cpu_id, end_cpu_id))
++        lower_cpu_ids = list(range(start_cpu_id + total_pcores, end_cpu_id + total_pcores))
++        bind_cpu_ids = upper_cpu_ids + lower_cpu_ids
+     else:
+-        # HT off
+-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
++        # HT off - use list() with range for better performance
++        bind_cpu_ids = list(range(start_cpu_id, end_cpu_id))
+ 
+     # set cpu_affinity to current process
+     p.cpu_affinity(bind_cpu_ids)

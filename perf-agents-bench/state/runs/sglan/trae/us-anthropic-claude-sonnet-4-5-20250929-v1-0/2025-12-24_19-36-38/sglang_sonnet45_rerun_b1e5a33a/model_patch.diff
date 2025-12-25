@@ -1,0 +1,182 @@
+--- /tmp/original_layers.py	2025-12-24 23:01:43.182999353 +0000
++++ /tmp/current_layers.py	2025-12-24 23:01:43.180999312 +0000
+@@ -94,19 +94,21 @@
+ 
+     def forward(self, input_: torch.Tensor):
+         # duplicate the logic in ColumnParallelLinear
+-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+-        output_parallel = self.base_layer.quant_method.apply(
+-            self.base_layer, input_, bias
++        base_layer = self.base_layer
++        skip_bias_add = base_layer.skip_bias_add
++        bias = None if skip_bias_add else base_layer.bias
++        output_parallel = base_layer.quant_method.apply(
++            base_layer, input_, bias
+         )
+ 
+         if self.set_lora:
+             output_parallel = self.apply_lora(output_parallel, input_)
+ 
+-        if self.base_layer.gather_output:
++        if base_layer.gather_output:
+             output = tensor_model_parallel_all_gather(output_parallel)
+         else:
+             output = output_parallel
+-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
++        output_bias = base_layer.bias if skip_bias_add else None
+         return output, output_bias
+ 
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+@@ -115,9 +117,7 @@
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+         shard_size = self.base_layer.output_partition_sizes[0]
+         start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
+-        B = B[start_idx:end_idx, :]
+-        return B
++        return B[start_idx:start_idx + shard_size, :]
+ 
+ 
+ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -137,18 +137,8 @@
+         self.A_buffer_gate_up = A_buffer
+         if self.lora_backend.fuse_stacked_lora_b:
+             # B_buffer_gate_up: (num_lora, 2 * output_dim, r)
+-            if not hasattr(self, "B_buffer_gate_up") or self.B_buffer_gate_up is None:
+-                self.B_buffer_gate_up = torch.empty(
+-                    (
+-                        B_buffer[0].shape[0],
+-                        2 * B_buffer[0].shape[1],
+-                        B_buffer[0].shape[2],
+-                    ),
+-                    dtype=B_buffer[0].dtype,
+-                    device=B_buffer[0].device,
+-                )
+-            self.B_buffer_gate_up[:, : B_buffer[0].shape[1], :].copy_(B_buffer[0])
+-            self.B_buffer_gate_up[:, B_buffer[0].shape[1] :, :].copy_(B_buffer[1])
++            # Use torch.cat for more efficient concatenation
++            self.B_buffer_gate_up = torch.cat([B_buffer[0], B_buffer[1]], dim=1)
+         else:
+             self.B_buffer_gate_up = (B_buffer[0], B_buffer[1])
+ 
+@@ -174,8 +164,7 @@
+         # Since the outputs for both gate and up are identical, we use a random one.
+         shard_size = self.base_layer.output_partition_sizes[0]
+         start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
+-        return B[:, start_idx:end_idx, :]
++        return B[:, start_idx:start_idx + shard_size, :]
+ 
+ 
+ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -202,30 +191,12 @@
+             output_dim_q, output_dim_kv = B_buffer_q.shape[-2], B_buffer_kv.shape[-2]
+ 
+             # B_buffer_qkv: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+-            if not hasattr(self, "B_buffer_qkv") or self.B_buffer_qkv is None:
+-                self.B_buffer_qkv = torch.empty(
+-                    (
+-                        B_buffer_q[0].shape[0],
+-                        output_dim_q + 2 * output_dim_kv,
+-                        B_buffer_q[0].shape[2],
+-                    ),
+-                    dtype=B_buffer_q[0].dtype,
+-                    device=B_buffer_q[0].device,
+-                )
+-            self.B_buffer_qkv[:, :output_dim_q, :].copy_(B_buffer_q[0])
+-            self.B_buffer_qkv[:, output_dim_q : output_dim_q + output_dim_kv, :].copy_(
+-                B_buffer_kv[0]
+-            )
+-            self.B_buffer_qkv[:, output_dim_q + output_dim_kv :, :].copy_(
+-                B_buffer_kv[1]
+-            )
++            # Use torch.cat for more efficient concatenation
++            self.B_buffer_qkv = torch.cat([B_buffer_q[0], B_buffer_kv[0], B_buffer_kv[1]], dim=1)
+ 
+             # Offsets of q/k/v in output dimension
+-            if not hasattr(self, "output_offset") or self.output_offset is None:
+-                self.output_offset = torch.empty(
+-                    4, dtype=torch.int32, device=B_buffer_q.device
+-                )
+-            self.output_offset[:4] = torch.tensor(
++            # Create tensor directly instead of empty + assignment
++            self.output_offset = torch.tensor(
+                 [
+                     0,
+                     output_dim_q,
+@@ -271,16 +242,13 @@
+         base_layer = self.base_layer
+         q_proj_shard_size = base_layer.q_proj_shard_size
+         kv_proj_shard_size = base_layer.kv_proj_shard_size
+-        num_kv_head_replicas = base_layer.num_kv_head_replicas
+ 
+         q_start_idx = q_proj_shard_size * tp_rank
+-        q_end_idx = q_start_idx + q_proj_shard_size
+ 
+-        kv_shard_id = tp_rank // num_kv_head_replicas
++        kv_shard_id = tp_rank // base_layer.num_kv_head_replicas
+         kv_start_idx = kv_proj_shard_size * kv_shard_id
+-        kv_end_idx = kv_start_idx + kv_proj_shard_size
+ 
+-        return B_q[q_start_idx:q_end_idx, :], B_kv[:, kv_start_idx:kv_end_idx, :]
++        return B_q[q_start_idx:q_start_idx + q_proj_shard_size, :], B_kv[:, kv_start_idx:kv_start_idx + kv_proj_shard_size, :]
+ 
+ 
+ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -312,44 +280,41 @@
+ 
+     def forward(self, input_: torch.Tensor):
+         # duplicate the logic in RowParallelLinear
+-        if self.base_layer.input_is_parallel:
++        base_layer = self.base_layer
++        if base_layer.input_is_parallel:
+             input_parallel = input_
+         else:
+             tp_rank = get_tensor_model_parallel_rank()
+             splitted_input = split_tensor_along_last_dim(
+-                input_, num_partitions=self.base_layer.tp_size
++                input_, num_partitions=base_layer.tp_size
+             )
+             input_parallel = splitted_input[tp_rank].contiguous()
+-        output_parallel = self.base_layer.quant_method.apply(
+-            self.base_layer, input_parallel
++        output_parallel = base_layer.quant_method.apply(
++            base_layer, input_parallel
+         )
+ 
+         if self.set_lora:
+             output_parallel = self.apply_lora(output_parallel, input_parallel)
+ 
+-        if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
++        if base_layer.reduce_results and base_layer.tp_size > 1:
+             output_ = tensor_model_parallel_all_reduce(output_parallel)
+         else:
+             output_ = output_parallel
+ 
+-        if not self.base_layer.skip_bias_add:
+-            output = (
+-                output_ + self.base_layer.bias
+-                if self.base_layer.bias is not None
+-                else output_
+-            )
++        skip_bias_add = base_layer.skip_bias_add
++        if not skip_bias_add:
++            bias = base_layer.bias
++            output = output_ + bias if bias is not None else output_
+             output_bias = None
+         else:
+             output = output_
+-            output_bias = self.base_layer.bias
++            output_bias = base_layer.bias
+         return output, output_bias
+ 
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+         shard_size = self.base_layer.input_size_per_partition
+         start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
+-        A = A[:, start_idx:end_idx].contiguous()
+-        return A
++        return A[:, start_idx:start_idx + shard_size].contiguous()
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+         return B

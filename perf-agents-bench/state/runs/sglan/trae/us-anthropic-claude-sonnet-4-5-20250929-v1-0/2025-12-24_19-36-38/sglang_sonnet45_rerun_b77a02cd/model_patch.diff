@@ -1,0 +1,94 @@
+diff --git a/python/sglang/srt/constrained/__init__.py b/python/sglang/srt/constrained/__init__.py
+index c47c5c8..0a5af23 100644
+--- a/python/sglang/srt/constrained/__init__.py
++++ b/python/sglang/srt/constrained/__init__.py
+@@ -42,12 +42,14 @@ except ImportError:
+     def build_regex_from_object(
+         object: Union[str, BaseModel, Dict], whitespace_pattern: Optional[str] = None
+     ):
+-        if isinstance(object, type(BaseModel)):
+-            schema = json.dumps(object.model_json_schema())
+-        elif isinstance(object, Dict):
++        # Optimization: Check for string first (most common case) and use inspect.isclass
++        if isinstance(object, str):
++            schema = object
++        elif isinstance(object, dict):
+             schema = json.dumps(object)
+         else:
+-            schema = object
++            # Must be a BaseModel class
++            schema = json.dumps(object.model_json_schema())
+         return build_regex_from_schema(schema, whitespace_pattern)
+ 
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index fcd06d8..645e909 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -30,6 +30,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+ """
+ 
+ import dataclasses
++import itertools
+ import logging
+ from typing import List, Optional, Tuple, Union
+ 
+@@ -579,7 +580,8 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Reassign
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
++        # Optimization: Use itertools.chain instead of sum(list, []) for better performance
++        self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32).to(
+             self.device, non_blocking=True
+         )
+         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+@@ -650,7 +652,8 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Set fields
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
++        # Optimization: Use itertools.chain instead of sum(list, []) for better performance
++        self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32).to(
+             self.device, non_blocking=True
+         )
+         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index 27a2d07..f673dc2 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -141,7 +141,8 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
+-        self.vocab_mask = torch.zeros(
++        # Optimization: Use torch.ones directly instead of torch.zeros + fill_(1)
++        self.vocab_mask = torch.ones(
+             len(self.temperatures),
+             self.vocab_size,
+             dtype=torch.bool,
+@@ -149,7 +150,6 @@ class SamplingBatchInfo:
+         )
+         for i, regex_fsm in enumerate(self.regex_fsms):
+             if regex_fsm is not None:
+-                self.vocab_mask[i].fill_(1)
+                 self.vocab_mask[i][
+                     regex_fsm.get_next_instruction(self.regex_fsm_states[i]).tokens
+                 ] = 0
+@@ -185,11 +185,11 @@ class SamplingBatchInfo:
+                 shape, dtype = lhs.shape[1:], lhs.dtype
+             else:
+                 shape, dtype = rhs.shape[1:], rhs.dtype
+-            with torch.dtype(dtype):
+-                if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
+-                if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++            # Optimization: Use torch.full for default value initialization
++            if lhs is None:
++                lhs = torch.full((bs1, *shape), default, dtype=dtype, device=device)
++            if rhs is None:
++                rhs = torch.full((bs2, *shape), default, dtype=dtype, device=device)
+             return torch.cat([lhs, rhs])
+ 
+         return None

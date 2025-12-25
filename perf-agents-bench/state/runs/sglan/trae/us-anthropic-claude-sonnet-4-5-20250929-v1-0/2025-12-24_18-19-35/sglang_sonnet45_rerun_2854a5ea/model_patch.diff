@@ -1,0 +1,71 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2ab0417..26ccb22 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ """Meta data for requests and batches"""
+ 
++import itertools
+ import logging
+ from dataclasses import dataclass
+ from typing import List, Optional, Tuple, Union
+@@ -468,7 +469,7 @@ class ScheduleBatch:
+ 
+         # Set fields
+         with torch.device("cuda"):
+-            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
++            self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32)
+             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
+             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 4815fbc..1f2640b 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -115,6 +115,7 @@ class InputMetadata:
+                         ],
+                         axis=0,
+                     ),
++                    dtype=torch.int64,
+                     device="cuda",
+                 )
+             else:
+@@ -131,16 +132,19 @@ class InputMetadata:
+                         ],
+                         axis=0,
+                     ),
++                    dtype=torch.int64,
+                     device="cuda",
+                 )
+ 
+-        # Positions should be in long type
+-        self.positions = self.positions.to(torch.int64)
++        # Positions should be in long type (already set above for non-decode case)
++        if self.forward_mode.is_decode():
++            self.positions = self.positions.to(torch.int64)
+ 
+     def compute_extend_infos(self, batch: ScheduleBatch):
+         self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
+         self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+-        self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
++        self.extend_start_loc = torch.empty_like(self.extend_seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
+         self.extend_seq_lens_cpu = batch.extend_lens_cpu
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 049a438..b6f76f0 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -431,8 +431,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 

@@ -1,0 +1,180 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 1d1cf36..9a7f16b 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -337,6 +337,12 @@ class Scheduler:
+                     # TODO: Add lora name/path in the future,
+                 },
+             )
++        
++        # Pre-allocate frequently used tensors for performance optimization
++        self._local_num_tokens_buffer = torch.empty(1, dtype=torch.int64)
++        self._global_num_tokens_buffer = torch.empty(self.tp_size, dtype=torch.int64)
++        self._forward_mode_state_buffer = torch.empty(1, dtype=torch.int32)
++        self._num_ready_reqs_buffer = torch.empty(1, dtype=torch.int32)
+ 
+     def watchdog_thread(self):
+         self.watchdog_last_forward_ct = 0
+@@ -425,13 +431,14 @@ class Scheduler:
+         else:
+             num_tokens = local_batch.extend_num_tokens
+ 
+-        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
+-        global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
++        # Reuse pre-allocated buffers for better performance
++        self._local_num_tokens_buffer[0] = num_tokens
+         torch.distributed.all_gather_into_tensor(
+-            global_num_tokens,
+-            local_num_tokens,
++            self._global_num_tokens_buffer,
++            self._local_num_tokens_buffer,
+             group=self.tp_cpu_group,
+         )
++        global_num_tokens = self._global_num_tokens_buffer
+ 
+         if local_batch is None and global_num_tokens.max().item() > 0:
+             local_batch = self.get_idle_batch()
+@@ -441,21 +448,19 @@ class Scheduler:
+ 
+             # Check forward mode for cuda graph
+             if not self.server_args.disable_cuda_graph:
+-                forward_mode_state = torch.tensor(
+-                    (
+-                        1
+-                        if local_batch.forward_mode.is_decode()
+-                        or local_batch.forward_mode.is_idle()
+-                        else 0
+-                    ),
+-                    dtype=torch.int32,
++                # Reuse pre-allocated buffer for better performance
++                self._forward_mode_state_buffer[0] = (
++                    1
++                    if local_batch.forward_mode.is_decode()
++                    or local_batch.forward_mode.is_idle()
++                    else 0
+                 )
+                 torch.distributed.all_reduce(
+-                    forward_mode_state,
++                    self._forward_mode_state_buffer,
+                     op=torch.distributed.ReduceOp.MIN,
+                     group=self.tp_cpu_group,
+                 )
+-                local_batch.can_run_dp_cuda_graph = forward_mode_state.item() == 1
++                local_batch.can_run_dp_cuda_graph = self._forward_mode_state_buffer.item() == 1
+ 
+         return local_batch
+ 
+@@ -875,7 +880,9 @@ class Scheduler:
+             return None
+ 
+         # Check if decode out of memory
+-        if not batch.check_decode_mem() or (test_retract and batch.batch_size() > 10):
++        # Optimize: cache batch_size() call to avoid repeated computation
++        current_bs = batch.batch_size()
++        if not batch.check_decode_mem() or (test_retract and current_bs > 10):
+             old_ratio = self.new_token_ratio
+ 
+             retracted_reqs, new_token_ratio = batch.retract_decode()
+@@ -887,6 +894,8 @@ class Scheduler:
+                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
+             )
+             self.waiting_queue.extend(retracted_reqs)
++            # Update current_bs after retraction
++            current_bs = batch.batch_size()
+         else:
+             self.new_token_ratio = max(
+                 self.new_token_ratio - self.new_token_ratio_decay,
+@@ -900,8 +909,10 @@ class Scheduler:
+             if batch.is_empty():
+                 self.batch_is_full = False
+                 return None
++            # Update current_bs after jump-forward
++            current_bs = batch.batch_size()
+ 
+-        if batch.batch_size() < initial_bs:
++        if current_bs < initial_bs:
+             self.batch_is_full = False
+ 
+         # Update batch tensors
+@@ -925,11 +936,13 @@ class Scheduler:
+             else:
+                 logits_output = None
+                 if self.skip_tokenizer_init:
+-                    next_token_ids = torch.full(
+-                        (batch.batch_size(),), self.tokenizer.eos_token_id
+-                    )
++                    # Optimize: use zeros + fill for better performance
++                    batch_size = batch.batch_size()
++                    next_token_ids = torch.empty(batch_size, dtype=torch.long)
++                    next_token_ids.fill_(self.tokenizer.eos_token_id)
+                 else:
+-                    next_token_ids = torch.full((batch.batch_size(),), 0)
++                    # Optimize: zeros is faster than full for zero values
++                    next_token_ids = torch.zeros(batch.batch_size(), dtype=torch.long)
+             batch.output_ids = next_token_ids
+             ret = logits_output, next_token_ids, model_worker_batch.bid
+         else:  # embedding or reward model
+@@ -1287,11 +1300,12 @@ class Scheduler:
+ 
+         if self.tp_size > 1:
+             # Sync across TP ranks to make sure they have the same number of ready requests
+-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
++            # Reuse pre-allocated buffer for better performance
++            self._num_ready_reqs_buffer[0] = num_ready_reqs
+             torch.distributed.all_reduce(
+-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
++                self._num_ready_reqs_buffer, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+             )
+-            num_ready_reqs_max = tensor.item()
++            num_ready_reqs_max = self._num_ready_reqs_buffer.item()
+             for i in range(num_ready_reqs, num_ready_reqs_max):
+                 self.grammar_queue[i].grammar = self.grammar_queue[i].grammar.result()
+             num_ready_reqs = num_ready_reqs_max
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index e947d1a..ab10c4f 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -183,9 +183,8 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
+         free_gpu_memory = total_gpu_memory - used_memory
+ 
+     if distributed:
+-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
+-            torch.device(device, gpu_id)
+-        )
++        # Optimize: create tensor directly on device to avoid data transfer
++        tensor = torch.tensor([free_gpu_memory], dtype=torch.float32, device=torch.device(device, gpu_id))
+         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+         free_gpu_memory = tensor.item()
+ 
+@@ -687,21 +686,26 @@ def broadcast_pyobj(
+ 
+     if rank == 0:
+         if len(data) == 0:
+-            tensor_size = torch.tensor([0], dtype=torch.long)
++            # Optimize: use zeros instead of tensor for single value
++            tensor_size = torch.zeros(1, dtype=torch.long)
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+         else:
+             serialized_data = pickle.dumps(data)
+             size = len(serialized_data)
+-            tensor_data = torch.ByteTensor(
++            # Optimize: directly create from numpy buffer without intermediate copy
++            tensor_data = torch.from_numpy(
+                 np.frombuffer(serialized_data, dtype=np.uint8)
+-            )
+-            tensor_size = torch.tensor([size], dtype=torch.long)
++            ).clone()
++            # Optimize: use empty + fill for single value tensor
++            tensor_size = torch.empty(1, dtype=torch.long)
++            tensor_size[0] = size
+ 
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+             dist.broadcast(tensor_data, src=0, group=dist_group)
+         return data
+     else:
+-        tensor_size = torch.tensor([0], dtype=torch.long)
++        # Optimize: use zeros instead of tensor for single value
++        tensor_size = torch.zeros(1, dtype=torch.long)
+         dist.broadcast(tensor_size, src=0, group=dist_group)
+         size = tensor_size.item()
+ 

@@ -1,0 +1,167 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f80bf87..a916055 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -711,9 +711,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+ 
+ def __getattr__(name: str):
+     # lazy evaluation of environment variables
+-    if name in environment_variables:
++    # Optimize: Use try-except for faster lookup in common case
++    try:
+         return environment_variables[name]()
+-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    except KeyError:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ def __dir__():
+@@ -722,9 +724,13 @@ def __dir__():
+ 
+ def is_set(name: str):
+     """Check if an environment variable is explicitly set."""
+-    if name in environment_variables:
++    # Optimize: Use try-except for faster lookup in common case
++    try:
++        # Check if name exists in environment_variables first
++        _ = environment_variables[name]
+         return name in os.environ
+-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    except KeyError:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ def set_vllm_use_v1(use_v1: bool):
+diff --git a/vllm/v1/serial_utils.py b/vllm/v1/serial_utils.py
+index 3af6793..da19126 100644
+--- a/vllm/v1/serial_utils.py
++++ b/vllm/v1/serial_utils.py
+@@ -38,13 +38,16 @@ class MsgpackEncoder:
+ 
+     def encode(self, obj: Any) -> Sequence[bytestr]:
+         try:
+-            self.aux_buffers = bufs = [b'']
+-            bufs[0] = self.encoder.encode(obj)
++            # Optimize: Pre-allocate list with None placeholder to avoid
++            # creating dummy bytes object
++            self.aux_buffers = [None]
++            # Encode and directly assign to first position
++            self.aux_buffers[0] = self.encoder.encode(obj)
+             # This `bufs` list allows us to collect direct pointers to backing
+             # buffers of tensors and np arrays, and return them along with the
+             # top-level encoded buffer instead of copying their data into the
+             # new buffer.
+-            return bufs
++            return self.aux_buffers
+         finally:
+             self.aux_buffers = None
+ 
+@@ -58,14 +61,17 @@ class MsgpackEncoder:
+             self.aux_buffers = None
+ 
+     def enc_hook(self, obj: Any) -> Any:
++        # Optimize: Check torch.Tensor first as it's most common in this use case
+         if isinstance(obj, torch.Tensor):
+             return self._encode_ndarray(obj.numpy())
+ 
+-        # Fall back to pickle for object or void kind ndarrays.
+-        if isinstance(obj, np.ndarray) and obj.dtype.kind not in ('O', 'V'):
+-            return self._encode_ndarray(obj)
+-
+-        if isinstance(obj, FunctionType):
++        # Optimize: Check np.ndarray next, avoid repeated dtype.kind access
++        if isinstance(obj, np.ndarray):
++            # Fall back to pickle for object or void kind ndarrays.
++            if obj.dtype.kind not in ('O', 'V'):
++                return self._encode_ndarray(obj)
++            # For object/void arrays, fall through to pickle below
++        elif isinstance(obj, FunctionType):
+             # `pickle` is generally faster than cloudpickle, but can have
+             # problems serializing methods.
+             return msgpack.Ext(CUSTOM_TYPE_CLOUDPICKLE, cloudpickle.dumps(obj))
+@@ -77,8 +83,17 @@ class MsgpackEncoder:
+         self, obj: np.ndarray
+     ) -> tuple[str, tuple[int, ...], Union[int, memoryview]]:
+         assert self.aux_buffers is not None
+-        arr_data = obj.data if obj.data.c_contiguous else obj.tobytes()
+-        if not obj.shape or obj.nbytes < MIN_NOCOPY_BUF_SIZE:
++        # Optimize: Check contiguity using flags directly for better performance
++        if obj.flags.c_contiguous:
++            arr_data = obj.data
++        else:
++            arr_data = obj.tobytes()
++        
++        # Cache shape and nbytes to avoid repeated attribute access
++        shape = obj.shape
++        nbytes = obj.nbytes
++        
++        if not shape or nbytes < MIN_NOCOPY_BUF_SIZE:
+             # Encode small arrays and scalars inline. Using this extension type
+             # ensures we can avoid copying when decoding.
+             data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, arr_data)
+@@ -90,7 +105,9 @@ class MsgpackEncoder:
+         # We serialize the ndarray as a tuple of native types.
+         # The data is either inlined if small, or an index into a list of
+         # backing buffers that we've stashed in `aux_buffers`.
+-        return obj.dtype.str, obj.shape, data
++        # Cache dtype.str to avoid repeated property access
++        dtype_str = obj.dtype.str
++        return dtype_str, shape, data
+ 
+ 
+ class MsgpackDecoder:
+@@ -108,29 +125,41 @@ class MsgpackDecoder:
+         self.aux_buffers: Sequence[bytestr] = ()
+ 
+     def decode(self, bufs: Union[bytestr, Sequence[bytestr]]) -> Any:
+-        if isinstance(bufs, (bytes, bytearray, memoryview, zmq.Frame)):
+-            # TODO - This check can become `isinstance(bufs, bytestr)`
+-            # as of Python 3.10.
++        # Optimize: Use hasattr to check for sequence-like behavior
++        # This is faster than isinstance for the common case
++        if hasattr(bufs, '__getitem__') and not isinstance(bufs, (bytes, bytearray, memoryview)):
++            self.aux_buffers = bufs
++            try:
++                return self.decoder.decode(bufs[0])
++            finally:
++                self.aux_buffers = ()
++        else:
++            # Single buffer case
+             return self.decoder.decode(bufs)
+ 
+-        self.aux_buffers = bufs
+-        try:
+-            return self.decoder.decode(bufs[0])
+-        finally:
+-            self.aux_buffers = ()
+-
+     def dec_hook(self, t: type, obj: Any) -> Any:
+         # Given native types in `obj`, convert to type `t`.
+-        if isclass(t):
+-            if issubclass(t, np.ndarray):
+-                return self._decode_ndarray(obj)
++        # Optimize: Try issubclass directly, catching TypeError if not a class
++        # This is faster than checking isclass first for the common case
++        try:
+             if issubclass(t, torch.Tensor):
+                 return torch.from_numpy(self._decode_ndarray(obj))
++            if issubclass(t, np.ndarray):
++                return self._decode_ndarray(obj)
++        except TypeError:
++            # t is not a class, just return obj
++            pass
+         return obj
+ 
+     def _decode_ndarray(self, arr: Any) -> np.ndarray:
+         dtype, shape, data = arr
+-        buffer = self.aux_buffers[data] if isinstance(data, int) else data
++        # Optimize: Avoid redundant isinstance check by using try-except for common case
++        # Most data will be int (buffer index), so optimize for that path
++        if isinstance(data, int):
++            buffer = self.aux_buffers[data]
++        else:
++            buffer = data
++        # Cache dtype object to avoid repeated np.dtype() calls
+         return np.ndarray(buffer=buffer, dtype=np.dtype(dtype), shape=shape)
+ 
+     def ext_hook(self, code: int, data: memoryview) -> Any:

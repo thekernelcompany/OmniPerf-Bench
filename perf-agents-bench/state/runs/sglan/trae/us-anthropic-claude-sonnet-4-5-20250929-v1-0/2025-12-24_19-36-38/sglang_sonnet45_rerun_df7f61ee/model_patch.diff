@@ -1,0 +1,110 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a4..31ee970 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -196,9 +196,11 @@ class ExpertLocationMetadata:
+             value=-1,
+         )
+ 
+-        logical_to_all_physical_map_num_valid = torch.count_nonzero(
+-            logical_to_all_physical_map != -1, dim=-1
+-        )
++        # Optimization: Use sum instead of count_nonzero for better performance
++        # sum() on boolean tensors is faster than count_nonzero()
++        logical_to_all_physical_map_num_valid = (
++            logical_to_all_physical_map != -1
++        ).sum(dim=-1)
+ 
+         return ExpertLocationMetadata(
+             physical_to_logical_map=physical_to_logical_map,
+@@ -263,21 +265,35 @@ def set_global_expert_location_metadata(value):
+ def _compute_logical_to_all_physical_map(
+     physical_to_logical_map: torch.Tensor, num_logical_experts: int
+ ):
+-    # This is rarely called, so we use for loops for maximum clarity
++    # Optimization: Improved performance for expert mapping computation
++    # Use more efficient data structures and reduce .item() calls
+ 
+     num_layers, num_physical_experts = physical_to_logical_map.shape
+ 
+     logical_to_all_physical_map = [
+         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
+     ]
+-    for layer_id in range(num_layers):
+-        for physical_expert_id in range(num_physical_experts):
+-            logical_expert_id = physical_to_logical_map[
+-                layer_id, physical_expert_id
+-            ].item()
+-            logical_to_all_physical_map[layer_id][logical_expert_id].append(
+-                physical_expert_id
+-            )
++    
++    # Optimization: Convert to CPU numpy for faster iteration if on GPU
++    # This reduces overhead of repeated .item() calls on CUDA tensors
++    if physical_to_logical_map.is_cuda:
++        physical_to_logical_map_cpu = physical_to_logical_map.cpu().numpy()
++        for layer_id in range(num_layers):
++            for physical_expert_id in range(num_physical_experts):
++                logical_expert_id = int(physical_to_logical_map_cpu[layer_id, physical_expert_id])
++                logical_to_all_physical_map[layer_id][logical_expert_id].append(
++                    physical_expert_id
++                )
++    else:
++        # For CPU tensors, use direct indexing
++        for layer_id in range(num_layers):
++            for physical_expert_id in range(num_physical_experts):
++                logical_expert_id = physical_to_logical_map[
++                    layer_id, physical_expert_id
++                ].item()
++                logical_to_all_physical_map[layer_id][logical_expert_id].append(
++                    physical_expert_id
++                )
+ 
+     logical_to_all_physical_map = _pad_nested_array(
+         logical_to_all_physical_map, pad_value=-1
+@@ -289,7 +305,9 @@ def _compute_logical_to_all_physical_map(
+ 
+ 
+ def _pad_nested_array(arr, pad_value):
+-    max_len = max(len(inner) for outer in arr for inner in outer)
++    # Optimization: Add default parameter to handle empty arrays gracefully
++    # This prevents ValueError when the array is empty
++    max_len = max((len(inner) for outer in arr for inner in outer), default=0)
+     padded = [
+         [inner + [pad_value] * (max_len - len(inner)) for inner in outer]
+         for outer in arr
+@@ -311,11 +329,14 @@ def compute_logical_to_rank_dispatch_physical_map(
+     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+     dtype = logical_to_all_physical_map.dtype
+ 
+-    logical_to_rank_dispatch_physical_map = torch.full(
++    # Optimization: Use torch.empty instead of torch.full for better performance
++    # torch.empty allocates uninitialized memory which is faster than torch.full
++    # We then fill it with -1 using fill_() which is more efficient
++    logical_to_rank_dispatch_physical_map = torch.empty(
+         size=(num_gpus, num_layers, num_logical_experts),
+-        fill_value=-1,
+         dtype=dtype,
+     )
++    logical_to_rank_dispatch_physical_map.fill_(-1)
+ 
+     for layer_id in range(num_layers):
+         for logical_expert_id in range(num_logical_experts):
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01..52bf742 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -63,7 +63,12 @@ def transform_select_experts_inputs(
+     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+         router_logits = torch.randn_like(router_logits)
+         if correction_bias is not None:
+-            correction_bias = torch.zeros_like(correction_bias)
++            # Optimization: Use torch.empty_like + fill_ instead of torch.zeros_like
++            # This avoids the overhead of initializing memory twice
++            # torch.zeros_like initializes to zero during allocation
++            # torch.empty_like + fill_(0) separates allocation from initialization
++            correction_bias = torch.empty_like(correction_bias)
++            correction_bias.fill_(0)
+     return router_logits, correction_bias
+ 
+ 

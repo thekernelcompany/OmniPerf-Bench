@@ -1,0 +1,161 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 1d1cf36..c12de3d 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -425,7 +425,9 @@ class Scheduler:
+         else:
+             num_tokens = local_batch.extend_num_tokens
+ 
+-        local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64)
++        # Optimize: Use torch.empty + fill instead of torch.tensor for better performance
++        local_num_tokens = torch.empty(1, dtype=torch.int64)
++        local_num_tokens[0] = num_tokens
+         global_num_tokens = torch.empty(self.tp_size, dtype=torch.int64)
+         torch.distributed.all_gather_into_tensor(
+             global_num_tokens,
+@@ -441,14 +443,13 @@ class Scheduler:
+ 
+             # Check forward mode for cuda graph
+             if not self.server_args.disable_cuda_graph:
+-                forward_mode_state = torch.tensor(
+-                    (
+-                        1
+-                        if local_batch.forward_mode.is_decode()
+-                        or local_batch.forward_mode.is_idle()
+-                        else 0
+-                    ),
+-                    dtype=torch.int32,
++                # Optimize: Use torch.empty + fill instead of torch.tensor
++                forward_mode_state = torch.empty(1, dtype=torch.int32)
++                forward_mode_state[0] = (
++                    1
++                    if local_batch.forward_mode.is_decode()
++                    or local_batch.forward_mode.is_idle()
++                    else 0
+                 )
+                 torch.distributed.all_reduce(
+                     forward_mode_state,
+@@ -819,8 +820,10 @@ class Scheduler:
+         can_run_list = adder.can_run_list
+         if len(can_run_list) == 0:
+             return None
++        # Optimize: Create set once instead of in list comprehension
++        can_run_set = set(can_run_list)
+         self.waiting_queue = [
+-            x for x in self.waiting_queue if x not in set(can_run_list)
++            x for x in self.waiting_queue if x not in can_run_set
+         ]
+ 
+         if adder.new_inflight_req is not None:
+@@ -924,12 +927,13 @@ class Scheduler:
+                 return
+             else:
+                 logits_output = None
++                # Optimize: Use torch.empty + fill_ instead of torch.full for better performance
++                batch_size = batch.batch_size()
++                next_token_ids = torch.empty(batch_size, dtype=torch.long)
+                 if self.skip_tokenizer_init:
+-                    next_token_ids = torch.full(
+-                        (batch.batch_size(),), self.tokenizer.eos_token_id
+-                    )
++                    next_token_ids.fill_(self.tokenizer.eos_token_id)
+                 else:
+-                    next_token_ids = torch.full((batch.batch_size(),), 0)
++                    next_token_ids.fill_(0)
+             batch.output_ids = next_token_ids
+             ret = logits_output, next_token_ids, model_worker_batch.bid
+         else:  # embedding or reward model
+@@ -1122,10 +1126,12 @@ class Scheduler:
+             input_token_logprobs = output.input_token_logprobs[
+                 pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
+             ]
++            # Optimize: Cache len(req.fill_ids) to avoid redundant calls
++            fill_ids_len = len(req.fill_ids)
+             input_token_ids = req.fill_ids[
+-                len(req.fill_ids)
++                fill_ids_len
+                 - num_input_logprobs
+-                + 1 : len(req.fill_ids)
++                + 1 : fill_ids_len
+                 - req.last_update_decode_tokens
+             ]
+             req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
+@@ -1139,6 +1145,8 @@ class Scheduler:
+ 
+         if req.last_update_decode_tokens != 0:
+             # Some decode tokens are re-computed in an extend batch
++            # Optimize: Cache len(req.fill_ids) to avoid redundant calls
++            fill_ids_len = len(req.fill_ids)
+             req.output_token_logprobs.extend(
+                 list(
+                     zip(
+@@ -1151,8 +1159,8 @@ class Scheduler:
+                             - 1
+                         ],
+                         req.fill_ids[
+-                            len(req.fill_ids)
+-                            - req.last_update_decode_tokens : len(req.fill_ids)
++                            fill_ids_len
++                            - req.last_update_decode_tokens : fill_ids_len
+                         ],
+                     )
+                 )
+@@ -1287,7 +1295,9 @@ class Scheduler:
+ 
+         if self.tp_size > 1:
+             # Sync across TP ranks to make sure they have the same number of ready requests
+-            tensor = torch.tensor(num_ready_reqs, dtype=torch.int32)
++            # Optimize: Use torch.empty + fill instead of torch.tensor
++            tensor = torch.empty(1, dtype=torch.int32)
++            tensor[0] = num_ready_reqs
+             torch.distributed.all_reduce(
+                 tensor, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+             )
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index e947d1a..7f2a4c0 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -183,9 +183,9 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
+         free_gpu_memory = total_gpu_memory - used_memory
+ 
+     if distributed:
+-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
+-            torch.device(device, gpu_id)
+-        )
++        # Optimize: Use torch.empty + fill instead of torch.tensor for better performance
++        tensor = torch.empty(1, dtype=torch.float32, device=torch.device(device, gpu_id))
++        tensor[0] = free_gpu_memory
+         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+         free_gpu_memory = tensor.item()
+ 
+@@ -687,7 +687,9 @@ def broadcast_pyobj(
+ 
+     if rank == 0:
+         if len(data) == 0:
+-            tensor_size = torch.tensor([0], dtype=torch.long)
++            # Optimize: Use torch.empty + fill instead of torch.tensor
++            tensor_size = torch.empty(1, dtype=torch.long)
++            tensor_size[0] = 0
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+         else:
+             serialized_data = pickle.dumps(data)
+@@ -695,13 +697,17 @@ def broadcast_pyobj(
+             tensor_data = torch.ByteTensor(
+                 np.frombuffer(serialized_data, dtype=np.uint8)
+             )
+-            tensor_size = torch.tensor([size], dtype=torch.long)
++            # Optimize: Use torch.empty + fill instead of torch.tensor
++            tensor_size = torch.empty(1, dtype=torch.long)
++            tensor_size[0] = size
+ 
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+             dist.broadcast(tensor_data, src=0, group=dist_group)
+         return data
+     else:
+-        tensor_size = torch.tensor([0], dtype=torch.long)
++        # Optimize: Use torch.empty + fill instead of torch.tensor
++        tensor_size = torch.empty(1, dtype=torch.long)
++        tensor_size[0] = 0
+         dist.broadcast(tensor_size, src=0, group=dist_group)
+         size = tensor_size.item()
+ 

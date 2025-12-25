@@ -1,0 +1,119 @@
+diff --git a/python/sglang/srt/constrained/outlines_backend.py b/python/sglang/srt/constrained/outlines_backend.py
+index cc68b97..51907e6 100644
+--- a/python/sglang/srt/constrained/outlines_backend.py
++++ b/python/sglang/srt/constrained/outlines_backend.py
+@@ -60,15 +60,18 @@ class OutlinesGrammar(BaseGrammarObject):
+         suffix_bytes = []
+         continuation_range = range(0x80, 0xC0)
+         cur_state = self.state
+-        while (
+-            len(jump_forward_bytes) and jump_forward_bytes[0][0] in continuation_range
+-        ):
++        idx = 0
++        while idx < len(jump_forward_bytes) and jump_forward_bytes[idx][0] in continuation_range:
+             # continuation bytes
+-            byte_edge = jump_forward_bytes.pop(0)
++            byte_edge = jump_forward_bytes[idx]
+             suffix_bytes.append(byte_edge[0])
+             cur_state = byte_edge[1]
++            idx += 1
+ 
+-        suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
++        # Remove processed bytes from the beginning
++        del jump_forward_bytes[:idx]
++
++        suffix_tokens = [f"<0x{b:02X}>" for b in suffix_bytes]
+         suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
+         return suffix_ids, cur_state
+ 
+diff --git a/python/sglang/srt/constrained/xgrammar_backend.py b/python/sglang/srt/constrained/xgrammar_backend.py
+index ab4df5c..74e05dd 100644
+--- a/python/sglang/srt/constrained/xgrammar_backend.py
++++ b/python/sglang/srt/constrained/xgrammar_backend.py
+@@ -66,10 +66,11 @@ class XGrammarGrammar(BaseGrammarObject):
+     def jump_and_retokenize(
+         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+     ):
++        # Find the first position where tokens differ
+         k = 0
+-        for i, old_id in enumerate(old_output_ids):
+-            if old_id == new_output_ids[i]:
+-                k = i + 1
++        for old_id, new_id in zip(old_output_ids, new_output_ids):
++            if old_id == new_id:
++                k += 1
+             else:
+                 break
+ 
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index a341c2b..bdf36be 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -49,23 +49,26 @@ class SamplingBatchInfo:
+     ):
+         reqs = batch.reqs
+         device = batch.device
+-        temperatures = (
+-            torch.tensor(
+-                [r.sampling_params.temperature for r in reqs],
+-                dtype=torch.float,
+-            )
+-            .view(-1, 1)
+-            .to(device, non_blocking=True)
+-        )
++        temperatures = torch.tensor(
++            [r.sampling_params.temperature for r in reqs],
++            dtype=torch.float,
++            device=device,
++        ).view(-1, 1)
+         top_ps = torch.tensor(
+-            [r.sampling_params.top_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_p for r in reqs],
++            dtype=torch.float,
++            device=device,
++        )
+         top_ks = torch.tensor(
+-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.top_k for r in reqs],
++            dtype=torch.int32,
++            device=device,
++        )
+         min_ps = torch.tensor(
+-            [r.sampling_params.min_p for r in reqs], dtype=torch.float
+-        ).to(device, non_blocking=True)
++            [r.sampling_params.min_p for r in reqs],
++            dtype=torch.float,
++            device=device,
++        )
+ 
+         ret = cls(
+             temperatures=temperatures,
+@@ -137,8 +140,9 @@ class SamplingBatchInfo:
+             self.vocab_mask = None
+             return
+ 
++        batch_size = len(self.temperatures)
+         self.vocab_mask = torch.zeros(
+-            len(self.temperatures),
++            batch_size,
+             self.vocab_size,
+             dtype=torch.bool,
+             device=self.device,
+@@ -178,11 +182,10 @@ class SamplingBatchInfo:
+                 shape, dtype = lhs.shape[1:], lhs.dtype
+             else:
+                 shape, dtype = rhs.shape[1:], rhs.dtype
+-            with torch.dtype(dtype):
+-                if lhs is None:
+-                    lhs = torch.empty((bs1, *shape), device=device).fill_(default)
+-                if rhs is None:
+-                    rhs = torch.empty((bs2, *shape), device=device).fill_(default)
++            if lhs is None:
++                lhs = torch.full((bs1, *shape), default, dtype=dtype, device=device)
++            if rhs is None:
++                rhs = torch.full((bs2, *shape), default, dtype=dtype, device=device)
+             return torch.cat([lhs, rhs])
+ 
+         return None
