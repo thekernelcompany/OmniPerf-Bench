@@ -60,19 +60,22 @@ playwright --version
 ## Configuration Files
 
 ### 1. TRAE Configuration (`third-party/trae-agent/trae_config.yaml`)
-Create or verify this file exists with the following content:
+Create or verify this file exists with the following content. The snippet below uses AWS Bedrock (Claude 4.5) for the main TRAE agent model and leaves Lakeview on native Anthropic for summaries:
 
 ```yaml
 model_providers:
-  openai:
-    provider: openai
-    api_key: "${OPENAI_API_KEY}"
-    base_url: "https://api.openai.com/v1"
+  bedrock:
+    provider: bedrock
+    aws_region: ${AWS_REGION:-us-east-1}
+    aws_profile: ${AWS_PROFILE:-}
+  anthropic:
+    provider: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
 
 models:
   trae_agent_model:
-    model_provider: openai
-    model: gpt-5-2025-08-07
+    model_provider: bedrock
+    model: us.anthropic.claude-sonnet-4-20250514-v1:0
     max_tokens: 32000
     temperature: 0.5
     top_p: 1
