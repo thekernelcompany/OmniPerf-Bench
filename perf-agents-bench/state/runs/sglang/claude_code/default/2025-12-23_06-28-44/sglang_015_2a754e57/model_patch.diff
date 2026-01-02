@@ -1,0 +1,98 @@
+diff --git a/python/sglang/bench_latency.py b/python/sglang/bench_latency.py
+index a163cbd30..0025d3d99 100644
+--- a/python/sglang/bench_latency.py
++++ b/python/sglang/bench_latency.py
+@@ -137,7 +137,7 @@ def prepare_synthetic_inputs(bench_args, tokenizer):
+ 
+     reqs = []
+     for i in range(len(input_ids)):
+-        req = Req(rid=i, origin_input_text="", origin_input_ids=list(input_ids[i]))
++        req = Req(rid=i, origin_input_text="", origin_input_ids=input_ids[i].tolist())
+         req.prefix_indices = []
+         req.sampling_params = sampling_params
+         req.input_ids = req.origin_input_ids
+diff --git a/python/sglang/global_config.py b/python/sglang/global_config.py
+index 0cc0f747f..edfd768e1 100644
+--- a/python/sglang/global_config.py
++++ b/python/sglang/global_config.py
+@@ -27,7 +27,7 @@ class GlobalConfig:
+ 
+         # Request dependency time due to network delay
+         self.request_dependency_delay = 0.02
+-        self.wait_for_new_request_delay = 0.0006
++        self.wait_for_new_request_delay = 0.0004
+ 
+         # New generation token ratio estimation
+         self.base_new_token_ratio = 0.4
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index e41514706..4890d5871 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -69,9 +69,10 @@ class InputMetadata:
+     flashinfer_decode_wrapper: "BatchDecodeWithPagedKVCacheWrapper" = None
+ 
+     def init_flashinfer_args(self, num_qo_heads, num_kv_heads, head_dim):
+-        self.kv_indptr = torch.zeros(
++        self.kv_indptr = torch.empty(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_last_page_len = torch.ones(
+             (self.batch_size,), dtype=torch.int32, device="cuda"
+@@ -92,9 +93,10 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.zeros(
++            self.qo_indptr = torch.empty(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
++            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+ 
+             self.flashinfer_prefill_wrapper.end_forward()
+@@ -124,7 +126,8 @@ class InputMetadata:
+ 
+     def init_extend_args(self):
+         self.extend_seq_lens = self.seq_lens - self.prefix_lens
+-        self.extend_start_loc = torch.zeros_like(self.seq_lens)
++        self.extend_start_loc = torch.empty_like(self.seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.max_extend_len = int(torch.max(self.extend_seq_lens))
+ 
+@@ -147,7 +150,8 @@ class InputMetadata:
+         flashinfer_decode_wrapper=None,
+     ):
+         batch_size = len(req_pool_indices)
+-        start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++        start_loc[0] = 0
+         start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+         total_num_tokens = int(torch.sum(seq_lens))
+         max_seq_len = int(torch.max(seq_lens))
+@@ -353,8 +357,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+diff --git a/python/sglang/srt/server.py b/python/sglang/srt/server.py
+index e28530889..93c5c6201 100644
+--- a/python/sglang/srt/server.py
++++ b/python/sglang/srt/server.py
+@@ -251,7 +251,7 @@ def launch_server(server_args: ServerArgs, pipe_finish_writer, model_overide_arg
+ 
+         # Wait until the server is launched
+         for _ in range(120):
+-            time.sleep(0.5)
++            time.sleep(0.3)
+             try:
+                 requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                 break

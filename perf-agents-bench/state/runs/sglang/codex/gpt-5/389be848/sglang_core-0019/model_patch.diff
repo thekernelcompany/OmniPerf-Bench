@@ -1,0 +1,76 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 8895e6be6..21e23c215 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -49,10 +49,7 @@ def fused_topk_native(
+         hidden_states.shape[0] == gating_output.shape[0]
+     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+     M, _ = hidden_states.shape
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
++    # Avoid unnecessary pre-allocation; topk returns new tensors
+     topk_weights = F.softmax(gating_output.float(), dim=-1)
+     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+     if renormalize:
+@@ -117,14 +114,15 @@ def grouped_topk(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    # Use boolean mask to reduce memory bandwidth and avoid casts
++    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
++    tmp_scores = scores.masked_fill(~score_mask, 0.0)  # [n, e]
+     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     if n_share_experts_fusion:
+         topk_ids[:, -1] = torch.randint(
+@@ -146,7 +144,8 @@ def grouped_topk(
+ 
+     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
++    if num_token_non_padded is not None:
++        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+     return topk_weights, topk_ids
+ 
+ 
+@@ -177,16 +176,15 @@ def biased_grouped_topk_impl(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    # Use boolean mask to reduce memory bandwidth and avoid casts
++    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores_for_choice.masked_fill(
+-        ~score_mask.bool(), float("-inf")
+-    )  # [n, e]
++    tmp_scores = scores_for_choice.masked_fill(~score_mask, float("-inf"))  # [n, e]
+     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     topk_weights = scores.gather(1, topk_ids)
+ 
+@@ -263,6 +261,9 @@ def biased_grouped_topk(
+         )
+         # TODO merge into kernel for this branch
+         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
++        # Avoid compiling and invoking the masking kernel when not needed
++        if num_token_non_padded is None:
++            return topk_weights, topk_ids
+         # TODO will fuse this into kernel, thus use slow manual operation now
+         torch.compile(
+             _mask_topk_ids_padded_region, dynamic=True, backend=get_compiler_backend()

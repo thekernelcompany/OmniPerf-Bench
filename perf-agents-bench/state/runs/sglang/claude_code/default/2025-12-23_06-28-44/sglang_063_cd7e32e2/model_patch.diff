@@ -1,0 +1,82 @@
+diff --git a/python/sglang/srt/models/llama4.py b/python/sglang/srt/models/llama4.py
+index d933f27..55cb108 100644
+--- a/python/sglang/srt/models/llama4.py
++++ b/python/sglang/srt/models/llama4.py
+@@ -64,11 +64,12 @@ class Llama4MoE(nn.Module):
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         router_scores_aK, router_indices_aK = fast_topk(gating_output, topk, dim=-1)
+-        router_scores_aK = torch.sigmoid(router_scores_aK.float()).to(
++        # Optimize by removing redundant view().reshape() and using in-place sigmoid
++        router_scores_aK = torch.sigmoid_(router_scores_aK.float()).to(
+             hidden_states.dtype
+         )
+         return (
+-            router_scores_aK.view(-1).reshape(router_scores_aK.shape),
++            router_scores_aK,
+             router_indices_aK.to(torch.int32),
+         )
+ 
+@@ -238,10 +239,13 @@ class Llama4Attention(nn.Module):
+         )
+ 
+     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
++        # Optimize by reducing intermediate tensor allocations
+         floor = torch.floor((positions + 1.0) / self.floor_scale)
+-        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+-
+-        return attn_scale.unsqueeze(-1)
++        floor.add_(1.0)
++        torch.log_(floor)
++        floor.mul_(self.attn_scale)
++        floor.add_(1.0)
++        return floor.unsqueeze(-1)
+ 
+     def forward(
+         self,
+@@ -257,10 +261,18 @@ class Llama4Attention(nn.Module):
+ 
+         if self.qk_norm is not None:
+             # TODO: support float
+-            q = q.reshape(-1, self.head_dim).contiguous().bfloat16()
+-            k = k.reshape(-1, self.head_dim).contiguous().bfloat16()
+-            q = self.qk_norm(q).to(q.dtype)
+-            k = self.qk_norm(k).to(k.dtype)
++            # Optimize by storing original dtype and reducing reshape operations
++            orig_dtype = q.dtype
++            q = q.reshape(-1, self.head_dim)
++            k = k.reshape(-1, self.head_dim)
++            if q.dtype != torch.bfloat16:
++                q = q.contiguous().bfloat16()
++                k = k.contiguous().bfloat16()
++            q = self.qk_norm(q)
++            k = self.qk_norm(k)
++            if orig_dtype != torch.bfloat16:
++                q = q.to(orig_dtype)
++                k = k.to(orig_dtype)
+             q = q.reshape(-1, self.q_size)
+             k = k.reshape(-1, self.kv_size)
+ 
+@@ -270,7 +282,8 @@ class Llama4Attention(nn.Module):
+         # https://arxiv.org/abs/2501.19399
+         if self.attn_temperature_tuning and not self.use_rope:
+             attn_scale = self._get_attn_scale(positions)
+-            q = (q * attn_scale).to(q.dtype)
++            # Optimize by using in-place multiplication when possible
++            q = q.mul(attn_scale)
+ 
+         attn_output = self.attn(q, k, v, forward_batch)
+         output, _ = self.o_proj(attn_output)
+@@ -435,7 +448,11 @@ class Llama4Model(nn.Module):
+         aux_hidden_states = []
+         for i in range(len(self.layers)):
+             if i in self.layers_to_capture:
+-                aux_hidden_states.append(hidden_states + residual)
++                # Optimize by avoiding in-place addition for captures
++                if residual is not None:
++                    aux_hidden_states.append(hidden_states + residual)
++                else:
++                    aux_hidden_states.append(hidden_states)
+             layer = self.layers[i]
+             hidden_states, residual = layer(
+                 positions,

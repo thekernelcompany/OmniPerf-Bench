@@ -1,0 +1,195 @@
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index a391dd7..2152cdb 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -558,16 +558,17 @@ class TokenizerManager:
+     ):
+         batch_size = obj.batch_size
+ 
+-        generators = []
+-        rids = []
++        # Optimize: Pre-allocate lists with known size to avoid dynamic resizing
++        generators = [None] * batch_size
++        rids = [None] * batch_size
+         if getattr(obj, "parallel_sample_num", 1) == 1:
+             # Send all requests
+             for i in range(batch_size):
+                 tmp_obj = obj[i]
+                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                 self._send_one_request(tmp_obj, tokenized_obj, created_time)
+-                generators.append(self._wait_one_response(tmp_obj, request))
+-                rids.append(tmp_obj.rid)
++                generators[i] = self._wait_one_response(tmp_obj, request)
++                rids[i] = tmp_obj.rid
+         else:
+             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+             if batch_size > 128:
+@@ -595,14 +596,20 @@ class TokenizerManager:
+                 await self._wait_one_response(tmp_obj, request).__anext__()
+ 
+             # Expand requests, assign new rids for them, and send them
++            # Optimize: Pre-allocate with exact size needed
++            total_samples = batch_size * obj.parallel_sample_num
++            generators = [None] * total_samples
++            rids = [None] * total_samples
++            idx = 0
+             for i in range(batch_size):
+                 for _ in range(obj.parallel_sample_num):
+                     tmp_obj = copy.copy(objs[i])
+                     tokenized_obj = copy.copy(tokenized_objs[i])
+                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                     self._send_one_request(tmp_obj, tokenized_obj, created_time)
+-                    generators.append(self._wait_one_response(tmp_obj, request))
+-                    rids.append(tmp_obj.rid)
++                    generators[idx] = self._wait_one_response(tmp_obj, request)
++                    rids[idx] = tmp_obj.rid
++                    idx += 1
+ 
+         # Wait for all requests
+         is_stream = hasattr(obj, "stream") and obj.stream
+@@ -931,16 +938,21 @@ class TokenizerManager:
+             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
+         ],
+     ):
++        # Optimize: Cache method references to avoid repeated attribute lookups
++        rid_to_state_get = self.rid_to_state.get
++        finished_reasons = recv_obj.finished_reasons
++        prompt_tokens = recv_obj.prompt_tokens
++
+         for i, rid in enumerate(recv_obj.rids):
+-            state = self.rid_to_state.get(rid, None)
++            state = rid_to_state_get(rid, None)
+             if state is None:
+                 continue
+ 
+             # Build meta_info and return value
+             meta_info = {
+                 "id": rid,
+-                "finish_reason": recv_obj.finished_reasons[i],
+-                "prompt_tokens": recv_obj.prompt_tokens[i],
++                "finish_reason": finished_reasons[i],
++                "prompt_tokens": prompt_tokens[i],
+             }
+ 
+             if getattr(state.obj, "return_logprob", False):
+@@ -1060,14 +1072,14 @@ class TokenizerManager:
+         decode_to_text: bool,
+     ):
+         if not decode_to_text:
+-            return [
+-                (logprob, token_id, None)
+-                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
+-            ]
++            # Optimize: Direct tuple construction without intermediate list comprehension
++            return tuple((logprob, token_id, None)
++                        for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx))
+         else:
+             assert self.tokenizer is not None
+             token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
++            # Optimize: Use tuple instead of list for immutable return
++            return tuple(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+ 
+     def detokenize_top_logprobs_tokens(
+         self,
+@@ -1077,16 +1089,14 @@ class TokenizerManager:
+     ):
+         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
+         # We should batch all top-k tokens in all positions.
+-        ret = []
+-        for i in range(len(token_logprobs_val)):
++        # Optimize: Pre-allocate list with known size to avoid dynamic resizing
++        n = len(token_logprobs_val)
++        ret = [None] * n
++        for i in range(n):
+             if token_logprobs_val[i]:
+-                ret.append(
+-                    self.detokenize_logprob_tokens(
+-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+-                    )
++                ret[i] = self.detokenize_logprob_tokens(
++                    token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                 )
+-            else:
+-                ret.append(None)
+         return ret
+ 
+     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+@@ -1195,7 +1205,9 @@ class _Communicator(Generic[T]):
+         self._sender = sender
+         self._fan_out = fan_out
+         self._result_event: Optional[asyncio.Event] = None
++        # Optimize: Pre-allocate list with expected size to avoid dynamic resizing
+         self._result_values: Optional[List[T]] = None
++        self._result_count: int = 0
+         self._ready_queue: Deque[asyncio.Future] = deque()
+ 
+     async def __call__(self, obj):
+@@ -1210,17 +1222,25 @@ class _Communicator(Generic[T]):
+             self._sender.send_pyobj(obj)
+ 
+         self._result_event = asyncio.Event()
+-        self._result_values = []
++        # Optimize: Pre-allocate list with exact size to avoid resizing
++        self._result_values = [None] * self._fan_out if self._fan_out > 1 else []
++        self._result_count = 0
+         await self._result_event.wait()
+         result_values = self._result_values
+         self._result_event = self._result_values = None
++        self._result_count = 0
+ 
+-        if len(self._ready_queue) > 0:
++        if self._ready_queue:
+             self._ready_queue.popleft().set()
+ 
+         return result_values
+ 
+     def handle_recv(self, recv_obj: T):
+-        self._result_values.append(recv_obj)
+-        if len(self._result_values) == self._fan_out:
++        # Optimize: Use counter and index assignment for pre-allocated lists
++        if self._fan_out > 1:
++            self._result_values[self._result_count] = recv_obj
++        else:
++            self._result_values.append(recv_obj)
++        self._result_count += 1
++        if self._result_count == self._fan_out:
+             self._result_event.set()
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index e1768b5..cb6e994 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1201,8 +1201,10 @@ class ServerArgs:
+         args.tp_size = args.tensor_parallel_size
+         args.dp_size = args.data_parallel_size
+         args.ep_size = args.expert_parallel_size
+-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+-        return cls(**{attr: getattr(args, attr) for attr in attrs})
++        # Optimize: Build dict directly without intermediate list
++        fields = dataclasses.fields(cls)
++        kwargs = {field.name: getattr(args, field.name) for field in fields}
++        return cls(**kwargs)
+ 
+     def url(self):
+         if is_valid_ipv6_address(self.host):
+@@ -1227,14 +1229,13 @@ class ServerArgs:
+         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+ 
+         if isinstance(self.lora_paths, list):
++            # Optimize: Build dict directly using dict comprehension
+             lora_paths = self.lora_paths
+-            self.lora_paths = {}
+-            for lora_path in lora_paths:
+-                if "=" in lora_path:
+-                    name, path = lora_path.split("=", 1)
+-                    self.lora_paths[name] = path
+-                else:
+-                    self.lora_paths[lora_path] = lora_path
++            self.lora_paths = {
++                (parts[0] if len(parts := lora_path.split("=", 1)) == 2 else lora_path):
++                (parts[1] if len(parts) == 2 else lora_path)
++                for lora_path in lora_paths
++            }
+ 
+ 
+ def prepare_server_args(argv: List[str]) -> ServerArgs:

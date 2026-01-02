@@ -1,0 +1,124 @@
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index 68bcb5b..1171952 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -21,7 +21,7 @@ The radix tree data structure for managing the KV cache.
+ 
+ import heapq
+ import time
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from typing import TYPE_CHECKING, Callable, List, Optional
+ 
+ import torch
+@@ -34,6 +34,8 @@ if TYPE_CHECKING:
+ 
+ 
+ class TreeNode:
++    __slots__ = ('children', 'parent', 'key', 'value', 'lock_ref', 'last_access_time')
++
+     def __init__(self):
+         self.children = defaultdict(TreeNode)
+         self.parent = None
+@@ -47,12 +49,10 @@ class TreeNode:
+ 
+ 
+ def _key_match(key0: List, key1: List):
+-    i = 0
+-    for k0, k1 in zip(key0, key1):
++    for i, (k0, k1) in enumerate(zip(key0, key1)):
+         if k0 != k1:
+-            break
+-        i += 1
+-    return i
++            return i
++    return min(len(key0), len(key1))
+ 
+ 
+ class RadixCache(BasePrefixCache):
+@@ -84,9 +84,9 @@ class RadixCache(BasePrefixCache):
+         last_node = [self.root_node]
+         self._match_prefix_helper(self.root_node, key, value, last_node)
+         if value:
+-            value = torch.concat(value)
++            value = torch.cat(value)
+         else:
+-            value = torch.tensor([], dtype=torch.int32)
++            value = torch.empty(0, dtype=torch.int32)
+         return value, last_node[0]
+ 
+     def insert(self, key: List, value=None):
+@@ -177,10 +177,11 @@ class RadixCache(BasePrefixCache):
+         heapq.heapify(leaves)
+ 
+         num_evicted = 0
+-        while num_evicted < num_tokens and len(leaves):
++        root_node = self.root_node
++        while num_evicted < num_tokens and leaves:
+             x = heapq.heappop(leaves)
+ 
+-            if x == self.root_node:
++            if x is root_node:
+                 break
+             if x.lock_ref > 0:
+                 continue
+@@ -189,7 +190,7 @@ class RadixCache(BasePrefixCache):
+             num_evicted += len(x.value)
+             self._delete_leaf(x)
+ 
+-            if len(x.parent.children) == 0:
++            if not x.parent.children:
+                 heapq.heappush(leaves, x.parent)
+ 
+     def inc_lock_ref(self, node: TreeNode):
+@@ -226,12 +227,14 @@ class RadixCache(BasePrefixCache):
+     def _match_prefix_helper(
+         self, node: TreeNode, key: List, value, last_node: TreeNode
+     ):
+-        node.last_access_time = time.time()
++        current_time = time.time()
++        node.last_access_time = current_time
+         if len(key) == 0:
+             return
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
++            child.last_access_time = current_time
+             prefix_len = _key_match(child.key, key)
+             if prefix_len < len(child.key):
+                 new_node = self._split_node(child.key, child, prefix_len)
+@@ -257,12 +260,14 @@ class RadixCache(BasePrefixCache):
+         return new_node
+ 
+     def _insert_helper(self, node: TreeNode, key: List, value):
+-        node.last_access_time = time.time()
++        current_time = time.time()
++        node.last_access_time = current_time
+         if len(key) == 0:
+             return 0
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
++            child.last_access_time = current_time
+             prefix_len = _key_match(child.key, key)
+ 
+             if prefix_len == len(child.key):
+@@ -283,6 +288,7 @@ class RadixCache(BasePrefixCache):
+             new_node.parent = node
+             new_node.key = key
+             new_node.value = value
++            new_node.last_access_time = current_time
+             node.children[key[0]] = new_node
+             self.evictable_size_ += len(value)
+         return 0
+@@ -307,7 +313,7 @@ class RadixCache(BasePrefixCache):
+ 
+     def _collect_leaves(self):
+         ret_list = []
+-        stack = [self.root_node]
++        stack = deque([self.root_node])
+ 
+         while stack:
+             cur_node = stack.pop()

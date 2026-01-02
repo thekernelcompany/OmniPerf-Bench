@@ -1,0 +1,87 @@
+diff --git a/python/sglang/srt/managers/tp_worker_overlap_thread.py b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+index 5d78b97..cfa99bc 100644
+--- a/python/sglang/srt/managers/tp_worker_overlap_thread.py
++++ b/python/sglang/srt/managers/tp_worker_overlap_thread.py
+@@ -55,6 +55,12 @@ class TpModelWorkerClient:
+             (self.max_running_requests * 5,), dtype=torch.int32, device=self.device
+         )
+ 
++        # Pre-allocate tensors for token ID operations to reduce allocations
++        self.max_batch_size = self.max_running_requests
++        self._arange_cache = torch.empty(
++            (self.max_batch_size,), dtype=torch.int32, device=self.device
++        )
++
+         # Launch a thread
+         self.input_queue = Queue()
+         self.output_queue = Queue()
+@@ -88,13 +94,13 @@ class TpModelWorkerClient:
+         while True:
+             model_worker_batch, future_token_ids_ct = self.input_queue.get()
+ 
+-            # Resolve future tokens in the input
++            # Resolve future tokens in the input - optimized in-place operation
+             input_ids = model_worker_batch.input_ids
+-            input_ids[:] = torch.where(
+-                input_ids < 0,
+-                self.future_token_ids_map[torch.clamp(-input_ids, min=0)],
+-                input_ids,
+-            )
++            # Use masked indexing to avoid torch.where allocation
++            negative_mask = input_ids < 0
++            if negative_mask.any():
++                negative_indices = torch.clamp(-input_ids[negative_mask], min=0)
++                input_ids[negative_mask] = self.future_token_ids_map[negative_indices]
+ 
+             # Run forward
+             logits_output, next_token_ids = self.worker.forward_batch_generation(
+@@ -103,15 +109,19 @@ class TpModelWorkerClient:
+ 
+             # Update the future token ids map
+             bs = len(model_worker_batch.seq_lens)
+-            future_next_token_ids = torch.arange(
+-                -(future_token_ids_ct + bs),
+-                -(future_token_ids_ct),
+-                dtype=torch.int32,
+-                device=self.device,
+-            )
+-            self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
+-                torch.int32
+-            )
++            # Reuse pre-allocated cache instead of torch.arange
++            future_next_token_ids = self._arange_cache[:bs]
++            start_idx = -(future_token_ids_ct + bs)
++            end_idx = -future_token_ids_ct
++            torch.arange(start_idx, end_idx, out=future_next_token_ids, dtype=torch.int32)
++
++            # Avoid unnecessary dtype conversion if already int32
++            if next_token_ids.dtype == torch.int32:
++                self.future_token_ids_map[-future_next_token_ids] = next_token_ids
++            else:
++                self.future_token_ids_map[-future_next_token_ids] = next_token_ids.to(
++                    torch.int32
++                )
+ 
+             # Set the result
+             next_token_ids = next_token_ids.tolist()
+@@ -126,14 +136,13 @@ class TpModelWorkerClient:
+         # Push a new batch to the queue
+         self.input_queue.put((model_worker_batch.copy(), self.future_token_ids_ct))
+ 
+-        # Allocate output future objects
++        # Allocate output future objects - reuse cache
+         bs = len(model_worker_batch.seq_lens)
+-        future_next_token_ids = torch.arange(
+-            -(self.future_token_ids_ct + bs),
+-            -(self.future_token_ids_ct),
+-            dtype=torch.int32,
+-            device=self.device,
+-        )
++        future_next_token_ids = self._arange_cache[:bs].clone()
++        start_idx = -(self.future_token_ids_ct + bs)
++        end_idx = -self.future_token_ids_ct
++        torch.arange(start_idx, end_idx, out=future_next_token_ids, dtype=torch.int32)
++
+         self.future_token_ids_ct = (
+             self.future_token_ids_ct + bs
+         ) % self.future_token_ids_limit

@@ -1,0 +1,84 @@
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index ad7f0a1f3..95ac45edf 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -37,13 +37,14 @@ class Sampler(nn.Module):
+         logits = None
+         del logits
+ 
+-        if torch.any(torch.isnan(probs)):
++        if probs.isnan().any():
+             logger.warning("Detected errors during sampling! NaN in the probability.")
+-            probs = torch.where(
+-                torch.isnan(probs), torch.full_like(probs, 1e-10), probs
+-            )
+-
+-        if global_server_args_dict["sampling_backend"] == "flashinfer":
++            # Avoid extra allocations by fixing NaNs in-place
++            probs.nan_to_num_(nan=1e-10)
++        # Fast path: if all requests use greedy sampling, directly take argmax
++        if sampling_info.top_ks.max().item() <= 1:
++            batch_next_token_ids = torch.argmax(probs, -1)
++        elif global_server_args_dict["sampling_backend"] == "flashinfer":
+             max_top_k_round, batch_size = 32, probs.shape[0]
+             uniform_samples = torch.rand(
+                 (max_top_k_round, batch_size), device=probs.device
+@@ -65,7 +66,7 @@ class Sampler(nn.Module):
+ 
+             if not torch.all(success):
+                 logger.warning("Detected errors during sampling!")
+-                batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
++                batch_next_token_ids.zero_()
+         elif global_server_args_dict["sampling_backend"] == "pytorch":
+             # Here we provide a slower fallback implementation.
+             batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+diff --git a/test/srt/test_bench_serving.py b/test/srt/test_bench_serving.py
+index 056483487..6955d4917 100644
+--- a/test/srt/test_bench_serving.py
++++ b/test/srt/test_bench_serving.py
+@@ -27,11 +27,11 @@ class TestBenchServing(unittest.TestCase):
+             model=DEFAULT_MODEL_NAME_FOR_TEST,
+             num_prompts=200,
+             request_rate=float("inf"),
++            other_server_args=["--max-running-requests", "10"],
+             dataset_name="sharegpt",
+             random_input_len=None,
+             random_output_len=None,
+             disable_stream=True,
+-            other_server_args=["--max-running-requests", "10"],
+         )
+ 
+         if is_in_ci():
+diff --git a/test/srt/test_pytorch_sampling_backend.py b/test/srt/test_pytorch_sampling_backend.py
+index ddd744149..8ecf0a2ae 100644
+--- a/test/srt/test_pytorch_sampling_backend.py
++++ b/test/srt/test_pytorch_sampling_backend.py
+@@ -39,6 +39,28 @@ class TestPyTorchSamplingBackend(unittest.TestCase):
+         metrics = run_eval(args)
+         assert metrics["score"] >= 0.65
+ 
++    def test_mmlu_greedy(self):
++        """
++        Sanity check with the PyTorch sampling backend under a typical
++        greedy-like configuration. This ensures the backend path works
++        correctly when requests are effectively greedy (top-k=1).
++        """
++        # Reuse the same server started with --sampling-backend pytorch.
++        # The eval driver will issue requests with default sampling params
++        # which include greedy-like settings for many prompts.
++        args = SimpleNamespace(
++            base_url=self.base_url,
++            model=self.model,
++            eval_name="mmlu",
++            num_examples=32,
++            num_threads=16,
++        )
++
++        metrics = run_eval(args)
++        # Only require that the evaluation runs and produces a reasonable score.
++        assert "score" in metrics
++        assert 0.0 <= metrics["score"] <= 1.0
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

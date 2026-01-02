@@ -1,0 +1,138 @@
+diff --git a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+index f1ee5d40e..a61d8937d 100644
+--- a/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
++++ b/sgl-kernel/csrc/allreduce/trt_reduce_internal.cu
+@@ -109,13 +109,13 @@ struct PackedOn16Bytes<__nv_bfloat16> {
+ 
+ // add two 128b data
+ template <typename T>
+-inline __device__ int4 add128b(T& a, T& b) {
+-  T c;
+-  c.unpacked[0] = a.unpacked[0] + b.unpacked[0];
+-  c.unpacked[1] = a.unpacked[1] + b.unpacked[1];
+-  c.unpacked[2] = a.unpacked[2] + b.unpacked[2];
+-  c.unpacked[3] = a.unpacked[3] + b.unpacked[3];
+-  return c.packed;
++__forceinline__ __device__ int4 add128b(T& a, T& b) {
++  // Optimize: reuse a's storage instead of allocating new struct
++  a.unpacked[0] = a.unpacked[0] + b.unpacked[0];
++  a.unpacked[1] = a.unpacked[1] + b.unpacked[1];
++  a.unpacked[2] = a.unpacked[2] + b.unpacked[2];
++  a.unpacked[3] = a.unpacked[3] + b.unpacked[3];
++  return a.packed;
+ }
+ 
+ __inline__ __device__ void multi_gpu_barrier(
+@@ -140,7 +140,9 @@ __inline__ __device__ void multi_gpu_barrier(
+     // All blocks check that corresponding block 0 on other GPUs have set the flag
+     // No deadlock because block #0 is always the first block started
+     uint32_t* peer_barrier_d = signals[local_rank] + offset + tidx;
++    // Optimize: add brief pause in spin loop to reduce memory traffic
+     while (ld_flag_acquire(peer_barrier_d) != flag) {
++      __nanosleep(20);
+     }
+   }
+ 
+@@ -172,13 +174,16 @@ __inline__ __device__ void block_barrier(
+ 
+     uint32_t* peer_barrier_d = signals[local_rank] + flag_block_offset + tidx;
+     // Blocks check that corresponding blocks on other GPUs have also set the flag
++    // Optimize: add brief pause in spin loops to reduce memory traffic
+     if constexpr (need_fence) {
+       st_flag_release(flag, signals[tidx] + flag_block_offset + local_rank);
+       while (ld_flag_acquire(peer_barrier_d) != flag) {
++        __nanosleep(20);
+       }
+     } else {
+       st_flag_volatile(flag, signals[tidx] + flag_block_offset + local_rank);
+       while (ld_flag_volatile(peer_barrier_d) != flag) {
++        __nanosleep(20);
+       }
+     }
+   }
+@@ -230,8 +235,9 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+   size_t chunk_end = std::min((bidx + 1) * params.elts_per_block, params.elts_per_rank);
+ 
+   if constexpr (COPY_INPUT) {
+-    T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
++    T const* __restrict__ local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+     // Copy from local buffer to shareable buffer
++    // Optimize: use restrict keyword for better compiler optimization
+     for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+       *reinterpret_cast<int4*>(&local_shared_buffer[iter_offset]) =
+           *reinterpret_cast<int4 const*>(&local_input_buffer[iter_offset]);
+@@ -245,16 +251,19 @@ static __global__ void __launch_bounds__(512, 1) oneShotAllReduceKernel(AllReduc
+   for (size_t iter_offset = chunk_start; iter_offset < chunk_end; iter_offset += blockDim.x * NUM_ELTS) {
+     // Iterate over the different ranks/devices on the node to load the values.
+     PackedStruct vals[RANKS_PER_NODE];
++    // Optimize: use efficient memory loads
+ #pragma unroll
+     for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+-      vals[ii].packed = *reinterpret_cast<int4 const*>(&((T*)peer_comm_buffer_ptrs[ii])[iter_offset]);
++      T const* src_ptr = &((T const*)peer_comm_buffer_ptrs[ii])[iter_offset];
++      vals[ii].packed = *reinterpret_cast<int4 const*>(src_ptr);
+     }
+ 
+     // Sum the values from the different ranks.
+     PackedStruct sums;
+-    sums.packed = {0, 0, 0, 0};
++    // Optimize: directly use first value instead of initializing to zero then adding
++    sums.packed = vals[0].packed;
+ #pragma unroll
+-    for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
++    for (int rank = 1; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+       sums.packed = add128b(sums, vals[rank]);
+     }
+@@ -312,10 +321,11 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
+   static constexpr int PACKED_ELTS = 16 / sizeof(T);
+   using PackedType = typename PackedOn16Bytes<T>::Type;
+ 
+-  T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
++  // Optimize: use restrict keyword for better compiler optimization
++  T const* __restrict__ local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+   auto peer_comm_buffer_ptrs = params.peer_comm_buffer_ptrs->ptrs;
+-  T* local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
+-  T* local_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
++  T* __restrict__ local_shared_buffer = reinterpret_cast<T*>(peer_comm_buffer_ptrs[params.local_rank]);
++  T* __restrict__ local_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+ 
+   size_t const chunk_start = bidx * params.elts_per_block + tidx * PACKED_ELTS;
+   size_t const chunk_end = min(chunk_start + params.elts_per_block, params.elts_per_rank);
+@@ -361,16 +371,19 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
+ 
+     // Iterate over the different ranks/devices on the node to load the values.
+     PackedType vals[RANKS_PER_NODE];
++    // Optimize: use efficient memory loads
+ #pragma unroll
+     for (int ii = 0; ii < RANKS_PER_NODE; ++ii) {
+-      vals[ii].packed = *reinterpret_cast<int4 const*>(&buffers_unorder[ii][responsible_block_offset]);
++      T const* src_ptr = &buffers_unorder[ii][responsible_block_offset];
++      vals[ii].packed = *reinterpret_cast<int4 const*>(src_ptr);
+     }
+ 
+     // Sum the values from the different ranks.
+     PackedType sums;
+-    sums.packed = {0, 0, 0, 0};
++    // Optimize: directly use first value instead of initializing to zero then adding
++    sums.packed = vals[0].packed;
+ #pragma unroll
+-    for (int rank = 0; rank < RANKS_PER_NODE; ++rank) {
++    for (int rank = 1; rank < RANKS_PER_NODE; ++rank) {
+       // Always reduce from rank 0 to ensure stable reduce order.
+       sums.packed = add128b(sums, vals[rank]);
+     }
+@@ -413,11 +426,11 @@ static __global__ void __launch_bounds__(512, 1) twoShotAllReduceKernel(AllReduc
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-inline int divUp(int a, int b) {
++__forceinline__ int divUp(int a, int b) {
+   return (a + b - 1) / b;
+ }
+ 
+-inline int roundUp(int a, int n) {
++__forceinline__ int roundUp(int a, int n) {
+   return divUp(a, n) * n;
+ }
+ 

@@ -1,0 +1,50 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index aeab9d4..b118283 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -146,7 +146,7 @@ def apply_w8a8_block_fp8_linear(
+         q_input, x_scale = per_token_group_quant_fp8(
+             input_2d, block_size[1], column_major_scales=False
+         )
+-        output = torch.zeros(
++        output = torch.empty(
+             [q_input.shape[0], weight.shape[0]],
+             dtype=input.dtype,
+             device=q_input.device,
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 339aaad..8dc8b34 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -344,8 +344,8 @@ class DeepseekV2MoE(nn.Module):
+                 routed_scaling_factor=self.routed_scaling_factor,
+             )
+         else:
+-            topk_idx = torch.full(
+-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++            topk_idx = torch.empty(
++                (0, self.top_k), dtype=torch.int, device=hidden_states.device
+             )
+             topk_weights = torch.empty(
+                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+@@ -781,8 +781,19 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+             )
+         else:
+-            q = torch.cat([q_nope_out, q_pe], dim=-1)
+-            k = torch.cat([k_nope, k_pe], dim=-1)
++            # Optimize: pre-allocate and use slice assignment instead of torch.cat
++            q = torch.empty(
++                (q_nope_out.shape[0], q_nope_out.shape[1], self.kv_lora_rank + self.qk_rope_head_dim),
++                dtype=q_nope_out.dtype, device=q_nope_out.device
++            )
++            q[..., :self.kv_lora_rank] = q_nope_out
++            q[..., self.kv_lora_rank:] = q_pe
++            k = torch.empty(
++                (k_nope.shape[0], k_nope.shape[1], self.kv_lora_rank + self.qk_rope_head_dim),
++                dtype=k_nope.dtype, device=k_nope.device
++            )
++            k[..., :self.kv_lora_rank] = k_nope
++            k[..., self.kv_lora_rank:] = k_pe
+             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+ 

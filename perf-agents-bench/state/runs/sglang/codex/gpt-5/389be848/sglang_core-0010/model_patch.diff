@@ -1,0 +1,113 @@
+diff --git a/docs/backend/server_arguments.md b/docs/backend/server_arguments.md
+index 3d2aae8f2..3efe2c228 100644
+--- a/docs/backend/server_arguments.md
++++ b/docs/backend/server_arguments.md
+@@ -91,6 +91,7 @@ Please consult the documentation below to learn more about the parameters you ma
+ * `enable_ep_moe`: Enables expert parallelism that distributes the experts onto multiple GPUs for MoE models.
+ * `ep_size`: The size of EP. Please shard the model weights with `tp_size=ep_size`, for detailed benchmarking refer to [this PR](https://github.com/sgl-project/sglang/pull/2203). If not set, `ep_size` will be automatically set to `tp_size`.
+ * `enable_deepep_moe`: Enables expert parallelism that distributes the experts onto multiple GPUs for DeepSeek-V3 model based on deepseek-ai/DeepEP.
++* `deepep_mode`: Select the mode when enabling DeepEP MoE. Options are `normal`, `low_latency`, or `auto`. Default is `auto` (uses `low_latency` for decode batches and `normal` for prefill batches).
+ 
+ ## Memory and scheduling
+ 
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 30c9eb6a7..eb3dc253d 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -145,7 +145,9 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    # Avoid global zero-initialization; only the first element needs to be 0.
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr[0] = 0
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+     compute_seg_indptr_triton_kernel[(num_experts,)](
+@@ -529,7 +531,9 @@ def grouped_gemm_triton(
+         "BLOCK_SIZE_K": 128,
+     }
+ 
+-    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    # Only the prefix value is required to be zero; avoid full zero-init
++    m_num_tiles_indptr = torch.empty(batch_size + 1, device=a.device, dtype=torch.int64)
++    m_num_tiles_indptr[0] = 0
+     compute_m_num_tiles_indptr[(1,)](
+         m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
+     )
+diff --git a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+index 6b67f6cea..0bd49c2a7 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
++++ b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+@@ -366,7 +366,8 @@ class DeepEPDispatcher:
+                     BLOCK_SIZE=512,
+                 )
+             else:
+-                output = torch.zeros(
++                # Use empty since the tensor has zero elements; avoids unnecessary zero-fill.
++                output = torch.empty(
+                     (0, hidden_states.shape[1]),
+                     device=hidden_states.device,
+                     dtype=hidden_states.dtype,
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index ab8b81602..e5ef5f25b 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -921,14 +921,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            # Avoid unnecessary zero-initialization for empty tensors
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 6f4725487..a5ab0c84f 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -161,6 +161,7 @@ class ServerArgs:
+     enable_dp_attention: bool = False
+     enable_ep_moe: bool = False
+     enable_deepep_moe: bool = False
++    deepep_mode: str = "auto"  # one of ["normal", "low_latency", "auto"]
+     enable_torch_compile: bool = False
+     torch_compile_max_bs: int = 32
+     cuda_graph_max_bs: Optional[int] = None
+@@ -307,6 +308,12 @@ class ServerArgs:
+             logger.info(
+                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+             )
++            if self.deepep_mode not in ("normal", "low_latency", "auto"):
++                logger.warning(
++                    "Invalid deepep_mode '%s'; falling back to 'auto'",
++                    self.deepep_mode,
++                )
++                self.deepep_mode = "auto"
+ 
+         # Speculative Decoding
+         if self.speculative_algorithm == "NEXTN":
+@@ -1082,6 +1089,13 @@ class ServerArgs:
+             action="store_true",
+             help="Enabling DeepEP MoE implementation for EP MoE.",
+         )
++        parser.add_argument(
++            "--deepep-mode",
++            type=str,
++            default=ServerArgs.deepep_mode,
++            choices=["normal", "low_latency", "auto"],
++            help="Mode for DeepEP MoE: normal (prefill), low_latency (decode), or auto to pick based on batch mode.",
++        )
+ 
+         # Server warmups
+         parser.add_argument(

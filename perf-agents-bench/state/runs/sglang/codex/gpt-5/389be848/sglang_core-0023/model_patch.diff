@@ -1,0 +1,65 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 26c5e617a..8f2385d3e 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -941,6 +941,12 @@ class DeepseekV2AttentionMLA(nn.Module):
+     ) -> torch.Tensor:
+ 
+         assert forward_batch.num_prefix_chunks is not None
++        # Preallocate ping-pong buffers to avoid per-chunk allocations
++        tmp_output_a = torch.empty_like(accum_output)
++        tmp_output_b = torch.empty_like(accum_output)
++        tmp_lse_a = torch.empty_like(accum_lse)
++        tmp_lse_b = torch.empty_like(accum_lse)
++
+         for i in range(forward_batch.num_prefix_chunks):
+             forward_batch.set_prefix_chunk_idx(i)
+ 
+@@ -977,10 +983,13 @@ class DeepseekV2AttentionMLA(nn.Module):
+ 
+             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+             lse = torch.transpose(lse, 0, 1).contiguous()
+-            tmp_output = torch.empty_like(accum_output)
+-            tmp_lse = torch.empty_like(accum_lse)
+-            merge_state_v2(output, lse, accum_output, accum_lse, tmp_output, tmp_lse)
+-            accum_output, accum_lse = tmp_output, tmp_lse
++            # Alternate between two buffers so src/dst never alias
++            if (i & 1) == 0:
++                out_buf, lse_buf = tmp_output_a, tmp_lse_a
++            else:
++                out_buf, lse_buf = tmp_output_b, tmp_lse_b
++            merge_state_v2(output, lse, accum_output, accum_lse, out_buf, lse_buf)
++            accum_output, accum_lse = out_buf, lse_buf
+ 
+         return accum_output
+ 
+@@ -1607,7 +1616,8 @@ class DeepseekV2ForCausalLM(nn.Module):
+                     "up_proj.weight",
+                     "up_proj.weight_scale_inv",
+                 ]
+-            names_to_remove = []
++            # Use a set for O(1) membership checks and avoid duplicates
++            names_to_remove = set()
+             for moe_layer in tqdm(
+                 range(
+                     self.config.first_k_dense_replace,
+@@ -1622,16 +1632,17 @@ class DeepseekV2ForCausalLM(nn.Module):
+                         shared_expert_weight_name = (
+                             f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                         )
++                        # Avoid unnecessary tensor cloning; reuse the same tensor
+                         weights_list.append(
+                             (
+                                 f"model.layers.{moe_layer}."
+                                 f"mlp.experts."
+                                 f"{self.config.n_routed_experts + num_repeat}"
+                                 f".{suffix}",
+-                                weights_dict[shared_expert_weight_name].clone(),
++                                weights_dict[shared_expert_weight_name],
+                             )
+                         )
+-                        names_to_remove += [shared_expert_weight_name]
++                        names_to_remove.add(shared_expert_weight_name)
+             weights = [w for w in weights_list if w[0] not in names_to_remove]
+ 
+         # Params for weights, fp8 weight scales, fp8 activation scales

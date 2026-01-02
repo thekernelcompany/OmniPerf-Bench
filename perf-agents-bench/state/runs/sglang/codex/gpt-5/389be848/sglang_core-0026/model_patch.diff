@@ -1,0 +1,95 @@
+diff --git a/python/sglang/srt/managers/policy_scheduler.py b/python/sglang/srt/managers/policy_scheduler.py
+index 30a009c2e..9253b1672 100644
+--- a/python/sglang/srt/managers/policy_scheduler.py
++++ b/python/sglang/srt/managers/policy_scheduler.py
+@@ -18,27 +18,18 @@ limitations under the License.
+ import random
+ from collections import defaultdict
+ from contextlib import contextmanager
++from typing import List
+ 
+ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+ 
+ 
+ class PolicyScheduler:
+-    def __init__(
+-        self,
+-        policy,
+-        max_running_seqs,
+-        max_prefill_num_tokens,
+-        max_total_num_tokens,
+-        tree_cache,
+-    ):
+-        if tree_cache.disable and policy == "lpm":
+-            # LMP is meaningless when the tree cache is disabled.
++    def __init__(self, policy, tree_cache):
++        if tree_cache.disable and policy in ["lpm", "dfs-weight"]:
++            # LPM and DFS-weight are meaningless when the tree cache is disabled.
+             policy = "fcfs"
+ 
+         self.policy = policy
+-        self.max_running_seqs = max_running_seqs
+-        self.max_prefill_num_tokens = max_prefill_num_tokens
+-        self.max_total_num_tokens = max_total_num_tokens
+         self.tree_cache = tree_cache
+ 
+     def get_priority_queue(self, waiting_queue):
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 0228073c7..ceeca3cd8 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -165,13 +165,7 @@ class ModelTpServer:
+                 disable=server_args.disable_radix_cache,
+             )
+         self.tree_cache_metrics = {"total": 0, "hit": 0}
+-        self.scheduler = PolicyScheduler(
+-            self.schedule_policy,
+-            self.max_running_requests,
+-            self.max_prefill_tokens,
+-            self.max_total_num_tokens,
+-            self.tree_cache,
+-        )
++        self.scheduler = PolicyScheduler(self.schedule_policy, self.tree_cache)
+         self.req_to_token_pool = self.model_runner.req_to_token_pool
+         self.token_to_kv_pool = self.model_runner.token_to_kv_pool
+ 
+@@ -377,9 +371,14 @@ class ModelTpServer:
+         for req in self.waiting_queue:
+             req.input_ids = req.origin_input_ids + req.output_ids
+             # NOTE: the prefix_indices must always be aligned with last_node
+-            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
+-                rid=req.rid, key=req.adjust_max_prefix_ids()
+-            )
++            if self.tree_cache.disable:
++                # Fast path: avoid unnecessary work when cache is disabled
++                req.prefix_indices = []
++                req.last_node = self.tree_cache.root_node
++            else:
++                req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
++                    rid=req.rid, key=req.adjust_max_prefix_ids()
++                )
+             req.extend_input_len = len(req.input_ids) - len(req.prefix_indices)
+ 
+         # Get priority queue
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index c23812049..1b7edefb8 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -169,6 +169,8 @@ class RadixCache(BasePrefixCache):
+                 heapq.heappush(leaves, x.parent)
+ 
+     def inc_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 0:
+@@ -179,6 +181,8 @@ class RadixCache(BasePrefixCache):
+         return delta
+ 
+     def dec_lock_ref(self, node: TreeNode):
++        if self.disable:
++            return 0
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 1:

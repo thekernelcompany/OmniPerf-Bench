@@ -1,0 +1,92 @@
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index 379b233..567fc26 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -100,6 +100,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         self, base_layer: MergedColumnParallelLinear, segment_gemm, lora_rank, scaling
+     ) -> None:
+         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
++        self.lora_output_cache = None
+ 
+     def set_lora_info(self, A_buffer, B_buffer, bs, seq_lens, weight_indices):
+         self.set_lora = True
+@@ -120,7 +121,10 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         )
+         # FIXME
+         assert lora_a_output.shape[-1] == self.lora_rank * 2
+-        lora_output = torch.empty_like(base_output)
++        # Cache and reuse lora_output tensor
++        if self.lora_output_cache is None or self.lora_output_cache.shape != base_output.shape:
++            self.lora_output_cache = torch.empty_like(base_output)
++        lora_output = self.lora_output_cache
+         output_dim = lora_output.shape[-1] // 2
+         for i in range(2):
+             left = output_dim * i
+@@ -143,6 +147,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         self, base_layer: QKVParallelLinear, segment_gemm, lora_rank, scaling
+     ) -> None:
+         super().__init__(base_layer, segment_gemm, lora_rank, scaling)
++        self.lora_output_cache = None
+ 
+     def set_lora_info(
+         self, A_buffer_qkv, B_buffer_q, B_buffer_kv, bs, seq_lens, weight_indices
+@@ -165,7 +170,10 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+             weight_indices=self.weight_indices,
+         )
+         # FIXME parallelize qkv
+-        lora_output = torch.empty_like(base_output)
++        # Cache and reuse lora_output tensor
++        if self.lora_output_cache is None or self.lora_output_cache.shape != base_output.shape:
++            self.lora_output_cache = torch.empty_like(base_output)
++        lora_output = self.lora_output_cache
+         # q
+         output_dim_q = self.B_buffer_q.shape[-2]
+         lora_output[:, :output_dim_q] = self.segment_gemm.run(
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 59cd7e1..f0c5e7c 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -243,6 +243,9 @@ class LoRAManager:
+     def init_lora_batch(self):
+         self.active_uids = set()  # set of active loras
+         self.buffer_id = {}  # lora uid -> idx in memory pool
++        # Cache for seg_lens and weight_indices to avoid repeated allocations
++        self.seg_lens_cache = {}
++        self.weight_indices_cache = {}
+ 
+     def get_weight_name(self, name, idx):
+         for target_weight_name in self.target_weights:
+@@ -254,7 +257,7 @@ class LoRAManager:
+         if uid is None:
+             for i in range(num_layer):
+                 for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] *= 0
++                    self.A_buffer[k][i][buffer_id].fill_(0)
+             return
+ 
+         for i in range(num_layer):
+@@ -292,12 +295,18 @@ class LoRAManager:
+ 
+         # setup lora in forward modules
+         bs = forward_batch.batch_size
+-        seg_lens = (
+-            forward_batch.extend_seq_lens
+-            if forward_batch.forward_mode.is_extend()
+-            else torch.ones(bs)
+-        )
+-        weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
++        if forward_batch.forward_mode.is_extend():
++            seg_lens = forward_batch.extend_seq_lens
++        else:
++            # Cache and reuse seg_lens tensor
++            if bs not in self.seg_lens_cache:
++                self.seg_lens_cache[bs] = torch.ones(bs, device="cuda")
++            seg_lens = self.seg_lens_cache[bs]
++
++        # Cache and reuse weight_indices tensor
++        if bs not in self.weight_indices_cache:
++            self.weight_indices_cache[bs] = torch.empty((bs,), dtype=torch.int64, device="cuda")
++        weight_indices = self.weight_indices_cache[bs]
+         for i, lora_path in enumerate(forward_batch.lora_paths):
+             weight_indices[i] = self.buffer_id[lora_path]
+ 

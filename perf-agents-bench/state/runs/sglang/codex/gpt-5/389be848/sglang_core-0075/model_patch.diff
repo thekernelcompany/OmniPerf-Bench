@@ -1,0 +1,291 @@
+diff --git a/.github/workflows/pr-test.yml b/.github/workflows/pr-test.yml
+index fb62ac488..45759c0be 100644
+--- a/.github/workflows/pr-test.yml
++++ b/.github/workflows/pr-test.yml
+@@ -162,6 +162,18 @@ jobs:
+           cd test/srt
+           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_default_fp8
+ 
++      - name: Benchmark VLM offline throughput
++        timeout-minutes: 10
++        run: |
++          cd test/srt
++          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_offline_throughput
++
++      - name: Benchmark VLM online latency
++        timeout-minutes: 10
++        run: |
++          cd test/srt
++          python3 -m unittest test_bench_serving.TestBenchServing.test_vlm_online_latency
++
+   performance-test-2-gpu:
+     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+         github.event.pull_request.draft == false
+diff --git a/python/sglang/bench_serving.py b/python/sglang/bench_serving.py
+index 9b2722126..b94b93246 100644
+--- a/python/sglang/bench_serving.py
++++ b/python/sglang/bench_serving.py
+@@ -191,7 +191,8 @@ async def async_request_openai_completions(
+         generated_text = ""
+         output_len = request_func_input.output_len
+         ttft = 0.0
+-        st = time.perf_counter()
++        perf_counter = time.perf_counter
++        st = perf_counter()
+         most_recent_timestamp = st
+         try:
+             async with session.post(
+@@ -204,7 +205,7 @@ async def async_request_openai_completions(
+                             continue
+ 
+                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+-                        latency = time.perf_counter() - st
++                        latency = perf_counter() - st
+                         if chunk == "[DONE]":
+                             pass
+                         else:
+@@ -214,10 +215,10 @@ async def async_request_openai_completions(
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+                             if data["choices"][0]["text"]:
+-                                timestamp = time.perf_counter()
++                                timestamp = perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
++                                    ttft = perf_counter() - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+@@ -273,7 +274,8 @@ async def async_request_truss(
+ 
+         generated_text = ""
+         ttft = 0.0
+-        st = time.perf_counter()
++        perf_counter = time.perf_counter
++        st = perf_counter()
+         most_recent_timestamp = st
+         try:
+             async with session.post(
+@@ -286,7 +288,7 @@ async def async_request_truss(
+                             continue
+ 
+                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+-                        latency = time.perf_counter() - st
++                        latency = perf_counter() - st
+                         if chunk == "[DONE]":
+                             pass
+                         else:
+@@ -296,10 +298,10 @@ async def async_request_truss(
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+                             if data["choices"][0]["text"]:
+-                                timestamp = time.perf_counter()
++                                timestamp = perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
++                                    ttft = perf_counter() - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+@@ -690,6 +692,28 @@ def sample_random_requests(
+     dataset_path: str,
+     random_sample: bool = True,
+ ) -> List[Tuple[str, int, int]]:
++    # Try to load from cache to avoid recomputation on repeated runs
++    try:
++        cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
++        cache_dir.mkdir(parents=True, exist_ok=True)
++        cache_key = (
++            f"random_{getattr(tokenizer, '__class__', type(tokenizer)).__name__}_"
++            f"{getattr(tokenizer, 'vocab_size', 0)}_{input_len}_{output_len}_"
++            f"{num_prompts}_{range_ratio}_{'sharegpt' if random_sample else 'synthetic'}.pkl"
++        )
++        random_cache_path = cache_dir / cache_key
++    except Exception:
++        random_cache_path = None
++
++    if random_cache_path is not None and random_cache_path.exists():
++        try:
++            with open(random_cache_path, "rb") as f:
++                cached = pickle.load(f)
++                if isinstance(cached, list) and cached:
++                    print(f"Loading cached random dataset from {random_cache_path}")
++                    return cached
++        except Exception:
++            pass
+     input_lens = np.random.randint(
+         max(int(input_len * range_ratio), 1),
+         input_len + 1,
+@@ -766,6 +790,14 @@ def sample_random_requests(
+ 
+     print(f"#Input tokens: {np.sum(input_lens)}")
+     print(f"#Output tokens: {np.sum(output_lens)}")
++    # Save cache
++    if random_cache_path is not None:
++        try:
++            with open(random_cache_path, "wb") as f:
++                pickle.dump(input_requests, f)
++            print(f"Cached random dataset to {random_cache_path}")
++        except Exception:
++            pass
+     return input_requests
+ 
+ 
+@@ -890,6 +922,8 @@ def calculate_metrics(
+     tokenizer: PreTrainedTokenizerBase,
+     backend: str,
+ ) -> Tuple[BenchmarkMetrics, List[int]]:
++    # Allow skipping retokenization via env for faster client-side metric calc
++    skip_retokenize = _get_bool_env_var("SGLANG_BENCH_SKIP_RETOKENIZE", "false")
+     output_lens: List[int] = []
+     retokenized_output_lens: List[int] = []
+     total_input = 0
+@@ -898,26 +932,35 @@ def calculate_metrics(
+     tpots: List[float] = []
+     ttfts: List[float] = []
+     e2e_latencies: List[float] = []
+-    for i in range(len(outputs)):
+-        if outputs[i].success:
+-            output_len = outputs[i].output_len
+-            output_lens.append(output_len)
+-            retokenized_output_len = len(
+-                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
+-            )
+-            retokenized_output_lens.append(retokenized_output_len)
++    # Bind frequently used methods locally for speed
++    tok_encode = tokenizer.encode
++    out_append = output_lens.append
++    retok_append = retokenized_output_lens.append
++    ttfts_append = ttfts.append
++    e2e_append = e2e_latencies.append
++    tpots_append = tpots.append
++    itls_extend = itls.extend
++
++    for i, out in enumerate(outputs):
++        if out.success:
++            output_len = out.output_len
++            out_append(output_len)
++            if skip_retokenize:
++                retok_len = output_len
++            else:
++                retok_len = len(tok_encode(out.generated_text, add_special_tokens=False))
++            retok_append(retok_len)
+             total_input += input_requests[i][1]
+             if output_len > 1:
+-                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+-            itls += outputs[i].itl
+-            ttfts.append(outputs[i].ttft)
+-
+-            e2e_latencies.append(outputs[i].latency)
+-
++                tpots_append((out.latency - out.ttft) / (output_len - 1))
++            if out.itl:
++                itls_extend(out.itl)
++            ttfts_append(out.ttft)
++            e2e_append(out.latency)
+             completed += 1
+         else:
+-            output_lens.append(0)
+-            retokenized_output_lens.append(0)
++            out_append(0)
++            retok_append(0)
+ 
+     if completed == 0:
+         warnings.warn(
+@@ -925,17 +968,19 @@ def calculate_metrics(
+             "on the benchmark arguments.",
+             stacklevel=2,
+         )
++    total_output_sum = sum(output_lens)
++    total_output_retok_sum = sum(retokenized_output_lens)
+     metrics = BenchmarkMetrics(
+         completed=completed,
+         total_input=total_input,
+-        total_output=sum(output_lens),
+-        total_output_retokenized=sum(retokenized_output_lens),
++        total_output=total_output_sum,
++        total_output_retokenized=total_output_retok_sum,
+         request_throughput=completed / dur_s,
+         input_throughput=total_input / dur_s,
+-        output_throughput=sum(output_lens) / dur_s,
+-        output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
+-        total_throughput=(total_input + sum(output_lens)) / dur_s,
+-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
++        output_throughput=total_output_sum / dur_s,
++        output_throughput_retokenized=total_output_retok_sum / dur_s,
++        total_throughput=(total_input + total_output_sum) / dur_s,
++        total_throughput_retokenized=(total_input + total_output_retok_sum)
+         / dur_s,
+         mean_ttft_ms=np.mean(ttfts or 0)
+         * 1000,  # ttfts is empty if streaming is not supported by backend
+@@ -999,7 +1044,7 @@ async def benchmark(
+ 
+     # Use the first request for all warmup iterations
+     test_prompt, test_prompt_len, test_output_len = input_requests[0]
+-    if lora_names is not None and len(lora_names) != 0:
++    if lora_names:
+         lora_name = lora_names[0]
+     else:
+         lora_name = None
+@@ -1057,7 +1102,7 @@ async def benchmark(
+     tasks: List[asyncio.Task] = []
+     async for request in get_request(input_requests, request_rate):
+         prompt, prompt_len, output_len = request
+-        if lora_names is not None and len(lora_names) != 0:
++        if lora_names:
+             idx = random.randint(0, len(lora_names) - 1)
+             lora_name = lora_names[idx]
+         else:
+diff --git a/test/srt/test_bench_serving.py b/test/srt/test_bench_serving.py
+index 032f4fae3..83607ce02 100644
+--- a/test/srt/test_bench_serving.py
++++ b/test/srt/test_bench_serving.py
+@@ -222,6 +222,46 @@ class TestBenchServing(CustomTestCase):
+             else:
+                 self.assertGreater(res["output_throughput"], 2200)
+ 
++    def test_vlm_offline_throughput(self):
++        from sglang.test.test_utils import DEFAULT_SMALL_VLM_MODEL_NAME
++
++        res = run_bench_serving(
++            model=DEFAULT_SMALL_VLM_MODEL_NAME,
++            num_prompts=50,
++            request_rate=float("inf"),
++            other_server_args=[],
++            dataset_name="random",
++            random_input_len=256,
++            random_output_len=128,
++        )
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_vlm_offline_throughput\n"
++                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
++            )
++            self.assertGreater(res["output_throughput"], 200)
++
++    def test_vlm_online_latency(self):
++        from sglang.test.test_utils import DEFAULT_SMALL_VLM_MODEL_NAME
++
++        res = run_bench_serving(
++            model=DEFAULT_SMALL_VLM_MODEL_NAME,
++            num_prompts=50,
++            request_rate=1,
++            other_server_args=[],
++            dataset_name="random",
++            random_input_len=128,
++            random_output_len=64,
++        )
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_vlm_online_latency\n"
++                f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
++            )
++            self.assertLess(res["median_e2e_latency_ms"], 20000)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

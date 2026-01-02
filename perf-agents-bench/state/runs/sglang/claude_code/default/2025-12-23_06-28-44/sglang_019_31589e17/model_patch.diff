@@ -1,0 +1,69 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 29f18f0ef..3e586e677 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -528,9 +528,8 @@ class DeepseekV2MoE(nn.Module):
+         final_hidden_states = state.pop("hidden_states_after_combine")
+ 
+         if (shared_output := state.pop("shared_output")) is not None:
+-            x = shared_output
+-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+-            final_hidden_states = x
++            shared_output.add_(final_hidden_states, alpha=self.routed_scaling_factor)
++            final_hidden_states = shared_output
+         else:
+             final_hidden_states *= self.routed_scaling_factor
+ 
+@@ -984,8 +983,28 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+             )
+         else:
+-            q = torch.cat([q_nope_out, q_pe], dim=-1)
+-            k = torch.cat([k_nope, k_pe], dim=-1)
++            # Preallocate and fill instead of concatenation for better performance
++            q_nope_dim = q_nope_out.shape[-1]
++            q_pe_dim = q_pe.shape[-1]
++            k_nope_dim = k_nope.shape[-1]
++            k_pe_dim = k_pe.shape[-1]
++
++            q = torch.empty(
++                (*q_nope_out.shape[:-1], q_nope_dim + q_pe_dim),
++                dtype=q_nope_out.dtype,
++                device=q_nope_out.device
++            )
++            q[..., :q_nope_dim] = q_nope_out
++            q[..., q_nope_dim:] = q_pe
++
++            k = torch.empty(
++                (*k_nope.shape[:-1], k_nope_dim + k_pe_dim),
++                dtype=k_nope.dtype,
++                device=k_nope.device
++            )
++            k[..., :k_nope_dim] = k_nope
++            k[..., k_nope_dim:] = k_pe
++
+             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+ 
+@@ -1829,7 +1848,7 @@ class DeepseekV2ForCausalLM(nn.Module):
+                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+             if not use_deep_gemm_bmm:
+-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
++                self_attn.w_kc = w_kc.contiguous()
+                 self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                 if (
+                     hasattr(self_attn.kv_b_proj, "weight_scale")
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f40..30d2465e5 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -324,7 +324,7 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,

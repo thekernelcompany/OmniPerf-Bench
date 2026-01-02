@@ -1,0 +1,171 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 940a25d..954e525 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -79,14 +79,15 @@ class TransferInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
+-        if msg[4] == b"" and msg[5] == b"":
+-            is_dummy = True
+-            dst_kv_indices = np.array([], dtype=np.int64)
++        # Optimize: Check for empty bytes more efficiently and use empty() instead of array()
++        is_dummy = not msg[4] and not msg[5]
++        if is_dummy:
++            dst_kv_indices = np.empty(0, dtype=np.int64)
+             dst_aux_index = None
+         else:
+-            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
++            # Optimize: Avoid unnecessary copy by using frombuffer directly
++            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64).copy()
+             dst_aux_index = int(msg[5].decode("ascii"))
+-            is_dummy = False
+         return cls(
+             room=int(msg[0].decode("ascii")),
+             endpoint=msg[1].decode("ascii"),
+@@ -111,13 +112,16 @@ class KVArgsRegisterInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
++        # Optimize: Pre-calculate lengths and use direct unpacking
++        num_kv_ptrs = len(msg[4]) // 8
++        num_aux_ptrs = len(msg[5]) // 8
+         return cls(
+             room=str(msg[0].decode("ascii")),
+             endpoint=msg[1].decode("ascii"),
+             dst_port=int(msg[2].decode("ascii")),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
++            dst_kv_ptrs=list(struct.unpack(f"{num_kv_ptrs}Q", msg[4])) if num_kv_ptrs > 0 else [],
++            dst_aux_ptrs=list(struct.unpack(f"{num_aux_ptrs}Q", msg[5])) if num_aux_ptrs > 0 else [],
+         )
+ 
+ 
+@@ -243,15 +247,13 @@ class MooncakeKVManager(BaseKVManager):
+             prefill_kv_indices, dst_kv_indices
+         )
+ 
++        # Optimize: Use zip for faster iteration instead of range-based indexing
+         num_layers = len(self.kv_args.kv_data_ptrs)
+-        layers_params = [
+-            (
+-                self.kv_args.kv_data_ptrs[layer_id],
+-                dst_kv_ptrs[layer_id],
+-                self.kv_args.kv_item_lens[layer_id],
+-            )
+-            for layer_id in range(num_layers)
+-        ]
++        layers_params = list(zip(
++            self.kv_args.kv_data_ptrs,
++            dst_kv_ptrs,
++            self.kv_args.kv_item_lens
++        ))
+ 
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+@@ -306,9 +308,10 @@ class MooncakeKVManager(BaseKVManager):
+     def sync_status_to_decode_endpoint(
+         self, remote: str, dst_port: int, room: int, status: int
+     ):
+-        if ":" in remote:
+-            remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++        # Optimize: Use partition for faster string splitting and avoid redundant string concat
++        remote_ip = remote.partition(":")[0]
++        endpoint = f"tcp://{remote_ip}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -437,11 +440,13 @@ class MooncakeKVManager(BaseKVManager):
+         def bootstrap_thread():
+             """This thread recvs pre-alloc notification from the decode engine"""
+             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
++            # Optimize: Pre-encode string constant for comparison
++            none_bytes = b"None"
+             while True:
+                 waiting_req_bytes = self.server_socket.recv_multipart()
+-                room = waiting_req_bytes[0].decode("ascii")
++                room_bytes = waiting_req_bytes[0]
+                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
+-                if room == "None":
++                if room_bytes == none_bytes:
+                     self.decode_kv_args_table[mooncake_session_id] = (
+                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                     )
+@@ -455,8 +460,9 @@ class MooncakeKVManager(BaseKVManager):
+                     )
+                     continue
+                 else:
++                    # Optimize: Decode room_bytes only when needed
+                     required_dst_info_num = int(waiting_req_bytes[6].decode("ascii"))
+-                    room = int(room)
++                    room = int(room_bytes.decode("ascii"))
+                     if room not in self.transfer_infos:
+                         self.transfer_infos[room] = {}
+ 
+@@ -563,8 +569,9 @@ class MooncakeKVManager(BaseKVManager):
+         # NOTE(shangming): sharding according to the dst_infos to make sure
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
++        # Optimize: Use partition for faster string parsing
+         dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
++        session_port_sum = sum(int(session.partition(":")[2]) for session in dst_infos)
+         shard_idx = session_port_sum % len(self.transfer_queues)
+ 
+         self.transfer_queues[shard_idx].put(
+@@ -925,12 +932,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
++            # Optimize: Use single struct.pack call instead of joining individual packs
++            kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++            aux_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++            packed_kv_data_ptrs = struct.pack(f"{len(kv_ptrs)}Q", *kv_ptrs) if kv_ptrs else b""
++            packed_aux_data_ptrs = struct.pack(f"{len(aux_ptrs)}Q", *aux_ptrs) if aux_ptrs else b""
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:
+@@ -956,6 +962,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+ 
+     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
++        # Optimize: Cache frequently reused encoded strings
++        bootstrap_room_bytes = str(self.bootstrap_room).encode("ascii")
++        local_ip_bytes = get_local_ip_by_remote().encode("ascii")
++        rank_port_bytes = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_bytes = self.session_id.encode("ascii")
++        required_dst_info_bytes = str(self.required_dst_info_num).encode("ascii")
++        aux_index_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
++
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+@@ -966,13 +980,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        str(self.bootstrap_room).encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
++                        bootstrap_room_bytes,
++                        local_ip_bytes,
++                        rank_port_bytes,
++                        session_id_bytes,
+                         kv_indices.tobytes() if not is_dummy else b"",
+-                        str(aux_index).encode("ascii") if not is_dummy else b"",
+-                        str(self.required_dst_info_num).encode("ascii"),
++                        aux_index_bytes if not is_dummy else b"",
++                        required_dst_info_bytes,
+                     ]
+                 )
+ 

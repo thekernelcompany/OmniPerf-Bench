@@ -1,0 +1,81 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_A100-SXM4-80GB.json b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_A100-SXM4-80GB.json
+index 8cc6c643f..414dec232 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_A100-SXM4-80GB.json
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_A100-SXM4-80GB.json
+@@ -138,9 +138,9 @@
+     "4096": {
+         "BLOCK_SIZE_M": 128,
+         "BLOCK_SIZE_N": 128,
+-        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 1,
+-        "num_warps": 4,
+-        "num_stages": 3
++        "num_warps": 8,
++        "num_stages": 4
+     }
+ }
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_H100_80GB_HBM3.json b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_H100_80GB_HBM3.json
+index ef6a0479c..a7152be21 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_H100_80GB_HBM3.json
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=1280,device_name=NVIDIA_H100_80GB_HBM3.json
+@@ -138,9 +138,9 @@
+     "4096": {
+         "BLOCK_SIZE_M": 128,
+         "BLOCK_SIZE_N": 256,
+-        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 32,
+         "num_warps": 8,
+-        "num_stages": 4
++        "num_stages": 5
+     }
+ }
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=640,device_name=NVIDIA_A100-SXM4-80GB.json b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=640,device_name=NVIDIA_A100-SXM4-80GB.json
+index b2799ed3a..54ccd0a68 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=640,device_name=NVIDIA_A100-SXM4-80GB.json
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/E=64,N=640,device_name=NVIDIA_A100-SXM4-80GB.json
+@@ -138,9 +138,9 @@
+     "4096": {
+         "BLOCK_SIZE_M": 128,
+         "BLOCK_SIZE_N": 128,
+-        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 1,
+-        "num_warps": 4,
+-        "num_stages": 3
++        "num_warps": 8,
++        "num_stages": 4
+     }
+ }
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/configs/README b/python/sglang/srt/layers/moe/fused_moe_triton/configs/README
+index 4aa527f27..2bf9cf652 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/configs/README
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/configs/README
+@@ -10,3 +10,9 @@ and TP4 on A100. Mixtral has intermediate size N = 14336, i.e. for TP2 we have
+ N = 7168 and for TP4 we have N = 3584.
+ 
+ See `benchmark/kernels/fused_moe_triton/README.md` on how to generate these config files.
++
++## Performance Optimizations
++
++The MoE kernel implementation has been optimized for performance:
++- Memory allocation patterns use torch.full() instead of torch.empty().fill_() for better efficiency
++- Tensor initialization is minimized where possible to reduce overhead
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+index bd1432d38..7cdbfc835 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py
+@@ -691,10 +691,9 @@ def moe_align_block_size(
+         by block_size for proper block matrix operations.
+     """
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+-    sorted_ids = torch.empty(
+-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
++    sorted_ids = torch.full(
++        (max_num_tokens_padded,), topk_ids.numel(), dtype=torch.int32, device=topk_ids.device
+     )
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty(
+         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device

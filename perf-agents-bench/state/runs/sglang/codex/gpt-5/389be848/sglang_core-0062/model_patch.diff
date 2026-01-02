@@ -1,0 +1,122 @@
+diff --git a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+index 1a2036dc0..6c206dd49 100644
+--- a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
++++ b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+@@ -24,12 +24,17 @@ def _decode_kernel(
+     n: tl.constexpr,
+     d: tl.constexpr,
+     e: tl.constexpr,
++    d_original: tl.constexpr,
++    e_original: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr = 32,
+ ):
+     off_bh = tl.program_id(0)
+     off_h = off_bh % h
+ 
+-    qk_offset = off_bh * n * d
+-    v_offset = off_bh * n * e
++    # Offsets for flattened tensors. Q/K/V are stored using the original
++    # inner-dimension sizes, while KV/Out use the padded/aligned sizes.
++    qk_offset = off_bh * n * d_original
++    v_offset = off_bh * n * e_original
+     o_offset = off_bh * n * e
+     kv_offset = off_bh * d * e
+ 
+@@ -39,21 +44,31 @@ def _decode_kernel(
+     d_idx = tl.arange(0, d)
+     e_idx = tl.arange(0, e)
+ 
+-    q = tl.load(Q + qk_offset + d_idx)
+-    k = tl.load(K + qk_offset + d_idx)
+-    v = tl.load(V + v_offset + e_idx)
++    # Create masks for original dimensions
++    d_mask = d_idx < d_original
++    e_mask = e_idx < e_original
++
++    # Masked loads avoid the need to pad inputs in Python
++    q = tl.load(Q + qk_offset + d_idx, mask=d_mask, other=0.0)
++    k = tl.load(K + qk_offset + d_idx, mask=d_mask, other=0.0)
++    v = tl.load(V + v_offset + e_idx, mask=e_mask, other=0.0)
+ 
+     kv = tl.load(KV + kv_offset + d_idx[:, None] * e + e_idx[None, :])
+ 
+     k_v_prod = k[:, None] * v[None, :]
+     kv = ratio * kv + k_v_prod
+ 
++    # Store back only the valid [d_original, e_original] region
++    kv_store_mask = (d_idx[:, None] < d_original) & (e_idx[None, :] < e_original)
+     tl.store(
+-        KV + kv_offset + d_idx[:, None] * e + e_idx[None, :], kv.to(KV.dtype.element_ty)
++        KV + kv_offset + d_idx[:, None] * e + e_idx[None, :],
++        kv.to(KV.dtype.element_ty),
++        mask=kv_store_mask,
+     )
+ 
+     o = tl.sum(q[:, None] * kv, axis=0)
+-    tl.store(Out + o_offset + e_idx, o.to(Out.dtype.element_ty))
++    # Only write valid output elements
++    tl.store(Out + o_offset + e_idx, o.to(Out.dtype.element_ty), mask=e_mask)
+ 
+ 
+ def lightning_attn_decode(q, k, v, kv, s):
+@@ -62,24 +77,23 @@ def lightning_attn_decode(q, k, v, kv, s):
+     e = v.shape[-1]
+     assert n == 1, "Sequence length must be 1 in decode mode"
+ 
+-    # Pad dimensions to power of 2
+-    d_padded = next_power_of_2(d)
+-    e_padded = next_power_of_2(e)
+-
+-    # Pad inputs
+-    q_padded = F.pad(q, (0, d_padded - d))
+-    k_padded = F.pad(k, (0, d_padded - d))
+-    v_padded = F.pad(v, (0, e_padded - e))
+-    kv_padded = F.pad(kv, (0, e_padded - e, 0, d_padded - d))
+-
+-    # Ensure inputs are contiguous
+-    q_padded = q_padded.contiguous()
+-    k_padded = k_padded.contiguous()
+-    v_padded = v_padded.contiguous()
+-    kv_padded = kv_padded.contiguous().to(torch.float32)
++    # Align dimensions to a friendly block size to reduce padding overhead
++    BLOCK_SIZE = 32
++    d_padded = next_multiple_of(d, BLOCK_SIZE)
++    e_padded = next_multiple_of(e, BLOCK_SIZE)
++
++    # Avoid padding Q/K/V by using masked loads in the Triton kernel
++    q_padded = q.contiguous()
++    k_padded = k.contiguous()
++    v_padded = v.contiguous()
++
++    # Allocate a padded KV buffer without initializing the entire tensor
++    # Copy only the valid region to minimize memory traffic
++    kv_padded = torch.empty(b, h, d_padded, e_padded, dtype=torch.float32, device=kv.device)
++    kv_padded[..., :d, :e] = kv.to(torch.float32)
+     s = s.contiguous()
+ 
+-    # Create output tensor (padded)
++    # Create output tensor (padded) without zero-initialization
+     o_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
+ 
+     # Launch kernel
+@@ -96,6 +110,8 @@ def lightning_attn_decode(q, k, v, kv, s):
+         n=n,
+         d=d_padded,
+         e=e_padded,
++        d_original=d,
++        e_original=e,
+     )
+ 
+     # Remove padding
+@@ -105,8 +121,9 @@ def lightning_attn_decode(q, k, v, kv, s):
+     return o, kv_out
+ 
+ 
+-def next_power_of_2(n):
+-    return 2 ** (int(math.ceil(math.log(n, 2))))
++def next_multiple_of(n, k):
++    # Return the smallest multiple of k that is >= n
++    return ((n + k - 1) // k) * k
+ 
+ 
+ class MiniMaxText01LightningAttention(nn.Module):

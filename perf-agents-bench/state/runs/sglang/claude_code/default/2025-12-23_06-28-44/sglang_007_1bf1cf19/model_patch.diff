@@ -1,0 +1,149 @@
+diff --git a/python/sglang/lang/interpreter.py b/python/sglang/lang/interpreter.py
+index 00691ca50..64e5e7bf5 100644
+--- a/python/sglang/lang/interpreter.py
++++ b/python/sglang/lang/interpreter.py
+@@ -273,12 +273,12 @@ class StreamExecutor:
+             for _ in range(number)
+         ]
+         for i in range(number):
+-            exes[i].variables = dict(self.variables)
+-            exes[i].text_ = str(self.text_)
+-            exes[i].messages_ = list(self.messages_)
++            exes[i].variables = self.variables.copy()
++            exes[i].text_ = self.text_
++            exes[i].messages_ = self.messages_.copy()
+             exes[i].cur_role = self.cur_role
+             exes[i].fork_start_text_pos = len(self.text_)
+-            exes[i].images_ = list(self.images_)
++            exes[i].images_ = self.images_.copy()
+ 
+         return exes
+ 
+@@ -354,7 +354,8 @@ class StreamExecutor:
+             raise ValueError(f"Unknown type: {type(other)}")
+ 
+     def _execute_fill(self, value: str):
+-        value = str(value)
++        if not isinstance(value, str):
++            value = str(value)
+         if self.speculated_text.startswith(value):
+             self.speculated_text = self.speculated_text[len(value) :]
+         else:
+@@ -672,7 +673,7 @@ class ProgramState:
+                 while True:
+                     event.wait()
+                     event.clear()
+-                    out = str(self.stream_executor.text_[prev:])
++                    out = self.stream_executor.text_[prev:]
+                     prev += len(out)
+                     if out:
+                         yield out
+@@ -683,7 +684,7 @@ class ProgramState:
+                 while True:
+                     event.wait()
+                     event.clear()
+-                    out = str(self.stream_executor.variables[var_name][prev:])
++                    out = self.stream_executor.variables[var_name][prev:]
+                     prev += len(out)
+                     if out:
+                         yield out
+@@ -707,7 +708,7 @@ class ProgramState:
+                 while True:
+                     await loop.run_in_executor(None, event.wait)
+                     event.clear()
+-                    out = str(self.stream_executor.text_[prev:])
++                    out = self.stream_executor.text_[prev:]
+                     prev += len(out)
+                     if out:
+                         yield out
+@@ -718,7 +719,7 @@ class ProgramState:
+                 while True:
+                     await loop.run_in_executor(None, event.wait)
+                     event.clear()
+-                    out = str(self.stream_executor.variables[var_name][prev:])
++                    out = self.stream_executor.variables[var_name][prev:]
+                     prev += len(out)
+                     if out:
+                         if return_meta_data:
+diff --git a/python/sglang/srt/managers/router/radix_cache.py b/python/sglang/srt/managers/router/radix_cache.py
+index 7bb8a4b2a..ebc11bfa3 100644
+--- a/python/sglang/srt/managers/router/radix_cache.py
++++ b/python/sglang/srt/managers/router/radix_cache.py
+@@ -49,9 +49,10 @@ class RadixCache:
+ 
+         value = []
+         last_node = [self.root_node]
+-        self._match_prefix_helper(self.root_node, key, value, last_node)
++        current_time = time.time()
++        self._match_prefix_helper(self.root_node, key, value, last_node, current_time)
+         if value:
+-            value = torch.concat(value)
++            value = torch.cat(value)
+         return value, last_node[0]
+ 
+     def insert(self, key, value=None):
+@@ -60,7 +61,8 @@ class RadixCache:
+ 
+         if value is None:
+             value = [x for x in key]
+-        return self._insert_helper(self.root_node, key, value)
++        current_time = time.time()
++        return self._insert_helper(self.root_node, key, value, current_time)
+ 
+     def pretty_print(self):
+         self._print_helper(self.root_node, 0)
+@@ -115,12 +117,12 @@ class RadixCache:
+         return self.evictable_size_
+ 
+     ##### Internal Helper Functions #####
+-    def _match_prefix_helper(self, node, key, value, last_node):
+-        node.last_access_time = time.time()
++    def _match_prefix_helper(self, node, key, value, last_node, current_time):
++        node.last_access_time = current_time
+         if len(key) == 0:
+             return
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+             if prefix_len < len(child.key):
+@@ -130,7 +132,7 @@ class RadixCache:
+             else:
+                 value.append(child.value)
+                 last_node[0] = child
+-                self._match_prefix_helper(child, key[prefix_len:], value, last_node)
++                self._match_prefix_helper(child, key[prefix_len:], value, last_node, current_time)
+ 
+     def _split_node(self, key, child, split_len):
+         # new_node -> child
+@@ -146,12 +148,12 @@ class RadixCache:
+         new_node.parent.children[key[:split_len][0]] = new_node
+         return new_node
+ 
+-    def _insert_helper(self, node, key, value):
+-        node.last_access_time = time.time()
++    def _insert_helper(self, node, key, value, current_time):
++        node.last_access_time = current_time
+         if len(key) == 0:
+             return 0
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+ 
+@@ -161,11 +163,11 @@ class RadixCache:
+                 else:
+                     key = key[prefix_len:]
+                     value = value[prefix_len:]
+-                    return prefix_len + self._insert_helper(child, key, value)
++                    return prefix_len + self._insert_helper(child, key, value, current_time)
+ 
+             new_node = self._split_node(child.key, child, prefix_len)
+             return prefix_len + self._insert_helper(
+-                new_node, key[prefix_len:], value[prefix_len:]
++                new_node, key[prefix_len:], value[prefix_len:], current_time
+             )
+ 
+         if len(key):

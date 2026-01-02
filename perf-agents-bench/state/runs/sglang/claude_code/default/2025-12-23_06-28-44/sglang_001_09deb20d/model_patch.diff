@@ -1,0 +1,139 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index f95c30786..1319b902e 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -13,6 +13,24 @@ class LogitsProcessor(nn.Module):
+         super().__init__()
+         self.config = config
+         self.tp_size = get_tensor_model_parallel_world_size()
++        # Pre-allocate commonly used tensors to avoid repeated allocations
++        self._zero_tensor_cache = None
++        self._arange_cache = None
++        self._arange_cache_size = 0
++
++    def _get_zero_tensor(self):
++        """Get or create a cached zero tensor to avoid repeated allocations."""
++        if self._zero_tensor_cache is None:
++            self._zero_tensor_cache = torch.tensor([0], device="cuda")
++        return self._zero_tensor_cache
++
++    def _get_arange(self, size):
++        """Get or create a cached arange tensor to avoid repeated allocations."""
++        if self._arange_cache is None or self._arange_cache_size < size:
++            self._arange_cache = torch.arange(size, device="cuda")
++            self._arange_cache_size = size
++            return self._arange_cache
++        return self._arange_cache[:size]
+ 
+     def _get_normalized_prompt_logprobs(
+         self, prefill_token_logprobs, input_metadata: InputMetadata
+@@ -21,10 +39,12 @@ class LogitsProcessor(nn.Module):
+             prefill_token_logprobs, dim=0, dtype=torch.float32
+         )
+ 
+-        start = input_metadata.extend_start_loc.clone()
++        # Avoid clone by computing directly without modifying input_metadata
++        start = input_metadata.extend_start_loc
+         end = start + input_metadata.extend_seq_lens - 2
+-        start.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
+-        end.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
++        # Use torch.clamp instead of clamp_ to avoid in-place modification
++        start = start.clamp(min=0, max=prefill_token_logprobs.shape[0] - 1)
++        end = end.clamp(min=0, max=prefill_token_logprobs.shape[0] - 1)
+         sum_logp = (
+             logprobs_cumsum[end]
+             - logprobs_cumsum[start]
+@@ -98,7 +118,8 @@ class LogitsProcessor(nn.Module):
+                     all_logits = tensor_model_parallel_all_gather(all_logits)
+                 all_logits = all_logits[:, : self.config.vocab_size]
+ 
+-            all_logprobs = torch.log(torch.softmax(all_logits.float(), dim=-1) + 1e-6)
++            # Use log_softmax for better numerical stability and performance
++            all_logprobs = torch.nn.functional.log_softmax(all_logits.float(), dim=-1)
+ 
+             prefill_top_logprobs, decode_top_logprobs = self._get_top_logprobs(
+                 all_logprobs, input_metadata
+@@ -119,9 +140,12 @@ class LogitsProcessor(nn.Module):
+ 
+                 # Compute the logprobs and normalized logprobs for the prefill tokens.
+                 # Note that we pad a zero at the end of each sequence for easy computation.
++                # Use cached tensors to avoid repeated allocations
++                arange_indices = self._get_arange(all_logprobs.shape[0])
++                zero_tensor = self._get_zero_tensor()
+                 prefill_token_logprobs = all_logprobs[
+-                    torch.arange(all_logprobs.shape[0], device="cuda"),
+-                    torch.cat([input_ids[1:], torch.tensor([0], device="cuda")]),
++                    arange_indices,
++                    torch.cat([input_ids[1:], zero_tensor]),
+                 ]
+ 
+                 normalized_prompt_logprobs = self._get_normalized_prompt_logprobs(
+diff --git a/python/sglang/srt/managers/router/model_rpc.py b/python/sglang/srt/managers/router/model_rpc.py
+index f283635c3..b5af5e9a8 100644
+--- a/python/sglang/srt/managers/router/model_rpc.py
++++ b/python/sglang/srt/managers/router/model_rpc.py
+@@ -103,8 +103,10 @@ class ModelRpcServer:
+                 else server_args.max_prefill_num_token
+             ),
+         )
++        # Optimize tensor creation with explicit dtype and device
++        logit_bias_list = get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
+         self.int_token_logit_bias = torch.tensor(
+-            get_int_token_logit_bias(self.tokenizer, self.model_config.vocab_size)
++            logit_bias_list, dtype=torch.float32, device="cpu"
+         )
+         set_random_seed(server_args.random_seed)
+         logger.info(
+@@ -150,6 +152,18 @@ class ModelRpcServer:
+         self.min_new_token_ratio = min(0.2 * server_args.schedule_conservativeness, 1.0)
+         self.new_token_ratio_step = (0.0001, 0.05)  # (down, up)
+ 
++        # Cache for torch.arange to avoid repeated allocations
++        self._arange_cache = None
++        self._arange_cache_size = 0
++
++    def _get_arange(self, size, device="cuda"):
++        """Get or create a cached arange tensor to avoid repeated allocations."""
++        if self._arange_cache is None or self._arange_cache_size < size:
++            self._arange_cache = torch.arange(size, device=device)
++            self._arange_cache_size = size
++            return self._arange_cache
++        return self._arange_cache[:size]
++
+     def flush_cache(self):
+         if len(self.forward_queue) == 0 and (
+             self.running_batch is None or len(self.running_batch.reqs) == 0
+@@ -159,6 +173,9 @@ class ModelRpcServer:
+             self.regex_fsm_cache.reset()
+             self.req_to_token_pool.clear()
+             self.token_to_kv_pool.clear()
++            # Clear arange cache
++            self._arange_cache = None
++            self._arange_cache_size = 0
+             torch.cuda.empty_cache()
+             logger.info("Cache flushed successfully!")
+         else:
+@@ -436,8 +453,10 @@ class ModelRpcServer:
+         reqs = batch.reqs
+         last_token_logprobs = None
+         if last_logprobs is not None:
++            # Use cached arange to avoid repeated allocations
++            arange_indices = self._get_arange(len(reqs), device=last_logprobs.device)
+             last_token_logprobs = (
+-                last_logprobs[torch.arange(len(reqs)), next_token_ids].cpu().tolist()
++                last_logprobs[arange_indices, next_token_ids].cpu().tolist()
+             )
+ 
+         # Check finish condition
+@@ -530,8 +549,10 @@ class ModelRpcServer:
+         reqs = batch.reqs
+         new_token_logprobs = None
+         if last_logprobs is not None:
++            # Use cached arange to avoid repeated allocations
++            arange_indices = self._get_arange(len(reqs), device=last_logprobs.device)
+             new_token_logprobs = last_logprobs[
+-                torch.arange(len(reqs)), next_token_ids
++                arange_indices, next_token_ids
+             ].tolist()
+ 
+         # Check finish condition

@@ -1,0 +1,80 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index 66fbb36ea..ccee17478 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -502,8 +502,8 @@ class DeepEPMoE(EPMoE):
+                 dtype=hidden_states_fp8.dtype,
+             ),
+             (
+-                # TODO check whether need `zeros`
+-                torch.zeros(
++                # Allocate without initialization; ep_scatter writes full buffer
++                torch.empty(
+                     (ceil_div(K // 128, 4), all_tokens),
+                     device=hidden_states_fp8.device,
+                     dtype=torch.int,
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index d0a9ed132..efe99e6bf 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -127,9 +127,6 @@ class FusedMoE(torch.nn.Module):
+             self.expert_map_cpu = torch.full(
+                 (self.num_experts,), -1, dtype=torch.int32, device="cpu"
+             )
+-            self.expert_map_cpu = torch.full(
+-                (self.num_experts,), -1, dtype=torch.int32, device="cpu"
+-            )
+             # Create a expert map for the local experts
+             self.expert_map_cpu[
+                 self.moe_ep_rank
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 03faea684..d98b6a145 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1099,14 +1099,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         )
+ 
+         if not decoder_out_cache_loc:
+-            self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            # Avoid unnecessary zero-initialization for empty tensors
++            self.out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
+ 
+         if not encoder_out_cache_loc:
+-            self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
++            # Avoid unnecessary zero-initialization for empty tensors
++            self.encoder_out_cache_loc = torch.empty(0, dtype=torch.int64).to(
+                 self.device, non_blocking=True
+             )
+         else:
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index b5b13d9ac..16e715ab9 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -596,8 +596,9 @@ class DeepseekV2MoE(nn.Module):
+                 ),
+             )
+         else:
+-            topk_idx = torch.full(
+-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++            # Use empty tensors for zero-token case to avoid unnecessary fills
++            topk_idx = torch.empty(
++                (0, self.top_k), dtype=torch.int, device=hidden_states.device
+             )
+             topk_weights = torch.empty(
+                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+@@ -660,8 +661,9 @@ class DeepseekV2MoE(nn.Module):
+                     ),
+                 )
+         else:
+-            state.topk_idx_local = torch.full(
+-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
++            # Use empty tensors for zero-token case to avoid unnecessary fills
++            state.topk_idx_local = torch.empty(
++                (0, self.top_k), dtype=torch.int, device=hidden_states.device
+             )
+             state.topk_weights_local = torch.empty(
+                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device

@@ -1,0 +1,105 @@
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2ab041726..26ccb2243 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ """Meta data for requests and batches"""
+ 
++import itertools
+ import logging
+ from dataclasses import dataclass
+ from typing import List, Optional, Tuple, Union
+@@ -468,7 +469,7 @@ class ScheduleBatch:
+ 
+         # Set fields
+         with torch.device("cuda"):
+-            self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
++            self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32)
+             self.req_pool_indices = torch.tensor(req_pool_indices_cpu)
+             self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+             self.position_ids_offsets = torch.zeros((bs,), dtype=torch.int64)
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index fe9afc9f3..69e86df67 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -1003,7 +1003,7 @@ def broadcast_recv_input(
+         else:
+             serialized_data = pickle.dumps(data)
+             size = len(serialized_data)
+-            tensor_data = torch.ByteTensor(list(serialized_data))
++            tensor_data = torch.frombuffer(serialized_data, dtype=torch.uint8)
+             tensor_size = torch.tensor([size], dtype=torch.long)
+ 
+             dist.broadcast(tensor_size, src=0, group=dist_group)
+@@ -1020,6 +1020,6 @@ def broadcast_recv_input(
+         tensor_data = torch.empty(size, dtype=torch.uint8)
+         dist.broadcast(tensor_data, src=0, group=dist_group)
+ 
+-        serialized_data = bytes(tensor_data.tolist())
++        serialized_data = tensor_data.cpu().numpy().tobytes()
+         data = pickle.loads(serialized_data)
+         return data
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 4815fbc56..70bcd4ca3 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -107,32 +107,25 @@ class InputMetadata:
+                 self.positions = (self.seq_lens - 1) + position_ids_offsets
+         else:
+             if True:
+-                self.positions = torch.tensor(
+-                    np.concatenate(
+-                        [
+-                            np.arange(batch.prefix_lens_cpu[i], len(req.fill_ids))
+-                            for i, req in enumerate(batch.reqs)
+-                        ],
+-                        axis=0,
+-                    ),
+-                    device="cuda",
+-                )
++                # Directly create on device to avoid CPU->GPU transfer
++                position_list = []
++                for i, req in enumerate(batch.reqs):
++                    position_list.extend(range(batch.prefix_lens_cpu[i], len(req.fill_ids)))
++                self.positions = torch.tensor(position_list, device="cuda", dtype=torch.int64)
++                return  # Already int64, skip conversion
+             else:
+                 # Deprecated
+                 position_ids_offsets_cpu = position_ids_offsets.cpu().numpy()
+-                self.positions = torch.tensor(
+-                    np.concatenate(
+-                        [
+-                            np.arange(
+-                                batch.prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
+-                                len(req.fill_ids) + position_ids_offsets_cpu[i],
+-                            )
+-                            for i, req in enumerate(batch.reqs)
+-                        ],
+-                        axis=0,
+-                    ),
+-                    device="cuda",
+-                )
++                position_list = []
++                for i, req in enumerate(batch.reqs):
++                    position_list.extend(
++                        range(
++                            batch.prefix_lens_cpu[i] + position_ids_offsets_cpu[i],
++                            len(req.fill_ids) + position_ids_offsets_cpu[i],
++                        )
++                    )
++                self.positions = torch.tensor(position_list, device="cuda", dtype=torch.int64)
++                return  # Already int64, skip conversion
+ 
+         # Positions should be in long type
+         self.positions = self.positions.to(torch.int64)
+@@ -140,7 +133,8 @@ class InputMetadata:
+     def compute_extend_infos(self, batch: ScheduleBatch):
+         self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
+         self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+-        self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
++        self.extend_start_loc = torch.empty_like(self.extend_seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
+         self.extend_seq_lens_cpu = batch.extend_lens_cpu

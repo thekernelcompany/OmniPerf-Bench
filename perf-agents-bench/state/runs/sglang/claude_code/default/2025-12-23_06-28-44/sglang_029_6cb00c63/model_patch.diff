@@ -1,0 +1,96 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 4c3faee..337b27a 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -243,15 +243,12 @@ class MooncakeKVManager(BaseKVManager):
+             prefill_kv_indices, dst_kv_indices
+         )
+ 
+-        num_layers = len(self.kv_args.kv_data_ptrs)
+-        layers_params = [
+-            (
+-                self.kv_args.kv_data_ptrs[layer_id],
+-                dst_kv_ptrs[layer_id],
+-                self.kv_args.kv_item_lens[layer_id],
+-            )
+-            for layer_id in range(num_layers)
+-        ]
++        # Optimize by using zip instead of range-based list comprehension
++        layers_params = list(zip(
++            self.kv_args.kv_data_ptrs,
++            dst_kv_ptrs,
++            self.kv_args.kv_item_lens
++        ))
+ 
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+@@ -306,9 +303,11 @@ class MooncakeKVManager(BaseKVManager):
+     def sync_status_to_decode_endpoint(
+         self, remote: str, dst_port: int, room: int, status: int
+     ):
++        # Optimize string operations: use rpartition and f-string for faster concatenation
+         if ":" in remote:
+-            remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++            remote = remote.rpartition(":")[0]
++        endpoint = f"tcp://{remote}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -564,7 +563,8 @@ class MooncakeKVManager(BaseKVManager):
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
+         dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
++        # Optimize string operations by using str.rpartition which is faster than split
++        session_port_sum = sum(int(session.rpartition(":")[2]) for session in dst_infos)
+         shard_idx = session_port_sum % len(self.transfer_queues)
+ 
+         self.transfer_queues[shard_idx].put(
+@@ -750,6 +750,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
+     _socket_cache = {}
+     _socket_locks = {}
+     _global_lock = threading.Lock()
++    # Pre-encode frequently used strings to optimize performance
++    _NONE_BYTES = b"None"
++    _EMPTY_BYTES = b""
+ 
+     def __init__(
+         self,
+@@ -923,18 +926,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
++            # Optimize struct packing by using single pack call with format string
++            kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++            aux_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++            packed_kv_data_ptrs = struct.pack(f"{len(kv_ptrs)}Q", *kv_ptrs)
++            packed_aux_data_ptrs = struct.pack(f"{len(aux_ptrs)}Q", *aux_ptrs)
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        "None".encode("ascii"),
++                        self._NONE_BYTES,
+                         get_local_ip_by_remote().encode("ascii"),
+                         str(self.kv_mgr.rank_port).encode("ascii"),
+                         self.session_id.encode("ascii"),
+@@ -968,8 +970,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
+                         get_local_ip_by_remote().encode("ascii"),
+                         str(self.kv_mgr.rank_port).encode("ascii"),
+                         self.session_id.encode("ascii"),
+-                        kv_indices.tobytes() if not is_dummy else b"",
+-                        str(aux_index).encode("ascii") if not is_dummy else b"",
++                        kv_indices.tobytes() if not is_dummy else self._EMPTY_BYTES,
++                        str(aux_index).encode("ascii") if not is_dummy else self._EMPTY_BYTES,
+                         str(self.required_dst_info_num).encode("ascii"),
+                     ]
+                 )

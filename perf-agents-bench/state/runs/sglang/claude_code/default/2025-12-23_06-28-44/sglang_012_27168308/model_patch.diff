@@ -1,0 +1,134 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index a7af87144..a7baf034a 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -111,7 +111,8 @@ def grouped_topk(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
++    group_mask = torch.empty_like(group_scores)  # [n, n_group]
++    group_mask.zero_()
+     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+@@ -166,7 +167,8 @@ def biased_grouped_topk_impl(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
++    group_mask = torch.empty_like(group_scores)  # [n, n_group]
++    group_mask.zero_()
+     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index e88022beb..c365b2fa5 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -232,23 +232,23 @@ class CudaGraphRunner:
+ 
+         # Graph inputs
+         with torch.device("cuda"):
+-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
++            self.input_ids = torch.empty((self.max_num_token,), dtype=torch.int64)
++            self.req_pool_indices = torch.empty((self.max_bs,), dtype=torch.int32)
+             self.seq_lens = torch.full(
+                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+             )
+-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
+-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
++            self.out_cache_loc = torch.empty((self.max_num_token,), dtype=torch.int64)
++            self.positions = torch.empty((self.max_num_token,), dtype=torch.int64)
++            self.mrope_positions = torch.empty((3, self.max_bs), dtype=torch.int64)
+ 
+             # pipeline parallelism
+             if self.pp_size > 1:
+                 self.pp_proxy_tensors = {
+-                    "hidden_states": torch.zeros(
++                    "hidden_states": torch.empty(
+                         (self.max_bs, self.model_runner.model_config.hidden_size),
+                         dtype=torch.bfloat16,
+                     ),
+-                    "residual": torch.zeros(
++                    "residual": torch.empty(
+                         (self.max_bs, self.model_runner.model_config.hidden_size),
+                         dtype=torch.bfloat16,
+                     ),
+@@ -259,7 +259,7 @@ class CudaGraphRunner:
+                 model_runner.spec_algorithm.is_eagle3()
+                 and not model_runner.is_draft_worker
+             ):
+-                self.hidden_states = torch.zeros(
++                self.hidden_states = torch.empty(
+                     (
+                         self.max_num_token,
+                         3 * self.model_runner.model_config.hidden_size,
+@@ -268,7 +268,7 @@ class CudaGraphRunner:
+                 )
+                 self.model_runner.model.set_eagle3_layers_to_capture()
+             elif model_runner.spec_algorithm.is_eagle():
+-                self.hidden_states = torch.zeros(
++                self.hidden_states = torch.empty(
+                     (self.max_num_token, self.model_runner.model_config.hidden_size),
+                     dtype=self.model_runner.dtype,
+                 )
+@@ -282,14 +282,14 @@ class CudaGraphRunner:
+                 self.encoder_lens = None
+             if self.enable_dp_attention or self.enable_sp_layernorm:
+                 # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
+-                self.gathered_buffer = torch.zeros(
++                self.gathered_buffer = torch.empty(
+                     (
+                         self.max_bs * self.dp_size * self.num_tokens_per_bs,
+                         self.model_runner.model_config.hidden_size,
+                     ),
+                     dtype=self.model_runner.dtype,
+                 )
+-                self.global_num_tokens_gpu = torch.zeros(
++                self.global_num_tokens_gpu = torch.empty(
+                     (self.dp_size,), dtype=torch.int32
+                 )
+ 
+@@ -548,7 +548,6 @@ class CudaGraphRunner:
+         bs = self.capture_bs[index]
+         if bs != raw_bs:
+             self.seq_lens.fill_(1)
+-            self.out_cache_loc.zero_()
+ 
+         # Common inputs
+         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+@@ -632,7 +631,7 @@ class CudaGraphRunner:
+             else:
+                 spec_info = EagleVerifyInput(
+                     draft_token=None,
+-                    custom_mask=torch.zeros(
++                    custom_mask=torch.empty(
+                         (num_tokens * self.model_runner.model_config.context_len),
+                         dtype=torch.bool,
+                         device="cuda",
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 5018f92d5..817c721e4 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -305,7 +305,7 @@ class ForwardBatch:
+             ).to(device, non_blocking=True)
+ 
+             sum_len = sum(batch.global_num_tokens)
+-            ret.gathered_buffer = torch.zeros(
++            ret.gathered_buffer = torch.empty(
+                 (sum_len, model_runner.model_config.hidden_size),
+                 dtype=model_runner.dtype,
+                 device=device,
+@@ -683,7 +683,8 @@ def compute_position_torch(
+         ],
+         axis=0,
+     )
+-    extend_start_loc = torch.zeros_like(extend_seq_lens)
++    extend_start_loc = torch.empty_like(extend_seq_lens)
++    extend_start_loc[0] = 0
+     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+     return positions.to(torch.int64), extend_start_loc
+ 

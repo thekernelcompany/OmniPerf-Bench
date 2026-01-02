@@ -1,0 +1,86 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a4..23462b5 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -266,6 +266,7 @@ def _compute_logical_to_all_physical_map(
+     # This is rarely called, so we use for loops for maximum clarity
+ 
+     num_layers, num_physical_experts = physical_to_logical_map.shape
++    device = physical_to_logical_map.device
+ 
+     logical_to_all_physical_map = [
+         [[] for _ in range(num_logical_experts)] for _ in range(num_layers)
+@@ -284,7 +285,7 @@ def _compute_logical_to_all_physical_map(
+     )
+ 
+     return torch.tensor(
+-        logical_to_all_physical_map, device=physical_to_logical_map.device
++        logical_to_all_physical_map, dtype=torch.int64, device=device
+     )
+ 
+ 
+@@ -311,11 +312,11 @@ def compute_logical_to_rank_dispatch_physical_map(
+     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+     dtype = logical_to_all_physical_map.dtype
+ 
+-    logical_to_rank_dispatch_physical_map = torch.full(
++    logical_to_rank_dispatch_physical_map = torch.empty(
+         size=(num_gpus, num_layers, num_logical_experts),
+-        fill_value=-1,
+         dtype=dtype,
+     )
++    logical_to_rank_dispatch_physical_map.fill_(-1)
+ 
+     for layer_id in range(num_layers):
+         for logical_expert_id in range(num_logical_experts):
+@@ -339,10 +340,12 @@ def compute_logical_to_rank_dispatch_physical_map(
+                     output_partial[gpu_id] = same_gpu_physical_expert_ids[0]
+ 
+             num_remain = torch.sum(output_partial == -1).item()
+-            output_partial[output_partial == -1] = torch.tensor(
+-                _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r),
+-                dtype=dtype,
+-            )
++            if num_remain > 0:
++                fair_choices_result = _fair_choices(candidate_physical_expert_ids, k=num_remain, r=r)
++                output_partial[output_partial == -1] = torch.tensor(
++                    fair_choices_result,
++                    dtype=dtype,
++                )
+ 
+     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+ 
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01..a45af0b 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -63,7 +63,8 @@ def transform_select_experts_inputs(
+     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+         router_logits = torch.randn_like(router_logits)
+         if correction_bias is not None:
+-            correction_bias = torch.zeros_like(correction_bias)
++            correction_bias = torch.empty_like(correction_bias)
++            correction_bias.fill_(0)
+     return router_logits, correction_bias
+ 
+ 
+@@ -91,13 +92,13 @@ def _topk_ids_logical_to_physical_dynamic(
+ ) -> torch.Tensor:
+     topk_ids_original_shape = topk_ids.shape
+     device = topk_ids.device
+-    topk_ids = topk_ids.flatten()
++    topk_ids_flat = topk_ids.flatten()
+ 
++    num_valid = info.partial_logical_to_all_physical_map_num_valid[topk_ids_flat]
+     chosen_dispatch_index = (
+-        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
++        torch.randint(0, 65536, topk_ids_flat.shape, dtype=torch.int32, device=device)
++        % num_valid
+     )
+-    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
++    result = info.partial_logical_to_all_physical_map[topk_ids_flat, chosen_dispatch_index]
+ 
+-    topk_ids = topk_ids.view(topk_ids_original_shape)
+-    return topk_ids
++    return result.view(topk_ids_original_shape)

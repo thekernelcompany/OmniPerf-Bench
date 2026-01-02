@@ -1,0 +1,170 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index db30d8c..b312405 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -114,8 +114,8 @@ class KVArgsRegisterInfo:
+             endpoint=msg[1].decode("ascii"),
+             dst_port=int(msg[2].decode("ascii")),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
++            dst_kv_ptrs=struct.unpack(f"{len(msg[4])//8}Q", msg[4]),
++            dst_aux_ptrs=struct.unpack(f"{len(msg[5])//8}Q", msg[5]),
+             dst_tp_rank=int(msg[6].decode("ascii")),
+             dst_tp_size=int(msg[7].decode("ascii")),
+             dst_kv_item_len=int(msg[8].decode("ascii")),
+@@ -270,16 +270,17 @@ class MooncakeKVManager(BaseKVManager):
+ 
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+-            src_addr_list = []
+-            dst_addr_list = []
+-            length_list = []
+-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
++            num_blocks = len(prefill_kv_blocks)
++            src_addr_list = [0] * num_blocks
++            dst_addr_list = [0] * num_blocks
++            length_list = [0] * num_blocks
++            for idx, (prefill_index, decode_index) in enumerate(zip(prefill_kv_blocks, dst_kv_blocks)):
+                 src_addr = src_ptr + int(prefill_index[0]) * item_len
+                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                 length = item_len * len(prefill_index)
+-                src_addr_list.append(src_addr)
+-                dst_addr_list.append(dst_addr)
+-                length_list.append(length)
++                src_addr_list[idx] = src_addr
++                dst_addr_list[idx] = dst_addr
++                length_list[idx] = length
+             return self.engine.batch_transfer_sync(
+                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
+             )
+@@ -348,7 +349,7 @@ class MooncakeKVManager(BaseKVManager):
+             num_heads_to_send = heads_per_decode_rank
+             dst_head_offset = 0
+ 
+-        layer_transfer_params = []
++        layer_transfer_params = [None] * num_layers
+         for layer_id in range(num_layers):
+             item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]
+ 
+@@ -375,16 +376,14 @@ class MooncakeKVManager(BaseKVManager):
+                     f"target page size ({item_len_of_decode_rank_page})"
+                 )
+                 return -1
+-            layer_transfer_params.append(
+-                (
+-                    self.kv_args.kv_data_ptrs[layer_id],
+-                    dst_kv_ptrs[layer_id],
+-                    item_len_of_prefill_rank_page,
+-                    item_len_of_decode_rank_page,
+-                    src_slice_offset,
+-                    dst_slice_offset,
+-                    slice_lens_per_page,
+-                )
++            layer_transfer_params[layer_id] = (
++                self.kv_args.kv_data_ptrs[layer_id],
++                dst_kv_ptrs[layer_id],
++                item_len_of_prefill_rank_page,
++                item_len_of_decode_rank_page,
++                src_slice_offset,
++                dst_slice_offset,
++                slice_lens_per_page,
+             )
+ 
+         def process_layer_tp_aware(layer_params):
+@@ -397,14 +396,18 @@ class MooncakeKVManager(BaseKVManager):
+                 dst_offset,
+                 slice_lens_per_page,
+             ) = layer_params
+-            src_addr_list = []
+-            dst_addr_list = []
+-            length_list = []
+ 
+             # Calculate strides for a single token slot
+             bytes_per_token_on_prefill = src_item_len // page_size
+             bytes_per_token_on_decode = dst_item_len // page_size
+ 
++            # Pre-allocate lists for better performance
++            total_transfers = len(prefill_kv_indices) * page_size
++            src_addr_list = [0] * total_transfers
++            dst_addr_list = [0] * total_transfers
++            length_list = [slice_lens_per_page] * total_transfers
++
++            transfer_idx = 0
+             for i in range(len(prefill_kv_indices)):
+                 prefill_page_idx = int(prefill_kv_indices[i])
+                 decode_page_idx = int(dst_kv_indices[i])
+@@ -429,9 +432,9 @@ class MooncakeKVManager(BaseKVManager):
+                     src_slice_addr = src_token_slot_start_addr + src_offset
+                     dst_slice_addr = dst_token_slot_start_addr + dst_offset
+ 
+-                    src_addr_list.append(src_slice_addr)
+-                    dst_addr_list.append(dst_slice_addr)
+-                    length_list.append(slice_lens_per_page)
++                    src_addr_list[transfer_idx] = src_slice_addr
++                    dst_addr_list[transfer_idx] = dst_slice_addr
++                    transfer_idx += 1
+ 
+                     logger.debug(
+                         f"SYNC: sid={mooncake_session_id}, "
+@@ -466,18 +469,19 @@ class MooncakeKVManager(BaseKVManager):
+         dst_aux_ptrs: list[int],
+         dst_aux_index: int,
+     ):
+-        src_addr_list = []
+-        dst_addr_list = []
+-        length_list = []
+         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+         prefill_aux_item_lens = self.kv_args.aux_item_lens
++        num_aux = len(dst_aux_ptrs)
++        src_addr_list = [0] * num_aux
++        dst_addr_list = [0] * num_aux
++        length_list = [0] * num_aux
+         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+             length = prefill_aux_item_lens[i]
+             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+             dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+-            src_addr_list.append(src_addr)
+-            dst_addr_list.append(dst_addr)
+-            length_list.append(length)
++            src_addr_list[i] = src_addr
++            dst_addr_list[i] = dst_addr
++            length_list[i] = length
+         return self.engine.batch_transfer_sync(
+             mooncake_session_id, src_addr_list, dst_addr_list, length_list
+         )
+@@ -722,9 +726,9 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            current_rooms = self.addr_to_rooms_tracker[
++                            current_rooms = list(self.addr_to_rooms_tracker[
+                                 bootstrap_addr
+-                            ].copy()
++                            ])
+ 
+                             for bootstrap_room in current_rooms:
+                                 # Remove KVPoll.Success requests from the tracker
+@@ -1181,17 +1185,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+             packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
++                [struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs]
+             )
+             packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
++                [struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs]
+             )
+             tp_rank = self.kv_mgr.kv_args.engine_rank
+             tp_size = self.kv_mgr.tp_size // self.kv_mgr.dp_size
+             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+-            dst_tp_rank = str(tp_rank).encode("ascii")
+-            dst_tp_size = str(tp_size).encode("ascii")
+-            dst_kv_item_len = str(kv_item_len).encode("ascii")
++            dst_tp_rank = f"{tp_rank}".encode("ascii")
++            dst_tp_size = f"{tp_size}".encode("ascii")
++            dst_kv_item_len = f"{kv_item_len}".encode("ascii")
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:

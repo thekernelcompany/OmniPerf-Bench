@@ -1,0 +1,233 @@
+diff --git a/model_patch.diff b/model_patch.diff
+index c76456a..e69de29 100644
+--- a/model_patch.diff
++++ b/model_patch.diff
+@@ -1,228 +0,0 @@
+-diff --git a/benchmark/lora/launch_server.py b/benchmark/lora/launch_server.py
+-index 1fa4d71..b0877de 100644
+---- a/benchmark/lora/launch_server.py
+-+++ b/benchmark/lora/launch_server.py
+-@@ -11,18 +11,19 @@ LORA_PATH = {
+- def launch_server(args):
+-     base_path = LORA_PATH["base"]
+-     lora_path = LORA_PATH["lora"]
+--    max_loras_per_batch = 4
+- 
+--    if args.base_only:
+--        cmd = f"python -m sglang.launch_server --model {base_path} "
+--    else:
+--        cmd = f"python -m sglang.launch_server --model {base_path} --lora-paths "
+--        for i in range(NUM_LORAS):
+--            lora_name = f"lora{i}"
+--            cmd += f"{lora_name}={lora_path} "
+--    cmd += f"--disable-radix --disable-cuda-graph "
+--    cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
+--    cmd += f"--max-running-requests {args.max_running_requests}"
+-+    parts = ["python -m sglang.launch_server", f"--model {base_path}"]
+-+    if not args.base_only:
+-+        num = args.num_loras if hasattr(args, "num_loras") and args.num_loras is not None else NUM_LORAS
+-+        loras = (f"lora{i}={lora_path}" for i in range(num))
+-+        parts.append("--lora-paths " + " ".join(loras))
+-+    parts.extend([
+-+        "--disable-radix",
+-+        "--disable-cuda-graph",
+-+        f"--max-loras-per-batch {args.max_loras_per_batch}",
+-+        f"--max-running-requests {args.max_running_requests}",
+-+    ])
+-+    cmd = " ".join(parts)
+-     print(cmd)
+-     os.system(cmd)
+- 
+-diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+-index 379b233..c8d9e0e 100644
+---- a/python/sglang/srt/lora/lora.py
+-+++ b/python/sglang/srt/lora/lora.py
+-@@ -299,7 +299,8 @@ class LoRALayer(nn.Module):
+- 
+-     def load_to_gpu(self):
+-         for name, weight in self.weights.items():
+--            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
+-+            # merge dtype and device move; non_blocking may speed H2D when possible
+-+            self.weight_gpu[name] = weight.to(device="cuda", dtype=torch.float16, non_blocking=True)
+- 
+-     def offload_from_gpu(self):
+-         for name, weight in self.weights.items():
+-@@ -336,7 +337,7 @@ class LoRAAdapter(nn.Module):
+- 
+-     def load_to_gpu(self):
+-         for name, weight in self.weights.items():
+--            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
+-+            self.weights_gpu[name] = weight.to(device="cuda", dtype=torch.float16, non_blocking=True)
+-         for layer in self.layers:
+-             layer.load_to_gpu()
+- 
+-@@ -357,9 +358,10 @@ class LoRAAdapter(nn.Module):
+-             match = re.search(r"layers\.(\d+)\.", name)
+-             if match is not None:
+-                 layer_id = int(match.group(1))
+--                self.layers[layer_id].weights[name] = loaded_weight.cpu()
+-+                # keep on CPU; avoid redundant copy if already CPU
+-+                self.layers[layer_id].weights[name] = loaded_weight.to("cpu", copy=False)
+-             else:
+--                self.weights[name] = loaded_weight.cpu()
+-+                self.weights[name] = loaded_weight.to("cpu", copy=False)
+- 
+-         # stack kv_proj and gate_up_proj
+-         for i in range(self.base_hf_config.num_hidden_layers):
+-diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+-index 59cd7e1..d4c5cd2 100644
+---- a/python/sglang/srt/lora/lora_manager.py
+-+++ b/python/sglang/srt/lora/lora_manager.py
+-@@ -105,6 +105,7 @@ class LoRAManager:
+-         self.load_config = load_config
+-         self.dtype = dtype
+- 
+-+        # allocate once and reuse
+-         workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
+-         self.segment_gemm = SegmentGEMMWrapper(workspace_buffer)
+- 
+-@@ -113,15 +114,14 @@ class LoRAManager:
+-         self.init_lora_batch()
+- 
+-     def match_target_modules(self, module_name):
+--        for target_module in self.target_modules:
+--            if module_name.split(".")[-1] == target_module:
+--                return True
+--        return False
+-+        last = module_name.split(".")[-1]
+-+        return any(last == target for target in self.target_modules)
+- 
+-     def get_target_modules(self):
+-         modules = []
+-+        mt = self.match_target_modules
+-         for module_name, module in self.base_model.named_modules():
+--            if self.match_target_modules(module_name):
+-+            if mt(module_name):
+-                 modules.append((module_name, module))
+-         return modules
+- 
+-@@ -137,10 +137,9 @@ class LoRAManager:
+-         self.configs = {}
+-         self.origin_target_modules = set()
+-         for name, path in self.lora_paths.items():
+--            self.configs[name] = LoRAConfig(path)
+--            self.origin_target_modules = set(self.origin_target_modules) | set(
+--                self.configs[name].target_modules
+--            )
+-+            conf = LoRAConfig(path)
+-+            self.configs[name] = conf
+-+            self.origin_target_modules |= set(conf.target_modules)
+-         if hasattr(self.base_model, "get_module_name"):
+-             self.target_modules = {
+-                 self.base_model.get_module_name(module)
+-@@ -148,13 +147,9 @@ class LoRAManager:
+-             }
+-         else:
+-             logger.warning(
+--                f"WARNING: get_module_name() is not defined, "
+--                f"which is used to map config module name to model implementation module name."
+--                f"Use the default one, but please check if it is correct for your model."
+-+                f"WARNING: get_module_name() is not defined, which is used to map config module name to model implementation module name. Use the default one, but please check if it is correct for your model."
+-             )
+--            self.target_modules = {
+--                get_module_name(module) for module in self.origin_target_modules
+--            }
+-+            self.target_modules = {get_module_name(module) for module in self.origin_target_modules}
+-         self.target_weights = set(
+-             [get_stacked_name(module) for module in self.origin_target_modules]
+-         )
+-@@ -164,12 +159,9 @@ class LoRAManager:
+-         self.lora_id = {}
+-         for name in self.lora_paths.keys():
+-             self.lora_id[name] = len(self.loras)
+--            self.loras.append(
+--                LoRAAdapter(
+--                    name, self.configs[name], self.base_hf_config, self.load_config
+--                )
+--            )
+--            self.loras[-1].initialize_weights()
+-+            adp = LoRAAdapter(name, self.configs[name], self.base_hf_config, self.load_config)
+-+            self.loras.append(adp)
+-+            adp.initialize_weights()
+- 
+-         # misc lora configs
+-         self.max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+-@@ -181,9 +173,7 @@ class LoRAManager:
+-         # monkey patch to use the LoRA version
+-         self.lora_modules = []
+-         for module_name, module in self.get_target_modules():
+--            self.lora_modules.append(
+--                (module_name, self.set_lora_module(module_name, module))
+--            )
+-+            self.lora_modules.append((module_name, self.set_lora_module(module_name, module)))
+- 
+-     def init_lora_memory_pool(self):
+-         # preallocate lora memory pool
+-@@ -196,13 +186,12 @@ class LoRAManager:
+-                 hidden_dim_A, _ = self.base_model.get_hidden_dim(module_A)
+-             else:
+-                 logger.warning(
+--                    f"WARNING: get_hidden_dim() is not defined, "
+--                    f"which is used to get the hidden dim for different lora modules"
+--                    f"Use the default one, but please check if it is correct for your model."
+-+                    f"WARNING: get_hidden_dim() is not defined, which is used to get the hidden dim for different lora modulesUse the default one, but please check if it is correct for your model."
+-                 )
+-                 hidden_dim_A, _ = get_hidden_dim(module_A, self.base_hf_config)
+-             c = self.loras[-1].get_stacked_multiply(module_A)
+-             if module_A not in self.A_buffer:
+-+                # use empty to avoid unnecessary zero fill
+-                 self.A_buffer[module_A] = [
+-                     torch.empty(
+-                         (
+-@@ -213,16 +202,14 @@ class LoRAManager:
+-                         dtype=self.dtype,
+-                         device="cuda",
+-                     )
+--                    for i in range(num_layer)
+-+                    for _ in range(num_layer)
+-                 ]
+-             # init B tensor, column_major=True
+-             if hasattr(self.base_model, "get_hidden_dim"):
+-                 _, hidden_dim_B = self.base_model.get_hidden_dim(module_B)
+-             else:
+-                 logger.warning(
+--                    f"WARNING: get_hidden_dim() is not defined, "
+--                    f"which is used to get the hidden dim for different lora modules"
+--                    f"Use the default one, but please check if it is correct for your model."
+-+                    f"WARNING: get_hidden_dim() is not defined, which is used to get the hidden dim for different lora modulesUse the default one, but please check if it is correct for your model."
+-                 )
+-                 _, hidden_dim_B = get_hidden_dim(module_B, self.base_hf_config)
+-             c = self.loras[-1].get_stacked_multiply(module_B)
+-@@ -237,7 +224,7 @@ class LoRAManager:
+-                         dtype=self.dtype,
+-                         device="cuda",
+-                     )
+--                    for i in range(num_layer)
+-+                    for _ in range(num_layer)
+-                 ]
+- 
+-     def init_lora_batch(self):
+-@@ -254,7 +241,9 @@ class LoRAManager:
+-         if uid is None:
+-             for i in range(num_layer):
+-                 for k in self.A_buffer.keys():
+--                    self.A_buffer[k][i][buffer_id] *= 0
+-+                    # avoid in-place multiply by zero; simply zero via resize_ to new tensor then fill_(0) is costly.
+-+                    # Use .zero_() directly which is efficient.
+-+                    self.A_buffer[k][i][buffer_id].zero_()
+-             return
+- 
+-         for i in range(num_layer):
+-@@ -292,10 +281,11 @@ class LoRAManager:
+- 
+-         # setup lora in forward modules
+-         bs = forward_batch.batch_size
+-+        # avoid creating ones on CPU; ensure cuda dtype int32 as used later for seg lengths
+-         seg_lens = (
+-             forward_batch.extend_seq_lens
+-             if forward_batch.forward_mode.is_extend()
+--            else torch.ones(bs)
+-+            else torch.ones(bs, device="cuda")
+-         )
+-         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
+-         for i, lora_path in enumerate(forward_batch.lora_paths):

@@ -1,0 +1,126 @@
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 4459213..8c6e018 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -106,30 +106,32 @@ class CudaGraphRunner:
+ 
+         # Common inputs
+         self.max_bs = max_batch_size_to_capture
+-        self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.req_pool_indices = torch.zeros(
++        self.input_ids = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.req_pool_indices = torch.empty(
+             (self.max_bs,), dtype=torch.int32, device="cuda"
+         )
+-        self.seq_lens = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.position_ids_offsets = torch.ones(
++        self.seq_lens = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.position_ids_offsets = torch.empty(
+             (self.max_bs,), dtype=torch.int32, device="cuda"
+         )
+-        self.out_cache_loc = torch.zeros(
++        self.position_ids_offsets.fill_(1)
++        self.out_cache_loc = torch.empty(
+             (self.max_bs,), dtype=torch.int32, device="cuda"
+         )
+ 
+         # FlashInfer inputs
+-        self.flashinfer_kv_indptr = torch.zeros(
++        self.flashinfer_kv_indptr = torch.empty(
+             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
+         )
+-        self.flashinfer_kv_indices = torch.zeros(
++        self.flashinfer_kv_indices = torch.empty(
+             (self.max_bs * model_runner.model_config.context_len,),
+             dtype=torch.int32,
+             device="cuda",
+         )
+-        self.flashinfer_kv_last_page_len = torch.ones(
++        self.flashinfer_kv_last_page_len = torch.empty(
+             (self.max_bs,), dtype=torch.int32, device="cuda"
+         )
++        self.flashinfer_kv_last_page_len.fill_(1)
+         if model_runner.sliding_window_size is None:
+             self.flashinfer_workspace_buffer = (
+                 self.model_runner.flashinfer_workspace_buffer
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index a443b11..8c4180a 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -149,7 +149,8 @@ class InputMetadata:
+             ]
+             self.extend_seq_lens = torch.tensor(extend_lens_cpu, device="cuda")
+             self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+-            self.extend_start_loc = torch.zeros_like(self.seq_lens)
++            self.extend_start_loc = torch.empty_like(self.seq_lens)
++            self.extend_start_loc[0] = 0
+             self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+             self.extend_no_prefix = all(l == 0 for l in batch.prefix_lens_cpu)
+ 
+@@ -221,7 +222,8 @@ class InputMetadata:
+     def init_triton_args(self, batch: ScheduleBatch):
+         """Init auxiliary variables for triton attention backend."""
+         self.triton_max_seq_len = int(torch.max(self.seq_lens))
+-        self.triton_start_loc = torch.zeros_like(self.seq_lens, dtype=torch.int32)
++        self.triton_start_loc = torch.empty_like(self.seq_lens, dtype=torch.int32)
++        self.triton_start_loc[0] = 0
+         self.triton_start_loc[1:] = torch.cumsum(self.seq_lens[:-1], dim=0)
+ 
+         if self.forward_mode == ForwardMode.DECODE:
+@@ -321,7 +323,8 @@ def update_flashinfer_indices(
+         else:
+             paged_kernel_lens = seq_lens
+ 
+-        kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
++        kv_indptr = torch.empty((batch_size + 1,), dtype=torch.int32, device="cuda")
++        kv_indptr[0] = 0
+         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+ 
+         kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+@@ -356,7 +359,8 @@ def update_flashinfer_indices(
+             )
+         else:
+             # extend part
+-            qo_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
++            qo_indptr = torch.empty((batch_size + 1,), dtype=torch.int32, device="cuda")
++            qo_indptr[0] = 0
+             qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+ 
+             if flashinfer_use_ragged:
+@@ -402,7 +406,8 @@ def update_flashinfer_indices(
+ 
+             kv_start_idx = seq_lens - paged_kernel_lens
+ 
+-            kv_indptr = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
++            kv_indptr = torch.empty((batch_size + 1,), dtype=torch.int32, device="cuda")
++            kv_indptr[0] = 0
+             kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+ 
+             kv_indices = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+@@ -435,9 +440,10 @@ def update_flashinfer_indices(
+                 )
+             else:
+                 # extend part
+-                qo_indptr = torch.zeros(
++                qo_indptr = torch.empty(
+                     (batch_size + 1,), dtype=torch.int32, device="cuda"
+                 )
++                qo_indptr[0] = 0
+                 qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+ 
+                 model_runner.flashinfer_prefill_wrapper_paged[wrapper_id].end_forward()
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 09b3c71..0d70a81 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -415,8 +415,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 

@@ -1,0 +1,112 @@
+diff --git a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+index 1a2036d..2bf0198 100644
+--- a/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
++++ b/benchmark/kernels/minmax-text-01-lighting_attention/benchmark_lighting_attention_decode.py
+@@ -10,6 +10,9 @@ import triton
+ import triton.language as tl
+ from einops import rearrange
+ 
++# Global variable for eval mode
++do_eval = False
++
+ 
+ @triton.jit
+ def _decode_kernel(
+@@ -66,21 +69,33 @@ def lightning_attn_decode(q, k, v, kv, s):
+     d_padded = next_power_of_2(d)
+     e_padded = next_power_of_2(e)
+ 
+-    # Pad inputs
+-    q_padded = F.pad(q, (0, d_padded - d))
+-    k_padded = F.pad(k, (0, d_padded - d))
+-    v_padded = F.pad(v, (0, e_padded - e))
+-    kv_padded = F.pad(kv, (0, e_padded - e, 0, d_padded - d))
++    # Fast path: if no padding needed, use inputs directly
++    if d == d_padded and e == e_padded:
++        q_padded = q.contiguous()
++        k_padded = k.contiguous()
++        v_padded = v.contiguous()
++        kv_padded = kv.contiguous().to(torch.float32)
++        s = s.contiguous()
++        o_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
++    else:
++        # Pre-allocate padded tensors and copy data (avoid F.pad overhead)
++        # torch.empty creates contiguous tensors by default, no need for extra .contiguous()
++        q_padded = torch.empty(b, h, n, d_padded, dtype=q.dtype, device=q.device)
++        q_padded[..., :d] = q
++
++        k_padded = torch.empty(b, h, n, d_padded, dtype=k.dtype, device=k.device)
++        k_padded[..., :d] = k
++
++        v_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
++        v_padded[..., :e] = v
++
++        kv_padded = torch.empty(b, h, d_padded, e_padded, dtype=torch.float32, device=kv.device)
++        kv_padded[..., :d, :e] = kv.to(torch.float32)
+ 
+-    # Ensure inputs are contiguous
+-    q_padded = q_padded.contiguous()
+-    k_padded = k_padded.contiguous()
+-    v_padded = v_padded.contiguous()
+-    kv_padded = kv_padded.contiguous().to(torch.float32)
+-    s = s.contiguous()
++        s = s.contiguous()
+ 
+-    # Create output tensor (padded)
+-    o_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
++        # Create output tensor (padded)
++        o_padded = torch.empty(b, h, n, e_padded, dtype=v.dtype, device=v.device)
+ 
+     # Launch kernel
+     grid = (b * h, 1)
+@@ -182,37 +197,20 @@ class MiniMaxText01LightningAttention(nn.Module):
+ 
+         # decode mode
+         kv = past_key_value  # [b, h, d, e]
+-        output = []
++        # Pre-allocate output tensor to avoid list appends and concat
++        output = torch.empty(b, self.num_heads, n, self.head_dim, dtype=q.dtype, device=q.device)
++
+         for i in range(n):
+-            # kv: [b, h, d, e]
+-            # ratio: [h, 1, 1]
+-            # k: [b, h, n, d]
+-            # v: [b, h, n, e]
+-            # k[:, :, i : i + 1]: [b, h, 1, d]
+-            # v[:, :, i : i + 1]: [b, h, 1, e]
+-            # ratio * kv: [b, h, d, e]
+-            # torch.einsum(
+-            #     "... n d, ... n e -> ... d e",
+-            #     k[:, :, i : i + 1],
+-            #     v[:, :, i : i + 1],
+-            # )
+-            # [b, h, d, e] + [b, h, d, e] -> [b, h, d, e]
+-            kv = ratio * kv + torch.einsum(
+-                "... n d, ... n e -> ... d e",
+-                k[:, :, i : i + 1],
+-                v[:, :, i : i + 1],
+-            )
+-            # q[:, :, i : i + 1]: [b, h, 1, d]
+-            # kv.to(q.dtype): [b, h, d, e]
+-            # torch.einsum(
+-            #     "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
+-            # )
+-            # [b, h, 1, d] * [b, h, d, e] -> [b, h, 1, e]
+-            qkv = torch.einsum(
+-                "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
+-            )
+-            output.append(qkv)
+-        output = torch.concat(output, dim=-2)
++            # Use torch.bmm for better performance than einsum
++            # kv update: ratio * kv + k[i]^T @ v[i]
++            k_i = k[:, :, i : i + 1]  # [b, h, 1, d]
++            v_i = v[:, :, i : i + 1]  # [b, h, 1, e]
++
++            # Optimize: use matmul instead of einsum for better performance
++            kv = ratio * kv + k_i.transpose(-2, -1) @ v_i
++
++            # q[i] @ kv: [b, h, 1, d] @ [b, h, d, e] -> [b, h, 1, e]
++            output[:, :, i : i + 1] = q[:, :, i : i + 1] @ kv.to(q.dtype)
+ 
+         # reshape
+         output = rearrange(output, "b h n d -> b n (h d)")

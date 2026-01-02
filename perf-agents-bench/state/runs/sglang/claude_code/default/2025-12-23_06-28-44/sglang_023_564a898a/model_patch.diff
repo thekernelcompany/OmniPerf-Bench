@@ -1,0 +1,117 @@
+diff --git a/python/sglang/srt/layers/fused_moe.py b/python/sglang/srt/layers/fused_moe.py
+index 7dddabb..b9d6006 100644
+--- a/python/sglang/srt/layers/fused_moe.py
++++ b/python/sglang/srt/layers/fused_moe.py
+@@ -207,12 +207,12 @@ def moe_align_block_size(
+     sorted_ids = torch.empty(
+         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+     )
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     expert_ids = torch.empty(
+         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+     )
+     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
++    sorted_ids.fill_(topk_ids.numel())
+     ops.moe_align_block_size(
+         topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_tokens_post_pad
+     )
+diff --git a/python/sglang/srt/managers/controller/cuda_graph_runner.py b/python/sglang/srt/managers/controller/cuda_graph_runner.py
+index 2e37e55..0f48176 100644
+--- a/python/sglang/srt/managers/controller/cuda_graph_runner.py
++++ b/python/sglang/srt/managers/controller/cuda_graph_runner.py
+@@ -23,18 +23,18 @@ class CudaGraphRunner:
+ 
+         # Common inputs
+         self.max_bs = max_batch_size_to_capture
+-        self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.input_ids = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.req_pool_indices = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
+         self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.position_ids_offsets = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.position_ids_offsets = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.out_cache_loc = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
+ 
+         # FlashInfer inputs
+         self.flashinfer_workspace_buffer = self.model_runner.flashinfer_workspace_buffers[0]
+-        self.flashinfer_kv_indptr = torch.zeros(
++        self.flashinfer_kv_indptr = torch.empty(
+             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
+         )
+-        self.flashinfer_kv_indices = torch.zeros(
++        self.flashinfer_kv_indices = torch.empty(
+             (self.max_bs * model_runner.model_config.context_len,), dtype=torch.int32, device="cuda"
+         )
+         self.flashinfer_kv_last_page_len = torch.ones(
+diff --git a/python/sglang/srt/managers/controller/infer_batch.py b/python/sglang/srt/managers/controller/infer_batch.py
+index d89e978..ee66718 100644
+--- a/python/sglang/srt/managers/controller/infer_batch.py
++++ b/python/sglang/srt/managers/controller/infer_batch.py
+@@ -345,7 +345,7 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
+ 
+         # Allocate memory
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -781,7 +781,8 @@ class InputMetadata:
+                 device="cuda",
+             )
+             extend_seq_lens = seq_lens - prefix_lens
+-            extend_start_loc = torch.zeros_like(seq_lens)
++            extend_start_loc = torch.empty_like(seq_lens)
++            extend_start_loc[0] = 0
+             extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+             extend_no_prefix = torch.all(prefix_lens == 0)
+             total_num_tokens = int(torch.sum(seq_lens))
+@@ -827,9 +828,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+     else:
+         paged_kernel_lens = prefix_lens
+ 
+-    kv_indptr = torch.zeros(
++    kv_indptr = torch.empty(
+         (batch_size + 1,), dtype=torch.int32, device="cuda"
+     )
++    kv_indptr[0] = 0
+     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+     req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+     paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+@@ -859,9 +861,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+         )
+     else:
+         # extend part
+-        qo_indptr = torch.zeros(
++        qo_indptr = torch.empty(
+             (batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        qo_indptr[0] = 0
+         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+ 
+         model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
+@@ -890,7 +893,8 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+ def init_triton_args(forward_mode, seq_lens, prefix_lens):
+     batch_size = len(seq_lens)
+     max_seq_len = int(torch.max(seq_lens))
+-    start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc[0] = 0
+     start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+ 
+     if forward_mode == ForwardMode.DECODE:
+diff --git a/python/sglang/srt/memory_pool.py b/python/sglang/srt/memory_pool.py
+index 245e6ef..9b78636 100644
+--- a/python/sglang/srt/memory_pool.py
++++ b/python/sglang/srt/memory_pool.py
+@@ -41,7 +41,7 @@ class TokenToKVPool:
+         self.size = size
+         # mem_state is the reference counter.
+         # We also add one slot. This slot is used for writing dummy output from padded tokens.
+-        self.mem_state = torch.zeros((self.size + 1,), dtype=torch.int16, device="cuda")
++        self.mem_state = torch.empty((self.size + 1,), dtype=torch.int16, device="cuda")
+         self.total_ref_ct = 0
+ 
+         # [size, key/value, head_num, head_dim] for each layer

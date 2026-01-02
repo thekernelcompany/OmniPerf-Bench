@@ -1,0 +1,114 @@
+diff --git a/benchmark/benchmark_batch/benchmark_batch.py b/benchmark/benchmark_batch/benchmark_batch.py
+index 15ef0ab..2ed7246 100644
+--- a/benchmark/benchmark_batch/benchmark_batch.py
++++ b/benchmark/benchmark_batch/benchmark_batch.py
+@@ -43,20 +43,21 @@ def generate_random_prompt(index, tokenizer_dir, num_tokens):
+ def prepare_all_prompts(num_requests, batch_size, num_tokens, tokenizer_dir):
+     """Generate prompts for all requests in parallel."""
+     total_prompts = num_requests * batch_size
+-    all_prompts = [None] * total_prompts
++    all_prompts = []
+     max_workers = min(os.cpu_count() or 1, total_prompts)
+ 
+     with ProcessPoolExecutor(max_workers=max_workers) as executor:
+-        futures = [
+-            executor.submit(generate_random_prompt, i, tokenizer_dir, num_tokens)
++        futures = {
++            executor.submit(generate_random_prompt, i, tokenizer_dir, num_tokens): i
+             for i in range(total_prompts)
+-        ]
++        }
++        all_prompts = [None] * total_prompts
+         for future in tqdm(
+             concurrent.futures.as_completed(futures),
+             total=total_prompts,
+             desc="Generating prompts",
+         ):
+-            index = futures.index(future)
++            index = futures[future]
+             all_prompts[index] = future.result()
+ 
+     batched_prompts = [
+diff --git a/benchmark/benchmark_batch/benchmark_tokenizer.py b/benchmark/benchmark_batch/benchmark_tokenizer.py
+index c00bfb8..ec4d707 100644
+--- a/benchmark/benchmark_batch/benchmark_tokenizer.py
++++ b/benchmark/benchmark_batch/benchmark_tokenizer.py
+@@ -16,7 +16,7 @@ NUM_RUNS = 5  # Number of runs for each batch size to get reliable measurements
+ def generate_random_prompts(num_prompts, num_tokens, tokenizer):
+     """Generate random prompts with specified token count."""
+     vocab_size = tokenizer.vocab_size
+-    all_prompts = []
++    all_prompts = [None] * num_prompts
+ 
+     print(f"Generating {num_prompts} random prompts with {num_tokens} tokens each...")
+     for i in range(num_prompts):
+@@ -31,7 +31,7 @@ def generate_random_prompts(num_prompts, num_tokens, tokenizer):
+         prompt = f"Prompt {i}: {random_text}"
+         tokens = tokenizer.encode(prompt)
+         print(f"  Prompt {i}: {len(tokens)} tokens")
+-        all_prompts.append(prompt)
++        all_prompts[i] = prompt
+ 
+     return all_prompts
+ 
+@@ -40,7 +40,7 @@ def benchmark_sequential_vs_batch(prompts, batch_size, tokenizer):
+     """Compare sequential vs batch tokenization for a given batch size."""
+ 
+     # Sequential tokenization using encode()
+-    sequential_times = []
++    sequential_times = [0.0] * NUM_RUNS
+     for run in range(NUM_RUNS):
+         batch_prompts = prompts[:batch_size]  # Use same prompts for fair comparison
+ 
+@@ -48,17 +48,17 @@ def benchmark_sequential_vs_batch(prompts, batch_size, tokenizer):
+         for prompt in batch_prompts:
+             tokens = tokenizer.encode(prompt)
+         sequential_time = (time.time() - start_time) * 1000
+-        sequential_times.append(sequential_time)
++        sequential_times[run] = sequential_time
+ 
+     # Batch tokenization using tokenizer()
+-    batch_times = []
++    batch_times = [0.0] * NUM_RUNS
+     for run in range(NUM_RUNS):
+         batch_prompts = prompts[:batch_size]  # Use same prompts for fair comparison
+ 
+         start_time = time.time()
+         tokens = tokenizer(batch_prompts)
+         batch_time = (time.time() - start_time) * 1000
+-        batch_times.append(batch_time)
++        batch_times[run] = batch_time
+ 
+     return {
+         "batch_size": batch_size,
+diff --git a/benchmark/kernels/scheduler_batch/benchmark_write_req_to_token_pool_triton.py b/benchmark/kernels/scheduler_batch/benchmark_write_req_to_token_pool_triton.py
+index 1ce43c8..1115508 100644
+--- a/benchmark/kernels/scheduler_batch/benchmark_write_req_to_token_pool_triton.py
++++ b/benchmark/kernels/scheduler_batch/benchmark_write_req_to_token_pool_triton.py
+@@ -116,7 +116,7 @@ def test_write_req_to_token_pool():
+     extend_len = 14
+ 
+     # Initialize input tensors
+-    req_to_token = torch.zeros(
++    req_to_token = torch.empty(
+         (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+     )
+     req_pool_indices = torch.tensor([42], dtype=torch.int32, device="cuda")
+@@ -175,7 +175,7 @@ def test_write_req_to_token_pool():
+     extend_lens_list = [14, 20, 30]
+     total_extend_len = sum(extend_lens_list)
+ 
+-    req_to_token = torch.zeros(
++    req_to_token = torch.empty(
+         (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+     )
+     req_pool_indices = torch.tensor([42, 100, 200], dtype=torch.int32, device="cuda")
+@@ -251,7 +251,7 @@ def get_benchmark():
+         extend_lens_list = [extend_len] * batch_size
+         total_extend_len = sum(extend_lens_list)
+ 
+-        req_to_token = torch.zeros(
++        req_to_token = torch.empty(
+             (max_batch, max_context_len), dtype=torch.int32, device="cuda"
+         )
+         req_pool_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")

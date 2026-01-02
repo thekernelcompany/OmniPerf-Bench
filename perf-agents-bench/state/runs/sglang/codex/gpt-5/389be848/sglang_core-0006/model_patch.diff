@@ -1,0 +1,182 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/memory_pool.py b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+index 6e8edaf92..6dfaeb019 100644
+--- a/python/sglang/srt/disaggregation/mooncake/memory_pool.py
++++ b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+@@ -11,30 +11,52 @@ from torch.cuda.memory import CUDAPluggableAllocator
+ class MooncakeNVLinkAllocator:
+     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+     _lock: Final = threading.Lock()
++    _so_path_cache: Optional[str] = None
+ 
+     @classmethod
+     def _get_so_path(cls) -> str:
+-        """Dynamically locate hook.so in the mooncake package installation"""
++        """Locate mooncake's hook.so efficiently with caching and env override."""
++        # Cached result
++        if cls._so_path_cache is not None:
++            return cls._so_path_cache
++
++        # Env override for fast-path
++        env_path = os.environ.get("SGLANG_MOONCAKE_HOOK_SO")
++        if env_path and os.path.exists(env_path):
++            cls._so_path_cache = env_path
++            return env_path
++
++        # Try importlib.resources (modern API if available)
+         try:
+-            # Attempt to locate package resource
+-            with resources.path("mooncake", "hook.so") as so_path:
+-                if so_path.exists():
+-                    return str(so_path)
+-        except (ImportError, FileNotFoundError, TypeError):
++            files = getattr(resources, "files", None)
++            if files is not None:
++                so_path = files("mooncake").joinpath("hook.so")
++                if so_path.is_file():
++                    cls._so_path_cache = str(so_path)
++                    return cls._so_path_cache
++            else:
++                with resources.path("mooncake", "hook.so") as so:
++                    if so.exists():
++                        cls._so_path_cache = str(so)
++                        return cls._so_path_cache
++        except (ImportError, FileNotFoundError, TypeError, AttributeError):
+             pass
+ 
+-        # Fallback strategy: check in package location via import metadata
++        # Fallback: derive from installed package location
+         try:
+-            import mooncake
++            import mooncake  # type: ignore
+ 
+             base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
+             so_path = os.path.join(base_path, "hook.so")
+             if os.path.exists(so_path):
++                cls._so_path_cache = so_path
+                 return so_path
+         except (ImportError, FileNotFoundError, TypeError):
+-            raise ImportError(
+-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+-            )
++            pass
++
++        raise ImportError(
++            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL requires mooncake-transfer-engine >= 0.3.3.post2."
++        )
+ 
+     @classmethod
+     def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f1b..9d5cc4be3 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -302,22 +302,17 @@ class MHATokenToKVPool(KVCache):
+             ):
+                 # [size, head_num, head_dim] for each layer
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+-                self.k_buffer = [
+-                    torch.zeros(
+-                        (self.size + self.page_size, self.head_num, self.head_dim),
+-                        dtype=self.store_dtype,
+-                        device=self.device,
+-                    )
+-                    for _ in range(self.layer_num)
+-                ]
+-                self.v_buffer = [
+-                    torch.zeros(
+-                        (self.size + self.page_size, self.head_num, self.head_dim),
+-                        dtype=self.store_dtype,
+-                        device=self.device,
+-                    )
+-                    for _ in range(self.layer_num)
+-                ]
++                shape = (self.size + self.page_size, self.head_num, self.head_dim)
++                self.k_buffer = []
++                self.v_buffer = []
++                for _ in range(self.layer_num):
++                    k = torch.empty(shape, dtype=self.store_dtype, device=self.device)
++                    v = torch.empty(shape, dtype=self.store_dtype, device=self.device)
++                    # Keep semantics for padded slot 0 only
++                    k[0].zero_()
++                    v[0].zero_()
++                    self.k_buffer.append(k)
++                    self.v_buffer.append(v)
+ 
+         self.data_ptrs = torch.tensor(
+             [x.data_ptr() for x in self.k_buffer + self.v_buffer],
+@@ -619,14 +614,12 @@ class MLATokenToKVPool(KVCache):
+                 else nullcontext()
+             ):
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+-                self.kv_buffer = [
+-                    torch.zeros(
+-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+-                        dtype=self.store_dtype,
+-                        device=device,
+-                    )
+-                    for _ in range(layer_num)
+-                ]
++                shape = (size + page_size, 1, kv_lora_rank + qk_rope_head_dim)
++                self.kv_buffer = []
++                for _ in range(layer_num):
++                    buf = torch.empty(shape, dtype=self.store_dtype, device=device)
++                    buf[0].zero_()
++                    self.kv_buffer.append(buf)
+ 
+         self.layer_transfer_counter = None
+ 
+@@ -757,26 +750,23 @@ class DoubleSparseTokenToKVPool(KVCache):
+ 
+         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+             # [size, head_num, head_dim] for each layer
+-            self.k_buffer = [
+-                torch.zeros(
+-                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+-                )
+-                for _ in range(layer_num)
+-            ]
+-            self.v_buffer = [
+-                torch.zeros(
+-                    (size + page_size, head_num, head_dim), dtype=dtype, device=device
+-                )
+-                for _ in range(layer_num)
+-            ]
++            shape_kv = (size + page_size, head_num, head_dim)
++            self.k_buffer, self.v_buffer = [], []
++            for _ in range(layer_num):
++                kb = torch.empty(shape_kv, dtype=dtype, device=device)
++                vb = torch.empty(shape_kv, dtype=dtype, device=device)
++                kb[0].zero_()
++                vb[0].zero_()
++                self.k_buffer.append(kb)
++                self.v_buffer.append(vb)
+ 
+             # [size, head_num, heavy_channel_num] for each layer
+-            self.label_buffer = [
+-                torch.zeros(
+-                    (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+-                )
+-                for _ in range(layer_num)
+-            ]
++            shape_lbl = (size + 1, head_num, heavy_channel_num)
++            self.label_buffer = []
++            for _ in range(layer_num):
++                lb = torch.empty(shape_lbl, dtype=dtype, device=device)
++                lb[0].zero_()
++                self.label_buffer.append(lb)
+ 
+     def get_key_buffer(self, layer_id: int):
+         return self.k_buffer[layer_id - self.start_layer]
+diff --git a/scripts/ci_install_dependency.sh b/scripts/ci_install_dependency.sh
+index 922c886c4..85b497b6d 100755
+--- a/scripts/ci_install_dependency.sh
++++ b/scripts/ci_install_dependency.sh
+@@ -23,7 +23,7 @@ pip install -e "python[dev]"
+ pip list
+ 
+ # Install additional dependencies
+-pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
++pip install mooncake-transfer-engine==0.3.3.post2 nvidia-cuda-nvrtc-cu12
+ 
+ # For lmms_evals evaluating MMMU
+ git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

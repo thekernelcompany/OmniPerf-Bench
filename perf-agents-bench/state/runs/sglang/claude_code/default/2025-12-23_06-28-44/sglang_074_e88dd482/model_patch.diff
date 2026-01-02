@@ -1,0 +1,266 @@
+diff --git a/python/sglang/bench_serving.py b/python/sglang/bench_serving.py
+index 9b27221..56d8b59 100644
+--- a/python/sglang/bench_serving.py
++++ b/python/sglang/bench_serving.py
+@@ -637,7 +637,8 @@ def sample_sharegpt_requests(
+ 
+     # Filter out sequences that are too long or too short
+     filtered_dataset: List[Tuple[str, int, int]] = []
+-    for i in range(len(dataset)):
++    dataset_len = len(dataset)
++    for i in range(dataset_len):
+         if len(filtered_dataset) == num_requests:
+             break
+ 
+@@ -690,13 +691,17 @@ def sample_random_requests(
+     dataset_path: str,
+     random_sample: bool = True,
+ ) -> List[Tuple[str, int, int]]:
++    # Pre-compute range bounds to avoid repeated calculations
++    min_input_len = max(int(input_len * range_ratio), 1)
++    min_output_len = int(output_len * range_ratio)
++
+     input_lens = np.random.randint(
+-        max(int(input_len * range_ratio), 1),
++        min_input_len,
+         input_len + 1,
+         size=num_prompts,
+     )
+     output_lens = np.random.randint(
+-        int(output_len * range_ratio),
++        min_output_len,
+         output_len + 1,
+         size=num_prompts,
+     )
+@@ -771,8 +776,10 @@ def sample_random_requests(
+ 
+ def gen_prompt(tokenizer, token_num):
+     """Generate a random prompt of specified token length using tokenizer vocabulary."""
+-    all_available_tokens = list(tokenizer.get_vocab().values())
+-    selected_tokens = random.choices(all_available_tokens, k=token_num)
++    # Cache the token list to avoid repeated list() calls
++    if not hasattr(tokenizer, '_cached_vocab_values'):
++        tokenizer._cached_vocab_values = list(tokenizer.get_vocab().values())
++    selected_tokens = random.choices(tokenizer._cached_vocab_values, k=token_num)
+     return tokenizer.decode(selected_tokens)
+ 
+ 
+@@ -815,9 +822,10 @@ def sample_generated_shared_prefix_requests(
+         system_prompt = gen_prompt(tokenizer, system_prompt_len)
+         system_prompts.append(system_prompt)
+ 
+-    # Generate questions
++    # Generate questions (pre-compute total count)
++    total_questions = num_groups * prompts_per_group
+     questions = []
+-    for _ in range(num_groups * prompts_per_group):
++    for _ in range(total_questions):
+         question = gen_prompt(tokenizer, question_len)
+         questions.append(question)
+ 
+@@ -890,6 +898,8 @@ def calculate_metrics(
+     tokenizer: PreTrainedTokenizerBase,
+     backend: str,
+ ) -> Tuple[BenchmarkMetrics, List[int]]:
++    # Pre-allocate lists with known size for better performance
++    num_outputs = len(outputs)
+     output_lens: List[int] = []
+     retokenized_output_lens: List[int] = []
+     total_input = 0
+@@ -898,21 +908,23 @@ def calculate_metrics(
+     tpots: List[float] = []
+     ttfts: List[float] = []
+     e2e_latencies: List[float] = []
+-    for i in range(len(outputs)):
+-        if outputs[i].success:
+-            output_len = outputs[i].output_len
++
++    # Use enumerate to avoid repeated indexing
++    for i, output in enumerate(outputs):
++        if output.success:
++            output_len = output.output_len
+             output_lens.append(output_len)
+             retokenized_output_len = len(
+-                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
++                tokenizer.encode(output.generated_text, add_special_tokens=False)
+             )
+             retokenized_output_lens.append(retokenized_output_len)
+             total_input += input_requests[i][1]
+             if output_len > 1:
+-                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+-            itls += outputs[i].itl
+-            ttfts.append(outputs[i].ttft)
++                tpots.append((output.latency - output.ttft) / (output_len - 1))
++            itls.extend(output.itl)  # Use extend instead of += for better performance
++            ttfts.append(output.ttft)
+ 
+-            e2e_latencies.append(outputs[i].latency)
++            e2e_latencies.append(output.latency)
+ 
+             completed += 1
+         else:
+diff --git a/python/sglang/test/test_utils.py b/python/sglang/test/test_utils.py
+index 6bcacb4..6e4f58b 100644
+--- a/python/sglang/test/test_utils.py
++++ b/python/sglang/test/test_utils.py
+@@ -510,6 +510,7 @@ class TestFile:
+ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+     tic = time.time()
+     success = True
++    num_files = len(files)
+ 
+     for i, file in enumerate(files):
+         filename, estimated_time = file.name, file.estimated_time
+@@ -520,7 +521,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+ 
+             filename = os.path.join(os.getcwd(), filename)
+             print(
+-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
++                f".\n.\nBegin ({i}/{num_files - 1}):\npython3 {filename}\n.\n.\n",
+                 flush=True,
+             )
+             tic = time.time()
+@@ -532,7 +533,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+             elapsed = time.time() - tic
+ 
+             print(
+-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
++                f".\n.\nEnd ({i}/{num_files - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
+                 flush=True,
+             )
+             return process.returncode
+@@ -554,10 +555,11 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+             success = False
+             break
+ 
++    elapsed_total = time.time() - tic
+     if success:
+-        print(f"Success. Time elapsed: {time.time() - tic:.2f}s", flush=True)
++        print(f"Success. Time elapsed: {elapsed_total:.2f}s", flush=True)
+     else:
+-        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s", flush=True)
++        print(f"Fail. Time elapsed: {elapsed_total:.2f}s", flush=True)
+ 
+     return 0 if success else -1
+ 
+@@ -582,36 +584,37 @@ def get_benchmark_args(
+     seed: int = 0,
+     pd_seperated: bool = False,
+ ):
+-    return SimpleNamespace(
+-        backend="sglang",
+-        base_url=base_url,
+-        host=None,
+-        port=None,
+-        dataset_name=dataset_name,
+-        dataset_path=dataset_path,
+-        model=None,
+-        tokenizer=tokenizer,
+-        num_prompts=num_prompts,
+-        sharegpt_output_len=sharegpt_output_len,
+-        sharegpt_context_len=sharegpt_context_len,
+-        random_input_len=random_input_len,
+-        random_output_len=random_output_len,
+-        random_range_ratio=0.0,
+-        request_rate=request_rate,
+-        multi=None,
+-        output_file=None,
+-        disable_tqdm=False,
+-        disable_stream=disable_stream,
+-        return_logprob=False,
+-        seed=seed,
+-        disable_ignore_eos=disable_ignore_eos,
+-        extra_request_body=None,
+-        apply_chat_template=False,
+-        profile=None,
+-        lora_name=None,
+-        prompt_suffix="",
+-        pd_seperated=pd_seperated,
+-    )
++    # Construct namespace directly with dict for faster initialization
++    return SimpleNamespace(**{
++        "backend": "sglang",
++        "base_url": base_url,
++        "host": None,
++        "port": None,
++        "dataset_name": dataset_name,
++        "dataset_path": dataset_path,
++        "model": None,
++        "tokenizer": tokenizer,
++        "num_prompts": num_prompts,
++        "sharegpt_output_len": sharegpt_output_len,
++        "sharegpt_context_len": sharegpt_context_len,
++        "random_input_len": random_input_len,
++        "random_output_len": random_output_len,
++        "random_range_ratio": 0.0,
++        "request_rate": request_rate,
++        "multi": None,
++        "output_file": None,
++        "disable_tqdm": False,
++        "disable_stream": disable_stream,
++        "return_logprob": False,
++        "seed": seed,
++        "disable_ignore_eos": disable_ignore_eos,
++        "extra_request_body": None,
++        "apply_chat_template": False,
++        "profile": None,
++        "lora_name": None,
++        "prompt_suffix": "",
++        "pd_seperated": pd_seperated,
++    })
+ 
+ 
+ def run_bench_serving(
+@@ -803,18 +806,23 @@ def run_bench_one_batch_server(
+ def lcs(X, Y):
+     m = len(X)
+     n = len(Y)
+-    L = [[0] * (n + 1) for _ in range(m + 1)]
+-
+-    for i in range(m + 1):
+-        for j in range(n + 1):
+-            if i == 0 or j == 0:
+-                L[i][j] = 0
+-            elif X[i - 1] == Y[j - 1]:
+-                L[i][j] = L[i - 1][j - 1] + 1
++    # Optimize memory: use two rows instead of full 2D array
++    # Previous row and current row
++    prev_row = [0] * (n + 1)
++    curr_row = [0] * (n + 1)
++
++    for i in range(1, m + 1):
++        for j in range(1, n + 1):
++            if X[i - 1] == Y[j - 1]:
++                curr_row[j] = prev_row[j - 1] + 1
+             else:
+-                L[i][j] = max(L[i - 1][j], L[i][j - 1])
++                curr_row[j] = max(prev_row[j], curr_row[j - 1])
++        # Swap rows for next iteration
++        prev_row, curr_row = curr_row, prev_row
++        # Clear curr_row for reuse
++        curr_row = [0] * (n + 1)
+ 
+-    return L[m][n]
++    return prev_row[n]
+ 
+ 
+ def calculate_rouge_l(output_strs_list1, output_strs_list2):
+@@ -823,10 +831,14 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
+ 
+     for s1, s2 in zip(output_strs_list1, output_strs_list2):
+         lcs_len = lcs(s1, s2)
+-        precision = lcs_len / len(s1) if len(s1) > 0 else 0
+-        recall = lcs_len / len(s2) if len(s2) > 0 else 0
+-        if precision + recall > 0:
+-            fmeasure = (2 * precision * recall) / (precision + recall)
++        len_s1 = len(s1)
++        len_s2 = len(s2)
++        # Avoid repeated len() calls
++        precision = lcs_len / len_s1 if len_s1 > 0 else 0
++        recall = lcs_len / len_s2 if len_s2 > 0 else 0
++        precision_plus_recall = precision + recall
++        if precision_plus_recall > 0:
++            fmeasure = (2 * precision * recall) / precision_plus_recall
+         else:
+             fmeasure = 0.0
+         rouge_l_scores.append(fmeasure)

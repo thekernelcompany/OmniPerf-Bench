@@ -1,0 +1,99 @@
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 53d6620..f5f5c1e 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -21,10 +21,10 @@ class LogitsProcessor(nn.Module):
+             prefill_token_logprobs, dim=0, dtype=torch.float32
+         )
+ 
+-        start = input_metadata.extend_start_loc.clone()
++        start = input_metadata.extend_start_loc
+         end = start + input_metadata.extend_seq_lens - 2
+-        start.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
+-        end.clamp_(min=0, max=prefill_token_logprobs.shape[0] - 1)
++        start = start.clamp(min=0, max=prefill_token_logprobs.shape[0] - 1)
++        end = end.clamp(min=0, max=prefill_token_logprobs.shape[0] - 1)
+         sum_logp = (
+             logprobs_cumsum[end]
+             - logprobs_cumsum[start]
+diff --git a/python/sglang/srt/managers/router/infer_batch.py b/python/sglang/srt/managers/router/infer_batch.py
+index dbe9437..c68c78b 100644
+--- a/python/sglang/srt/managers/router/infer_batch.py
++++ b/python/sglang/srt/managers/router/infer_batch.py
+@@ -250,7 +250,8 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets.zero_()
+ 
+         # Alloc mem
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -277,9 +278,10 @@ class Batch:
+         for i in range(bs):
+             if reqs[i].sampling_params.dtype == "int":
+                 if logit_bias is None:
+-                    logit_bias = torch.zeros(
++                    logit_bias = torch.empty(
+                         (bs, vocab_size), dtype=torch.float32, device=device
+                     )
++                    logit_bias.zero_()
+                 logit_bias[i] = int_token_logit_bias
+ 
+         # Set fields
+@@ -495,13 +497,15 @@ class Batch:
+                 else other.logit_bias.shape[1]
+             )
+             if self.logit_bias is None:
+-                self.logit_bias = torch.zeros(
++                self.logit_bias = torch.empty(
+                     (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
++                self.logit_bias.zero_()
+             if other.logit_bias is None:
+-                other.logit_bias = torch.zeros(
++                other.logit_bias = torch.empty(
+                     (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
++                other.logit_bias.zero_()
+             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
+ 
+     def sample(self, logits: torch.Tensor):
+@@ -513,7 +517,7 @@ class Batch:
+ 
+         has_regex = any(req.regex_fsm is not None for req in self.reqs)
+         if has_regex:
+-            allowed_mask = torch.empty_like(logits[0], dtype=torch.bool)
++            allowed_mask = torch.empty(logits.shape[1], dtype=torch.bool, device=logits.device)
+             for i, req in enumerate(self.reqs):
+                 if req.regex_fsm is not None:
+                     allowed_mask.zero_()
+diff --git a/python/sglang/srt/managers/router/model_runner.py b/python/sglang/srt/managers/router/model_runner.py
+index 34b1607..affd8bb 100644
+--- a/python/sglang/srt/managers/router/model_runner.py
++++ b/python/sglang/srt/managers/router/model_runner.py
+@@ -69,9 +69,10 @@ class InputMetadata:
+             BatchPrefillWithPagedKVCacheWrapper,
+         )
+ 
+-        self.kv_indptr = torch.zeros(
++        self.kv_indptr = torch.empty(
+             (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        self.kv_indptr[0] = 0
+         self.kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+         self.kv_last_page_len = torch.ones(
+             (self.batch_size,), dtype=torch.int32, device="cuda"
+@@ -95,9 +96,10 @@ class InputMetadata:
+             self.forward_mode == ForwardMode.PREFILL
+             or self.forward_mode == ForwardMode.EXTEND
+         ):
+-            self.qo_indptr = torch.zeros(
++            self.qo_indptr = torch.empty(
+                 (self.batch_size + 1,), dtype=torch.int32, device="cuda"
+             )
++            self.qo_indptr[0] = 0
+             self.qo_indptr[1:] = torch.cumsum(self.extend_seq_lens, dim=0)
+             self.prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                 workspace_buffer, "NHD"

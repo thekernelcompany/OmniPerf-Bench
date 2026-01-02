@@ -1,0 +1,129 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df53..2fb941c30 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -71,23 +71,29 @@ class LoRAManager:
+ 
+         self.init_loras()
+         self.init_lora_memory_pool()
++        # Preallocate reusable buffers for per-batch LoRA metadata to avoid reallocations
++        self._lora_ranks_buf_i32 = torch.empty(self.max_loras_per_batch, dtype=torch.int32, device=self.device)
++        self._lora_ranks_buf_i64 = torch.empty(self.max_loras_per_batch, dtype=torch.int64, device=self.device)
++        self._scalings_buf = torch.empty(self.max_loras_per_batch, dtype=torch.float32, device=self.device)
+ 
+     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+         with torch.device("cuda"):
+             self.cuda_graph_batch_info = LoRABatchInfo(
+                 bs=self.max_bs_in_cuda_graph,
+-                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
+-                seg_indptr=torch.zeros(
++                seg_lens=torch.empty(self.max_bs_in_cuda_graph, dtype=torch.int32),
++                seg_indptr=torch.empty(
+                     self.max_bs_in_cuda_graph + 1, dtype=torch.int32
+                 ),
+                 max_len=0,
+-                weight_indices=torch.zeros(
++                weight_indices=torch.empty(
+                     self.max_bs_in_cuda_graph, dtype=torch.int32
+                 ),
+-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
++                lora_ranks=torch.empty(self.max_loras_per_batch, dtype=torch.int32),
++                scalings=torch.empty(self.max_loras_per_batch, dtype=torch.float32),
+             )
++            # Cache a tensor of ones to avoid per-iteration fill_
++            self._ones_cuda_graph = torch.ones(self.max_bs_in_cuda_graph, dtype=torch.int32, device="cuda")
+ 
+     def init_loras(self):
+         # Config of each LoRA adapter
+@@ -167,7 +173,8 @@ class LoRAManager:
+             # Do in-place updates when CUDA graph is enabled and the batch forward mode
+             # could use CUDA graph.
+             self.cuda_graph_batch_info.bs = bs
+-            self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
++            self.cuda_graph_batch_info.seg_lens[:bs].copy_(self._ones_cuda_graph[:bs])
++            self.cuda_graph_batch_info.seg_indptr[0] = 0
+             torch.cumsum(
+                 self.cuda_graph_batch_info.seg_lens[:bs],
+                 dim=0,
+@@ -175,36 +182,38 @@ class LoRAManager:
+             )
+             self.cuda_graph_batch_info.max_len = 1
+ 
++            lora_ranks = self._lora_ranks_buf_i32
++            scalings = self._scalings_buf
++            # Reset only the active indices; avoid reallocation
++            lora_ranks.zero_()
++            scalings.zero_()
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+                 self.cuda_graph_batch_info.weight_indices[i] = (
+                     self.memory_pool.get_buffer_id(lora_path)
+                 )
+                 if lora_path is not None:
+                     lora = self.loras[lora_path]
+-                    self.cuda_graph_batch_info.lora_ranks[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.config.hf_config["r"]
+-                    self.cuda_graph_batch_info.scalings[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.scaling
++                    lora_ranks[self.cuda_graph_batch_info.weight_indices[i]] = lora.config.hf_config["r"]
++                    scalings[self.cuda_graph_batch_info.weight_indices[i]] = lora.scaling
++            self.cuda_graph_batch_info.lora_ranks.copy_(lora_ranks)
++            self.cuda_graph_batch_info.scalings.copy_(scalings)
+             batch_info = self.cuda_graph_batch_info
+         else:
+             seg_lens = (
+                 forward_batch.extend_seq_lens
+                 if forward_batch.forward_mode.is_extend()
+-                else torch.ones(bs, device=self.device)
++                else torch.ones(bs, dtype=torch.int32, device=self.device)
+             )
+-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
++            seg_indptr = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
++            seg_indptr[0] = 0
+             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+             max_len = int(torch.max(seg_lens))
+             weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+ 
+-            lora_ranks = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+-            )
+-            scalings = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+-            )
++            lora_ranks = self._lora_ranks_buf_i64
++            scalings = self._scalings_buf
++            lora_ranks.zero_()
++            scalings.zero_()
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                 if lora_path is not None:
+@@ -217,8 +226,8 @@ class LoRAManager:
+                 seg_indptr=seg_indptr,
+                 max_len=max_len,
+                 weight_indices=weight_indices,
+-                lora_ranks=lora_ranks,
+-                scalings=scalings,
++                lora_ranks=lora_ranks.clone(),
++                scalings=scalings.clone(),
+             )
+         self.lora_backend.set_batch_info(batch_info)
+ 
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d21332..2014c65b8 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -165,7 +165,7 @@ class LoRAMemoryPool:
+         if uid is None:
+             for i in range(self.num_layer):
+                 for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++                    self.A_buffer[k][i][buffer_id].zero_()
+             return
+ 
+         assert lora_adapter is not None

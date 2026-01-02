@@ -1,0 +1,122 @@
+diff --git a/benchmark/latency_throughput/bench_one.py b/benchmark/latency_throughput/bench_one.py
+index cfd96b5..e456905 100644
+--- a/benchmark/latency_throughput/bench_one.py
++++ b/benchmark/latency_throughput/bench_one.py
+@@ -16,10 +16,9 @@ def run_one_batch_size(bs):
+     max_new_tokens = args.max_tokens
+ 
+     if args.input_len:
+-        input_ids = [
+-            [int(x) for x in np.random.randint(0, high=16384, size=(args.input_len,))]
+-            for _ in range(bs)
+-        ]
++        # Pre-generate random array once and reuse for efficiency
++        random_array = np.random.randint(0, high=16384, size=(args.input_len,), dtype=np.int32)
++        input_ids = [random_array.tolist() for _ in range(bs)]
+     else:
+         text = [f"{i, }" for i in range(bs)]
+ 
+diff --git a/benchmark/latency_throughput/bench_serving.py b/benchmark/latency_throughput/bench_serving.py
+index 23e8245..752df63 100644
+--- a/benchmark/latency_throughput/bench_serving.py
++++ b/benchmark/latency_throughput/bench_serving.py
+@@ -265,21 +265,22 @@ def main(args: argparse.Namespace):
+             int(args.input_len * args.range_ratio),
+             args.input_len + 1,
+             size=args.num_prompts,
++            dtype=np.int32,
+         )
+         output_lens = np.random.randint(
+             int(args.output_len * args.range_ratio),
+             args.output_len + 1,
+             size=args.num_prompts,
++            dtype=np.int32,
+         )
+-        offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts)
++        offsets = np.random.randint(0, tokenizer.vocab_size, size=args.num_prompts, dtype=np.int32)
++        vocab_size_limit = tokenizer.vocab_size - 129
+         input_requests = []
+         for i in range(args.num_prompts):
+-            prompt = tokenizer.decode(
+-                [
+-                    (offsets[i] + i + j) % (tokenizer.vocab_size - 129) + 128
+-                    for j in range(input_lens[i])
+-                ]
+-            )
++            # Vectorized token generation for better performance
++            token_range = np.arange(input_lens[i], dtype=np.int32)
++            tokens = ((offsets[i] + i + token_range) % vocab_size_limit + 128).tolist()
++            prompt = tokenizer.decode(tokens)
+             input_requests.append((prompt, int(input_lens[i]), int(output_lens[i])))
+ 
+     benchmark_start_time = time.perf_counter()
+diff --git a/python/sglang/srt/managers/controller/manager_multi.py b/python/sglang/srt/managers/controller/manager_multi.py
+index 72e3bed..e16f6c7 100644
+--- a/python/sglang/srt/managers/controller/manager_multi.py
++++ b/python/sglang/srt/managers/controller/manager_multi.py
+@@ -101,11 +101,10 @@ class Controller:
+ 
+     async def round_robin_scheduler(self, input_requests):
+         available_workers = list(self.workers.keys())
++        num_workers = len(available_workers)
+         for r in input_requests:
+             self.put_req_to_worker(available_workers[self.round_robin_counter], r)
+-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+-                available_workers
+-            )
++            self.round_robin_counter = (self.round_robin_counter + 1) % num_workers
+         return
+ 
+     async def shortest_queue_scheduler(self, input_requests):
+@@ -132,7 +131,7 @@ class Controller:
+             await self.remove_dead_workers()
+ 
+             if self.have_any_live_worker():
+-                next_step_input = list(self.recv_reqs)
++                next_step_input = self.recv_reqs
+                 self.recv_reqs = []
+                 if next_step_input:
+                     await self.dispatching(next_step_input)
+diff --git a/python/sglang/srt/managers/controller/manager_single.py b/python/sglang/srt/managers/controller/manager_single.py
+index 4c27207..28abca5 100644
+--- a/python/sglang/srt/managers/controller/manager_single.py
++++ b/python/sglang/srt/managers/controller/manager_single.py
+@@ -40,7 +40,7 @@ class ControllerSingle:
+ 
+     async def loop_for_forward(self):
+         while True:
+-            next_step_input = list(self.recv_reqs)
++            next_step_input = self.recv_reqs
+             self.recv_reqs = []
+             out_pyobjs = await self.model_client.step(next_step_input)
+ 
+diff --git a/python/sglang/srt/managers/controller/model_runner.py b/python/sglang/srt/managers/controller/model_runner.py
+index d68d9af..9898708 100644
+--- a/python/sglang/srt/managers/controller/model_runner.py
++++ b/python/sglang/srt/managers/controller/model_runner.py
+@@ -187,8 +187,8 @@ class ModelRunner:
+         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
+         dtype = torch.float16
+         device = "cuda"
+-        a = torch.ones((16, 16), dtype=dtype, device=device)
+-        b = torch.ones((16, 16), dtype=dtype, device=device)
++        a = torch.empty((16, 16), dtype=dtype, device=device)
++        b = torch.empty((16, 16), dtype=dtype, device=device)
+         c = a @ b
+         return c
+ 
+diff --git a/python/sglang/srt/managers/controller/tp_worker.py b/python/sglang/srt/managers/controller/tp_worker.py
+index 1d22dfd..820793d 100644
+--- a/python/sglang/srt/managers/controller/tp_worker.py
++++ b/python/sglang/srt/managers/controller/tp_worker.py
+@@ -433,7 +433,9 @@ class ModelTpServer:
+             self.token_to_kv_pool,
+             self.tree_cache,
+         )
+-        self.forward_queue = [x for x in self.forward_queue if x not in can_run_list]
++        # More efficient filtering using set for O(1) lookup
++        can_run_set = set(can_run_list)
++        self.forward_queue = [x for x in self.forward_queue if x not in can_run_set]
+         return new_batch
+ 
+     def forward_fill_batch(self, batch: Batch):

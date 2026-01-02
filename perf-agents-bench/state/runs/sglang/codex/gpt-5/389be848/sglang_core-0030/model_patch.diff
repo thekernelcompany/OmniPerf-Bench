@@ -1,0 +1,201 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index e77164372..308afed45 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -48,6 +48,23 @@ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --dis
+ $ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-ib-device ${device_name} --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ ```
+ 
++### Advanced Configuration
++
++PD Disaggregation with Mooncake supports the following environment variables for fine‑grained control over system behavior.
++
++#### Prefill Server Configuration
++| Variable | Description | Default |
++|:--------:|:-----------:|:--------:|
++| `SGLANG_DISAGGREGATION_THREAD_POOL_SIZE` | Worker threads for KV transfer operations per TP rank | `int(0.75 * os.cpu_count()) // 8`, clamped to [4, 12] |
++| `SGLANG_DISAGGREGATION_QUEUE_SIZE` | Maximum pending tasks per parallel transfer queue | `4` |
++| `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` | Timeout (seconds) when waiting for destination KV indices during request initialization | `30` |
++
++#### Decode Server Configuration
++| Variable | Description | Default |
++|:--------:|:-----------:|:--------:|
++| `SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL` | Interval (seconds) between health checks to prefill bootstrap servers | `5.0` (minimum 2.0) |
++| `SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE` | Consecutive heartbeat failures before marking prefill server offline | `2` (minimum 1) |
++
+ ## NIXL
+ ### Requirements
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 4c3faeeb6..f3aa0185b 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -160,10 +160,13 @@ class MooncakeKVManager(BaseKVManager):
+             self.failed_sessions = set()
+             self.session_lock = threading.Lock()
+             # Determine the number of threads to use for kv sender
+-            cpu_count = os.cpu_count()
++            cpu_count = os.cpu_count() or 8
++            default_workers = int(0.75 * cpu_count) // 8
++            if default_workers < 1:
++                default_workers = 1
+             transfer_thread_pool_size = get_int_env_var(
+                 "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
+-                min(max(4, int(0.75 * cpu_count) // 8), 12),
++                min(max(4, default_workers), 12),
+             )
+             transfer_queue_size = get_int_env_var("SGLANG_DISAGGREGATION_QUEUE_SIZE", 4)
+             self.transfer_queues: List[FastQueue] = [
+@@ -255,14 +258,16 @@ class MooncakeKVManager(BaseKVManager):
+ 
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
++            transfer_sync = self.engine.transfer_sync
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+-                src_addr = src_ptr + int(prefill_index[0]) * item_len
+-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+-                length = item_len * len(prefill_index)
++                base_src = int(prefill_index[0])
++                base_dst = int(decode_index[0])
++                block_len = item_len * len(prefill_index)
+ 
+-                status = self.engine.transfer_sync(
+-                    mooncake_session_id, src_addr, dst_addr, length
+-                )
++                src_addr = src_ptr + base_src * item_len
++                dst_addr = dst_ptr + base_dst * item_len
++
++                status = transfer_sync(mooncake_session_id, src_addr, dst_addr, block_len)
+                 if status != 0:
+                     return status
+             return 0
+@@ -308,7 +313,8 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++        endpoint = f"tcp://{remote}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -350,15 +356,14 @@ class MooncakeKVManager(BaseKVManager):
+ 
+                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                         # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+-                        if len(chunked_dst_kv_indice) < len(
+-                            kv_chunk.prefill_kv_indices
+-                        ):
+-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+-                                : len(chunked_dst_kv_indice)
+-                            ]
+-                            logger.warning(
+-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+-                            )
++                        if len(chunked_dst_kv_indice) < len(kv_chunk.prefill_kv_indices):
++                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[: len(chunked_dst_kv_indice)]
++                            if logger.isEnabledFor(logging.WARNING):
++                                logger.warning(
++                                    "len(chunked_dst_kv_indice) = %d, len(kv_chunk.prefill_kv_indices) = %d",
++                                    len(chunked_dst_kv_indice),
++                                    len(kv_chunk.prefill_kv_indices),
++                                )
+ 
+                         ret = self.send_kvcache(
+                             req.mooncake_session_id,
+@@ -467,7 +472,7 @@ class MooncakeKVManager(BaseKVManager):
+                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                         self.update_status(room, KVPoll.WaitingForInput)
+ 
+-        threading.Thread(target=bootstrap_thread).start()
++        threading.Thread(target=bootstrap_thread, daemon=True).start()
+ 
+     def start_decode_thread(self):
+         self.rank_port = get_free_port()
+@@ -486,8 +491,19 @@ class MooncakeKVManager(BaseKVManager):
+                 self.update_status(bootstrap_room, status)
+ 
+         def heartbeat_checker():
++            # Use monotonic clock to keep a stable heartbeat cadence
++            try:
++                next_ts = time.monotonic() + self.heartbeat_interval
++                use_monotonic = True
++            except Exception:
++                next_ts = time.time() + self.heartbeat_interval
++                use_monotonic = False
+             while True:
+-                time.sleep(self.heartbeat_interval)
++                now = time.monotonic() if use_monotonic else time.time()
++                sleep_dur = next_ts - now
++                if sleep_dur > 0:
++                    time.sleep(sleep_dur)
++                next_ts += self.heartbeat_interval
+                 with self.connection_lock:
+                     addresses = list(self.prefill_dp_size_table.keys())
+ 
+@@ -504,14 +520,13 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            for bootstrap_room in self.addr_to_rooms_tracker[
+-                                bootstrap_addr
+-                            ]:
+-                                # Remove KVPoll.Success requests from the map
+-                                if bootstrap_room not in self.request_status:
+-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+-                                        bootstrap_room
+-                                    )
++                            # Remove completed rooms in a single pass to avoid
++                            # repeated list removals (O(n^2))
++                            rooms = self.addr_to_rooms_tracker.get(bootstrap_addr, [])
++                            if rooms:
++                                self.addr_to_rooms_tracker[bootstrap_addr] = [
++                                    r for r in rooms if r in self.request_status
++                                ]
+                         else:
+                             logger.info(
+                                 f"Attempting to reconnect to {bootstrap_addr}..."
+@@ -537,8 +552,8 @@ class MooncakeKVManager(BaseKVManager):
+                             if bootstrap_addr in self.session_pool:
+                                 del self.session_pool[bootstrap_addr]
+ 
+-        threading.Thread(target=decode_thread).start()
+-        threading.Thread(target=heartbeat_checker).start()
++        threading.Thread(target=decode_thread, daemon=True).start()
++        threading.Thread(target=heartbeat_checker, daemon=True).start()
+ 
+     def add_transfer_request(
+         self,
+@@ -681,6 +696,13 @@ class MooncakeKVSender(BaseKVSender):
+         self.conclude_state = None
+         # inner state
+         self.curr_idx = 0
++        # Precompute a monotonic deadline for bootstrapping timeout to avoid
++        # repeated arithmetic and wall-clock adjustments during poll()
++        try:
++            _now = time.monotonic()
++        except Exception:
++            _now = self.init_time
++        self._bootstrap_deadline = _now + getattr(self.kv_mgr, "bootstrap_time_out", 30)
+ 
+     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+         self.num_kv_indices = num_kv_indices
+@@ -713,12 +735,14 @@ class MooncakeKVSender(BaseKVSender):
+             if status in (KVPoll.Success, KVPoll.Failed):
+                 self.conclude_state = status
+             elif status == KVPoll.Bootstrapping:
+-                now = time.time()
+-                elapsed = now - self.init_time
+-                if elapsed >= self.kv_mgr.bootstrap_time_out:
++                try:
++                    now = time.monotonic()
++                except Exception:
++                    now = time.time()
++                if now >= self._bootstrap_deadline:
+                     self.kv_mgr.record_failure(
+                         self.bootstrap_room,
+-                        f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
++                        f"Request {self.bootstrap_room} timed out after {self.kv_mgr.bootstrap_time_out:.1f}s in KVPoll.Bootstrapping",
+                     )
+                     self.conclude_state = KVPoll.Failed
+                     return KVPoll.Failed

@@ -1,0 +1,158 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 29e861e9f..61bcfb763 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -106,13 +106,16 @@ class KVArgsRegisterInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
++        # Optimized: compute format strings once
++        kv_count = len(msg[4]) // 8
++        aux_count = len(msg[5]) // 8
+         return cls(
+             room=str(msg[0].decode("ascii")),
+             endpoint=msg[1].decode("ascii"),
+             dst_port=int(msg[2].decode("ascii")),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
++            dst_kv_ptrs=list(struct.unpack(f"{kv_count}Q", msg[4])),
++            dst_aux_ptrs=list(struct.unpack(f"{aux_count}Q", msg[5])),
+         )
+ 
+ 
+@@ -146,6 +149,8 @@ class MooncakeKVManager(BaseKVManager):
+         self.request_status: Dict[int, KVPoll] = {}
+         self.rank_port = None
+         self.server_socket = zmq.Context().socket(zmq.PULL)
++        # Cache for session port extraction to avoid repeated string splits
++        self._session_port_cache: Dict[str, int] = {}
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+@@ -250,13 +255,15 @@ class MooncakeKVManager(BaseKVManager):
+         ]
+ 
+         # Worker function for processing a single layer
++        # Optimized: reduce function call overhead in tight loop
++        engine_transfer = self.engine.transfer_sync
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                 src_addr = src_ptr + int(prefill_index[0]) * item_len
+                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                 length = item_len * len(prefill_index)
+ 
+-                status = self.engine.transfer_sync(
++                status = engine_transfer(
+                     mooncake_session_id, src_addr, dst_addr, length
+                 )
+                 if status != 0:
+@@ -302,9 +309,11 @@ class MooncakeKVManager(BaseKVManager):
+     def sync_status_to_decode_endpoint(
+         self, remote: str, dst_port: int, room: int, status: int
+     ):
++        # Optimized: avoid multiple string operations
+         if ":" in remote:
+-            remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++            remote = remote.split(":", 1)[0]
++        endpoint = f"tcp://{remote}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -356,12 +365,12 @@ class MooncakeKVManager(BaseKVManager):
+                                 f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                             )
+ 
++                        # Optimized: cache table lookup
++                        decode_kv_args = self.decode_kv_args_table[req.mooncake_session_id]
+                         ret = self.send_kvcache(
+                             req.mooncake_session_id,
+                             kv_chunk.prefill_kv_indices,
+-                            self.decode_kv_args_table[
+-                                req.mooncake_session_id
+-                            ].dst_kv_ptrs,
++                            decode_kv_args.dst_kv_ptrs,
+                             chunked_dst_kv_indice,
+                             executor,
+                         )
+@@ -386,12 +395,11 @@ class MooncakeKVManager(BaseKVManager):
+ 
+                         if kv_chunk.is_last:
+                             # Only the last chunk we need to send the aux data
++                            # Reuse the cached decode_kv_args from above
+                             ret = self.send_aux(
+                                 req.mooncake_session_id,
+                                 kv_chunk.prefill_aux_index,
+-                                self.decode_kv_args_table[
+-                                    req.mooncake_session_id
+-                                ].dst_aux_ptrs,
++                                decode_kv_args.dst_aux_ptrs,
+                                 req.dst_aux_index,
+                             )
+                             polls.append(True if ret == 0 else False)
+@@ -568,7 +576,12 @@ class MooncakeKVManager(BaseKVManager):
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
+         dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
++        # Optimized: cache session port extraction to avoid repeated splits
++        session_port_sum = 0
++        for session in dst_infos:
++            if session not in self._session_port_cache:
++                self._session_port_cache[session] = int(session.split(":")[1])
++            session_port_sum += self._session_port_cache[session]
+         shard_idx = session_port_sum % len(self.transfer_queues)
+ 
+         self.transfer_queues[shard_idx].put(
+@@ -937,12 +950,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
++            # Optimized: use single struct.pack call instead of join
++            kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++            packed_kv_data_ptrs = struct.pack(f"{len(kv_ptrs)}Q", *kv_ptrs)
++            aux_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++            packed_aux_data_ptrs = struct.pack(f"{len(aux_ptrs)}Q", *aux_ptrs)
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:
+diff --git a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+index 5643af70b..ad8d2ccad 100644
+--- a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
++++ b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+@@ -32,21 +32,19 @@ class MooncakeTransferEngine:
+     def register(self, ptr, length):
+         try:
+             ret_value = self.engine.register_memory(ptr, length)
++            if ret_value != 0:
++                logger.debug("Mooncake memory registration %s failed.", ptr)
+         except Exception:
+-            # Mark register as failed
+-            ret_value = -1
+-
+-        if ret_value != 0:
++            # Mark register as failed and log
+             logger.debug("Mooncake memory registration %s failed.", ptr)
+ 
+     def deregister(self, ptr):
+         try:
+             ret_value = self.engine.unregister_memory(ptr)
++            if ret_value != 0:
++                logger.debug("Mooncake memory deregistration %s failed.", ptr)
+         except Exception:
+-            # Mark deregister as failed
+-            ret_value = -1
+-
+-        if ret_value != 0:
++            # Mark deregister as failed and log
+             logger.debug("Mooncake memory deregistration %s failed.", ptr)
+ 
+     def initialize(
