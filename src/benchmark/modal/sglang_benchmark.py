@@ -29,6 +29,7 @@ import json
 import urllib.request
 import urllib.error
 import threading
+from datetime import datetime
 from typing import Dict, Optional, Any, Tuple, List
 from pathlib import Path
 from functools import lru_cache
@@ -37,6 +38,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 # Timeout for sandbox creation (seconds) - Modal may queue if GPUs unavailable
 SANDBOX_CREATE_TIMEOUT = 300  # 5 minutes
+
+
+def log(phase: str, message: str, level: str = "INFO"):
+    """Print timestamped log message with phase prefix."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    prefix = f"[{timestamp}] [{phase.upper()}]"
+    print(f"{prefix} {message}", flush=True)
 
 # Modal app configuration
 app = modal.App("sglang-benchmark")
@@ -2806,10 +2814,11 @@ def _run_single_phase_sandbox(
             human_patch=human_patch,
         )
 
-        # Create Modal image
-        # setup_dockerfile_commands runs before the image is validated
-        # This fixes Python symlink, typing_extensions, and missing libnuma
-        print(f"[{phase.upper()}] Creating Modal image from {docker_image}...", flush=True)
+        # Step 1: Create Modal image (CPU - no GPU needed for image building)
+        # setup_dockerfile_commands runs on Modal's build infrastructure
+        log(phase, f"Step 1/4: Building Modal image from {docker_image[:50]}...")
+        log(phase, "  - This uses CPU (no GPU cost) for Docker pull + setup")
+        image_start = time.time()
         image = modal.Image.from_registry(
             docker_image,
             force_build=True,
@@ -2821,14 +2830,18 @@ def _run_single_phase_sandbox(
                 "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
             ],
         )
-        print(f"[{phase.upper()}] Modal image created", flush=True)
+        log(phase, f"  - Image ready in {time.time() - image_start:.1f}s")
 
-        # Get App reference
-        print(f"[{phase.upper()}] Looking up Modal app 'sglang-benchmark'...", flush=True)
+        # Step 2: Get App reference
+        log(phase, "Step 2/4: Looking up Modal app 'sglang-benchmark'...")
         sandbox_app = modal.App.lookup("sglang-benchmark", create_if_missing=True)
-        print(f"[{phase.upper()}] Modal app ready", flush=True)
+        log(phase, "  - App ready")
 
-        print(f"[{phase.upper()}] Creating sandbox with {gpu_cfg['gpu']} (timeout: {SANDBOX_CREATE_TIMEOUT}s)...", flush=True)
+        # Step 3: Create GPU sandbox (THIS is where GPU costs start)
+        log(phase, f"Step 3/4: Creating GPU sandbox ({gpu_cfg['gpu']})...")
+        log(phase, f"  - Timeout: {SANDBOX_CREATE_TIMEOUT}s (will fail if no GPUs available)")
+        log(phase, "  - GPU billing starts when sandbox is created")
+        sandbox_start = time.time()
 
         # Use ThreadPoolExecutor to add timeout to sandbox creation
         # Modal can hang indefinitely if GPUs are not available
@@ -2850,24 +2863,31 @@ def _run_single_phase_sandbox(
             try:
                 sandbox = future.result(timeout=SANDBOX_CREATE_TIMEOUT)
             except FuturesTimeoutError:
+                log(phase, f"  - TIMEOUT after {SANDBOX_CREATE_TIMEOUT}s!")
                 raise TimeoutError(f"Sandbox creation timed out after {SANDBOX_CREATE_TIMEOUT}s - Modal may not have GPUs available")
 
-        print(f"[{phase.upper()}] Sandbox created successfully", flush=True)
+        log(phase, f"  - Sandbox created in {time.time() - sandbox_start:.1f}s")
 
-        # Write and run script
+        # Step 4: Run benchmark script
+        log(phase, "Step 4/4: Running benchmark script...")
         script_path = f"/tmp/benchmark_{phase}.py"
         f = sandbox.open(script_path, "w")
         f.write(script)
         f.close()
+        log(phase, f"  - Script written ({len(script)} bytes)")
 
+        benchmark_start = time.time()
         proc = sandbox.exec("python3", "-u", script_path)
 
         stdout_lines = []
         for line in proc.stdout:
             stdout_lines.append(line)
-            print(f"[{phase.upper()}] {line.rstrip()}")
+            # Add timestamp to each output line
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [{phase.upper()}] {line.rstrip()}", flush=True)
 
         proc.wait()
+        log(phase, f"  - Benchmark completed in {time.time() - benchmark_start:.1f}s")
 
         # Save full raw output IMMEDIATELY before any other processing
         full_output = "\n".join(line.rstrip('\n') for line in stdout_lines)
@@ -2876,11 +2896,14 @@ def _run_single_phase_sandbox(
         # Commit results volume to persist benchmark results
         try:
             results_volume.commit()
-            print(f"[{phase.upper()}] Results volume committed", flush=True)
+            log(phase, "  - Results volume committed")
         except Exception as commit_err:
-            print(f"[{phase.upper()}] Warning: Could not commit volume: {commit_err}", flush=True)
+            log(phase, f"  - Warning: Could not commit volume: {commit_err}")
 
+        # Terminate sandbox to stop GPU billing
         sandbox.terminate()
+        total_time = time.time() - start_time
+        log(phase, f"  - Sandbox terminated (total phase time: {total_time:.1f}s)")
 
         # Parse results
         json_match = re.search(
