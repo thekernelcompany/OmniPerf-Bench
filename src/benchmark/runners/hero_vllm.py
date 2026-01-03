@@ -120,7 +120,7 @@ def run_benchmark(
     gpu_config: str,
 ) -> Dict[str, Any]:
     """Run a single benchmark on Modal."""
-    from src.eval.modal_benchmark import run_3way_modal_benchmark
+    from src.benchmark.modal.vllm_benchmark import run_3way_modal_benchmark
 
     baseline_url = VLLM_WHEEL_URL.format(commit=parent_commit)
     human_url = VLLM_WHEEL_URL.format(commit=commit)

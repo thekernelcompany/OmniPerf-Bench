@@ -2,15 +2,19 @@
 Modal-based benchmark runner for SGLang OmniPerf.
 
 This module provides cloud GPU execution for SGLang benchmarks using Docker images.
-Similar to vLLM, it uses pre-built Docker images per commit with Python overlay
-for commits without exact images.
+Each phase (human, baseline, agent) uses its own pre-built Docker image from DockerHub.
+
+Docker images: ayushnangia16/sglang-docker:{commit_hash}
+- Human phase: Uses human commit image (has optimization)
+- Baseline phase: Uses base commit image (pre-optimization)
+- Agent phase: Uses base commit image + applies agent patch
 
 Usage:
     # Deploy the Modal app
-    modal deploy src/eval/sglang_modal_benchmark.py
+    modal deploy src/benchmark/modal/sglang_benchmark.py
 
     # Run a 3-way benchmark
-    modal run src/eval/sglang_modal_benchmark.py::run_3way_benchmark_docker \\
+    modal run src/benchmark/modal/sglang_benchmark.py::run_3way_benchmark_docker \\
         --human-commit "abc123" --base-commit "def456" \\
         --perf-command "..." --model "..."
 """
@@ -32,7 +36,7 @@ from functools import lru_cache
 app = modal.App("sglang-benchmark")
 
 # Docker image repository for SGLang commits
-SGLANG_DOCKER_REPO = "ayushnangia16/sglang-docker"
+SGLANG_DOCKER_REPO = "ayushnangia16/sglang-docker" # do not change
 SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
 
 # Volume for caching models
@@ -41,12 +45,15 @@ model_cache = modal.Volume.from_name("sglang-model-cache", create_if_missing=Tru
 # Volume for caching SGLang wheel builds (similar to vLLM)
 build_cache = modal.Volume.from_name("sglang-build-cache", create_if_missing=True)
 
+# Volume for storing benchmark results
+results_volume = modal.Volume.from_name("sglang-benchmark-results", create_if_missing=True)
+
 # GPU configurations
 GPU_CONFIGS = {
-    "H100:1": {"gpu": "H100", "count": 1, "timeout": 3600},
-    "H100:2": {"gpu": "H100", "count": 2, "timeout": 5400},
-    "H100:4": {"gpu": "H100", "count": 4, "timeout": 7200},
-    "H100:8": {"gpu": "H100", "count": 8, "timeout": 14400},
+    "H100:1": {"gpu": "H100", "count": 1, "timeout": 21600},
+    "H100:2": {"gpu": "H100", "count": 2, "timeout": 21600},
+    "H100:4": {"gpu": "H100", "count": 4, "timeout": 21600},
+    "H100:8": {"gpu": "H100", "count": 8, "timeout": 21600},
 }
 
 # CPU configuration for wheel building (no GPU needed for CUDA compilation)
@@ -1100,24 +1107,15 @@ def run_3way_benchmark_docker(
 
         # Note: SGLang Docker images don't need ENTRYPOINT/CMD clearing like vLLM
         # In fact, clearing them causes the container to crash immediately
-        image = (
-            modal.Image.from_registry(docker_image)
-            .run_commands([
-                # Install additional packages needed for benchmarking
-                "apt-get update && apt-get install -y git curl patch psmisc net-tools lsof || true",
-                # FIX: Docker image has huggingface-hub==1.2.3 but transformers requires <1.0
-                # Downgrade to compatible version (0.26.x is within >=0.34.0,<1.0 range - wait, 0.26 < 0.34)
-                # Actually need something like 0.35.x or 0.40.x
-                "pip install 'huggingface-hub>=0.35.0,<1.0' --force-reinstall || true",
-                # Install benchmark dependencies with --no-deps to avoid other cascading upgrades
-                "pip install --no-deps datasets pandas tqdm aiohttp requests pyairports pycountry || true",
-                # Clone SGLang repo for benchmark scripts
-                "git clone --depth 1 https://github.com/sgl-project/sglang.git /opt/sglang-benchmarks || true",
-            ])
-            .env({
-                "HF_HOME": "/root/.cache/huggingface",
-                "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
-            })
+        # setup_dockerfile_commands fixes Python symlink and typing_extensions
+        image = modal.Image.from_registry(
+            docker_image,
+            force_build=True,
+            setup_dockerfile_commands=[
+                "RUN ln -sf $(which python3) /usr/local/bin/python || true",
+                "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
+                "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
+            ],
         )
 
         # Get App reference for Sandbox (required when running outside Modal container)
@@ -1487,8 +1485,7 @@ def sanitize_for_json(text):
     cleaned = re_clean.sub(esc + r'[\\[\\]()#;?0-9]*[0-9A-Za-z]', '', cleaned)
     cleaned = cleaned.replace(chr(13), '')
     cleaned = ''.join(c for c in cleaned if ord(c) == 10 or ord(c) == 9 or ord(c) >= 32)
-    if len(cleaned) > 5000:
-        cleaned = "...(truncated)..." + cleaned[-5000:]
+    # No truncation - keep full output
     return cleaned
 
 for key in ["baseline_raw", "human_raw", "agent_raw"]:
@@ -2278,9 +2275,7 @@ def sanitize_for_json(text):
     cleaned = cleaned.replace(chr(13), '')  # CR
     # Remove remaining control characters (keep newline chr(10), tab chr(9), space chr(32)+)
     cleaned = ''.join(c for c in cleaned if ord(c) == 10 or ord(c) == 9 or ord(c) >= 32)
-    # Truncate to avoid huge JSON (keep last 5000 chars which has the metrics)
-    if len(cleaned) > 5000:
-        cleaned = "...(truncated)..." + cleaned[-5000:]
+    # No truncation - keep full output
     return cleaned
 
 # Clean raw fields before JSON serialization
@@ -2390,6 +2385,701 @@ def _parse_benchmark_results(output: str, result: Dict) -> Dict:
         if "BENCHMARK_RESULTS_JSON" in output:
             result["error"] = "Found JSON markers but couldn't extract content"
             print(f"Output contains markers but regex failed. Output length: {len(output)}")
+
+    return result
+
+
+# =====================================================================
+# Parallel 3-Way Benchmark (3 sandboxes, 3 GPUs, ~3x faster)
+# =====================================================================
+
+def _create_single_phase_script(
+    phase: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    agent_patch: Optional[str] = None,
+    base_commit: Optional[str] = None,
+    human_patch: Optional[str] = None,
+) -> str:
+    """Create a benchmark script for a single phase (baseline, human, or agent).
+
+    Uses SEPARATE DOCKER IMAGES approach (cleaner and more reliable):
+    - HUMAN: Human commit Docker image (has optimization)
+    - BASELINE: Base commit Docker image (pre-optimization, no patching!)
+    - AGENT: Base commit Docker image + agent_patch
+    """
+
+    port = {"baseline": 30001, "human": 30002, "agent": 30003}.get(phase, 30001)
+    escaped_agent_patch = repr(agent_patch) if agent_patch else "None"
+    # Note: human_patch no longer used - each phase uses its own Docker image
+
+    script = f'''
+import subprocess
+import sys
+import os
+import json
+import time
+import re
+import shutil
+from pathlib import Path
+
+# Set environment variables for HuggingFace cache
+os.environ["HF_HOME"] = "/root/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/root/.cache/huggingface"
+
+# Fix typing_extensions version for pydantic compatibility (Sentinel added in 4.10.0)
+# This needs to happen BEFORE importing any pydantic-related modules
+print("Upgrading typing_extensions for pydantic compatibility...")
+subprocess.run(["pip3", "install", "typing_extensions>=4.10.0", "--upgrade", "-q"], check=False)
+
+# Configuration
+PHASE = "{phase}"
+COMMIT = "{commit}"
+BASE_COMMIT = "{base_commit or ''}"
+AGENT_PATCH = {escaped_agent_patch}
+PERF_COMMAND = """{perf_command}"""
+MODEL = "{model}"
+PORT = {port}
+
+SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
+
+# Results storage
+results = {{
+    "phase": PHASE,
+    "metrics": {{}},
+    "status": "error",
+    "error": None,
+    "raw_output": "",
+}}
+
+def find_sglang_path():
+    """Find where SGLang is installed."""
+    result = subprocess.run(
+        ["python3", "-c", "import sglang; print(sglang.__path__[0] if hasattr(sglang, '__path__') else 'None')"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        sglang_path = result.stdout.strip()
+        if sglang_path != "None" and sglang_path.startswith("/"):
+            return sglang_path
+
+    # Fallback to known paths
+    known_paths = [
+        "/sgl-workspace/sglang/python/sglang",
+        "/usr/local/lib/python3.10/dist-packages/sglang",
+    ]
+    for path in known_paths:
+        if os.path.exists(path) and os.path.isfile(os.path.join(path, "__init__.py")):
+            return path
+    return None
+
+def clone_and_checkout(target_dir: str, commit: str):
+    """Clone SGLang repo at specific commit."""
+    if os.path.exists(target_dir):
+        shutil.rmtree(target_dir)
+    subprocess.run(["git", "clone", "--depth", "100", SGLANG_REPO_URL, target_dir], capture_output=True, timeout=300)
+    subprocess.run(["git", "fetch", "origin", commit], cwd=target_dir, capture_output=True, timeout=120)
+    result = subprocess.run(["git", "checkout", commit], cwd=target_dir, capture_output=True, text=True)
+    return result.returncode == 0
+
+def overlay_python_files(source_dir: str, target_dir: str):
+    """Overlay Python files from source to target."""
+    source_python = Path(source_dir) / "python" / "sglang"
+    target_python = Path(target_dir)
+
+    if not source_python.exists() or not target_python.exists():
+        return False
+
+    copied = 0
+    for py_file in source_python.rglob("*.py"):
+        rel_path = py_file.relative_to(source_python)
+        dest_file = target_python / rel_path
+        if dest_file.exists():
+            shutil.copy2(py_file, dest_file)
+            copied += 1
+        else:
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(py_file, dest_file)
+            copied += 1
+
+    print(f"  Overlaid {{copied}} Python files")
+    return copied > 0
+
+def apply_patch(repo_dir: str, patch_content: str):
+    """Apply patch to repository."""
+    patch_file = "/tmp/agent.patch"
+    with open(patch_file, 'w') as f:
+        f.write(patch_content)
+
+    result = subprocess.run(["git", "apply", "--verbose", patch_file], cwd=repo_dir, capture_output=True, text=True)
+    if result.returncode == 0:
+        return True
+
+    result = subprocess.run(["patch", "-p1", "-i", patch_file], cwd=repo_dir, capture_output=True, text=True)
+    return result.returncode == 0
+
+def parse_benchmark_output(output: str):
+    """Parse benchmark output to extract metrics."""
+    metrics = {{}}
+    patterns = {{
+        "request_throughput": r"Request throughput \\(req/s\\):\\s+([\\d.]+)",
+        "output_throughput": r"Output token throughput \\(tok/s\\):\\s+([\\d.]+)",
+        "input_throughput": r"Input token throughput \\(tok/s\\):\\s+([\\d.]+)",
+        "ttft_mean": r"Mean TTFT \\(ms\\):\\s+([\\d.]+)",
+        "ttft_median": r"Median TTFT \\(ms\\):\\s+([\\d.]+)",
+        "ttft_p99": r"P99 TTFT \\(ms\\):\\s+([\\d.]+)",
+        "tpot_mean": r"Mean TPOT \\(ms\\):\\s+([\\d.]+)",
+        "tpot_median": r"Median TPOT \\(ms\\):\\s+([\\d.]+)",
+        "tpot_p99": r"P99 TPOT \\(ms\\):\\s+([\\d.]+)",
+        "itl_mean": r"Mean ITL \\(ms\\):\\s+([\\d.]+)",
+        "itl_median": r"Median ITL \\(ms\\):\\s+([\\d.]+)",
+        "e2e_latency_mean": r"Mean E2E Latency \\(ms\\):\\s+([\\d.]+)",
+    }}
+
+    for name, pattern in patterns.items():
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            metrics[name] = float(match.group(1))
+
+    return metrics
+
+def needs_server(cmd: str) -> bool:
+    """Check if benchmark needs a server."""
+    return "bench_serving" in cmd or "--base-url" in cmd or "--host" in cmd
+
+def start_server(model: str, port: int):
+    """Start SGLang server."""
+    cmd = ["python3", "-m", "sglang.launch_server", "--model-path", model, "--port", str(port), "--host", "127.0.0.1"]
+    print(f"Server command: {{' '.join(cmd)}}")
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Combine stdout/stderr for easier debugging
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+
+def wait_for_server(port: int, timeout: int = 600, proc=None):
+    """Wait for server to be ready, capturing logs for debugging."""
+    import socket
+    import select
+    start = time.time()
+    server_logs = []
+
+    while time.time() - start < timeout:
+        # Check if server process died
+        if proc and proc.poll() is not None:
+            remaining = proc.stdout.read() if proc.stdout else ""
+            server_logs.append(remaining)
+            print(f"Server process died! Exit code: {{proc.returncode}}")
+            print(f"Server logs:\\n{{''.join(server_logs)}}")
+            return False
+
+        # Try to read server output (non-blocking)
+        if proc and proc.stdout:
+            try:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+                if ready:
+                    line = proc.stdout.readline()
+                    if line:
+                        server_logs.append(line)
+                        # Print key lines for debugging
+                        if any(x in line.lower() for x in ["error", "exception", "failed", "cuda", "memory", "ready"]):
+                            print(f"[SERVER] {{line.rstrip()}}")
+                        if "application startup complete" in line.lower() or "uvicorn running" in line.lower():
+                            print(f"Server ready after {{time.time() - start:.1f}}s")
+                            return True
+            except Exception as e:
+                pass
+
+        # Also try socket connection
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+            sock.close()
+            print(f"Server responding on port {{port}} after {{time.time() - start:.1f}}s")
+            time.sleep(2)  # Give it a moment to stabilize
+            return True
+        except:
+            pass
+
+        time.sleep(3)
+
+    # Timeout - print what we captured
+    print(f"Server startup timeout after {{timeout}}s")
+    if server_logs:
+        print(f"Last server logs:\\n{{''.join(server_logs[-50:])}}")  # Last 50 lines
+    return False
+
+def stop_server(proc):
+    """Stop server process."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except:
+        proc.kill()
+
+def run_benchmark(port: int, perf_command: str):
+    """Run the benchmark command."""
+    cmd = perf_command
+    if needs_server(cmd):
+        cmd = re.sub(r'--base-url\\s+\\S+', f'--base-url http://127.0.0.1:{{port}}', cmd)
+        cmd = re.sub(r'--host\\s+\\S+', f'--host 127.0.0.1', cmd)
+        # Replace existing --port or add it if not present
+        if re.search(r'--port\\s+\\d+', cmd):
+            cmd = re.sub(r'--port\\s+\\d+', f'--port {{port}}', cmd)
+        else:
+            cmd = f'{{cmd}} --port {{port}}'
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600, env=env)
+    output = result.stdout + result.stderr
+    return output, parse_benchmark_output(output)
+
+# Main execution
+print(f"=" * 60)
+print(f"[{{PHASE.upper()}}] Starting benchmark")
+print(f"=" * 60)
+
+try:
+    sglang_path = find_sglang_path()
+    print(f"SGLang path: {{sglang_path}}")
+
+    # =========================================================================
+    # SEPARATE DOCKER IMAGE APPROACH (cleaner than reverse-patch)
+    # =========================================================================
+    # - HUMAN: Human commit Docker image (has the optimization)
+    # - BASELINE: Base commit Docker image (pre-optimization, no patching!)
+    # - AGENT: Base commit Docker image + AGENT_PATCH
+    # =========================================================================
+
+    if PHASE == "human":
+        # Human: Use Docker image as-is (has the optimization)
+        print("[HUMAN] Using human commit Docker image (no changes needed)")
+
+    elif PHASE == "baseline":
+        # Baseline: Use base commit Docker image directly (no patching needed!)
+        print("[BASELINE] Using base commit Docker image (no changes needed)")
+
+    elif PHASE == "agent":
+        # Agent: Apply agent patch to base commit Docker image
+        repo_root = str(Path(sglang_path).parent.parent) if sglang_path else None
+
+        if AGENT_PATCH and repo_root:
+            print("[AGENT] Applying agent patch to base commit Docker image...")
+            print(f"[AGENT] Repo root: {{repo_root}}")
+            agent_patch_file = "/tmp/agent.patch"
+            with open(agent_patch_file, "w") as f:
+                f.write(AGENT_PATCH)
+
+            # Agent patch might have different path structure, try -p1 first
+            result = subprocess.run(
+                ["patch", "-p1", "-d", repo_root, "-i", agent_patch_file],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                print(f"[AGENT] Warning: Agent patch with -p1 failed, trying -p0...")
+                # Try -p0 (no strip)
+                result = subprocess.run(
+                    ["patch", "-p0", "-d", repo_root, "-i", agent_patch_file],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"[AGENT] Agent patch with -p0 also failed: {{result.stderr}}")
+                else:
+                    print("[AGENT] Successfully applied agent optimization with -p0")
+            else:
+                print("[AGENT] Successfully applied agent optimization")
+        elif not AGENT_PATCH:
+            print("[AGENT] No agent patch provided, using base Docker image as-is")
+
+    # Run benchmark
+    if needs_server(PERF_COMMAND):
+        print(f"[{{PHASE.upper()}}] Starting server on port {{PORT}}...")
+        server = start_server(MODEL, PORT)
+        try:
+            if not wait_for_server(PORT, timeout=600, proc=server):
+                raise Exception("Server failed to start")
+            print(f"[{{PHASE.upper()}}] Running benchmark...")
+            output, metrics = run_benchmark(PORT, PERF_COMMAND)
+        finally:
+            stop_server(server)
+    else:
+        print(f"[{{PHASE.upper()}}] Running standalone benchmark...")
+        output, metrics = run_benchmark(PORT, PERF_COMMAND)
+
+    results["raw_output"] = output  # Full output, no truncation
+    results["metrics"] = metrics
+    results["status"] = "success"
+    print(f"[{{PHASE.upper()}}] Metrics: {{metrics}}")
+
+except Exception as e:
+    import traceback
+    results["error"] = str(e)
+    results["status"] = "error"
+    print(f"[{{PHASE.upper()}}] Error: {{e}}")
+    traceback.print_exc()
+
+# Save results to Modal volume
+try:
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = Path(f"/results/{{COMMIT[:8]}}/{{timestamp}}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save phase result
+    result_file = results_dir / f"{{PHASE}}_result.json"
+    with open(result_file, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"[{{PHASE.upper()}}] Saved results to Modal volume: {{result_file}}")
+except Exception as save_err:
+    print(f"[{{PHASE.upper()}}] Warning: Could not save to volume: {{save_err}}")
+
+# Output results
+print("\\n=== PHASE_RESULTS_JSON ===")
+print(json.dumps(results))
+print("=== END_PHASE_RESULTS_JSON ===")
+'''
+    return script
+
+
+def _run_single_phase_sandbox(
+    phase: str,
+    commit: str,
+    docker_image: str,
+    perf_command: str,
+    model: str,
+    gpu_config: str,
+    agent_patch: Optional[str] = None,
+    base_commit: Optional[str] = None,
+    human_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a single benchmark phase in its own sandbox.
+
+    Uses SEPARATE DOCKER IMAGES approach (each phase uses its own image):
+    - HUMAN: Human commit Docker image (has optimization)
+    - BASELINE: Base commit Docker image (no patching needed!)
+    - AGENT: Base commit Docker image + agent_patch
+    """
+
+    result = {
+        "phase": phase,
+        "metrics": {},
+        "status": "error",
+        "error": None,
+        "duration_s": 0,
+        "raw_output": "",  # Full raw output from benchmark
+        "commit": commit,
+    }
+
+    start_time = time.time()
+    gpu_cfg = GPU_CONFIGS.get(gpu_config, GPU_CONFIGS["H100:1"])
+
+    try:
+        # Create the benchmark script
+        script = _create_single_phase_script(
+            phase=phase,
+            commit=commit,
+            perf_command=perf_command,
+            model=model,
+            agent_patch=agent_patch,
+            base_commit=base_commit,
+            human_patch=human_patch,
+        )
+
+        # Create Modal image
+        # setup_dockerfile_commands runs before the image is validated
+        # This fixes Python symlink and typing_extensions compatibility
+        print(f"[{phase.upper()}] Creating Modal image from {docker_image}...", flush=True)
+        image = modal.Image.from_registry(
+            docker_image,
+            force_build=True,
+            setup_dockerfile_commands=[
+                "RUN ln -sf $(which python3) /usr/local/bin/python || true",
+                "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
+                "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
+            ],
+        )
+        print(f"[{phase.upper()}] Modal image created", flush=True)
+
+        # Get App reference
+        print(f"[{phase.upper()}] Looking up Modal app 'sglang-benchmark'...", flush=True)
+        sandbox_app = modal.App.lookup("sglang-benchmark", create_if_missing=True)
+        print(f"[{phase.upper()}] Modal app ready", flush=True)
+
+        print(f"[{phase.upper()}] Creating sandbox with {gpu_cfg['gpu']}...", flush=True)
+        sandbox = modal.Sandbox.create(
+            app=sandbox_app,
+            image=image,
+            gpu=f"{gpu_cfg['gpu']}:{gpu_cfg['count']}" if gpu_cfg['count'] > 1 else gpu_cfg['gpu'],
+            timeout=gpu_cfg['timeout'],
+            volumes={
+                "/root/.cache/huggingface": model_cache,
+                "/results": results_volume,
+            },
+            secrets=[modal.Secret.from_name("huggingface-secret")],
+        )
+        print(f"[{phase.upper()}] Sandbox created successfully", flush=True)
+
+        # Write and run script
+        script_path = f"/tmp/benchmark_{phase}.py"
+        f = sandbox.open(script_path, "w")
+        f.write(script)
+        f.close()
+
+        proc = sandbox.exec("python3", "-u", script_path)
+
+        stdout_lines = []
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            print(f"[{phase.upper()}] {line.rstrip()}")
+
+        proc.wait()
+
+        # Save full raw output IMMEDIATELY before any other processing
+        full_output = "\n".join(line.rstrip('\n') for line in stdout_lines)
+        result["raw_output"] = full_output
+
+        # Commit results volume to persist benchmark results
+        try:
+            results_volume.commit()
+            print(f"[{phase.upper()}] Results volume committed", flush=True)
+        except Exception as commit_err:
+            print(f"[{phase.upper()}] Warning: Could not commit volume: {commit_err}", flush=True)
+
+        sandbox.terminate()
+
+        # Parse results
+        json_match = re.search(
+            r'=== PHASE_RESULTS_JSON ===\s*(\{.*\})\s*=== END_PHASE_RESULTS_JSON ===',
+            full_output,
+            re.DOTALL
+        )
+
+        if json_match:
+            parsed = json.loads(json_match.group(1).strip())
+            result["metrics"] = parsed.get("metrics", {})
+            result["status"] = parsed.get("status", "error")
+            if parsed.get("error"):
+                result["error"] = parsed["error"]
+        else:
+            result["error"] = "No results found in output"
+
+    except Exception as e:
+        result["error"] = f"Sandbox error: {str(e)}"
+        # Try to capture any partial output that was collected
+        if 'stdout_lines' in locals() and stdout_lines:
+            result["raw_output"] = "\n".join(line.rstrip('\n') for line in stdout_lines)
+
+    result["duration_s"] = time.time() - start_time
+    return result
+
+
+def run_3way_benchmark_docker_parallel(
+    human_commit: str,
+    base_commit: Optional[str],
+    agent_patch: Optional[str],
+    perf_command: str,
+    model: str,
+    gpu_config: str = "H100:1",
+    human_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run 3-way benchmark in PARALLEL using 3 separate Modal sandboxes.
+
+    Each benchmark (baseline, human, agent) runs on its own GPU simultaneously.
+    This is ~3x faster but uses 3x GPU hours.
+
+    Uses SEPARATE DOCKER IMAGES approach (cleaner and more reliable):
+    - HUMAN: Human commit Docker image (has optimization)
+    - BASELINE: Base commit Docker image (pre-optimization, no patching!)
+    - AGENT: Base commit Docker image + agent_patch
+
+    Args:
+        human_commit: Human commit hash (must have Docker image available)
+        base_commit: Baseline/parent commit hash (must have Docker image available)
+        agent_patch: Optional unified diff patch from agent
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_config: GPU configuration (e.g., "H100:1")
+        human_patch: Deprecated, no longer used (kept for API compatibility)
+
+    Returns:
+        Dict with baseline_metrics, human_metrics, agent_metrics, status, error
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import sys
+
+    print("[MODAL] Enabling Modal output...", flush=True)
+    modal.enable_output()
+    print("[MODAL] Modal output enabled", flush=True)
+
+    result = {
+        "status": "error",
+        "gpu_config": gpu_config,
+        "baseline_metrics": {},
+        "human_metrics": {},
+        "agent_metrics": None,
+        "human_improvement": {},
+        "agent_improvement": None,
+        "agent_vs_human": None,
+        "error": None,
+        "duration_s": 0,
+        "perf_command": perf_command,
+        "install_method": "docker_parallel",
+        "benchmark_mode": "parallel_3way",
+        # Raw outputs from each phase
+        "baseline_raw": "",
+        "human_raw": "",
+        "agent_raw": "",
+    }
+
+    start_time = time.time()
+
+    # Check Docker images for BOTH human and base commits
+    # Each phase uses its own Docker image (no more reverse-patch approach)
+    print(f"[MODAL] Checking Docker image for human commit {human_commit[:8]}...", flush=True)
+    if not has_prebuilt_image(human_commit):
+        result["error"] = f"No Docker image for human commit {human_commit[:8]}"
+        result["duration_s"] = time.time() - start_time
+        return result
+
+    full_human_commit = get_prebuilt_commit(human_commit)
+    human_docker_image = f"{SGLANG_DOCKER_REPO}:{full_human_commit}"
+    print(f"[MODAL] Human Docker image: {human_docker_image}", flush=True)
+
+    # Check baseline Docker image if base_commit provided
+    base_docker_image = None
+    if base_commit:
+        print(f"[MODAL] Checking Docker image for base commit {base_commit[:8]}...", flush=True)
+        if not has_prebuilt_image(base_commit):
+            result["error"] = f"No Docker image for base commit {base_commit[:8]}"
+            result["duration_s"] = time.time() - start_time
+            return result
+        full_base_commit = get_prebuilt_commit(base_commit)
+        base_docker_image = f"{SGLANG_DOCKER_REPO}:{full_base_commit}"
+        print(f"[MODAL] Base Docker image: {base_docker_image}", flush=True)
+
+    print(f"=== PARALLEL 3-WAY BENCHMARK ===")
+    print(f"Human Docker: {human_docker_image}")
+    print(f"Base Docker: {base_docker_image or 'N/A'}")
+    print(f"Human: {human_commit[:8]}, Base: {base_commit[:8] if base_commit else 'N/A'}")
+    print(f"Agent patch: {'Yes' if agent_patch else 'No'}")
+    print(f"GPU config: {gpu_config} x 3 sandboxes")
+
+    # Prepare phases to run - each with its own Docker image
+    # Format: (phase_name, commit, docker_image, agent_patch)
+    phases = []
+
+    # HUMAN phase uses human commit Docker image
+    phases.append(("human", human_commit, human_docker_image, None))
+
+    # BASELINE phase uses base commit Docker image (no patching needed!)
+    if base_commit and base_docker_image:
+        phases.append(("baseline", base_commit, base_docker_image, None))
+
+    # AGENT phase uses base commit Docker image + agent patch
+    if agent_patch and base_commit and base_docker_image:
+        phases.append(("agent", base_commit, base_docker_image, agent_patch))
+
+    print(f"Running {len(phases)} phases in parallel: {[p[0] for p in phases]}")
+
+    # Run phases in parallel
+    phase_results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for phase, commit, docker_image, patch in phases:
+            future = executor.submit(
+                _run_single_phase_sandbox,
+                phase=phase,
+                commit=commit,
+                docker_image=docker_image,
+                perf_command=perf_command,
+                model=model,
+                gpu_config=gpu_config,
+                agent_patch=patch,
+                base_commit=None,  # No longer needed - using separate Docker images
+                human_patch=None,  # No longer needed - no reverse-patch
+            )
+            futures[future] = phase
+
+        for future in as_completed(futures):
+            phase = futures[future]
+            try:
+                phase_result = future.result()
+                phase_results[phase] = phase_result
+                print(f"[{phase.upper()}] Completed: {phase_result.get('status')}")
+            except Exception as e:
+                phase_results[phase] = {"status": "error", "error": str(e), "metrics": {}}
+                print(f"[{phase.upper()}] Failed: {e}")
+
+    # Combine results - metrics AND raw outputs
+    errors = []
+
+    if "human" in phase_results:
+        result["human_metrics"] = phase_results["human"].get("metrics", {})
+        result["human_raw"] = phase_results["human"].get("raw_output", "")
+        if phase_results["human"].get("status") == "success":
+            result["status"] = "success"
+        elif phase_results["human"].get("error"):
+            errors.append(f"HUMAN: {phase_results['human']['error']}")
+
+    if "baseline" in phase_results:
+        result["baseline_metrics"] = phase_results["baseline"].get("metrics", {})
+        result["baseline_raw"] = phase_results["baseline"].get("raw_output", "")
+        if phase_results["baseline"].get("error"):
+            errors.append(f"BASELINE: {phase_results['baseline']['error']}")
+
+    if "agent" in phase_results:
+        result["agent_metrics"] = phase_results["agent"].get("metrics", {})
+        result["agent_raw"] = phase_results["agent"].get("raw_output", "")
+        if phase_results["agent"].get("error"):
+            errors.append(f"AGENT: {phase_results['agent']['error']}")
+
+    # Capture all errors
+    if errors:
+        result["error"] = "; ".join(errors)
+
+    # Calculate improvements
+    if result["baseline_metrics"] and result["human_metrics"]:
+        for k in result["baseline_metrics"]:
+            if k in result["human_metrics"] and result["baseline_metrics"][k] > 0:
+                base_v = result["baseline_metrics"][k]
+                human_v = result["human_metrics"][k]
+                if "throughput" in k:
+                    result["human_improvement"][k] = (human_v - base_v) / base_v * 100
+                else:
+                    result["human_improvement"][k] = (base_v - human_v) / base_v * 100
+
+    if result["baseline_metrics"] and result.get("agent_metrics"):
+        agent_imp = {}
+        for k in result["baseline_metrics"]:
+            if k in result["agent_metrics"] and result["baseline_metrics"][k] > 0:
+                base_v = result["baseline_metrics"][k]
+                agent_v = result["agent_metrics"][k]
+                if "throughput" in k:
+                    agent_imp[k] = (agent_v - base_v) / base_v * 100
+                else:
+                    agent_imp[k] = (base_v - agent_v) / base_v * 100
+        result["agent_improvement"] = agent_imp
+
+    if result.get("human_metrics") and result.get("agent_metrics"):
+        agent_vs_human = {}
+        for k in result["human_metrics"]:
+            if k in result["agent_metrics"] and result["human_metrics"][k] > 0:
+                human_v = result["human_metrics"][k]
+                agent_v = result["agent_metrics"][k]
+                if "throughput" in k:
+                    agent_vs_human[k] = (agent_v - human_v) / human_v * 100
+                else:
+                    agent_vs_human[k] = (human_v - agent_v) / human_v * 100
+        result["agent_vs_human"] = agent_vs_human
+
+    result["duration_s"] = time.time() - start_time
+    result["phase_durations"] = {p: r.get("duration_s", 0) for p, r in phase_results.items()}
+
+    print(f"\n=== PARALLEL BENCHMARK COMPLETE ===")
+    print(f"Total duration: {result['duration_s']:.1f}s")
+    print(f"Phase durations: {result['phase_durations']}")
 
     return result
 

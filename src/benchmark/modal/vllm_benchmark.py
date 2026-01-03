@@ -2459,7 +2459,7 @@ def run_benchmark_single_gpu(
 
             output = bench_result.stdout + bench_result.stderr
             result["metrics"] = parse_metrics(output)
-            result["raw_output"] = output[:5000]
+            result["raw_output"] = output
 
             if result["metrics"]:
                 result["status"] = "success"
@@ -2548,7 +2548,7 @@ def run_benchmark_4gpu(
 
             output = bench_result.stdout + bench_result.stderr
             result["metrics"] = parse_metrics(output)
-            result["raw_output"] = output[:5000]
+            result["raw_output"] = output
 
             if result["metrics"]:
                 result["status"] = "success"
@@ -2636,7 +2636,7 @@ def run_benchmark_8gpu(
 
             output = bench_result.stdout + bench_result.stderr
             result["metrics"] = parse_metrics(output)
-            result["raw_output"] = output[:5000]
+            result["raw_output"] = output
 
             if result["metrics"]:
                 result["status"] = "success"
@@ -3038,7 +3038,7 @@ def run_3way_benchmark_4gpu(
         try:
             baseline_output, baseline_metrics = run_benchmark_phase("BASELINE", baseline_commit)
             result["baseline_metrics"] = baseline_metrics
-            result["baseline_raw"] = baseline_output[:3000]
+            result["baseline_raw"] = baseline_output
 
             if not baseline_metrics:
                 result["error"] = "Baseline benchmark produced no metrics"
@@ -3065,7 +3065,7 @@ def run_3way_benchmark_4gpu(
         try:
             human_output, human_metrics = run_benchmark_phase("HUMAN", human_commit)
             result["human_metrics"] = human_metrics
-            result["human_raw"] = human_output[:3000]
+            result["human_raw"] = human_output
 
             if not human_metrics:
                 result["error"] = "Human benchmark produced no metrics"
@@ -3104,7 +3104,7 @@ def run_3way_benchmark_4gpu(
                     try:
                         agent_output, agent_metrics = run_benchmark_phase("AGENT", baseline_commit)
                         result["agent_metrics"] = agent_metrics
-                        result["agent_raw"] = agent_output[:3000]
+                        result["agent_raw"] = agent_output
 
                         if agent_metrics:
                             result["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
@@ -3594,7 +3594,7 @@ def run_3way_benchmark_1gpu(
 
         baseline_output, baseline_metrics = run_benchmark_phase("BASELINE", base_commit)
         result["baseline_metrics"] = baseline_metrics
-        result["baseline_raw"] = baseline_output[:3000]
+        result["baseline_raw"] = baseline_output
 
         if not baseline_metrics:
             result["error"] = "Baseline benchmark produced no metrics"
@@ -3633,7 +3633,7 @@ def run_3way_benchmark_1gpu(
                         try:
                             agent_output, agent_metrics = run_benchmark_phase("AGENT", base_commit)
                             result["agent_metrics"] = agent_metrics
-                            result["agent_raw"] = agent_output[:3000]
+                            result["agent_raw"] = agent_output
 
                             if agent_metrics:
                                 result["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
@@ -3662,7 +3662,7 @@ def run_3way_benchmark_1gpu(
                     try:
                         agent_output, agent_metrics = run_benchmark_phase("AGENT", base_commit)
                         result["agent_metrics"] = agent_metrics
-                        result["agent_raw"] = agent_output[:3000]
+                        result["agent_raw"] = agent_output
 
                         if agent_metrics:
                             result["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
@@ -3705,7 +3705,7 @@ def run_3way_benchmark_1gpu(
             try:
                 human_output, human_metrics = run_benchmark_phase("HUMAN", human_commit)
                 result["human_metrics"] = human_metrics
-                result["human_raw"] = human_output[:3000]
+                result["human_raw"] = human_output
 
                 if human_metrics:
                     result["human_improvement"] = compute_improvement(baseline_metrics, human_metrics)
@@ -3757,7 +3757,7 @@ def run_3way_benchmark_1gpu(
             try:
                 human_output, human_metrics = run_benchmark_phase("HUMAN", human_commit)
                 result["human_metrics"] = human_metrics
-                result["human_raw"] = human_output[:3000]
+                result["human_raw"] = human_output
 
                 if not human_metrics:
                     result["error"] = "Human benchmark produced no metrics"
@@ -3804,7 +3804,7 @@ def run_3way_benchmark_1gpu(
                             try:
                                 agent_output, agent_metrics = run_benchmark_phase("AGENT", base_commit)
                                 result["agent_metrics"] = agent_metrics
-                                result["agent_raw"] = agent_output[:3000]
+                                result["agent_raw"] = agent_output
 
                                 if agent_metrics:
                                     result["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
@@ -3849,7 +3849,7 @@ def run_3way_benchmark_1gpu(
                                 # Agent uses baseline commit scripts (it's baseline + patch)
                                 agent_output, agent_metrics = run_benchmark_phase("AGENT", base_commit)
                                 result["agent_metrics"] = agent_metrics
-                                result["agent_raw"] = agent_output[:3000]
+                                result["agent_raw"] = agent_output
 
                                 if agent_metrics:
                                     result["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
@@ -4187,6 +4187,10 @@ def run_3way_modal_benchmark_prebuilt(
         "prebuilt_mode": True,
         "baseline_image": f"{DOCKER_IMAGE_REPO}:{baseline_full}",
         "human_image": f"{DOCKER_IMAGE_REPO}:{human_full}",
+        # Raw outputs for debugging and analysis
+        "baseline_raw": "",
+        "human_raw": "",
+        "agent_raw": None,
     }
 
     # For pre-built images, we need to run separate sandboxes for baseline and human
@@ -4230,7 +4234,8 @@ print("BENCHMARK_OUTPUT_END")
             if "BENCHMARK_OUTPUT_START" in baseline_output:
                 benchmark_text = baseline_output.split("BENCHMARK_OUTPUT_START")[1].split("BENCHMARK_OUTPUT_END")[0]
                 result["baseline_metrics"] = parse_metrics(benchmark_text)
-                result["baseline_raw"] = benchmark_text[:3000]
+                # Save full raw output (no truncation - saved to separate file by caller)
+                result["baseline_raw"] = benchmark_text
             sb_baseline.terminate()
 
         if not result["baseline_metrics"]:
@@ -4275,7 +4280,8 @@ print("BENCHMARK_OUTPUT_END")
             if "BENCHMARK_OUTPUT_START" in human_output:
                 benchmark_text = human_output.split("BENCHMARK_OUTPUT_START")[1].split("BENCHMARK_OUTPUT_END")[0]
                 result["human_metrics"] = parse_metrics(benchmark_text)
-                result["human_raw"] = benchmark_text[:3000]
+                # Save full raw output (no truncation - saved to separate file by caller)
+                result["human_raw"] = benchmark_text
             sb_human.terminate()
 
         if not result["human_metrics"]:
@@ -4303,6 +4309,9 @@ print("BENCHMARK_OUTPUT_END")
                 result["agent_metrics"] = agent_result["agent_metrics"]
                 result["agent_improvement"] = compute_improvement(result["baseline_metrics"], result["agent_metrics"])
                 result["agent_vs_human"] = compute_improvement(result["human_metrics"], result["agent_metrics"])
+            # Also capture agent raw output if available
+            if agent_result.get("agent_raw"):
+                result["agent_raw"] = agent_result["agent_raw"]
 
         result["status"] = "success"
 
@@ -4312,6 +4321,336 @@ print("BENCHMARK_OUTPUT_END")
         result["traceback"] = tb
         print(f"[PRE-BUILT BENCHMARK] Exception: {str(e)}")
         print(f"[PRE-BUILT BENCHMARK] Traceback:\n{tb}")
+
+    return result
+
+
+# =====================================================================
+# Parallel 3-Way Benchmark (3 sandboxes, 3 GPUs, ~3x faster)
+# =====================================================================
+
+def _run_vllm_phase_sandbox(
+    phase: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    gpu_config: str = "H100:1",
+    agent_patch: Optional[str] = None,
+    base_commit: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a single vLLM benchmark phase in its own sandbox."""
+
+    result = {
+        "phase": phase,
+        "metrics": {},
+        "status": "error",
+        "error": None,
+        "duration_s": 0,
+        "raw_output": "",  # Full raw output from benchmark
+        "commit": commit,
+    }
+
+    start_time = time.time()
+
+    try:
+        # Get the pre-built image for this commit
+        full_commit = get_prebuilt_commit(commit)
+        if not full_commit:
+            result["error"] = f"No pre-built image for {commit[:8]}"
+            return result
+
+        image = get_prebuilt_image(full_commit)
+        if not image:
+            result["error"] = f"Failed to get image for {commit[:8]}"
+            return result
+
+        print(f"[{phase.upper()}] Creating sandbox with H100...")
+
+        # Create sandbox
+        sandbox_app = modal.App.lookup("omniperf-benchmark", create_if_missing=True)
+
+        sb = modal.Sandbox.create(
+            app=sandbox_app,
+            image=image,
+            gpu="H100",
+            timeout=7200,
+            secrets=[modal.Secret.from_name("huggingface-secret")],
+            volumes={"/root/.cache/huggingface": model_cache},
+        )
+
+        # For agent phase, we need to apply patch
+        if phase == "agent" and agent_patch:
+            # Clone vLLM repo and apply patch
+            patch_script = f'''
+import subprocess
+import sys
+import os
+
+# Clone vLLM repo
+subprocess.run(["git", "clone", "--depth", "100", "https://github.com/vllm-project/vllm.git", "/tmp/vllm_agent"], capture_output=True)
+subprocess.run(["git", "fetch", "origin", "{base_commit}"], cwd="/tmp/vllm_agent", capture_output=True)
+subprocess.run(["git", "checkout", "{base_commit}"], cwd="/tmp/vllm_agent", capture_output=True)
+
+# Write patch
+patch_content = {repr(agent_patch)}
+with open("/tmp/agent.patch", "w") as f:
+    f.write(patch_content)
+
+# Apply patch
+result = subprocess.run(["git", "apply", "/tmp/agent.patch"], cwd="/tmp/vllm_agent", capture_output=True, text=True)
+if result.returncode != 0:
+    result = subprocess.run(["patch", "-p1", "-i", "/tmp/agent.patch"], cwd="/tmp/vllm_agent", capture_output=True, text=True)
+
+# Overlay Python files
+import shutil
+from pathlib import Path
+vllm_install = subprocess.run(["python", "-c", "import vllm; print(vllm.__path__[0])"], capture_output=True, text=True)
+target_dir = Path(vllm_install.stdout.strip())
+source_dir = Path("/tmp/vllm_agent/vllm")
+
+if source_dir.exists() and target_dir.exists():
+    for py_file in source_dir.rglob("*.py"):
+        rel_path = py_file.relative_to(source_dir)
+        dest_file = target_dir / rel_path
+        if dest_file.exists():
+            shutil.copy2(py_file, dest_file)
+        else:
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(py_file, dest_file)
+    print("PATCH_APPLIED_SUCCESS")
+else:
+    print("PATCH_APPLIED_FAILED")
+'''
+            patch_proc = sb.exec("python", "-c", patch_script)
+            patch_output = ""
+            for line in patch_proc.stdout:
+                patch_output += line
+                print(f"[{phase.upper()}] {line.rstrip()}")
+            patch_proc.wait()
+
+            if "PATCH_APPLIED_FAILED" in patch_output:
+                result["error"] = "Failed to apply agent patch"
+                sb.terminate()
+                return result
+
+        # Run benchmark
+        benchmark_script = f'''
+import vllm
+import json
+import time
+import subprocess
+import re
+
+print(f"vLLM version: {{vllm.__version__}}")
+
+# Run benchmark command
+result = subprocess.run(
+    {repr(perf_command)},
+    shell=True,
+    capture_output=True,
+    text=True,
+    timeout=3600,
+)
+
+output = result.stdout + result.stderr
+print("BENCHMARK_OUTPUT_START")
+print(output)
+print("BENCHMARK_OUTPUT_END")
+
+# Parse metrics
+metrics = {{}}
+patterns = {{
+    "request_throughput": r"Request throughput[:\\s]+([\\d.]+)",
+    "output_throughput": r"Output token throughput[:\\s]+([\\d.]+)",
+    "ttft_mean": r"Mean TTFT[:\\s]+([\\d.]+)",
+    "tpot_mean": r"Mean TPOT[:\\s]+([\\d.]+)",
+    "itl_mean": r"Mean ITL[:\\s]+([\\d.]+)",
+}}
+
+for name, pattern in patterns.items():
+    match = re.search(pattern, output, re.IGNORECASE)
+    if match:
+        metrics[name] = float(match.group(1))
+
+print("METRICS_JSON_START")
+print(json.dumps(metrics))
+print("METRICS_JSON_END")
+'''
+
+        print(f"[{phase.upper()}] Running benchmark...")
+        bench_proc = sb.exec("python", "-c", benchmark_script)
+
+        stdout_lines = []
+        for line in bench_proc.stdout:
+            stdout_lines.append(line)
+            print(f"[{phase.upper()}] {line.rstrip()}")
+
+        bench_proc.wait()
+
+        # Save full raw output IMMEDIATELY before any other processing
+        full_output = "\n".join(stdout_lines)
+        result["raw_output"] = full_output
+
+        sb.terminate()
+
+        # Also extract just the benchmark output (between markers)
+        import re as re_mod
+        bench_match = re_mod.search(r'BENCHMARK_OUTPUT_START\s*(.*?)\s*BENCHMARK_OUTPUT_END', full_output, re_mod.DOTALL)
+        if bench_match:
+            result["benchmark_raw"] = bench_match.group(1).strip()
+
+        # Parse metrics from output
+        metrics_match = re_mod.search(r'METRICS_JSON_START\s*(\{.*?\})\s*METRICS_JSON_END', full_output, re_mod.DOTALL)
+        if metrics_match:
+            result["metrics"] = json.loads(metrics_match.group(1))
+            result["status"] = "success"
+        else:
+            result["error"] = "No metrics found in output"
+
+    except Exception as e:
+        result["error"] = f"Sandbox error: {str(e)}"
+        # Try to capture any partial output that was collected
+        if 'stdout_lines' in locals() and stdout_lines:
+            result["raw_output"] = "\n".join(stdout_lines)
+
+    result["duration_s"] = time.time() - start_time
+    return result
+
+
+def run_3way_modal_benchmark_prebuilt_parallel(
+    baseline_commit: str,
+    human_commit: str,
+    agent_patch: Optional[str],
+    perf_command: str,
+    model: str,
+    gpu_config: str = "H100:1",
+) -> Dict[str, Any]:
+    """
+    Run 3-way benchmark in PARALLEL using 3 separate Modal sandboxes.
+
+    Each benchmark (baseline, human, agent) runs on its own GPU simultaneously.
+    This is ~3x faster but uses 3x GPU hours.
+
+    Args:
+        baseline_commit: Full commit hash for baseline (must have pre-built image)
+        human_commit: Full commit hash for human/perf commit (must have pre-built image)
+        agent_patch: Unified diff patch from agent (optional)
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_config: GPU configuration (H100:1, etc.)
+
+    Returns:
+        Dict with baseline_metrics, human_metrics, agent_metrics, status, error
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    result = {
+        "status": "error",
+        "gpu_config": gpu_config,
+        "baseline_metrics": {},
+        "human_metrics": {},
+        "agent_metrics": None,
+        "human_improvement": {},
+        "agent_improvement": None,
+        "agent_vs_human": None,
+        "error": None,
+        "duration_s": 0,
+        "perf_command": perf_command,
+        "install_method": "prebuilt_parallel",
+        "benchmark_mode": "parallel_3way",
+        # Raw outputs for debugging and analysis
+        "baseline_raw": "",
+        "human_raw": "",
+        "agent_raw": None,
+    }
+
+    start_time = time.time()
+
+    # Verify pre-built images exist
+    baseline_full = get_prebuilt_commit(baseline_commit)
+    human_full = get_prebuilt_commit(human_commit)
+
+    if not baseline_full:
+        result["error"] = f"No pre-built image for baseline: {baseline_commit[:8]}"
+        return result
+    if not human_full:
+        result["error"] = f"No pre-built image for human: {human_commit[:8]}"
+        return result
+
+    print(f"=== PARALLEL 3-WAY BENCHMARK (vLLM) ===")
+    print(f"Baseline: {baseline_commit[:8]}, Human: {human_commit[:8]}")
+    print(f"Agent patch: {'Yes' if agent_patch else 'No'}")
+    print(f"GPU config: {gpu_config} x 3 sandboxes")
+
+    # Prepare phases to run
+    phases = [
+        ("baseline", baseline_commit, None, None),
+        ("human", human_commit, None, None),
+    ]
+
+    if agent_patch:
+        phases.append(("agent", baseline_commit, agent_patch, baseline_commit))
+
+    print(f"Running {len(phases)} phases in parallel: {[p[0] for p in phases]}")
+
+    # Run phases in parallel
+    phase_results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {}
+        for phase, commit, patch, base in phases:
+            future = executor.submit(
+                _run_vllm_phase_sandbox,
+                phase=phase,
+                commit=commit,
+                perf_command=perf_command,
+                model=model,
+                gpu_config=gpu_config,
+                agent_patch=patch,
+                base_commit=base,
+            )
+            futures[future] = phase
+
+        for future in as_completed(futures):
+            phase = futures[future]
+            try:
+                phase_result = future.result()
+                phase_results[phase] = phase_result
+                print(f"[{phase.upper()}] Completed: {phase_result.get('status')}")
+            except Exception as e:
+                phase_results[phase] = {"status": "error", "error": str(e), "metrics": {}}
+                print(f"[{phase.upper()}] Failed: {e}")
+
+    # Combine results - metrics AND raw outputs
+    if "baseline" in phase_results:
+        result["baseline_metrics"] = phase_results["baseline"].get("metrics", {})
+        result["baseline_raw"] = phase_results["baseline"].get("raw_output", "")
+
+    if "human" in phase_results:
+        result["human_metrics"] = phase_results["human"].get("metrics", {})
+        result["human_raw"] = phase_results["human"].get("raw_output", "")
+        if phase_results["human"].get("status") == "success":
+            result["status"] = "success"
+
+    if "agent" in phase_results:
+        result["agent_metrics"] = phase_results["agent"].get("metrics", {})
+        result["agent_raw"] = phase_results["agent"].get("raw_output", "")
+
+    # Calculate improvements
+    if result["baseline_metrics"] and result["human_metrics"]:
+        result["human_improvement"] = compute_improvement(result["baseline_metrics"], result["human_metrics"])
+
+    if result["baseline_metrics"] and result.get("agent_metrics"):
+        result["agent_improvement"] = compute_improvement(result["baseline_metrics"], result["agent_metrics"])
+
+    if result.get("human_metrics") and result.get("agent_metrics"):
+        result["agent_vs_human"] = compute_improvement(result["human_metrics"], result["agent_metrics"])
+
+    result["duration_s"] = time.time() - start_time
+    result["phase_durations"] = {p: r.get("duration_s", 0) for p, r in phase_results.items()}
+
+    print(f"\n=== PARALLEL BENCHMARK COMPLETE ===")
+    print(f"Total duration: {result['duration_s']:.1f}s")
+    print(f"Phase durations: {result['phase_durations']}")
 
     return result
 
@@ -4876,7 +5215,7 @@ try:
     # Use unique ports per phase to avoid port conflicts (vLLM 0.6.x bug)
     baseline_output, baseline_metrics = run_benchmark(PERF_COMMAND, MODEL, repo_path=repo_path, port=29001)
     results["baseline_metrics"] = baseline_metrics
-    results["baseline_raw"] = baseline_output[:3000]
+    results["baseline_raw"] = baseline_output
 
     if not baseline_metrics:
         raise RuntimeError("Baseline benchmark produced no metrics")
@@ -4896,7 +5235,7 @@ try:
 
     human_output, human_metrics = run_benchmark(PERF_COMMAND, MODEL, repo_path=human_repo_path, port=29002)
     results["human_metrics"] = human_metrics
-    results["human_raw"] = human_output[:3000]
+    results["human_raw"] = human_output
 
     if not human_metrics:
         raise RuntimeError("Human benchmark produced no metrics")
@@ -4941,7 +5280,7 @@ try:
 
             agent_output, agent_metrics = run_benchmark(PERF_COMMAND, MODEL, repo_path=agent_repo_path, port=29003)
             results["agent_metrics"] = agent_metrics
-            results["agent_raw"] = agent_output[:3000]
+            results["agent_raw"] = agent_output
 
             if agent_metrics:
                 print(f"  Agent metrics: {{agent_metrics}}")

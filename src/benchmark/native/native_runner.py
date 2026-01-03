@@ -715,7 +715,7 @@ class NativeBenchmarkRunner:
             Tuple of (metrics_dict, error_message)
         """
         try:
-            from src.eval.modal_benchmark import run_modal_benchmark
+            from src.benchmark.modal.vllm_benchmark import run_modal_benchmark
         except ImportError:
             logger.warning("Modal benchmark module not available, falling back to local")
             return {}, "Modal module not available"

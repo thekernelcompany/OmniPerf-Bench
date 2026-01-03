@@ -289,7 +289,7 @@ def run_3way_benchmark(
         Benchmark result dict with human_metrics always populated (when successful)
         baseline_metrics and agent_metrics will be empty unless separate images are built
     """
-    from src.eval.sglang_modal_benchmark import run_3way_modal_benchmark, has_prebuilt_image
+    from src.benchmark.modal.sglang_benchmark import run_3way_modal_benchmark, has_prebuilt_image
 
     print(f"Running SGLang benchmark on Modal with {gpu_config}...")
     print(f"  Human commit: {human_commit[:8]}")
