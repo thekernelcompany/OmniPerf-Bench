@@ -1107,11 +1107,13 @@ def run_3way_benchmark_docker(
 
         # Note: SGLang Docker images don't need ENTRYPOINT/CMD clearing like vLLM
         # In fact, clearing them causes the container to crash immediately
-        # setup_dockerfile_commands fixes Python symlink and typing_extensions
+        # setup_dockerfile_commands fixes Python symlink, typing_extensions, and missing libnuma
         image = modal.Image.from_registry(
             docker_image,
             force_build=True,
             setup_dockerfile_commands=[
+                # Fix missing libnuma (required by sgl_kernel on newer SGLang versions)
+                "RUN apt-get update && apt-get install -y libnuma1 libnuma-dev && rm -rf /var/lib/apt/lists/*",
                 "RUN ln -sf $(which python3) /usr/local/bin/python || true",
                 "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
                 "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
@@ -2788,12 +2790,14 @@ def _run_single_phase_sandbox(
 
         # Create Modal image
         # setup_dockerfile_commands runs before the image is validated
-        # This fixes Python symlink and typing_extensions compatibility
+        # This fixes Python symlink, typing_extensions, and missing libnuma
         print(f"[{phase.upper()}] Creating Modal image from {docker_image}...", flush=True)
         image = modal.Image.from_registry(
             docker_image,
             force_build=True,
             setup_dockerfile_commands=[
+                # Fix missing libnuma (required by sgl_kernel on newer SGLang versions)
+                "RUN apt-get update && apt-get install -y libnuma1 libnuma-dev && rm -rf /var/lib/apt/lists/*",
                 "RUN ln -sf $(which python3) /usr/local/bin/python || true",
                 "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
                 "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
