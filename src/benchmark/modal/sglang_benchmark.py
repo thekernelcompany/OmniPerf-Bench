@@ -1236,6 +1236,7 @@ def run_3way_benchmark_docker(
     perf_command: str,
     model: str,
     gpu_config: str = "H100:1",
+    human_patch: Optional[str] = None,  # Unused, for API compatibility
 ) -> Dict[str, Any]:
     """
     Run benchmark using Docker images.
