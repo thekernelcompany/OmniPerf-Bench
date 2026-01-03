@@ -28,9 +28,15 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import threading
 from typing import Dict, Optional, Any, Tuple, List
 from pathlib import Path
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+
+# Timeout for sandbox creation (seconds) - Modal may queue if GPUs unavailable
+SANDBOX_CREATE_TIMEOUT = 300  # 5 minutes
 
 # Modal app configuration
 app = modal.App("sglang-benchmark")
@@ -1123,15 +1129,27 @@ def run_3way_benchmark_docker(
         # Get App reference for Sandbox (required when running outside Modal container)
         sandbox_app = modal.App.lookup("sglang-benchmark", create_if_missing=True)
 
-        sandbox = modal.Sandbox.create(
-            app=sandbox_app,
-            image=image,
-            gpu=f"{gpu_cfg['gpu']}:{gpu_cfg['count']}" if gpu_cfg['count'] > 1 else gpu_cfg['gpu'],
-            timeout=gpu_cfg['timeout'],
-            volumes={"/root/.cache/huggingface": model_cache},
-            secrets=[modal.Secret.from_name("huggingface-secret")],
-            verbose=True,  # Enable detailed sandbox logging
-        )
+        print(f"Creating sandbox with {gpu_cfg['gpu']} (timeout: {SANDBOX_CREATE_TIMEOUT}s)...")
+
+        # Use ThreadPoolExecutor to add timeout to sandbox creation
+        # Modal can hang indefinitely if GPUs are not available
+        def create_sandbox():
+            return modal.Sandbox.create(
+                app=sandbox_app,
+                image=image,
+                gpu=f"{gpu_cfg['gpu']}:{gpu_cfg['count']}" if gpu_cfg['count'] > 1 else gpu_cfg['gpu'],
+                timeout=gpu_cfg['timeout'],
+                volumes={"/root/.cache/huggingface": model_cache},
+                secrets=[modal.Secret.from_name("huggingface-secret")],
+                verbose=True,  # Enable detailed sandbox logging
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(create_sandbox)
+            try:
+                sandbox = future.result(timeout=SANDBOX_CREATE_TIMEOUT)
+            except FuturesTimeoutError:
+                raise TimeoutError(f"Sandbox creation timed out after {SANDBOX_CREATE_TIMEOUT}s - Modal may not have GPUs available")
 
         print("Running 3-way benchmark in sandbox...")
 
@@ -2810,18 +2828,30 @@ def _run_single_phase_sandbox(
         sandbox_app = modal.App.lookup("sglang-benchmark", create_if_missing=True)
         print(f"[{phase.upper()}] Modal app ready", flush=True)
 
-        print(f"[{phase.upper()}] Creating sandbox with {gpu_cfg['gpu']}...", flush=True)
-        sandbox = modal.Sandbox.create(
-            app=sandbox_app,
-            image=image,
-            gpu=f"{gpu_cfg['gpu']}:{gpu_cfg['count']}" if gpu_cfg['count'] > 1 else gpu_cfg['gpu'],
-            timeout=gpu_cfg['timeout'],
-            volumes={
-                "/root/.cache/huggingface": model_cache,
-                "/results": results_volume,
-            },
-            secrets=[modal.Secret.from_name("huggingface-secret")],
-        )
+        print(f"[{phase.upper()}] Creating sandbox with {gpu_cfg['gpu']} (timeout: {SANDBOX_CREATE_TIMEOUT}s)...", flush=True)
+
+        # Use ThreadPoolExecutor to add timeout to sandbox creation
+        # Modal can hang indefinitely if GPUs are not available
+        def create_sandbox():
+            return modal.Sandbox.create(
+                app=sandbox_app,
+                image=image,
+                gpu=f"{gpu_cfg['gpu']}:{gpu_cfg['count']}" if gpu_cfg['count'] > 1 else gpu_cfg['gpu'],
+                timeout=gpu_cfg['timeout'],
+                volumes={
+                    "/root/.cache/huggingface": model_cache,
+                    "/results": results_volume,
+                },
+                secrets=[modal.Secret.from_name("huggingface-secret")],
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(create_sandbox)
+            try:
+                sandbox = future.result(timeout=SANDBOX_CREATE_TIMEOUT)
+            except FuturesTimeoutError:
+                raise TimeoutError(f"Sandbox creation timed out after {SANDBOX_CREATE_TIMEOUT}s - Modal may not have GPUs available")
+
         print(f"[{phase.upper()}] Sandbox created successfully", flush=True)
 
         # Write and run script
