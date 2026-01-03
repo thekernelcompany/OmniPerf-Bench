@@ -3264,57 +3264,61 @@ def run_3way_benchmark_docker_parallel(
 
     # Spawn all phases using Modal Functions (proper timeout handling)
     # spawn() returns immediately with FunctionCall handles
-    print(f"\n[MODAL] Spawning {len(phases)} benchmark phases...")
-    phase_calls: Dict[str, Any] = {}  # phase_name -> FunctionCall
-
-    for phase_name, commit, docker_image, patch in phases:
-        print(f"[{phase_name.upper()}] Spawning managed benchmark...")
-        call = run_phase_managed.spawn(
-            docker_image_tag=docker_image,
-            phase=phase_name,
-            commit=commit,
-            perf_command=perf_command,
-            model=model,
-            gpu_type=gpu_type,
-            gpu_count=gpu_count,
-            sandbox_timeout=sandbox_timeout,
-            agent_patch=patch,
-            human_patch=None,
-        )
-        phase_calls[phase_name] = call
-
-    print(f"[MODAL] All phases spawned. Waiting for results (timeout: {sandbox_timeout + 300}s per phase)...")
-
-    # Collect results with timeout
-    # get(timeout=...) provides proper server-side timeout handling
+    # IMPORTANT: Must run within app.run() context for spawn() to work
+    print(f"\n[MODAL] Starting Modal app context for spawning...")
     phase_results = {}
-    for phase_name, call in phase_calls.items():
-        try:
-            print(f"[{phase_name.upper()}] Waiting for results...")
-            # Extra 300s buffer for sandbox creation overhead
-            phase_result = call.get(timeout=sandbox_timeout + 300)
-            phase_results[phase_name] = phase_result
-            print(f"[{phase_name.upper()}] Completed: {phase_result.get('status')}")
-        except TimeoutError:
-            print(f"[{phase_name.upper()}] TIMEOUT - cancelling...")
+
+    with app.run():
+        print(f"[MODAL] Spawning {len(phases)} benchmark phases...")
+        phase_calls: Dict[str, Any] = {}  # phase_name -> FunctionCall
+
+        for phase_name, commit, docker_image, patch in phases:
+            print(f"[{phase_name.upper()}] Spawning managed benchmark...")
+            call = run_phase_managed.spawn(
+                docker_image_tag=docker_image,
+                phase=phase_name,
+                commit=commit,
+                perf_command=perf_command,
+                model=model,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                sandbox_timeout=sandbox_timeout,
+                agent_patch=patch,
+                human_patch=None,
+            )
+            phase_calls[phase_name] = call
+
+        print(f"[MODAL] All phases spawned. Waiting for results (timeout: {sandbox_timeout + 300}s per phase)...")
+
+        # Collect results with timeout
+        # get(timeout=...) provides proper server-side timeout handling
+        for phase_name, call in phase_calls.items():
             try:
-                call.cancel()
-            except Exception:
-                pass
-            phase_results[phase_name] = {
-                "status": "error",
-                "error": f"Timed out after {sandbox_timeout + 300}s",
-                "metrics": {},
-                "raw_output": "",
-            }
-        except Exception as e:
-            print(f"[{phase_name.upper()}] Failed: {e}")
-            phase_results[phase_name] = {
-                "status": "error",
-                "error": str(e),
-                "metrics": {},
-                "raw_output": "",
-            }
+                print(f"[{phase_name.upper()}] Waiting for results...")
+                # Extra 300s buffer for sandbox creation overhead
+                phase_result = call.get(timeout=sandbox_timeout + 300)
+                phase_results[phase_name] = phase_result
+                print(f"[{phase_name.upper()}] Completed: {phase_result.get('status')}")
+            except TimeoutError:
+                print(f"[{phase_name.upper()}] TIMEOUT - cancelling...")
+                try:
+                    call.cancel()
+                except Exception:
+                    pass
+                phase_results[phase_name] = {
+                    "status": "error",
+                    "error": f"Timed out after {sandbox_timeout + 300}s",
+                    "metrics": {},
+                    "raw_output": "",
+                }
+            except Exception as e:
+                print(f"[{phase_name.upper()}] Failed: {e}")
+                phase_results[phase_name] = {
+                    "status": "error",
+                    "error": str(e),
+                    "metrics": {},
+                    "raw_output": "",
+                }
 
     # Combine results - metrics AND raw outputs
     errors = []
