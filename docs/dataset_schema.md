@@ -149,3 +149,150 @@ Reference: [GSO](https://huggingface.co/datasets/gso-bench/gso)
 - Function extraction: prefer parser-based extraction; fallback to regex on hunk headers.
 - Timing parsing: parse `Execution time: <sec>s` lines from stored results.
 - Version: stable, reproducible string; include short hash of install commands.
+
+---
+
+## HuggingFace Benchmark Results Schema (v2.0)
+
+This section defines the unified schema for benchmark results uploaded to HuggingFace datasets.
+The schema is shared between vLLM and SGLang benchmark results for consistency.
+
+### Datasets Using This Schema
+- `Inferencebench/claude-code-vllm-benchmarks` - vLLM performance benchmarks
+- `Inferencebench/claude-code-sglang-benchmarks` - SGLang performance benchmarks
+
+### Unified Schema (38 columns)
+
+#### Metadata Columns (14)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `commit_hash` | string | Full 40-character commit SHA |
+| `commit_subject` | string | Commit message first line |
+| `repo` | string | Repository name (e.g., `vllm-project/vllm`) |
+| `model` | string | LLM model used for benchmark |
+| `gpu_config` | string | GPU configuration (e.g., `H100:1`) |
+| `benchmark_mode` | string | Benchmark type (`serving`, `latency`, `throughput`) |
+| `perf_command` | string | Exact benchmark command executed |
+| `status` | string | Result status (`success`, `error`, `exception`, etc.) |
+| `error` | string | Error message if failed |
+| `duration_s` | float | Total execution time in seconds |
+| `has_agent_patch` | bool | Whether agent produced a patch |
+| `agent_name` | string | Agent identifier (e.g., `claude-code`) |
+| `agent_model` | string | Agent model version |
+| `benchmark_date` | string | Date of benchmark (YYYY-MM-DD) |
+
+#### Latency Metrics - Baseline (4 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `baseline_ttft_mean` | float | Time to First Token - mean (ms) |
+| `baseline_ttft_median` | float | Time to First Token - median (ms) |
+| `baseline_tpot_mean` | float | Time per Output Token - mean (ms) |
+| `baseline_itl_mean` | float | Inter-Token Latency - mean (ms) |
+
+#### Latency Metrics - Human (4 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `human_ttft_mean` | float | Time to First Token - mean (ms) |
+| `human_ttft_median` | float | Time to First Token - median (ms) |
+| `human_tpot_mean` | float | Time per Output Token - mean (ms) |
+| `human_itl_mean` | float | Inter-Token Latency - mean (ms) |
+
+#### Latency Metrics - Agent (4 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `agent_ttft_mean` | float | Time to First Token - mean (ms) |
+| `agent_ttft_median` | float | Time to First Token - median (ms) |
+| `agent_tpot_mean` | float | Time per Output Token - mean (ms) |
+| `agent_itl_mean` | float | Inter-Token Latency - mean (ms) |
+
+#### Throughput Metrics (6 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `baseline_throughput` | float | Baseline requests/second |
+| `baseline_output_throughput` | float | Baseline output tokens/second |
+| `human_throughput` | float | Human optimization requests/second |
+| `human_output_throughput` | float | Human optimization output tokens/second |
+| `agent_throughput` | float | Agent optimization requests/second |
+| `agent_output_throughput` | float | Agent optimization output tokens/second |
+
+#### E2E Latency Metrics (6 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `baseline_e2e_latency_mean` | float | Baseline end-to-end latency - mean (ms) |
+| `baseline_e2e_latency_median` | float | Baseline end-to-end latency - median (ms) |
+| `human_e2e_latency_mean` | float | Human optimization E2E latency - mean (ms) |
+| `human_e2e_latency_median` | float | Human optimization E2E latency - median (ms) |
+| `agent_e2e_latency_mean` | float | Agent optimization E2E latency - mean (ms) |
+| `agent_e2e_latency_median` | float | Agent optimization E2E latency - median (ms) |
+
+### Removed Columns (v2.0)
+
+The following columns were removed from the unified schema:
+
+**Improvement Columns** (calculated at analysis time, not stored):
+- `human_improvement_*` - Human vs baseline improvement percentages
+- `agent_improvement_*` - Agent vs baseline improvement percentages
+- `agent_vs_human_*` - Agent vs human comparison percentages
+
+**P99 Columns** (SGLang-only, removed for consistency):
+- `*_ttft_p99`, `*_tpot_p99`, `*_itl_p99`
+
+**Other Removed Columns**:
+- `parent_commit` - Not needed for analysis
+- `human_input_throughput` - Removed for simplicity
+- `*_install_method` - Not important for analysis
+- `patch_type` - vLLM-only, removed for consistency
+
+### Column Name Mappings
+
+When processing source data, apply these mappings:
+
+| Old Name (SGLang) | New Name (Unified) |
+|-------------------|-------------------|
+| `*_request_throughput` | `*_throughput` |
+| `baseline_latency_avg` | (dropped) |
+| `human_latency_avg` | (dropped) |
+| `agent_latency_avg` | (dropped) |
+
+### Implementation
+
+The unified schema is implemented in `tools/unified_schema.py`:
+
+```python
+from unified_schema import UNIFIED_COLUMNS, normalize_row, get_schema_info
+
+# Get schema metadata
+info = get_schema_info()  # Returns version, column count, groups
+
+# Normalize a row to unified schema
+normalized = normalize_row(raw_row, source="vllm")  # or "sglang"
+```
+
+### Upload Scripts
+
+- `tools/push_vllm_to_hf.py` - Upload vLLM results with unified schema
+- `tools/push_sglang_to_hf_unified.py` - Upload SGLang results with unified schema
+
+Usage:
+```bash
+# Dry run (test without uploading)
+python tools/push_vllm_to_hf.py --dry-run
+
+# Upload to HuggingFace
+HF_TOKEN=xxx python tools/push_vllm_to_hf.py
+```
+
+### Data Availability Notes
+
+| Dataset | Baseline Metrics | Human Metrics | Agent Metrics |
+|---------|-----------------|---------------|---------------|
+| vLLM | ~15% of rows | ~15% of rows | ~15% of rows |
+| SGLang | 0% (overlay issues) | ~27% of rows | 0% (ABI issues) |
+
+**Root Cause**: SGLang's architecture (Python + sgl-kernel C++ + flashinfer CUDA) requires ABI compatibility, causing overlay/patch failures for baseline and agent runs.
