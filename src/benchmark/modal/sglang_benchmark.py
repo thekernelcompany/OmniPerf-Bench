@@ -36,8 +36,12 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
-# Timeout for sandbox creation (seconds) - Modal may queue if GPUs unavailable
-SANDBOX_CREATE_TIMEOUT = 300  # 5 minutes
+# Default timeout for benchmark execution (seconds)
+DEFAULT_BENCHMARK_TIMEOUT = 7200  # 2 hours
+
+# Legacy: Timeout for sandbox creation in deprecated _run_single_phase_sandbox
+# New code should use run_phase_managed.spawn() with FunctionCall.get(timeout=...)
+SANDBOX_CREATE_TIMEOUT = 300  # 5 minutes (legacy, kept for backward compat)
 
 
 def log(phase: str, message: str, level: str = "INFO"):
@@ -119,6 +123,205 @@ sglang_build_image = (
 BASELINE_PORT = 30001
 HUMAN_PORT = 30002
 AGENT_PORT = 30003
+
+
+# =====================================================================
+# Managed Benchmark Phase Runner (Modal Function)
+# =====================================================================
+#
+# This function runs on Modal infrastructure and manages the sandbox lifecycle.
+# Using spawn() + get(timeout=...) provides proper timeout handling and cleanup.
+
+# Lightweight orchestrator image (runs on CPU, creates GPU sandbox inside)
+orchestrator_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("requests", "aiohttp")
+)
+
+
+@app.function(
+    image=orchestrator_image,
+    timeout=DEFAULT_BENCHMARK_TIMEOUT + 600,  # Outer timeout > sandbox timeout
+    retries=0,  # Don't retry on timeout
+)
+def run_phase_managed(
+    docker_image_tag: str,
+    phase: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    gpu_type: str = "H100",
+    gpu_count: int = 1,
+    sandbox_timeout: int = DEFAULT_BENCHMARK_TIMEOUT,
+    agent_patch: Optional[str] = None,
+    human_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run a single benchmark phase with managed sandbox lifecycle.
+
+    This function runs on Modal infrastructure (CPU) and creates a GPU sandbox
+    for the actual benchmark. The sandbox is ALWAYS cleaned up via finally block,
+    preventing orphaned resources.
+
+    Benefits over direct Sandbox.create() from client:
+    - Server-side timeout handling via FunctionCall.get(timeout=...)
+    - Proper cleanup via finally block (sandbox.terminate())
+    - Can be cancelled via FunctionCall.cancel()
+    - No orphaned sandboxes on client timeout
+
+    Args:
+        docker_image_tag: Full Docker image tag (e.g., "ayushnangia16/sglang-docker:abc123")
+        phase: Phase name ("human", "baseline", "agent")
+        commit: Commit hash being benchmarked
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_type: GPU type (default "H100")
+        gpu_count: Number of GPUs (default 1)
+        sandbox_timeout: Timeout for sandbox execution (default 2 hours)
+        agent_patch: Optional agent patch to apply (for agent phase)
+        human_patch: Deprecated, kept for API compatibility
+
+    Returns:
+        Dict with phase, status, metrics, raw_output, error, duration_s
+    """
+    import time
+    import re
+    import json
+    from datetime import datetime
+
+    def log_managed(message: str):
+        """Log with timestamp and phase prefix."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] [{phase.upper()}] {message}", flush=True)
+
+    result = {
+        "phase": phase,
+        "status": "error",
+        "metrics": {},
+        "raw_output": "",
+        "error": None,
+        "duration_s": 0,
+        "commit": commit,
+    }
+
+    start_time = time.time()
+    sandbox = None
+
+    try:
+        # Step 1: Build Modal image from Docker registry
+        log_managed(f"Step 1/3: Building Modal image from {docker_image_tag[:50]}...")
+        image_start = time.time()
+        image = modal.Image.from_registry(
+            docker_image_tag,
+            force_build=True,
+            setup_dockerfile_commands=[
+                # Fix missing libnuma (required by sgl_kernel on newer SGLang versions)
+                "RUN apt-get update && apt-get install -y libnuma1 libnuma-dev && rm -rf /var/lib/apt/lists/*",
+                "RUN ln -sf $(which python3) /usr/local/bin/python || true",
+                "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
+                "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
+            ],
+        )
+        log_managed(f"  - Image ready in {time.time() - image_start:.1f}s")
+
+        # Step 2: Create GPU sandbox
+        log_managed(f"Step 2/3: Creating GPU sandbox ({gpu_type}:{gpu_count})...")
+        log_managed(f"  - Sandbox timeout: {sandbox_timeout}s")
+        log_managed("  - GPU billing starts when sandbox is created")
+        sandbox_start = time.time()
+
+        gpu_spec = f"{gpu_type}:{gpu_count}" if gpu_count > 1 else gpu_type
+
+        sandbox = modal.Sandbox.create(
+            image=image,
+            gpu=gpu_spec,
+            timeout=sandbox_timeout,
+            volumes={
+                "/root/.cache/huggingface": model_cache,
+                "/results": results_volume,
+            },
+            secrets=[modal.Secret.from_name("huggingface-secret")],
+        )
+        log_managed(f"  - Sandbox created in {time.time() - sandbox_start:.1f}s")
+
+        # Step 3: Run benchmark script
+        log_managed("Step 3/3: Running benchmark script...")
+
+        # Generate the benchmark script (reuse existing function)
+        script = _create_single_phase_script(
+            phase=phase,
+            commit=commit,
+            perf_command=perf_command,
+            model=model,
+            agent_patch=agent_patch,
+            base_commit=None,
+            human_patch=human_patch,
+        )
+
+        script_path = f"/tmp/benchmark_{phase}.py"
+        f = sandbox.open(script_path, "w")
+        f.write(script)
+        f.close()
+        log_managed(f"  - Script written ({len(script)} bytes)")
+
+        benchmark_start = time.time()
+        proc = sandbox.exec("python3", "-u", script_path)
+
+        stdout_lines = []
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [{phase.upper()}] {line.rstrip()}", flush=True)
+
+        proc.wait()
+        log_managed(f"  - Benchmark completed in {time.time() - benchmark_start:.1f}s")
+
+        # Save full raw output
+        full_output = "\n".join(line.rstrip('\n') for line in stdout_lines)
+        result["raw_output"] = full_output
+
+        # Commit results volume
+        try:
+            results_volume.commit()
+            log_managed("  - Results volume committed")
+        except Exception as commit_err:
+            log_managed(f"  - Warning: Could not commit volume: {commit_err}")
+
+        # Parse results from output
+        json_match = re.search(
+            r'=== PHASE_RESULTS_JSON ===\s*(\{.*\})\s*=== END_PHASE_RESULTS_JSON ===',
+            full_output,
+            re.DOTALL
+        )
+
+        if json_match:
+            parsed = json.loads(json_match.group(1).strip())
+            result["metrics"] = parsed.get("metrics", {})
+            result["status"] = parsed.get("status", "error")
+            if parsed.get("error"):
+                result["error"] = parsed["error"]
+        else:
+            result["error"] = "No results found in output"
+
+    except Exception as e:
+        result["error"] = f"Sandbox error: {str(e)}"
+        log_managed(f"  - Error: {str(e)}")
+        # Capture any partial output
+        if 'stdout_lines' in locals() and stdout_lines:
+            result["raw_output"] = "\n".join(line.rstrip('\n') for line in stdout_lines)
+
+    finally:
+        # CRITICAL: Always cleanup sandbox to stop GPU billing
+        if sandbox:
+            try:
+                sandbox.terminate()
+                log_managed("  - Sandbox terminated (cleanup complete)")
+            except Exception as term_err:
+                log_managed(f"  - Warning: Sandbox termination failed: {term_err}")
+
+    result["duration_s"] = time.time() - start_time
+    log_managed(f"Phase complete: {result['status']} ({result['duration_s']:.1f}s)")
+    return result
 
 
 # =====================================================================
@@ -2781,13 +2984,26 @@ def _run_single_phase_sandbox(
     base_commit: Optional[str] = None,
     human_patch: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run a single benchmark phase in its own sandbox.
+    """[DEPRECATED] Run a single benchmark phase in its own sandbox.
+
+    DEPRECATED: Use run_phase_managed.spawn() instead, which provides:
+    - Proper server-side timeout handling
+    - Cleanup via finally block (no orphaned sandboxes)
+    - Can be cancelled via FunctionCall.cancel()
+
+    This function is kept for backward compatibility and debugging.
 
     Uses SEPARATE DOCKER IMAGES approach (each phase uses its own image):
     - HUMAN: Human commit Docker image (has optimization)
     - BASELINE: Base commit Docker image (no patching needed!)
     - AGENT: Base commit Docker image + agent_patch
     """
+    import warnings
+    warnings.warn(
+        "_run_single_phase_sandbox is deprecated. Use run_phase_managed.spawn() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
 
     result = {
         "phase": phase,
@@ -3040,34 +3256,65 @@ def run_3way_benchmark_docker_parallel(
 
     print(f"Running {len(phases)} phases in parallel: {[p[0] for p in phases]}")
 
-    # Run phases in parallel
-    phase_results = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {}
-        for phase, commit, docker_image, patch in phases:
-            future = executor.submit(
-                _run_single_phase_sandbox,
-                phase=phase,
-                commit=commit,
-                docker_image=docker_image,
-                perf_command=perf_command,
-                model=model,
-                gpu_config=gpu_config,
-                agent_patch=patch,
-                base_commit=None,  # No longer needed - using separate Docker images
-                human_patch=None,  # No longer needed - no reverse-patch
-            )
-            futures[future] = phase
+    # Parse GPU config
+    gpu_cfg = GPU_CONFIGS.get(gpu_config, GPU_CONFIGS["H100:1"])
+    gpu_type = gpu_cfg["gpu"]
+    gpu_count = gpu_cfg["count"]
+    sandbox_timeout = gpu_cfg["timeout"]
 
-        for future in as_completed(futures):
-            phase = futures[future]
+    # Spawn all phases using Modal Functions (proper timeout handling)
+    # spawn() returns immediately with FunctionCall handles
+    print(f"\n[MODAL] Spawning {len(phases)} benchmark phases...")
+    phase_calls: Dict[str, Any] = {}  # phase_name -> FunctionCall
+
+    for phase_name, commit, docker_image, patch in phases:
+        print(f"[{phase_name.upper()}] Spawning managed benchmark...")
+        call = run_phase_managed.spawn(
+            docker_image_tag=docker_image,
+            phase=phase_name,
+            commit=commit,
+            perf_command=perf_command,
+            model=model,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            sandbox_timeout=sandbox_timeout,
+            agent_patch=patch,
+            human_patch=None,
+        )
+        phase_calls[phase_name] = call
+
+    print(f"[MODAL] All phases spawned. Waiting for results (timeout: {sandbox_timeout + 300}s per phase)...")
+
+    # Collect results with timeout
+    # get(timeout=...) provides proper server-side timeout handling
+    phase_results = {}
+    for phase_name, call in phase_calls.items():
+        try:
+            print(f"[{phase_name.upper()}] Waiting for results...")
+            # Extra 300s buffer for sandbox creation overhead
+            phase_result = call.get(timeout=sandbox_timeout + 300)
+            phase_results[phase_name] = phase_result
+            print(f"[{phase_name.upper()}] Completed: {phase_result.get('status')}")
+        except TimeoutError:
+            print(f"[{phase_name.upper()}] TIMEOUT - cancelling...")
             try:
-                phase_result = future.result()
-                phase_results[phase] = phase_result
-                print(f"[{phase.upper()}] Completed: {phase_result.get('status')}")
-            except Exception as e:
-                phase_results[phase] = {"status": "error", "error": str(e), "metrics": {}}
-                print(f"[{phase.upper()}] Failed: {e}")
+                call.cancel()
+            except Exception:
+                pass
+            phase_results[phase_name] = {
+                "status": "error",
+                "error": f"Timed out after {sandbox_timeout + 300}s",
+                "metrics": {},
+                "raw_output": "",
+            }
+        except Exception as e:
+            print(f"[{phase_name.upper()}] Failed: {e}")
+            phase_results[phase_name] = {
+                "status": "error",
+                "error": str(e),
+                "metrics": {},
+                "raw_output": "",
+            }
 
     # Combine results - metrics AND raw outputs
     errors = []
