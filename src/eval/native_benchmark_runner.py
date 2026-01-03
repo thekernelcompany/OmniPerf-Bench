@@ -620,6 +620,7 @@ class NativeBenchmarkRunner:
         output_dir: Path,
         timeout: int = DEFAULT_TIMEOUT,
         use_modal: bool = False,
+        all_modal: bool = False,
     ):
         self.vllm_repo_path = Path(vllm_repo_path).resolve()
         self.sglang_repo_path = Path(sglang_repo_path).resolve()
@@ -627,11 +628,14 @@ class NativeBenchmarkRunner:
         self.output_dir = Path(output_dir).resolve()
         self.timeout = timeout
         self.use_modal = use_modal
+        self.all_modal = all_modal
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.results: List[BenchmarkResult] = []
 
-        if self.use_modal:
+        if self.all_modal:
+            logger.info("Modal cloud GPU execution enabled for ALL benchmarks")
+        elif self.use_modal:
             logger.info("Modal cloud GPU execution enabled for large models")
 
     def get_repo_path(self, repo_name: str) -> Optional[Path]:
@@ -670,7 +674,7 @@ class NativeBenchmarkRunner:
             Tuple of (should_use_modal, gpu_config)
             gpu_config is like "H100:4" or None
         """
-        if not self.use_modal:
+        if not self.use_modal and not self.all_modal:
             return False, None
 
         # Check for explicit tensor parallelism in command
@@ -690,6 +694,10 @@ class NativeBenchmarkRunner:
             for pattern, config in self.LARGE_MODEL_GPU_MAP.items():
                 if pattern.lower() in model.lower():
                     return True, config
+
+        # If --all-modal is set, use Modal for all models with H100:1
+        if self.all_modal:
+            return True, "H100:1"
 
         return False, None
 
@@ -750,7 +758,7 @@ class NativeBenchmarkRunner:
         in a single Modal container for efficiency.
         """
         try:
-            # Import the 3-way benchmark function
+            # Import the Modal benchmark functions
             import importlib.util
             module_path = Path(__file__).parent / "modal_benchmark.py"
             if module_path.exists():
@@ -758,6 +766,8 @@ class NativeBenchmarkRunner:
                 modal_benchmark = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(modal_benchmark)
                 run_3way_modal_benchmark = modal_benchmark.run_3way_modal_benchmark
+                run_3way_modal_benchmark_prebuilt = modal_benchmark.run_3way_modal_benchmark_prebuilt
+                has_prebuilt_image = modal_benchmark.has_prebuilt_image
             else:
                 raise ImportError(f"Modal benchmark module not found at {module_path}")
         except Exception as e:
@@ -781,21 +791,54 @@ class NativeBenchmarkRunner:
             except Exception as e:
                 logger.warning(f"  Could not read agent patch: {e}")
 
-        # Run all 3 benchmarks in single Modal container
+        # Check if pre-built Docker images are available for baseline and human
+        use_prebuilt = False
+        try:
+            baseline_has_prebuilt = has_prebuilt_image(patch.pre_commit)
+            human_has_prebuilt = has_prebuilt_image(instance.commit_hash)
+            use_prebuilt = baseline_has_prebuilt and human_has_prebuilt
+            if use_prebuilt:
+                logger.info(f"  Using pre-built Docker images (faster ~70%)")
+            else:
+                if not baseline_has_prebuilt:
+                    logger.info(f"  No pre-built image for baseline {patch.pre_commit[:8]}")
+                if not human_has_prebuilt:
+                    logger.info(f"  No pre-built image for human {instance.commit_hash[:8]}")
+        except Exception as e:
+            logger.debug(f"  Pre-built image check failed: {e}")
+
+        # Run all 3 benchmarks
         logger.info(f"  Running 3-way benchmark on Modal ({gpu_config})...")
-        logger.info(f"    Baseline: {baseline_wheel.split('/')[-1][:50]}")
-        logger.info(f"    Human: {human_wheel.split('/')[-1][:50]}")
+        if use_prebuilt:
+            logger.info(f"    Baseline: pre-built image ({patch.pre_commit[:12]})")
+            logger.info(f"    Human: pre-built image ({instance.commit_hash[:12]})")
+        else:
+            logger.info(f"    Baseline: {baseline_wheel.split('/')[-1][:50]}")
+            logger.info(f"    Human: {human_wheel.split('/')[-1][:50]}")
         logger.info(f"    Agent patch: {'Yes' if agent_patch else 'No'}")
 
         try:
-            result = run_3way_modal_benchmark(
-                baseline_wheel_url=baseline_wheel,
-                human_wheel_url=human_wheel,
-                agent_patch=agent_patch,
-                perf_command=instance.perf_command,
-                model=model,
-                gpu_config=gpu_config,
-            )
+            if use_prebuilt:
+                # Use pre-built Docker images for faster benchmarks
+                result = run_3way_modal_benchmark_prebuilt(
+                    baseline_commit=patch.pre_commit,
+                    human_commit=instance.commit_hash,
+                    agent_patch=agent_patch,
+                    perf_command=instance.perf_command,
+                    model=model,
+                    gpu_config=gpu_config,
+                )
+            else:
+                # Fall back to wheel-based approach
+                result = run_3way_modal_benchmark(
+                    baseline_wheel_url=baseline_wheel,
+                    human_wheel_url=human_wheel,
+                    agent_patch=agent_patch,
+                    perf_command=instance.perf_command,
+                    model=model,
+                    gpu_config=gpu_config,
+                    base_commit=patch.pre_commit,  # For building from source with C/CUDA patches
+                )
         except Exception as e:
             logger.error(f"Modal execution failed: {e}")
             return BenchmarkResult(
@@ -1661,6 +1704,8 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--use-modal", action="store_true",
                        help="Use Modal cloud GPUs for large models requiring multi-GPU")
+    parser.add_argument("--all-modal", action="store_true",
+                       help="Force ALL benchmarks to use Modal (not just large models)")
 
     args = parser.parse_args()
 
@@ -1677,6 +1722,7 @@ def main():
         output_dir=args.output_dir,
         timeout=args.timeout,
         use_modal=args.use_modal,
+        all_modal=args.all_modal,
     )
 
     report = runner.run_all(
