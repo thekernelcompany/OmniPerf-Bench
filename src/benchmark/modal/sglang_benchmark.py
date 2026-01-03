@@ -143,6 +143,10 @@ orchestrator_image = (
     image=orchestrator_image,
     timeout=DEFAULT_BENCHMARK_TIMEOUT + 600,  # Outer timeout > sandbox timeout
     retries=0,  # Don't retry on timeout
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/results": results_volume,
+    },
 )
 def run_phase_managed(
     docker_image_tag: str,
