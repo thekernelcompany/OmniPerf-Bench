@@ -51,9 +51,24 @@ class HardMetrics:
     """Hard metrics from runtime benchmarks."""
     status: str
     metric_type: str  # "throughput", "ttft", "latency"
+    baseline_value: Optional[float]
     human_value: float
     agent_value: float
     agent_vs_human_pct: float  # positive = agent better
+    human_vs_baseline_pct: Optional[float] = None  # positive = human improved over baseline
+    agent_vs_baseline_pct: Optional[float] = None  # positive = agent improved over baseline
+
+    def baseline_str(self) -> str:
+        """Format baseline value for display."""
+        return f"{self.baseline_value:.1f}" if self.baseline_value is not None else "N/A"
+
+    def human_improvement_str(self) -> str:
+        """Format human improvement over baseline."""
+        return f"{self.human_vs_baseline_pct:+.1f}%" if self.human_vs_baseline_pct is not None else "N/A"
+
+    def agent_improvement_str(self) -> str:
+        """Format agent improvement over baseline."""
+        return f"{self.agent_vs_baseline_pct:+.1f}%" if self.agent_vs_baseline_pct is not None else "N/A"
 
 
 @dataclass
@@ -124,49 +139,70 @@ def load_hard_metrics(dataset_name: str = HARD_METRICS_DATASET) -> Dict[str, Har
 
         # Check for throughput metrics (higher is better) - unified schema uses throughput
         if row.get('agent_throughput') is not None and row.get('human_throughput') is not None:
+            baseline_val = row.get('baseline_throughput')
             human_val = row['human_throughput']
             agent_val = row['agent_throughput']
             # Positive means agent is better
             diff_pct = ((agent_val - human_val) / human_val) * 100 if human_val != 0 else 0
+            # For throughput, higher is better
+            human_vs_baseline = ((human_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+            agent_vs_baseline = ((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
                 status=row['status'],
                 metric_type="throughput",
+                baseline_value=baseline_val,
                 human_value=human_val,
                 agent_value=agent_val,
                 agent_vs_human_pct=diff_pct,
+                human_vs_baseline_pct=human_vs_baseline,
+                agent_vs_baseline_pct=agent_vs_baseline,
             )
             continue
 
         # Check for TTFT metrics (lower is better) - unified schema uses ttft_mean
         if row.get('agent_ttft_mean') is not None and row.get('human_ttft_mean') is not None:
+            baseline_val = row.get('baseline_ttft_mean')
             human_val = row['human_ttft_mean']
             agent_val = row['agent_ttft_mean']
             # Invert so positive means agent is better (lower TTFT)
             diff_pct = -((agent_val - human_val) / human_val) * 100 if human_val != 0 else 0
+            # For TTFT, lower is better, so invert (positive = improved)
+            human_vs_baseline = -((human_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+            agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
                 status=row['status'],
                 metric_type="ttft",
+                baseline_value=baseline_val,
                 human_value=human_val,
                 agent_value=agent_val,
                 agent_vs_human_pct=diff_pct,
+                human_vs_baseline_pct=human_vs_baseline,
+                agent_vs_baseline_pct=agent_vs_baseline,
             )
             continue
 
         # Check for TPOT metrics (lower is better) - unified schema uses tpot_mean
         if row.get('agent_tpot_mean') is not None and row.get('human_tpot_mean') is not None:
+            baseline_val = row.get('baseline_tpot_mean')
             human_val = row['human_tpot_mean']
             agent_val = row['agent_tpot_mean']
             # Invert so positive means agent is better (lower TPOT)
             diff_pct = -((agent_val - human_val) / human_val) * 100 if human_val != 0 else 0
+            # For TPOT, lower is better, so invert (positive = improved)
+            human_vs_baseline = -((human_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+            agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
                 status=row['status'],
                 metric_type="tpot",
+                baseline_value=baseline_val,
                 human_value=human_val,
                 agent_value=agent_val,
                 agent_vs_human_pct=diff_pct,
+                human_vs_baseline_pct=human_vs_baseline,
+                agent_vs_baseline_pct=agent_vs_baseline,
             )
 
     return hard_metrics
@@ -262,15 +298,18 @@ def print_report(
         print(f"  {cat}: {count} ({count/len(soft_metrics)*100:.1f}%)")
 
     # Detailed comparison table
-    print("\n" + "-"*90)
+    print("\n" + "-"*120)
     print("DETAILED COMPARISON (matched commits with hard metrics)")
-    print("-"*90)
-    print(f"{'Commit':<14} {'Metric':<11} {'Human':>10} {'Agent':>10} {'Diff%':>8} {'Soft Prediction':<20} {'Correct?'}")
-    print("-"*90)
+    print("-"*120)
+    print(f"{'Commit':<14} {'Metric':<7} {'Baseline':>10} {'Human':>10} {'Agent':>10} {'H vs B':>8} {'A vs B':>8} {'A vs H':>8} {'Soft Prediction':<20} {'OK?'}")
+    print("-"*120)
 
     for m in sorted(matches, key=lambda x: -x.hard.agent_vs_human_pct):
         correct_symbol = "✓" if m.prediction_correct else "✗"
-        print(f"{m.commit_hash:<14} {m.hard.metric_type:<11} {m.hard.human_value:>10.1f} {m.hard.agent_value:>10.1f} {m.hard.agent_vs_human_pct:>+7.1f}% {m.soft.speedup_likelihood:<20} {correct_symbol}")
+        baseline_str = m.hard.baseline_str()
+        h_vs_b = m.hard.human_improvement_str()
+        a_vs_b = m.hard.agent_improvement_str()
+        print(f"{m.commit_hash:<14} {m.hard.metric_type:<7} {baseline_str:>10} {m.hard.human_value:>10.1f} {m.hard.agent_value:>10.1f} {h_vs_b:>8} {a_vs_b:>8} {m.hard.agent_vs_human_pct:>+7.1f}% {m.soft.speedup_likelihood:<20} {correct_symbol}")
 
     # Prediction accuracy
     print("\n" + "-"*90)
@@ -345,12 +384,15 @@ def generate_markdown_report(
 
 ## Detailed Comparison
 
-| Commit | Metric | Human | Agent | Diff% | Soft Prediction | Tech Overlap | Correct? |
-|--------|--------|-------|-------|-------|-----------------|--------------|----------|
+| Commit | Metric | Baseline | Human | Agent | H vs B | A vs B | A vs H | Soft Prediction | Correct? |
+|--------|--------|----------|-------|-------|--------|--------|--------|-----------------|----------|
 """
     for m in sorted(matches, key=lambda x: -x.hard.agent_vs_human_pct):
         correct_symbol = "✓" if m.prediction_correct else "✗"
-        report += f"| `{m.commit_hash}` | {m.hard.metric_type} | {m.hard.human_value:.1f} | {m.hard.agent_value:.1f} | {m.hard.agent_vs_human_pct:+.1f}% | {m.soft.speedup_likelihood} | {m.soft.technique_overlap} | {correct_symbol} |\n"
+        baseline_str = m.hard.baseline_str()
+        h_vs_b = m.hard.human_improvement_str()
+        a_vs_b = m.hard.agent_improvement_str()
+        report += f"| `{m.commit_hash}` | {m.hard.metric_type} | {baseline_str} | {m.hard.human_value:.1f} | {m.hard.agent_value:.1f} | {h_vs_b} | {a_vs_b} | {m.hard.agent_vs_human_pct:+.1f}% | {m.soft.speedup_likelihood} | {correct_symbol} |\n"
 
     report += f"""
 
@@ -445,8 +487,11 @@ def main():
                         "soft_technique_overlap": m.soft.technique_overlap,
                         "soft_failure_mode": m.soft.failure_mode,
                         "hard_metric_type": m.hard.metric_type,
+                        "hard_baseline_value": m.hard.baseline_value,
                         "hard_human_value": m.hard.human_value,
                         "hard_agent_value": m.hard.agent_value,
+                        "hard_human_vs_baseline_pct": m.hard.human_vs_baseline_pct,
+                        "hard_agent_vs_baseline_pct": m.hard.agent_vs_baseline_pct,
                         "hard_agent_vs_human_pct": m.hard.agent_vs_human_pct,
                         "prediction_correct": m.prediction_correct,
                     }
