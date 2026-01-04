@@ -47,6 +47,67 @@ GSO_MAPPING = {
     "other": ("Mismanage Compute", "Destructive/Runaway"),
 }
 
+# GSO High-Level Category Descriptions
+GSO_HIGH_LEVEL_DESC = {
+    "Localization": (
+        "Agent failed to correctly identify the performance bottleneck. "
+        "Either targeted the wrong component entirely, or made changes that "
+        "were technically valid but addressed a less critical bottleneck than "
+        "what the human identified."
+    ),
+    "Avoid Complexity": (
+        "Agent recognized the bottleneck but avoided the necessary complexity "
+        "to fix it properly. Made superficial or incomplete changes rather than "
+        "implementing the full solution, often staying at a higher abstraction "
+        "level (e.g., Python) when lower-level work (e.g., CUDA/C++) was required."
+    ),
+    "Mismanage Compute": (
+        "Agent wasted computational resources through inefficient exploration, "
+        "over-engineered solutions, or catastrophic failures. Includes cases "
+        "where the agent destroyed/corrupted the repository or spent excessive "
+        "time exploring without producing actionable optimizations."
+    ),
+}
+
+# GSO Sub-Category Descriptions
+GSO_SUBCATEGORY_DESC = {
+    "Misdiagnosed Bottlenecks": (
+        "Agent optimized the wrong component. Failed to identify the actual "
+        "performance bottleneck that the human targeted. May have made valid "
+        "optimizations, but to code that wasn't the critical path."
+    ),
+    "Less Impactful": (
+        "Agent identified a related bottleneck but chose a less impactful "
+        "optimization target. The changes were valid but addressed a secondary "
+        "concern rather than the primary performance issue."
+    ),
+    "Lazy Optimization": (
+        "Agent made superficial changes that avoid the deeper work required. "
+        "Typically involves config tweaks, parameter adjustments, or minor "
+        "refactors when algorithmic or architectural changes were needed."
+    ),
+    "Wrong Abstraction Level": (
+        "Agent worked at the wrong level of the stack. Common pattern: staying "
+        "in Python when the human wrote CUDA kernels, or modifying high-level "
+        "APIs when low-level implementation changes were required."
+    ),
+    "Exploit-Heavy": (
+        "Agent over-engineered the solution with unnecessary complexity. Added "
+        "excessive abstractions, unnecessary features, or convoluted logic when "
+        "a simpler approach would have sufficed."
+    ),
+    "Explore-Heavy": (
+        "Agent spent most of its steps examining the codebase (reading files, "
+        "searching) without converging on actionable optimizations. High "
+        "explore-to-edit ratio (>40% read/search, ≤2 edits) with no success."
+    ),
+    "Destructive/Runaway": (
+        "Catastrophic failure where agent corrupted or destroyed the repository. "
+        "Includes cases of runaway edits, deletion of critical files, or changes "
+        "that made the codebase unbuildable/unusable."
+    ),
+}
+
 
 def detect_explore_heavy(tool_calls: Dict, failure_mode: str) -> bool:
     """
@@ -92,6 +153,11 @@ class SoftMetrics:
     bottleneck_target: str
     approach_comparison: str
     tool_calls: Optional[Dict] = None  # For explore-heavy detection
+    # New fields for success analysis
+    human_techniques: List[str] = field(default_factory=list)
+    agent_techniques: List[str] = field(default_factory=list)
+    task_domain: str = "unknown"
+    key_differences: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -166,6 +232,11 @@ def load_soft_metrics(analysis_dir: Path) -> Dict[str, SoftMetrics]:
                 bottleneck_target=pq.get("bottleneck_target", {}).get("category", "unknown"),
                 approach_comparison=pq.get("approach_comparison", {}).get("category", "unknown"),
                 tool_calls=tool_calls,
+                # New fields for success analysis
+                human_techniques=pq.get("optimization_techniques", {}).get("human_techniques", []),
+                agent_techniques=pq.get("optimization_techniques", {}).get("agent_techniques", []),
+                task_domain=pq.get("task_analysis", {}).get("domain", "unknown"),
+                key_differences=pq.get("observations", {}).get("key_differences", []),
             )
 
         except Exception as e:
@@ -358,6 +429,204 @@ def compute_gso_distribution(soft_metrics: Dict[str, SoftMetrics]) -> Dict:
     }
 
 
+# Success Analysis Categories - Implementation Alignment
+IMPLEMENTATION_ALIGNMENT = {
+    "identical": "Agent produced exactly same code as human",
+    "core_match_extras": "Got main optimization, added extra changes/noise",
+    "alternative_technique": "Same bottleneck, different valid solution method",
+    "alternative_target": "Different bottleneck, still valid optimization",
+}
+
+IMPLEMENTATION_ALIGNMENT_DESC = {
+    "identical": (
+        "Agent produced functionally identical code to the human solution. "
+        "Same optimization technique, same target, same implementation approach. "
+        "This is the ideal outcome - agent perfectly replicated human expertise."
+    ),
+    "core_match_extras": (
+        "Agent correctly identified and implemented the core optimization, but "
+        "included additional unnecessary changes. Common patterns: unrelated CI/CD "
+        "modifications, extra file touches, documentation changes, or redundant "
+        "refactoring alongside the main fix. The signal is correct but noisy."
+    ),
+    "alternative_technique": (
+        "Agent targeted the same performance bottleneck as the human but used a "
+        "different valid optimization technique. Example: human used argmax fast-path, "
+        "agent used single-mask operation - both valid solutions to the same problem. "
+        "Shows agent creativity while maintaining correctness."
+    ),
+    "alternative_target": (
+        "Agent optimized a different bottleneck than the human, but the optimization "
+        "was still valid and produced measurable improvement. Example: human fixed "
+        "benchmark logic, agent optimized serialization. Both are legitimate "
+        "performance wins, just different problem interpretations."
+    ),
+}
+
+# Success Analysis Categories - Agent Behavior Flags
+AGENT_BEHAVIOR_DESC = {
+    "over_engineering": (
+        "Agent applied significantly more optimization techniques than the human "
+        "(2+ additional techniques). Suggests a 'shotgun approach' - trying many "
+        "optimizations hoping one works, rather than surgical precision. May indicate "
+        "uncertainty about which technique will be effective."
+    ),
+    "diff_pollution": (
+        "Agent included unrelated changes in the diff: CI/CD pipeline modifications, "
+        "Dockerfile changes, BuildKite configs, documentation updates, or build scripts. "
+        "These changes don't contribute to the optimization and add noise to the patch."
+    ),
+    "scope_creep": (
+        "Agent modified files beyond the necessary scope. Examples: touching C++/CUDA "
+        "files when human stayed in Python, modifying test files unnecessarily, or "
+        "making changes to unrelated modules. Increases review burden and risk."
+    ),
+    "clean_patch": (
+        "Agent produced a surgical, minimal patch similar to what a human would write. "
+        "No unnecessary changes, focused scope, appropriate technique selection. "
+        "This is the ideal behavior pattern - efficient and precise."
+    ),
+}
+
+
+def classify_success_alignment(sm: SoftMetrics) -> str:
+    """
+    Classify successful commit's implementation alignment.
+
+    Categories:
+    - identical: Agent produced exactly same code (same_approach)
+    - core_match_extras: Got main optimization, added extras (similar_approach)
+    - alternative_technique: Same target, different method (valid_alternative + same_target)
+    - alternative_target: Different bottleneck, still valid (valid_alternative + related/different target)
+    """
+    approach = sm.approach_comparison
+    bottleneck = sm.bottleneck_target
+
+    if approach == "same_approach":
+        return "identical"
+    elif approach == "similar_approach":
+        return "core_match_extras"
+    elif approach == "valid_alternative":
+        if bottleneck == "same_target":
+            return "alternative_technique"
+        else:  # related_target, different_target, other
+            return "alternative_target"
+    return "unknown"
+
+
+def detect_agent_behavior_flags(sm: SoftMetrics) -> List[str]:
+    """
+    Detect agent behavior patterns from techniques and observations.
+
+    Flags (can co-occur):
+    - over_engineering: Agent used significantly more techniques than human
+    - diff_pollution: Included unrelated CI/CD/build changes (detected from key_differences)
+    - scope_creep: Modified extra files (detected from key_differences)
+    - clean_patch: Surgical, minimal changes (no issues detected)
+    """
+    flags = []
+
+    human_set = set(sm.human_techniques)
+    agent_set = set(sm.agent_techniques)
+
+    # Over-engineering: agent used 2+ more techniques than human
+    if len(agent_set) > len(human_set) + 1:
+        flags.append("over_engineering")
+
+    # Check key_differences for pollution/scope creep indicators
+    diff_text = " ".join(sm.key_differences).lower()
+
+    pollution_keywords = ["ci/cd", "buildkite", ".github", "dockerfile", "unrelated",
+                          "documentation", "build script", "thousands of lines"]
+    if any(kw in diff_text for kw in pollution_keywords):
+        flags.append("diff_pollution")
+
+    scope_keywords = ["additional file", "extra file", "modified c++", "cuda kernel",
+                      "modified files", "touched", "beyond"]
+    if any(kw in diff_text for kw in scope_keywords):
+        flags.append("scope_creep")
+
+    # If no issues, it's a clean patch
+    if not flags:
+        flags.append("clean_patch")
+
+    return flags
+
+
+def compute_success_analysis(soft_metrics: Dict[str, SoftMetrics]) -> Dict:
+    """
+    Analyze successful commits: implementation alignment and agent behavior.
+
+    Returns detailed breakdown of how agent succeeded and what patterns emerged.
+    """
+    successes = [sm for sm in soft_metrics.values()
+                 if sm.failure_mode == "not_applicable"]
+
+    if not successes:
+        return {"total_successes": 0}
+
+    # Alignment categories
+    alignment_counts = Counter()
+    # Behavior flags (can stack)
+    behavior_counts = Counter()
+    # Technique counts
+    human_technique_counts = Counter()
+    agent_technique_counts = Counter()
+    # Domain distribution
+    domain_counts = Counter()
+    # Technique match analysis
+    technique_match = {
+        "exact_match": 0,       # Same techniques
+        "agent_superset": 0,    # Agent used all human techniques + more
+        "agent_subset": 0,      # Agent used subset of human techniques
+        "partial_overlap": 0,   # Some overlap
+        "no_overlap": 0,        # Completely different
+    }
+
+    for sm in successes:
+        # Classification
+        alignment = classify_success_alignment(sm)
+        alignment_counts[alignment] += 1
+
+        # Behavior flags
+        flags = detect_agent_behavior_flags(sm)
+        for flag in flags:
+            behavior_counts[flag] += 1
+
+        # Techniques
+        for t in sm.human_techniques:
+            human_technique_counts[t] += 1
+        for t in sm.agent_techniques:
+            agent_technique_counts[t] += 1
+
+        # Domain
+        domain_counts[sm.task_domain] += 1
+
+        # Technique match
+        human_set = set(sm.human_techniques)
+        agent_set = set(sm.agent_techniques)
+        if human_set == agent_set:
+            technique_match["exact_match"] += 1
+        elif human_set <= agent_set and human_set:
+            technique_match["agent_superset"] += 1
+        elif agent_set <= human_set and agent_set:
+            technique_match["agent_subset"] += 1
+        elif human_set & agent_set:
+            technique_match["partial_overlap"] += 1
+        else:
+            technique_match["no_overlap"] += 1
+
+    return {
+        "total_successes": len(successes),
+        "implementation_alignment": dict(alignment_counts.most_common()),
+        "agent_behavior_flags": dict(behavior_counts.most_common()),
+        "human_techniques": dict(human_technique_counts.most_common()),
+        "agent_techniques": dict(agent_technique_counts.most_common()),
+        "task_domains": dict(domain_counts.most_common()),
+        "technique_match": technique_match,
+    }
+
+
 def generate_ascii_bar(count: int, total: int, max_width: int = 20) -> str:
     """Generate ASCII bar chart representation."""
     if total == 0:
@@ -462,6 +731,53 @@ def print_report(
     for subcategory, count in gso_dist["subcategory"].items():
         pct = count / failure_count * 100 if failure_count > 0 else 0
         print(f"  {subcategory:<25} {count:>4} ({pct:>5.1f}%)")
+
+    # Success Analysis
+    print("\n" + "-"*90)
+    print("SUCCESS ANALYSIS (Human vs Agent Techniques)")
+    print("-"*90)
+
+    success_analysis = compute_success_analysis(soft_metrics)
+    total_successes = success_analysis.get("total_successes", 0)
+
+    if total_successes > 0:
+        print(f"\nTotal Successes: {total_successes} ({total_successes/total_runs*100:.1f}% success rate)")
+
+        print(f"\nImplementation Alignment:")
+        for alignment, count in success_analysis["implementation_alignment"].items():
+            pct = count / total_successes * 100
+            bar = generate_ascii_bar(count, total_successes)
+            desc = IMPLEMENTATION_ALIGNMENT.get(alignment, "")
+            print(f"  {alignment:<22} {count:>3} ({pct:>5.1f}%)  {bar}  {desc}")
+
+        print(f"\nAgent Behavior Patterns:")
+        for flag, count in success_analysis["agent_behavior_flags"].items():
+            pct = count / total_successes * 100
+            bar = generate_ascii_bar(count, total_successes)
+            print(f"  {flag:<22} {count:>3} ({pct:>5.1f}%)  {bar}")
+
+        print(f"\nTechnique Distribution:")
+        print(f"  {'Human':<30} {'Agent':<30}")
+        human_techs = list(success_analysis["human_techniques"].items())
+        agent_techs = list(success_analysis["agent_techniques"].items())
+        max_rows = max(len(human_techs), len(agent_techs))
+        for i in range(max_rows):
+            h_str = f"{human_techs[i][0]}: {human_techs[i][1]}" if i < len(human_techs) else ""
+            a_str = f"{agent_techs[i][0]}: {agent_techs[i][1]}" if i < len(agent_techs) else ""
+            print(f"  {h_str:<30} {a_str:<30}")
+
+        print(f"\nTechnique Match (per commit):")
+        for match_type, count in success_analysis["technique_match"].items():
+            if count > 0:
+                pct = count / total_successes * 100
+                print(f"  {match_type:<20} {count:>3} ({pct:>5.1f}%)")
+
+        print(f"\nTask Domains:")
+        for domain, count in success_analysis["task_domains"].items():
+            pct = count / total_successes * 100
+            print(f"  {domain:<15} {count:>3} ({pct:>5.1f}%)")
+    else:
+        print("\n  No successful commits found.")
 
     print("\n" + "="*90)
 
@@ -580,6 +896,112 @@ def generate_markdown_report(
         pct = count / failure_count * 100 if failure_count > 0 else 0
         report += f"| {subcategory} | {count} | {pct:.1f}% |\n"
 
+    # GSO Category Definitions
+    report += """
+
+### Failure Category Definitions
+
+#### High-Level Categories
+
+| Category | Description |
+|----------|-------------|
+"""
+    for cat, desc in GSO_HIGH_LEVEL_DESC.items():
+        report += f"| **{cat}** | {desc} |\n"
+
+    report += """
+
+#### Sub-Category Definitions
+
+| Sub-Category | Description |
+|--------------|-------------|
+"""
+    for subcat, desc in GSO_SUBCATEGORY_DESC.items():
+        report += f"| **{subcat}** | {desc} |\n"
+
+    # Success Analysis
+    success_analysis = compute_success_analysis(soft_metrics)
+    total_successes = success_analysis.get("total_successes", 0)
+
+    if total_successes > 0:
+        report += f"""
+
+## Success Analysis (Human vs Agent)
+
+**Total Successes:** {total_successes} ({total_successes/total_runs*100:.1f}% success rate)
+
+### Implementation Alignment
+
+| Category | Count | % | Description |
+|----------|-------|---|-------------|
+"""
+        for alignment, count in success_analysis["implementation_alignment"].items():
+            pct = count / total_successes * 100
+            desc = IMPLEMENTATION_ALIGNMENT.get(alignment, "")
+            report += f"| {alignment} | {count} | {pct:.1f}% | {desc} |\n"
+
+        report += """
+
+### Agent Behavior Patterns
+
+| Pattern | Count | % |
+|---------|-------|---|
+"""
+        for flag, count in success_analysis["agent_behavior_flags"].items():
+            pct = count / total_successes * 100
+            report += f"| {flag} | {count} | {pct:.1f}% |\n"
+
+        report += """
+
+### Technique Distribution
+
+| Human Techniques | Count | Agent Techniques | Count |
+|------------------|-------|------------------|-------|
+"""
+        human_techs = list(success_analysis["human_techniques"].items())
+        agent_techs = list(success_analysis["agent_techniques"].items())
+        max_rows = max(len(human_techs), len(agent_techs))
+        for i in range(max_rows):
+            h_name = human_techs[i][0] if i < len(human_techs) else ""
+            h_count = human_techs[i][1] if i < len(human_techs) else ""
+            a_name = agent_techs[i][0] if i < len(agent_techs) else ""
+            a_count = agent_techs[i][1] if i < len(agent_techs) else ""
+            report += f"| {h_name} | {h_count} | {a_name} | {a_count} |\n"
+
+        report += """
+
+### Task Domains
+
+| Domain | Count | % |
+|--------|-------|---|
+"""
+        for domain, count in success_analysis["task_domains"].items():
+            pct = count / total_successes * 100
+            report += f"| {domain} | {count} | {pct:.1f}% |\n"
+
+        # Success Category Definitions
+        report += """
+
+### Success Category Definitions
+
+#### Implementation Alignment Categories
+
+| Category | Description |
+|----------|-------------|
+"""
+        for cat, desc in IMPLEMENTATION_ALIGNMENT_DESC.items():
+            report += f"| **{cat}** | {desc} |\n"
+
+        report += """
+
+#### Agent Behavior Patterns
+
+| Pattern | Description |
+|---------|-------------|
+"""
+        for pattern, desc in AGENT_BEHAVIOR_DESC.items():
+            report += f"| **{pattern}** | {desc} |\n"
+
     with open(output_path, 'w') as f:
         f.write(report)
 
@@ -627,6 +1049,7 @@ def main():
         if args.format in ["json", "all"]:
             json_path = args.output_dir / f"soft_hard_comparison{args.output_suffix}.json"
             gso_dist = compute_gso_distribution(soft_metrics)
+            success_analysis = compute_success_analysis(soft_metrics)
             output = {
                 "generated_at": datetime.now().isoformat(),
                 "soft_metrics_count": len(soft_metrics),
@@ -634,6 +1057,7 @@ def main():
                 "matched_count": len(matches),
                 "prediction_accuracy": sum(1 for m in matches if m.prediction_correct) / len(matches) if matches else 0,
                 "gso_distribution": gso_dist,
+                "success_analysis": success_analysis,
                 "matches": [
                     {
                         "commit": m.commit_hash,
