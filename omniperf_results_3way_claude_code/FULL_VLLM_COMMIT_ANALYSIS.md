@@ -3,12 +3,18 @@
 **Generated**: 2026-01-05
 **Total Commits**: 94
 **Successfully Benchmarked**: 24 (26%)
+**With Full 3-Way Agent Metrics**: 20 (21%)
 
 ---
 
 ## Executive Summary
 
-**Critical Finding**: Only 26% of commits successfully ran benchmarks. The remaining 74% failed due to:
+**Success Criteria**: A commit is "successful" when it completes a 3-way benchmark comparing:
+- **Baseline**: Parent commit (before optimization)
+- **Human**: The actual PR commit (ground truth optimization)
+- **Agent**: Claude Code's attempted optimization
+
+**Critical Finding**: Only 26% of commits ran benchmarks successfully. Of those, **20 commits (83%) have complete 3-way metrics including agent results**. The remaining 74% failed due to:
 
 | Root Cause | Count | Fixable? | Action Required |
 |------------|-------|----------|-----------------|
