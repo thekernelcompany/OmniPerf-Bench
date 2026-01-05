@@ -43,9 +43,11 @@ base_image = (
     )
     .pip_install(
         "torch==2.4.0",
-        "transformers>=4.40.0",
+        # Pin transformers to <4.46.0 to avoid aimv2 config conflict with older vLLM wheels
+        # (transformers 4.46+ registers aimv2, but vLLM also tries to register it)
+        "transformers>=4.40.0,<4.46.0",
         "huggingface_hub>=0.23.0",
-        "tokenizers>=0.19.0",
+        "tokenizers>=0.20.0",  # Need 0.20+ for DecodeStream used by newer vLLM
         "accelerate>=0.30.0",
         "numpy<2.0",
         "requests",
@@ -74,10 +76,12 @@ base_image = (
         "rm cmake-3.28.3-linux-x86_64.tar.gz",
         # Clone vLLM repo for benchmark scripts
         "git clone --depth 1 https://github.com/vllm-project/vllm.git /opt/vllm-benchmarks",
+        # CACHE BUST: Change this line to force image rebuild
+        "echo 'CACHE_BUST=20260103_v34_server_log_capture' > /tmp/cache_bust.txt",
     ])
     .env({
         # Cache bust - change to force image rebuild
-        "MODAL_CACHE_BUST": "20260102_v21_inplace_build_with_lock",
+        "MODAL_CACHE_BUST": "20260103_v34_server_log_capture",
         "HF_HOME": "/root/.cache/huggingface",
         "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
         # CUDA environment for compilation
@@ -770,9 +774,11 @@ def get_prebuilt_image(commit_hash: str) -> Optional[modal.Image]:
         .run_commands([
             # Clone vLLM repo for benchmark scripts (after Modal setup)
             "git clone --depth 1 https://github.com/vllm-project/vllm.git /opt/vllm-benchmarks || true",
+            # CACHE BUST: Change this line to force image rebuild
+            "echo 'CACHE_BUST=20260103_v34_server_log_capture' > /tmp/cache_bust.txt",
         ])
         .env({
-            "MODAL_CACHE_BUST": "20260102_v21_inplace_build_with_lock",
+            "MODAL_CACHE_BUST": "20260103_v34_server_log_capture",
             "HF_HOME": "/root/.cache/huggingface",
             "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
             # Also set via .env() for runtime (belt and suspenders)
@@ -1177,6 +1183,160 @@ def vllm_version_supports_serving(version: str) -> bool:
         return False
 
 
+# ==============================================================================
+# COMMIT-SPECIFIC DEPENDENCY MAP
+# ==============================================================================
+# Some commits have specific dependency requirements due to conflicts:
+# - aimv2 conflict: vLLM 0.8.x tries to register aimv2 but transformers>=4.46.0 already has it
+# - qwen2_5_vl: Newer models need transformers>=4.46.0
+#
+# Map format: commit_prefix -> {"transformers": "spec", "reason": "explanation"}
+# ==============================================================================
+COMMIT_DEPENDENCY_MAP = {
+    # vLLM 0.8.x commits with aimv2 conflict - need transformers<4.46.0
+    "3cd91dc9": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict with vLLM 0.8.5"},
+    "3476ed08": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "35fad35a": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "3092375e": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "3a243095": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "2f192835": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "2deb029d": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "2a052011": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "296f927f": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+    "379da6dc": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict"},
+
+    # Baseline commits that may also have aimv2 issues
+    "64172a97": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "54600709": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "95baec82": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "ebce310b": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "029c71de": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "36fb68f9": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "f1c85201": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+    "733e7c9e": {"transformers": "transformers>=4.40.0,<4.46.0", "reason": "aimv2 conflict baseline"},
+
+    # Commits that need newer transformers for model support
+    "67da5720": {"transformers": "transformers>=4.46.0", "reason": "Qwen2.5-VL model support"},
+    "5c04bb8b": {"transformers": "transformers>=4.46.0", "reason": "Qwen2.5-VL model support"},
+}
+
+
+def get_commit_dependency(commit_hash: str) -> Optional[Dict[str, str]]:
+    """Get dependency requirements for a specific commit.
+
+    Args:
+        commit_hash: Full or short commit hash
+
+    Returns:
+        Dict with 'transformers' and 'reason' if specific deps needed, None otherwise
+    """
+    if not commit_hash:
+        return None
+    # Check both short (8 char) and full hash
+    short_hash = commit_hash[:8]
+    for prefix, deps in COMMIT_DEPENDENCY_MAP.items():
+        if commit_hash.startswith(prefix) or short_hash.startswith(prefix):
+            return deps
+    return None
+
+
+def extract_commit_from_wheel_url(wheel_url: str) -> Optional[str]:
+    """Extract commit hash from wheel URL.
+
+    Example:
+        https://vllm-wheels.s3.us-west-2.amazonaws.com/abc123def/vllm-1.0.0.dev-...
+        -> abc123def
+    """
+    import re
+    # Match commit hash between slashes: /commit_hash/
+    match = re.search(r'/([a-f0-9]{7,40})/', wheel_url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def setup_transformers_version(commit_hash: Optional[str] = None) -> bool:
+    """
+    Set the correct transformers version based on vLLM version after wheel install.
+
+    This function must be called AFTER vLLM wheel is installed (from URL or cache).
+    It detects the installed vLLM version and installs the correct transformers version
+    to avoid conflicts like the aimv2 registration error.
+
+    Args:
+        commit_hash: Optional commit hash for commit-specific dependency lookup
+
+    Returns:
+        True if transformers was set successfully, False otherwise
+    """
+    import subprocess
+    import re
+    import os
+
+    env = os.environ.copy()
+    env["UV_SKIP_WHEEL_FILENAME_CHECK"] = "1"
+
+    # Get installed vLLM version
+    version_result = subprocess.run(
+        ["python", "-c", "import sys; sys.stderr = sys.stdout; import vllm; print('VLLM_VERSION:' + vllm.__version__)"],
+        capture_output=True,
+        text=True,
+    )
+    vllm_version_raw = version_result.stdout.strip()
+
+    # Extract version from output (handles INFO logs mixed in)
+    version_marker_match = re.search(r'VLLM_VERSION:(\S+)', vllm_version_raw)
+    if version_marker_match:
+        vllm_version = version_marker_match.group(1)
+    else:
+        version_pattern_match = re.search(r'(\d+\.\d+\.\d+)', vllm_version_raw)
+        vllm_version = version_pattern_match.group(1) if version_pattern_match else "unknown"
+
+    print(f"[TRANSFORMERS SETUP] Detected vLLM version: {vllm_version}")
+
+    # PRIORITY 1: Check commit-specific dependency map
+    commit_deps = get_commit_dependency(commit_hash) if commit_hash else None
+    if commit_deps:
+        transformers_spec = commit_deps["transformers"]
+        reason = commit_deps["reason"]
+        print(f"[TRANSFORMERS SETUP] Using commit-specific: {transformers_spec} (reason: {reason})")
+    else:
+        # PRIORITY 2: Version-based logic
+        version_match = re.match(r'(\d+)\.(\d+)', vllm_version)
+        if version_match:
+            major, minor = int(version_match.group(1)), int(version_match.group(2))
+            vllm_version_tuple = (major, minor)
+        else:
+            vllm_version_tuple = (0, 8)  # Default to older transformers (safer)
+            print(f"[TRANSFORMERS SETUP] Could not parse version, defaulting to older transformers")
+
+        # vLLM < 0.9: Use transformers<4.46.0 (avoids aimv2 conflict)
+        # vLLM >= 0.9: Use transformers>=4.46.0
+        if vllm_version_tuple >= (0, 9):
+            transformers_spec = "transformers>=4.46.0"
+            print(f"[TRANSFORMERS SETUP] vLLM {vllm_version} >= 0.9, using {transformers_spec}")
+        else:
+            transformers_spec = "transformers>=4.40.0,<4.46.0"
+            print(f"[TRANSFORMERS SETUP] vLLM {vllm_version} < 0.9, using {transformers_spec} (avoids aimv2)")
+
+    print(f"[TRANSFORMERS SETUP] Installing {transformers_spec} and tokenizers>=0.20.0")
+    tf_result = subprocess.run(
+        ["uv", "pip", "install", "--system", "--force-reinstall",
+         transformers_spec, "tokenizers>=0.20.0"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+
+    if tf_result.returncode != 0:
+        print(f"[TRANSFORMERS SETUP] WARNING: Failed to install: {tf_result.stderr[:200]}")
+        return False
+
+    print(f"[TRANSFORMERS SETUP] SUCCESS: {transformers_spec} installed")
+    return True
+
+
 def install_wheel(wheel_url: str) -> Tuple[bool, str]:
     """Install a vLLM wheel from URL."""
     import os
@@ -1217,35 +1377,80 @@ def install_wheel(wheel_url: str) -> Tuple[bool, str]:
         if result.returncode != 0:
             return False, f"Failed to install wheel: {result.stderr}"
 
-        # Verify installation
+        # Get vLLM version to determine transformers version
+        # Use a more robust method that filters INFO logs
         version_result = subprocess.run(
-            ["python", "-c", "import vllm; print(vllm.__version__)"],
+            ["python", "-c", "import sys; sys.stderr = sys.stdout; import vllm; print('VLLM_VERSION:' + vllm.__version__)"],
             capture_output=True,
             text=True,
         )
+        vllm_version_raw = version_result.stdout.strip()
+        print(f"[DEBUG] Raw version output: {vllm_version_raw[-200:]}")  # Last 200 chars
 
-        return True, version_result.stdout.strip()
+        # Extract version from output (handles INFO logs mixed in)
+        import re
+        # Look for our marker or a version pattern anywhere in output
+        version_marker_match = re.search(r'VLLM_VERSION:(\S+)', vllm_version_raw)
+        if version_marker_match:
+            vllm_version = version_marker_match.group(1)
+        else:
+            # Fallback: look for version pattern like 0.7.3 or 0.10.0
+            version_pattern_match = re.search(r'(\d+\.\d+\.\d+)', vllm_version_raw)
+            vllm_version = version_pattern_match.group(1) if version_pattern_match else "unknown"
+
+        print(f"[DEBUG] Detected vLLM version: {vllm_version}")
+
+        # Extract commit hash from wheel URL for commit-specific dependency lookup
+        commit_hash = extract_commit_from_wheel_url(wheel_url)
+        print(f"[DEBUG] Extracted commit hash from URL: {commit_hash}")
+
+        # PRIORITY 1: Check commit-specific dependency map
+        commit_deps = get_commit_dependency(commit_hash) if commit_hash else None
+        if commit_deps:
+            transformers_spec = commit_deps["transformers"]
+            reason = commit_deps["reason"]
+            print(f"[COMMIT_MAP] Using commit-specific transformers: {transformers_spec} (reason: {reason})")
+        else:
+            # PRIORITY 2: Fall back to version-based logic
+            # Parse major.minor version for comparison
+            version_match = re.match(r'(\d+)\.(\d+)', vllm_version)
+            if version_match:
+                major, minor = int(version_match.group(1)), int(version_match.group(2))
+                vllm_version_tuple = (major, minor)
+            else:
+                # Default to older transformers (safer - avoids aimv2 conflict)
+                vllm_version_tuple = (0, 8)
+                print(f"[DEBUG] Could not parse version '{vllm_version}', defaulting to (0,8) for older transformers (safe)")
+
+            # Version-based transformers selection
+            # - vLLM < 0.9: Use transformers<4.46.0 (avoids aimv2 conflict - vLLM 0.6.x-0.8.x register aimv2)
+            # - vLLM >= 0.9: Use latest transformers (aimv2 registration fixed with exist_ok=True)
+            if vllm_version_tuple >= (0, 9):
+                transformers_spec = "transformers>=4.46.0"
+                print(f"[DEBUG] vLLM {vllm_version} >= 0.9, using {transformers_spec}")
+            else:
+                transformers_spec = "transformers>=4.40.0,<4.46.0"
+                print(f"[DEBUG] vLLM {vllm_version} < 0.9, using {transformers_spec} (avoids aimv2 conflict)")
+
+        print(f"[DEBUG] Force reinstalling {transformers_spec} and tokenizers>=0.20.0")
+        tf_result = subprocess.run(
+            ["uv", "pip", "install", "--system", "--force-reinstall",
+             transformers_spec, "tokenizers>=0.20.0"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        if tf_result.returncode != 0:
+            print(f"[WARN] Failed to reinstall transformers/tokenizers: {tf_result.stderr[:200]}")
+
+        return True, vllm_version
     except Exception as e:
         return False, str(e)
 
 
 # Wheel URL pattern for vLLM S3 bucket
 VLLM_WHEEL_URL_PATTERN = "https://vllm-wheels.s3.us-west-2.amazonaws.com/{commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
-
-
-def extract_commit_from_wheel_url(wheel_url: str) -> Optional[str]:
-    """Extract commit hash from wheel URL.
-
-    Example:
-        https://vllm-wheels.s3.us-west-2.amazonaws.com/abc123def/vllm-1.0.0.dev-...
-        -> abc123def
-    """
-    import re
-    # Match commit hash between slashes: /commit_hash/
-    match = re.search(r'/([a-f0-9]{7,40})/', wheel_url)
-    if match:
-        return match.group(1)
-    return None
 
 
 def check_wheel_url_exists(commit: str) -> bool:
@@ -1665,6 +1870,10 @@ def install_from_cached_wheel(commit_hash: str, cache_dir: str = "/cache") -> Tu
 
     version = version_result.stdout.strip()
     print(f"[WHEEL INSTALL] SUCCESS: vLLM {version} installed from cached wheel")
+
+    # Set correct transformers version based on vLLM version (avoids aimv2 conflict)
+    setup_transformers_version(commit_hash)
+
     return True, version
 
 
@@ -2425,11 +2634,17 @@ def run_benchmark_single_gpu(
 
         if benchmark_type == "serving":
             # Start server
-            server = start_server(model, port=29000, tensor_parallel=1)
+            server = start_server(model, port=29000, tensor_parallel=1, log_file="/tmp/vllm_server.log")
 
             try:
                 if not wait_for_server(port=29000, timeout=3600):
-                    result["error"] = "Server failed to start within timeout"
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed to start within timeout. Logs: {server_logs}"
                     return result
 
                 # Run built-in benchmark
@@ -2511,11 +2726,17 @@ def run_benchmark_4gpu(
         result["vllm_version"] = version
 
         if benchmark_type == "serving":
-            server = start_server(model, port=29000, tensor_parallel=4)
+            server = start_server(model, port=29000, tensor_parallel=4, log_file="/tmp/vllm_server.log")
 
             try:
                 if not wait_for_server(port=29000, timeout=900):
-                    result["error"] = "Server failed to start within timeout"
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed to start within timeout. Logs: {server_logs}"
                     return result
 
                 # Run built-in benchmark
@@ -2600,11 +2821,17 @@ def run_benchmark_8gpu(
         result["vllm_version"] = version
 
         if benchmark_type == "serving":
-            server = start_server(model, port=29000, tensor_parallel=8)
+            server = start_server(model, port=29000, tensor_parallel=8, log_file="/tmp/vllm_server.log")
 
             try:
                 if not wait_for_server(port=29000, timeout=3600):
-                    result["error"] = "Server failed to start within timeout (check Modal dashboard logs for details)"
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed to start within timeout. Logs: {server_logs}"
                     return result
 
                 # Run built-in benchmark
@@ -3012,10 +3239,16 @@ def run_3way_benchmark_4gpu(
         """Run benchmark (serving or standalone) for a phase."""
         if needs_server:
             print(f"  Starting server for {phase_name} benchmark...")
-            server = start_server(model, port=29000, tensor_parallel=tensor_parallel)
+            server = start_server(model, port=29000, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
             try:
                 if not wait_for_server(port=29000, timeout=3600):
-                    raise RuntimeError(f"{phase_name} server failed to start")
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    raise RuntimeError(f"{phase_name} server failed to start. Logs: {server_logs}")
                 print(f"  Running {phase_name} serving benchmark...")
                 return run_perf_command(perf_command, model, port=29000, commit=commit_for_scripts)
             finally:
@@ -3184,10 +3417,16 @@ def run_3way_benchmark_2gpu(
         """Run benchmark (serving or standalone) for a phase."""
         if needs_server:
             print(f"  Starting server for {phase_name} benchmark...")
-            server = start_server(model, port=29000, tensor_parallel=tensor_parallel)
+            server = start_server(model, port=29000, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
             try:
                 if not wait_for_server(port=29000, timeout=3600):
-                    raise RuntimeError(f"{phase_name} server failed to start")
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    raise RuntimeError(f"{phase_name} server failed to start. Logs: {server_logs}")
                 print(f"  Running {phase_name} serving benchmark...")
                 return run_perf_command(perf_command, model, port=29000, commit=commit_for_scripts)
             finally:
@@ -3320,10 +3559,16 @@ def run_3way_benchmark_8gpu(
         """Run benchmark (serving or standalone) for a phase."""
         if needs_server:
             print(f"  Starting server for {phase_name} benchmark...")
-            server = start_server(model, port=29000, tensor_parallel=tensor_parallel)
+            server = start_server(model, port=29000, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
             try:
                 if not wait_for_server(port=29000, timeout=3600):
-                    raise RuntimeError(f"{phase_name} server failed to start")
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    raise RuntimeError(f"{phase_name} server failed to start. Logs: {server_logs}")
                 print(f"  Running {phase_name} serving benchmark...")
                 return run_perf_command(perf_command, model, port=29000, commit=commit_for_scripts)
             finally:
@@ -3944,6 +4189,472 @@ def ensure_vllm_build_cached(commit_hash: str, force_build_dir: bool = False) ->
         }
 
 
+# =============================================================================
+# PARALLEL BENCHMARK INFRASTRUCTURE (v3)
+# =============================================================================
+# Instead of running baseline → human → agent sequentially on ONE container,
+# we spawn 3 PARALLEL containers, each running ONE benchmark.
+# This cuts total benchmark time from ~30min to ~12min (3x speedup).
+# =============================================================================
+
+@app.function(
+    image=base_image,
+    gpu="H100",  # Single H100
+    timeout=7200,  # 2 hours per phase
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/cache": build_cache,
+    },
+)
+def run_single_phase_1gpu(
+    phase: str,  # "baseline", "human", or "agent"
+    wheel_url: Optional[str],
+    wheel_volume_path: Optional[str],
+    perf_command: str,
+    model: str,
+    commit: Optional[str] = None,
+    agent_patch: Optional[str] = None,  # Only for agent phase
+) -> Dict[str, Any]:
+    """Run a SINGLE benchmark phase on its own container.
+
+    This enables parallel execution: spawn 3 of these simultaneously.
+
+    Args:
+        phase: Which phase to run ("baseline", "human", or "agent")
+        wheel_url: S3 wheel URL (if available)
+        wheel_volume_path: Path to wheel in Modal volume (if built from source)
+        perf_command: Benchmark command
+        model: Model name
+        commit: Commit hash for benchmark script compatibility
+        agent_patch: Patch to apply (only for agent phase with Python-only patches)
+    """
+    result = {
+        "phase": phase,
+        "status": "error",
+        "metrics": {},
+        "version": None,
+        "error": None,
+        "duration_s": 0,
+    }
+
+    start_time = time.time()
+    tensor_parallel = 1
+    port = 18000 + hash(phase) % 1000  # Unique port per phase
+
+    # Initial cleanup
+    print(f"[{phase.upper()}] Starting single-phase benchmark...")
+    try:
+        subprocess.run(["pkill", "-9", "-f", "vllm"], capture_output=True, timeout=5)
+        subprocess.run(["fuser", "-k", "-9", f"{port}/tcp"], capture_output=True, timeout=5)
+        time.sleep(2)
+    except:
+        pass
+
+    # Determine wheel source
+    wheel_source = None
+    if wheel_url:
+        wheel_source = wheel_url
+        print(f"[{phase.upper()}] Using S3 wheel: {wheel_url[:80]}...")
+    elif wheel_volume_path:
+        wheel_source = wheel_volume_path
+        print(f"[{phase.upper()}] Using volume wheel: {wheel_volume_path}")
+    else:
+        result["error"] = f"No wheel source provided for {phase}"
+        return result
+
+    # Install wheel
+    print(f"[{phase.upper()}] Installing wheel...")
+    success, version = install_wheel(wheel_source)
+    if not success:
+        result["error"] = f"Wheel install failed: {version}"
+        result["duration_s"] = time.time() - start_time
+        return result
+
+    result["version"] = version
+    print(f"[{phase.upper()}] Installed vLLM {version}")
+
+    # For agent phase with Python-only patch, apply it
+    if phase == "agent" and agent_patch:
+        print(f"[{phase.upper()}] Applying Python-only agent patch...")
+        patch_success, patch_msg = apply_patch_to_vllm(agent_patch)
+        if not patch_success:
+            result["error"] = f"Patch apply failed: {patch_msg}"
+            result["duration_s"] = time.time() - start_time
+            return result
+
+    # Run benchmark
+    needs_server = is_serving_benchmark(perf_command)
+    print(f"[{phase.upper()}] Benchmark mode: {'serving' if needs_server else 'standalone'}")
+
+    try:
+        if needs_server:
+            print(f"[{phase.upper()}] Starting vLLM server on port {port}...")
+            server = start_server(model, port=port, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
+            try:
+                if not wait_for_server(port=port, timeout=3600):
+                    # Capture server logs
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed to start. Logs: {server_logs}"
+                    result["duration_s"] = time.time() - start_time
+                    return result
+
+                print(f"[{phase.upper()}] Running serving benchmark...")
+                output, metrics = run_perf_command(perf_command, model, port=port, commit=commit)
+            finally:
+                stop_server(server)
+        else:
+            print(f"[{phase.upper()}] Running standalone benchmark...")
+            output, metrics = run_standalone_benchmark(perf_command, model, tensor_parallel, commit=commit)
+
+        result["metrics"] = metrics
+        if metrics:
+            result["status"] = "success"
+            print(f"[{phase.upper()}] SUCCESS: {metrics}")
+        else:
+            output_tail = output[-2000:] if output else "No output captured"
+            result["error"] = f"Benchmark produced no metrics. Output tail: {output_tail}"
+            result["status"] = "no_metrics"
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[{phase.upper()}] Exception: {e}")
+
+    result["duration_s"] = time.time() - start_time
+    model_cache.commit()
+    return result
+
+
+@app.function(
+    image=base_image,
+    gpu="H100:2",
+    timeout=7200,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/cache": build_cache,
+    },
+)
+def run_single_phase_2gpu(
+    phase: str,
+    wheel_url: Optional[str],
+    wheel_volume_path: Optional[str],
+    perf_command: str,
+    model: str,
+    commit: Optional[str] = None,
+    agent_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run single benchmark phase on 2x H100 GPUs."""
+    # Same logic as 1gpu but with tensor_parallel=2
+    result = {
+        "phase": phase,
+        "status": "error",
+        "metrics": {},
+        "version": None,
+        "error": None,
+        "duration_s": 0,
+    }
+
+    start_time = time.time()
+    tensor_parallel = 2
+    port = 18000 + hash(phase) % 1000
+
+    print(f"[{phase.upper()}] Starting single-phase benchmark (2 GPU)...")
+    try:
+        subprocess.run(["pkill", "-9", "-f", "vllm"], capture_output=True, timeout=5)
+        subprocess.run(["fuser", "-k", "-9", f"{port}/tcp"], capture_output=True, timeout=5)
+        time.sleep(2)
+    except:
+        pass
+
+    wheel_source = wheel_url or wheel_volume_path
+    if not wheel_source:
+        result["error"] = f"No wheel source for {phase}"
+        return result
+
+    print(f"[{phase.upper()}] Installing wheel...")
+    success, version = install_wheel(wheel_source)
+    if not success:
+        result["error"] = f"Wheel install failed: {version}"
+        result["duration_s"] = time.time() - start_time
+        return result
+
+    result["version"] = version
+
+    if phase == "agent" and agent_patch:
+        patch_success, patch_msg = apply_patch_to_vllm(agent_patch)
+        if not patch_success:
+            result["error"] = f"Patch failed: {patch_msg}"
+            result["duration_s"] = time.time() - start_time
+            return result
+
+    needs_server = is_serving_benchmark(perf_command)
+
+    try:
+        if needs_server:
+            server = start_server(model, port=port, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
+            try:
+                if not wait_for_server(port=port, timeout=3600):
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed to start. Logs: {server_logs}"
+                    return result
+                output, metrics = run_perf_command(perf_command, model, port=port, commit=commit)
+            finally:
+                stop_server(server)
+        else:
+            output, metrics = run_standalone_benchmark(perf_command, model, tensor_parallel, commit=commit)
+
+        result["metrics"] = metrics
+        if metrics:
+            result["status"] = "success"
+        else:
+            output_tail = output[-2000:] if output else "No output captured"
+            result["error"] = f"No metrics. Output tail: {output_tail}"
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    result["duration_s"] = time.time() - start_time
+    model_cache.commit()
+    return result
+
+
+@app.function(
+    image=base_image,
+    gpu="H100:4",
+    timeout=7200,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/cache": build_cache,
+    },
+)
+def run_single_phase_4gpu(
+    phase: str,
+    wheel_url: Optional[str],
+    wheel_volume_path: Optional[str],
+    perf_command: str,
+    model: str,
+    commit: Optional[str] = None,
+    agent_patch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run single benchmark phase on 4x H100 GPUs."""
+    result = {"phase": phase, "status": "error", "metrics": {}, "version": None, "error": None, "duration_s": 0}
+    start_time = time.time()
+    tensor_parallel = 4
+    port = 18000 + hash(phase) % 1000
+
+    print(f"[{phase.upper()}] Starting single-phase benchmark (4 GPU)...")
+    try:
+        subprocess.run(["pkill", "-9", "-f", "vllm"], capture_output=True, timeout=5)
+        time.sleep(2)
+    except:
+        pass
+
+    wheel_source = wheel_url or wheel_volume_path
+    if not wheel_source:
+        result["error"] = f"No wheel source"
+        return result
+
+    success, version = install_wheel(wheel_source)
+    if not success:
+        result["error"] = f"Wheel install failed: {version}"
+        result["duration_s"] = time.time() - start_time
+        return result
+    result["version"] = version
+
+    if phase == "agent" and agent_patch:
+        patch_success, _ = apply_patch_to_vllm(agent_patch)
+        if not patch_success:
+            result["error"] = "Patch failed"
+            result["duration_s"] = time.time() - start_time
+            return result
+
+    needs_server = is_serving_benchmark(perf_command)
+    try:
+        if needs_server:
+            server = start_server(model, port=port, tensor_parallel=tensor_parallel, log_file="/tmp/vllm_server.log")
+            try:
+                if not wait_for_server(port=port, timeout=3600):
+                    # Capture server logs for debugging
+                    try:
+                        with open("/tmp/vllm_server.log", "r") as f:
+                            server_logs = f.read()[-5000:]
+                    except:
+                        server_logs = "No server logs available"
+                    result["error"] = f"Server failed. Logs: {server_logs}"
+                    return result
+                _, metrics = run_perf_command(perf_command, model, port=port, commit=commit)
+            finally:
+                stop_server(server)
+        else:
+            _, metrics = run_standalone_benchmark(perf_command, model, tensor_parallel, commit=commit)
+        result["metrics"] = metrics
+        result["status"] = "success" if metrics else "no_metrics"
+    except Exception as e:
+        result["error"] = str(e)
+
+    result["duration_s"] = time.time() - start_time
+    model_cache.commit()
+    return result
+
+
+def run_3way_parallel_benchmark(
+    baseline_wheel_url: Optional[str],
+    human_wheel_url: Optional[str],
+    agent_patch: Optional[str],
+    perf_command: str,
+    model: str,
+    gpu_config: str,
+    base_commit: Optional[str] = None,
+    human_commit: Optional[str] = None,
+    baseline_volume_path: Optional[str] = None,
+    human_volume_path: Optional[str] = None,
+    agent_volume_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run 3-way benchmark with PARALLEL execution on separate containers.
+
+    Instead of sequential baseline → human → agent on one container (~30min),
+    this spawns 3 containers simultaneously (~12min total, 3x faster).
+
+    Args:
+        baseline_wheel_url: S3 URL for baseline wheel
+        human_wheel_url: S3 URL for human wheel
+        agent_patch: Agent patch (for Python-only patches applied at runtime)
+        perf_command: Benchmark command
+        model: Model name
+        gpu_config: GPU config (H100:1, H100:2, H100:4)
+        base_commit: Baseline commit hash
+        human_commit: Human commit hash
+        baseline_volume_path: Path to baseline wheel in volume (if built from source)
+        human_volume_path: Path to human wheel in volume (if built from source)
+        agent_volume_path: Path to pre-built agent wheel in volume
+    """
+    print(f"[PARALLEL] Starting 3-way parallel benchmark with {gpu_config}...")
+    start_time = time.time()
+
+    # Select the right GPU function
+    if gpu_config == "H100:4":
+        fn_name = "run_single_phase_4gpu"
+    elif gpu_config == "H100:2":
+        fn_name = "run_single_phase_2gpu"
+    else:
+        fn_name = "run_single_phase_1gpu"
+
+    fn = modal.Function.from_name("omniperf-benchmark", fn_name)
+
+    # Spawn all phases in parallel
+    print(f"[PARALLEL] Spawning baseline, human" + (", agent" if agent_patch or agent_volume_path else "") + " in parallel...")
+
+    handles = {}
+
+    # Baseline
+    handles["baseline"] = fn.spawn(
+        phase="baseline",
+        wheel_url=baseline_wheel_url,
+        wheel_volume_path=baseline_volume_path,
+        perf_command=perf_command,
+        model=model,
+        commit=base_commit,
+        agent_patch=None,
+    )
+
+    # Human
+    handles["human"] = fn.spawn(
+        phase="human",
+        wheel_url=human_wheel_url,
+        wheel_volume_path=human_volume_path,
+        perf_command=perf_command,
+        model=model,
+        commit=human_commit,
+        agent_patch=None,
+    )
+
+    # Agent (if we have a patch or pre-built wheel)
+    if agent_patch or agent_volume_path:
+        # For agent, we either use pre-built wheel OR apply patch to baseline
+        handles["agent"] = fn.spawn(
+            phase="agent",
+            wheel_url=baseline_wheel_url if not agent_volume_path else None,  # Use baseline wheel if no pre-built
+            wheel_volume_path=agent_volume_path,
+            perf_command=perf_command,
+            model=model,
+            commit=base_commit,
+            agent_patch=agent_patch if not agent_volume_path else None,  # Apply patch if no pre-built wheel
+        )
+
+    # Collect results
+    print(f"[PARALLEL] Waiting for all phases to complete...")
+    results = {}
+    for phase, handle in handles.items():
+        print(f"[PARALLEL] Waiting for {phase}...")
+        results[phase] = handle.get()
+        print(f"[PARALLEL] {phase} completed: status={results[phase].get('status')}")
+
+    # Combine into standard result format
+    combined = {
+        "status": "error",
+        "gpu_config": gpu_config,
+        "execution_mode": "parallel",
+        "baseline_metrics": results.get("baseline", {}).get("metrics", {}),
+        "human_metrics": results.get("human", {}).get("metrics", {}),
+        "agent_metrics": results.get("agent", {}).get("metrics") if "agent" in results else None,
+        "human_improvement": {},
+        "agent_improvement": None,
+        "agent_vs_human": None,
+        "error": None,
+        "duration_s": time.time() - start_time,
+        "phase_durations": {p: r.get("duration_s", 0) for p, r in results.items()},
+        "perf_command": perf_command,
+    }
+
+    # Check for errors
+    errors = []
+    for phase, result in results.items():
+        if result.get("status") != "success":
+            errors.append(f"{phase}: {result.get('error', 'unknown error')}")
+
+    if errors:
+        combined["error"] = "; ".join(errors)
+        # Determine most specific failure status
+        if results.get("baseline", {}).get("status") != "success":
+            combined["status"] = "baseline_failed"
+        elif results.get("human", {}).get("status") != "success":
+            combined["status"] = "human_failed"
+        elif "agent" in results and results["agent"].get("status") != "success":
+            combined["status"] = "agent_failed"
+        return combined
+
+    # Compute improvements
+    baseline_metrics = combined["baseline_metrics"]
+    human_metrics = combined["human_metrics"]
+    agent_metrics = combined["agent_metrics"]
+
+    if baseline_metrics and human_metrics:
+        combined["human_improvement"] = compute_improvement(baseline_metrics, human_metrics)
+
+    if agent_metrics and baseline_metrics:
+        combined["agent_improvement"] = compute_improvement(baseline_metrics, agent_metrics)
+
+    if agent_metrics and human_metrics:
+        combined["agent_vs_human"] = compute_improvement(human_metrics, agent_metrics)
+
+    combined["status"] = "success"
+    print(f"[PARALLEL] All phases complete in {combined['duration_s']:.1f}s (vs ~{combined['duration_s']*3:.0f}s sequential)")
+
+    return combined
+
+
 def run_3way_modal_benchmark(
     baseline_wheel_url: str,
     human_wheel_url: str,
@@ -3953,13 +4664,14 @@ def run_3way_modal_benchmark(
     gpu_config: str = None,
     base_commit: Optional[str] = None,
     human_commit: Optional[str] = None,
+    parallel: bool = True,  # NEW: Enable parallel execution by default
 ) -> Dict[str, Any]:
     """
     Run 3-way benchmark on Modal with automatic GPU selection.
 
     This is the main entry point for calling from native_benchmark_runner.py
 
-    NEW ARCHITECTURE (v2):
+    NEW ARCHITECTURE (v3) - PARALLEL EXECUTION:
     1. ALL builds happen on CPU-only instances (~$0.20/hr)
     2. GPU instance ONLY installs pre-built wheels and runs benchmarks (~$4/hr)
     3. All wheels cached in Modal volume for reuse
@@ -4089,8 +4801,29 @@ def run_3way_modal_benchmark(
         )
 
     # =====================================================================
-    # PHASE 3: GPU BENCHMARK (no compilation - just install wheels and run)
+    # PHASE 3: GPU BENCHMARK - PARALLEL or SEQUENTIAL
     # =====================================================================
+
+    # Use PARALLEL execution for faster benchmarks (3x speedup)
+    # Only works for H100:1, H100:2, H100:4 (not H100:8 which is rare)
+    if parallel and gpu_config in ("H100:1", "H100:2", "H100:4", "H100", None):
+        print(f"[PARALLEL MODE] Using parallel execution for {gpu_config or 'H100:1'}...")
+        return run_3way_parallel_benchmark(
+            baseline_wheel_url=baseline_wheel_url,
+            human_wheel_url=human_wheel_url,
+            agent_patch=agent_patch,
+            perf_command=perf_command,
+            model=model,
+            gpu_config=gpu_config or "H100:1",
+            base_commit=base_commit,
+            human_commit=human_commit,
+            baseline_volume_path=wheel_sources["baseline"]["volume_path"],
+            human_volume_path=wheel_sources["human"]["volume_path"],
+            agent_volume_path=wheel_sources["agent"]["volume_path"],
+        )
+
+    # SEQUENTIAL execution (fallback for H100:8 or when parallel=False)
+    print(f"[SEQUENTIAL MODE] Using sequential execution for {gpu_config}...")
     if gpu_config == "H100:8":
         fn = modal.Function.from_name("omniperf-benchmark", "run_3way_benchmark_8gpu")
     elif gpu_config == "H100:4":
