@@ -121,6 +121,8 @@ def run_benchmark(
     agent_patch: Optional[Dict],
     gpu_config: str = "H100:1",
     human_only: bool = False,
+    baseline_only: bool = False,
+    agent_only: bool = False,
     parallel: bool = False,
 ) -> Dict[str, Any]:
     """Run the benchmark on Modal.
@@ -132,6 +134,8 @@ def run_benchmark(
         agent_patch: Agent patch info (if found)
         gpu_config: GPU configuration (H100:1, H100:2, etc.)
         human_only: Only benchmark human commit (no baseline/agent)
+        baseline_only: Only benchmark baseline commit (no human/agent)
+        agent_only: Only benchmark agent commit (requires agent patch)
         parallel: Run 3-way benchmark in parallel (3 GPUs, ~3x faster)
     """
 
@@ -155,7 +159,7 @@ def run_benchmark(
 
     # Determine base commit
     base_commit = None
-    if not human_only:
+    if not human_only or baseline_only or agent_only:
         if agent_patch and agent_patch.get("parent_commit"):
             base_commit = agent_patch["parent_commit"]
         else:
@@ -175,9 +179,138 @@ def run_benchmark(
     logger.info(f"Base commit: {base_commit}")
 
     if repo == "sglang":
-        if parallel and not human_only:
+        if baseline_only:
+            # Run only baseline benchmark using the dedicated function
+            from src.benchmark.modal.sglang_benchmark import (
+                run_baseline_benchmark,
+                SGLANG_DOCKER_REPO,
+                get_prebuilt_commit,
+                has_prebuilt_image,
+                GPU_CONFIGS,
+            )
+            import modal
+
+            if not base_commit:
+                return {"error": "No base commit found for baseline-only mode", "status": "error"}
+
+            if not has_prebuilt_image(base_commit):
+                return {"error": f"No Docker image for base commit {base_commit[:8]}", "status": "error"}
+
+            full_base_commit = get_prebuilt_commit(base_commit)
+            base_docker_image = f"{SGLANG_DOCKER_REPO}:{full_base_commit}"
+
+            logger.info(f"Using BASELINE-ONLY benchmark")
+            logger.info(f"Base Docker image: {base_docker_image}")
+
+            # Parse GPU config
+            gpu_cfg = GPU_CONFIGS.get(gpu_config, GPU_CONFIGS["H100:1"])
+
+            # Enable Modal output and run
+            modal.enable_output()
+
+            try:
+                run_baseline_fn = modal.Function.from_name("sglang-benchmark", "run_baseline_benchmark")
+                logger.info("Found deployed run_baseline_benchmark function")
+            except modal.exception.NotFoundError:
+                return {"error": "Modal app not deployed. Run: modal deploy src/benchmark/modal/sglang_benchmark.py", "status": "error"}
+
+            call = run_baseline_fn.spawn(
+                docker_image_tag=base_docker_image,
+                commit=base_commit,
+                perf_command=perf_command,
+                model=model,
+                gpu_type=gpu_cfg["gpu"],
+                gpu_count=gpu_cfg["count"],
+                sandbox_timeout=gpu_cfg["timeout"],
+            )
+
+            phase_result = call.get(timeout=gpu_cfg["timeout"] + 300)
+
+            result = {
+                "status": phase_result.get("status", "error"),
+                "baseline_metrics": phase_result.get("metrics", {}),
+                "human_metrics": {},
+                "agent_metrics": None,
+                "baseline_raw": phase_result.get("raw_output", ""),
+                "human_raw": "",
+                "agent_raw": "",
+                "error": phase_result.get("error"),
+                "benchmark_mode": "baseline_only",
+                "duration_s": phase_result.get("duration_s", 0),
+            }
+
+        elif agent_only:
+            # Run only agent benchmark using the dedicated function
+            from src.benchmark.modal.sglang_benchmark import (
+                run_agent_benchmark,
+                SGLANG_DOCKER_REPO,
+                get_prebuilt_commit,
+                has_prebuilt_image,
+                GPU_CONFIGS,
+            )
+            import modal
+
+            # Agent-only requires both base commit and agent patch
+            if not base_commit:
+                return {"error": "No base commit found for agent-only mode", "status": "error"}
+
+            if not patch_content:
+                return {"error": "No agent patch found for agent-only mode. Agent patch is required.", "status": "error"}
+
+            if not has_prebuilt_image(base_commit):
+                return {"error": f"No Docker image for base commit {base_commit[:8]}", "status": "error"}
+
+            full_base_commit = get_prebuilt_commit(base_commit)
+            base_docker_image = f"{SGLANG_DOCKER_REPO}:{full_base_commit}"
+
+            logger.info(f"Using AGENT-ONLY benchmark")
+            logger.info(f"Base Docker image: {base_docker_image}")
+            logger.info(f"Agent patch size: {len(patch_content)} bytes")
+
+            # Parse GPU config
+            gpu_cfg = GPU_CONFIGS.get(gpu_config, GPU_CONFIGS["H100:1"])
+
+            # Enable Modal output and run
+            modal.enable_output()
+
+            try:
+                run_agent_fn = modal.Function.from_name("sglang-benchmark", "run_agent_benchmark")
+                logger.info("Found deployed run_agent_benchmark function")
+            except modal.exception.NotFoundError:
+                return {"error": "Modal app not deployed. Run: modal deploy src/benchmark/modal/sglang_benchmark.py", "status": "error"}
+
+            call = run_agent_fn.spawn(
+                docker_image_tag=base_docker_image,
+                commit=base_commit,
+                perf_command=perf_command,
+                model=model,
+                agent_patch=patch_content,
+                gpu_type=gpu_cfg["gpu"],
+                gpu_count=gpu_cfg["count"],
+                sandbox_timeout=gpu_cfg["timeout"],
+            )
+
+            phase_result = call.get(timeout=gpu_cfg["timeout"] + 300)
+
+            result = {
+                "status": phase_result.get("status", "error"),
+                "baseline_metrics": {},
+                "human_metrics": {},
+                "agent_metrics": phase_result.get("metrics", {}),
+                "baseline_raw": "",
+                "human_raw": "",
+                "agent_raw": phase_result.get("raw_output", ""),
+                "error": phase_result.get("error"),
+                "benchmark_mode": "agent_only",
+                "duration_s": phase_result.get("duration_s", 0),
+            }
+
+        elif parallel:
+            # Uses spawn/get pattern with Modal functions
+            # Works for both 3-way and human-only (let it complete, don't ESC)
             from src.benchmark.modal.sglang_benchmark import run_3way_benchmark_docker_parallel
-            logger.info("Using PARALLEL 3-way benchmark (3 GPUs)")
+            phases = 1 if human_only else 3
+            logger.info(f"Using PARALLEL benchmark ({phases} phase{'s' if phases > 1 else ''}, Modal Functions)")
             result = run_3way_benchmark_docker_parallel(
                 human_commit=full_commit,
                 base_commit=base_commit,
@@ -401,6 +534,8 @@ Examples:
     parser.add_argument("--repo", choices=["sglang", "vllm"], default="sglang", help="Repository")
     parser.add_argument("--gpu", default="H100:1", help="GPU config (H100:1, H100:2, H100:4, H100:8)")
     parser.add_argument("--human-only", action="store_true", help="Only benchmark human commit")
+    parser.add_argument("--baseline-only", action="store_true", help="Only benchmark baseline commit")
+    parser.add_argument("--agent-only", action="store_true", help="Only benchmark agent commit (requires agent patch)")
     parser.add_argument("--parallel", action="store_true", help="Run 3-way benchmark in parallel (3 GPUs, ~3x faster)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without running")
 
@@ -437,6 +572,10 @@ Examples:
     print(f"  GPU: {args.gpu}")
     if args.human_only:
         print(f"  Mode: human-only")
+    elif args.baseline_only:
+        print(f"  Mode: baseline-only")
+    elif args.agent_only:
+        print(f"  Mode: agent-only")
     elif args.parallel:
         print(f"  Mode: 3-way PARALLEL (3 GPUs, ~3x faster)")
     else:
@@ -456,6 +595,8 @@ Examples:
         agent_patch=agent_patch,
         gpu_config=args.gpu,
         human_only=args.human_only,
+        baseline_only=args.baseline_only,
+        agent_only=args.agent_only,
         parallel=args.parallel,
     )
 

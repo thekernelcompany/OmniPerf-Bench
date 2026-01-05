@@ -72,6 +72,7 @@ GPU_CONFIGS = {
     "H100:2": {"gpu": "H100", "count": 2, "timeout": 21600},
     "H100:4": {"gpu": "H100", "count": 4, "timeout": 21600},
     "H100:8": {"gpu": "H100", "count": 8, "timeout": 21600},
+    "H200:1": {"gpu": "H200", "count": 1, "timeout": 21600},
 }
 
 # CPU configuration for wheel building (no GPU needed for CUDA compilation)
@@ -315,6 +316,40 @@ def run_phase_managed(
             result["raw_output"] = "\n".join(line.rstrip('\n') for line in stdout_lines)
 
     finally:
+        # Save full error log to Modal volume (prevents truncation)
+        if result["status"] == "error" or result.get("error"):
+            try:
+                error_dir = f"/results/errors/{commit[:8]}"
+                error_file = f"{error_dir}/{phase}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+                # Write error log with full details
+                error_log = f"""=== ERROR LOG ===
+Commit: {commit}
+Phase: {phase}
+Timestamp: {datetime.now().isoformat()}
+Docker Image: {docker_image_tag}
+Error: {result.get('error', 'Unknown')}
+
+=== FULL OUTPUT ({len(result.get('raw_output', ''))} chars) ===
+{result.get('raw_output', '(no output captured)')}
+
+=== END ERROR LOG ===
+"""
+                # Use sandbox to write if available, otherwise note it
+                if sandbox:
+                    try:
+                        sandbox.exec("mkdir", "-p", error_dir).wait()
+                        f = sandbox.open(error_file, "w")
+                        f.write(error_log)
+                        f.close()
+                        results_volume.commit()
+                        log_managed(f"  - Error log saved to {error_file}")
+                    except Exception as write_err:
+                        log_managed(f"  - Could not save error log: {write_err}")
+                else:
+                    log_managed(f"  - Sandbox unavailable for error logging")
+            except Exception as log_err:
+                log_managed(f"  - Error logging failed: {log_err}")
         # CRITICAL: Always cleanup sandbox to stop GPU billing
         if sandbox:
             try:
@@ -325,6 +360,363 @@ def run_phase_managed(
 
     result["duration_s"] = time.time() - start_time
     log_managed(f"Phase complete: {result['status']} ({result['duration_s']:.1f}s)")
+    return result
+
+
+# =====================================================================
+# Separate Benchmark Functions (Baseline, Human, Agent)
+# =====================================================================
+#
+# These functions provide cleaner separation of concerns for each benchmark phase.
+# Each function manages its own sandbox lifecycle and has phase-specific logic.
+
+
+@app.function(
+    image=orchestrator_image,
+    timeout=DEFAULT_BENCHMARK_TIMEOUT + 600,
+    retries=0,
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/results": results_volume,
+    },
+)
+def run_baseline_benchmark(
+    docker_image_tag: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    gpu_type: str = "H100",
+    gpu_count: int = 1,
+    sandbox_timeout: int = DEFAULT_BENCHMARK_TIMEOUT,
+) -> Dict[str, Any]:
+    """
+    Run baseline benchmark in its own sandbox.
+
+    Uses the base commit Docker image directly (no patching needed).
+    This represents the pre-optimization state.
+
+    Args:
+        docker_image_tag: Full Docker image tag for base commit
+        commit: Base commit hash
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_type: GPU type (default "H100")
+        gpu_count: Number of GPUs (default 1)
+        sandbox_timeout: Timeout for sandbox execution
+
+    Returns:
+        Dict with phase, status, metrics, raw_output, error, duration_s
+    """
+    return _run_phase_with_sandbox(
+        docker_image_tag=docker_image_tag,
+        phase="baseline",
+        commit=commit,
+        perf_command=perf_command,
+        model=model,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        sandbox_timeout=sandbox_timeout,
+        agent_patch=None,
+    )
+
+
+@app.function(
+    image=orchestrator_image,
+    timeout=DEFAULT_BENCHMARK_TIMEOUT + 600,
+    retries=0,
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/results": results_volume,
+    },
+)
+def run_human_benchmark(
+    docker_image_tag: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    gpu_type: str = "H100",
+    gpu_count: int = 1,
+    sandbox_timeout: int = DEFAULT_BENCHMARK_TIMEOUT,
+) -> Dict[str, Any]:
+    """
+    Run human benchmark in its own sandbox.
+
+    Uses the human commit Docker image directly (has the optimization).
+    This represents the ground truth optimization from the human PR.
+
+    Args:
+        docker_image_tag: Full Docker image tag for human commit
+        commit: Human commit hash
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_type: GPU type (default "H100")
+        gpu_count: Number of GPUs (default 1)
+        sandbox_timeout: Timeout for sandbox execution
+
+    Returns:
+        Dict with phase, status, metrics, raw_output, error, duration_s
+    """
+    return _run_phase_with_sandbox(
+        docker_image_tag=docker_image_tag,
+        phase="human",
+        commit=commit,
+        perf_command=perf_command,
+        model=model,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        sandbox_timeout=sandbox_timeout,
+        agent_patch=None,
+    )
+
+
+@app.function(
+    image=orchestrator_image,
+    timeout=DEFAULT_BENCHMARK_TIMEOUT + 600,
+    retries=0,
+    volumes={
+        "/root/.cache/huggingface": model_cache,
+        "/results": results_volume,
+    },
+)
+def run_agent_benchmark(
+    docker_image_tag: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    agent_patch: str,
+    gpu_type: str = "H100",
+    gpu_count: int = 1,
+    sandbox_timeout: int = DEFAULT_BENCHMARK_TIMEOUT,
+) -> Dict[str, Any]:
+    """
+    Run agent benchmark in its own sandbox.
+
+    Uses the base commit Docker image + applies agent patch.
+    This represents the AI agent's optimization attempt.
+
+    Args:
+        docker_image_tag: Full Docker image tag for base commit
+        commit: Base commit hash
+        perf_command: Benchmark command to run
+        model: Model name/path
+        agent_patch: Unified diff patch from agent
+        gpu_type: GPU type (default "H100")
+        gpu_count: Number of GPUs (default 1)
+        sandbox_timeout: Timeout for sandbox execution
+
+    Returns:
+        Dict with phase, status, metrics, raw_output, error, duration_s
+    """
+    return _run_phase_with_sandbox(
+        docker_image_tag=docker_image_tag,
+        phase="agent",
+        commit=commit,
+        perf_command=perf_command,
+        model=model,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        sandbox_timeout=sandbox_timeout,
+        agent_patch=agent_patch,
+    )
+
+
+def _run_phase_with_sandbox(
+    docker_image_tag: str,
+    phase: str,
+    commit: str,
+    perf_command: str,
+    model: str,
+    gpu_type: str,
+    gpu_count: int,
+    sandbox_timeout: int,
+    agent_patch: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Internal helper to run a benchmark phase with sandbox lifecycle management.
+
+    This is the shared implementation used by run_baseline_benchmark,
+    run_human_benchmark, and run_agent_benchmark.
+
+    Args:
+        docker_image_tag: Full Docker image tag
+        phase: Phase name ("baseline", "human", "agent")
+        commit: Commit hash being benchmarked
+        perf_command: Benchmark command to run
+        model: Model name/path
+        gpu_type: GPU type
+        gpu_count: Number of GPUs
+        sandbox_timeout: Timeout for sandbox execution
+        agent_patch: Optional agent patch (only for agent phase)
+
+    Returns:
+        Dict with phase, status, metrics, raw_output, error, duration_s
+    """
+    import time
+    import re
+    import json
+    from datetime import datetime
+
+    def log_phase(message: str):
+        """Log with timestamp and phase prefix."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] [{phase.upper()}] {message}", flush=True)
+
+    result = {
+        "phase": phase,
+        "status": "error",
+        "metrics": {},
+        "raw_output": "",
+        "error": None,
+        "duration_s": 0,
+        "commit": commit,
+    }
+
+    start_time = time.time()
+    sandbox = None
+
+    try:
+        # Step 1: Build Modal image from Docker registry
+        log_phase(f"Step 1/3: Building Modal image from {docker_image_tag[:50]}...")
+        image_start = time.time()
+        image = modal.Image.from_registry(
+            docker_image_tag,
+            force_build=True,
+            setup_dockerfile_commands=[
+                "RUN apt-get update && apt-get install -y libnuma1 libnuma-dev && rm -rf /var/lib/apt/lists/*",
+                "RUN ln -sf $(which python3) /usr/local/bin/python || true",
+                "RUN ln -sf $(which pip3) /usr/local/bin/pip || true",
+                "RUN pip3 install 'typing_extensions>=4.10.0' --upgrade -q || true",
+            ],
+        )
+        log_phase(f"  - Image ready in {time.time() - image_start:.1f}s")
+
+        # Step 2: Create GPU sandbox
+        log_phase(f"Step 2/3: Creating GPU sandbox ({gpu_type}:{gpu_count})...")
+        log_phase(f"  - Sandbox timeout: {sandbox_timeout}s")
+        log_phase("  - GPU billing starts when sandbox is created")
+        sandbox_start = time.time()
+
+        gpu_spec = f"{gpu_type}:{gpu_count}" if gpu_count > 1 else gpu_type
+
+        sandbox = modal.Sandbox.create(
+            image=image,
+            gpu=gpu_spec,
+            timeout=sandbox_timeout,
+            volumes={
+                "/root/.cache/huggingface": model_cache,
+                "/results": results_volume,
+            },
+            secrets=[modal.Secret.from_name("huggingface-secret")],
+        )
+        log_phase(f"  - Sandbox created in {time.time() - sandbox_start:.1f}s")
+
+        # Step 3: Run benchmark script
+        log_phase("Step 3/3: Running benchmark script...")
+
+        # Generate the benchmark script
+        script = _create_single_phase_script(
+            phase=phase,
+            commit=commit,
+            perf_command=perf_command,
+            model=model,
+            agent_patch=agent_patch,
+            base_commit=None,
+            human_patch=None,
+        )
+
+        script_path = f"/tmp/benchmark_{phase}.py"
+        f = sandbox.open(script_path, "w")
+        f.write(script)
+        f.close()
+        log_phase(f"  - Script written ({len(script)} bytes)")
+
+        benchmark_start = time.time()
+        proc = sandbox.exec("python3", "-u", script_path)
+
+        stdout_lines = []
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [{phase.upper()}] {line.rstrip()}", flush=True)
+
+        proc.wait()
+        log_phase(f"  - Benchmark completed in {time.time() - benchmark_start:.1f}s")
+
+        # Save full raw output
+        full_output = "\n".join(line.rstrip('\n') for line in stdout_lines)
+        result["raw_output"] = full_output
+
+        # Commit results volume
+        try:
+            results_volume.commit()
+            log_phase("  - Results volume committed")
+        except Exception as commit_err:
+            log_phase(f"  - Warning: Could not commit volume: {commit_err}")
+
+        # Parse results from output
+        json_match = re.search(
+            r'=== PHASE_RESULTS_JSON ===\s*(\{.*\})\s*=== END_PHASE_RESULTS_JSON ===',
+            full_output,
+            re.DOTALL
+        )
+
+        if json_match:
+            parsed = json.loads(json_match.group(1).strip())
+            result["metrics"] = parsed.get("metrics", {})
+            result["status"] = parsed.get("status", "error")
+            if parsed.get("error"):
+                result["error"] = parsed["error"]
+        else:
+            result["error"] = "No results found in output"
+
+    except Exception as e:
+        result["error"] = f"Sandbox error: {str(e)}"
+        log_phase(f"  - Error: {str(e)}")
+        if 'stdout_lines' in locals() and stdout_lines:
+            result["raw_output"] = "\n".join(line.rstrip('\n') for line in stdout_lines)
+
+    finally:
+        # Save error log if needed
+        if result["status"] == "error" or result.get("error"):
+            try:
+                error_dir = f"/results/errors/{commit[:8]}"
+                error_file = f"{error_dir}/{phase}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+                error_log = f"""=== ERROR LOG ===
+Commit: {commit}
+Phase: {phase}
+Timestamp: {datetime.now().isoformat()}
+Docker Image: {docker_image_tag}
+Error: {result.get('error', 'Unknown')}
+
+=== FULL OUTPUT ({len(result.get('raw_output', ''))} chars) ===
+{result.get('raw_output', '(no output captured)')}
+
+=== END ERROR LOG ===
+"""
+                if sandbox:
+                    try:
+                        sandbox.exec("mkdir", "-p", error_dir).wait()
+                        f = sandbox.open(error_file, "w")
+                        f.write(error_log)
+                        f.close()
+                        results_volume.commit()
+                        log_phase(f"  - Error log saved to {error_file}")
+                    except Exception as write_err:
+                        log_phase(f"  - Could not save error log: {write_err}")
+            except Exception as log_err:
+                log_phase(f"  - Error logging failed: {log_err}")
+
+        # CRITICAL: Always cleanup sandbox
+        if sandbox:
+            try:
+                sandbox.terminate()
+                log_phase("  - Sandbox terminated (cleanup complete)")
+            except Exception as term_err:
+                log_phase(f"  - Warning: Sandbox termination failed: {term_err}")
+
+    result["duration_s"] = time.time() - start_time
+    log_phase(f"Phase complete: {result['status']} ({result['duration_s']:.1f}s)")
     return result
 
 
@@ -2669,6 +3061,15 @@ os.environ["TRANSFORMERS_CACHE"] = "/root/.cache/huggingface"
 print("Upgrading typing_extensions for pydantic compatibility...")
 subprocess.run(["pip3", "install", "typing_extensions>=4.10.0", "--upgrade", "-q"], check=False)
 
+# Fix missing dependencies in some Docker images (e.g., cd6872334e9ead684049b8fccd5f2dac9433b1b4)
+# From sglang pyproject.toml [srt] optional dependencies
+print("Ensuring sglang[srt] dependencies are installed...")
+# Install deps - run separately to avoid silent failures
+subprocess.run(["pip3", "install", "-q", "numpy<2.0", "tqdm", "requests", "pybase64"], check=False)
+subprocess.run(["pip3", "install", "-q", "IPython"], check=False)  # uppercase I
+subprocess.run(["pip3", "install", "-q", "aiohttp", "fastapi", "psutil", "rpyc", "uvloop", "uvicorn", "pyzmq"], check=False)
+subprocess.run(["pip3", "install", "-q", "interegular", "lark", "numba", "pydantic", "diskcache", "cloudpickle", "pillow"], check=False)
+
 # Configuration
 PHASE = "{phase}"
 COMMIT = "{commit}"
@@ -2691,9 +3092,15 @@ results = {{
 
 def find_sglang_path():
     """Find where SGLang is installed."""
+    # First check with PYTHONPATH set
+    env = os.environ.copy()
+    sglang_python_paths = ["/sgl-workspace/sglang/python", "/sgl-workspace/sglang"]
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = ":".join(sglang_python_paths + ([existing_path] if existing_path else []))
+
     result = subprocess.run(
         ["python3", "-c", "import sglang; print(sglang.__path__[0] if hasattr(sglang, '__path__') else 'None')"],
-        capture_output=True, text=True
+        capture_output=True, text=True, env=env
     )
     if result.returncode == 0:
         sglang_path = result.stdout.strip()
@@ -2790,6 +3197,11 @@ def start_server(model: str, port: int):
     print(f"Server command: {{' '.join(cmd)}}")
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Set PYTHONPATH to include SGLang installation (typically /sgl-workspace/sglang/python)
+    sglang_python_paths = ["/sgl-workspace/sglang/python", "/sgl-workspace/sglang"]
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = ":".join(sglang_python_paths + ([existing_path] if existing_path else []))
+    print(f"PYTHONPATH: {{env['PYTHONPATH']}}")
     # Combine stdout/stderr for easier debugging
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
 
@@ -2866,6 +3278,10 @@ def run_benchmark(port: int, perf_command: str):
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Set PYTHONPATH to include SGLang installation
+    sglang_python_paths = ["/sgl-workspace/sglang/python", "/sgl-workspace/sglang"]
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = ":".join(sglang_python_paths + ([existing_path] if existing_path else []))
 
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600, env=env)
     output = result.stdout + result.stderr
@@ -2943,7 +3359,7 @@ try:
         print(f"[{{PHASE.upper()}}] Running standalone benchmark...")
         output, metrics = run_benchmark(PORT, PERF_COMMAND)
 
-    results["raw_output"] = output  # Full output, no truncation
+    results["raw_output"] = output
     results["metrics"] = metrics
     results["status"] = "success"
     print(f"[{{PHASE.upper()}}] Metrics: {{metrics}}")
@@ -3267,39 +3683,65 @@ def run_3way_benchmark_docker_parallel(
     gpu_count = gpu_cfg["count"]
     sandbox_timeout = gpu_cfg["timeout"]
 
-    # Spawn all phases using deployed Modal Function
+    # Spawn all phases using deployed Modal Functions
     # REQUIREMENT: Must deploy first with 'modal deploy src/benchmark/modal/sglang_benchmark.py'
-    print(f"\n[MODAL] Looking up deployed function 'run_phase_managed'...")
+    print(f"\n[MODAL] Looking up deployed benchmark functions...")
 
     try:
-        # Get reference to the deployed function
-        run_phase_fn = modal.Function.from_name("sglang-benchmark", "run_phase_managed")
-        print(f"[MODAL] Found deployed function")
-    except modal.exception.NotFoundError:
+        # Get references to the deployed functions (separate function per phase type)
+        run_baseline_fn = modal.Function.from_name("sglang-benchmark", "run_baseline_benchmark")
+        run_human_fn = modal.Function.from_name("sglang-benchmark", "run_human_benchmark")
+        run_agent_fn = modal.Function.from_name("sglang-benchmark", "run_agent_benchmark")
+        print(f"[MODAL] Found all deployed functions (baseline, human, agent)")
+    except modal.exception.NotFoundError as e:
         print(f"[MODAL] ERROR: Function not deployed!")
         print(f"[MODAL] Run: modal deploy src/benchmark/modal/sglang_benchmark.py")
-        result["error"] = "Modal app not deployed. Run: modal deploy src/benchmark/modal/sglang_benchmark.py"
+        result["error"] = f"Modal app not deployed. Run: modal deploy src/benchmark/modal/sglang_benchmark.py (missing: {e})"
         result["duration_s"] = time.time() - start_time
         return result
 
-    # Spawn all phases in parallel
+    # Spawn all phases in parallel using dedicated functions
     print(f"[MODAL] Spawning {len(phases)} benchmark phases...")
     phase_calls: Dict[str, Any] = {}  # phase_name -> FunctionCall
 
     for phase_name, commit, docker_image, patch in phases:
-        print(f"[{phase_name.upper()}] Spawning managed benchmark...")
-        call = run_phase_fn.spawn(
-            docker_image_tag=docker_image,
-            phase=phase_name,
-            commit=commit,
-            perf_command=perf_command,
-            model=model,
-            gpu_type=gpu_type,
-            gpu_count=gpu_count,
-            sandbox_timeout=sandbox_timeout,
-            agent_patch=patch,
-            human_patch=None,
-        )
+        print(f"[{phase_name.upper()}] Spawning benchmark...")
+
+        if phase_name == "baseline":
+            call = run_baseline_fn.spawn(
+                docker_image_tag=docker_image,
+                commit=commit,
+                perf_command=perf_command,
+                model=model,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                sandbox_timeout=sandbox_timeout,
+            )
+        elif phase_name == "human":
+            call = run_human_fn.spawn(
+                docker_image_tag=docker_image,
+                commit=commit,
+                perf_command=perf_command,
+                model=model,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                sandbox_timeout=sandbox_timeout,
+            )
+        elif phase_name == "agent":
+            call = run_agent_fn.spawn(
+                docker_image_tag=docker_image,
+                commit=commit,
+                perf_command=perf_command,
+                model=model,
+                agent_patch=patch,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                sandbox_timeout=sandbox_timeout,
+            )
+        else:
+            print(f"[{phase_name.upper()}] Unknown phase type, skipping")
+            continue
+
         phase_calls[phase_name] = call
 
     print(f"[MODAL] All phases spawned. Waiting for results (timeout: {sandbox_timeout + 300}s per phase)...")
