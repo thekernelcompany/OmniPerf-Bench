@@ -44,6 +44,31 @@ DEFAULT_BENCHMARK_TIMEOUT = 7200  # 2 hours
 SANDBOX_CREATE_TIMEOUT = 300  # 5 minutes (legacy, kept for backward compat)
 
 
+def sanitize_json_string(json_str: str) -> str:
+    """
+    Sanitize a JSON string by removing control characters that break parsing.
+
+    Progress bars (tqdm) output carriage returns, ANSI escape codes, and other
+    control characters that can break JSON parsing when embedded in raw_output fields.
+    """
+    # Remove ANSI escape codes (color codes, cursor movement, etc.)
+    esc = chr(27)  # ESC character
+    # ANSI CSI sequences: ESC [ ... letter
+    json_str = re.sub(esc + r'\[[0-9;]*[a-zA-Z]', '', json_str)
+    # ANSI OSC sequences: ESC ] ... BEL
+    json_str = re.sub(esc + r'\][^' + chr(7) + ']*' + chr(7), '', json_str)
+    # Other ESC sequences
+    json_str = re.sub(esc + r'[\[\]()#;?0-9]*[0-9A-Za-z]', '', json_str)
+
+    # Remove carriage returns (from progress bar updates)
+    json_str = json_str.replace(chr(13), '')
+
+    # Remove other control characters (keep \t, \n, and printable chars)
+    json_str = ''.join(c for c in json_str if ord(c) == 10 or ord(c) == 9 or ord(c) >= 32)
+
+    return json_str
+
+
 def log(phase: str, message: str, level: str = "INFO"):
     """Print timestamped log message with phase prefix."""
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -300,7 +325,7 @@ def run_phase_managed(
         )
 
         if json_match:
-            parsed = json.loads(json_match.group(1).strip())
+            parsed = json.loads(sanitize_json_string(json_match.group(1).strip()))
             result["metrics"] = parsed.get("metrics", {})
             result["status"] = parsed.get("status", "error")
             if parsed.get("error"):
@@ -661,7 +686,7 @@ def _run_phase_with_sandbox(
         )
 
         if json_match:
-            parsed = json.loads(json_match.group(1).strip())
+            parsed = json.loads(sanitize_json_string(json_match.group(1).strip()))
             result["metrics"] = parsed.get("metrics", {})
             result["status"] = parsed.get("status", "error")
             if parsed.get("error"):
@@ -3386,9 +3411,12 @@ try:
 except Exception as save_err:
     print(f"[{{PHASE.upper()}}] Warning: Could not save to volume: {{save_err}}")
 
-# Output results
+# Output results (exclude raw_output to avoid stdout line-splitting issues with large outputs)
+# The full raw_output is already saved to Modal volume above
+results_for_stdout = {{k: v for k, v in results.items() if k != "raw_output"}}
+results_for_stdout["raw_output"] = ""  # Placeholder - full output is in volume
 print("\\n=== PHASE_RESULTS_JSON ===")
-print(json.dumps(results))
+print(json.dumps(results_for_stdout))
 print("=== END_PHASE_RESULTS_JSON ===")
 '''
     return script
@@ -3550,7 +3578,7 @@ def _run_single_phase_sandbox(
         )
 
         if json_match:
-            parsed = json.loads(json_match.group(1).strip())
+            parsed = json.loads(sanitize_json_string(json_match.group(1).strip()))
             result["metrics"] = parsed.get("metrics", {})
             result["status"] = parsed.get("status", "error")
             if parsed.get("error"):
