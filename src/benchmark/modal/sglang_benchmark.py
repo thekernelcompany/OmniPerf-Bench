@@ -2090,6 +2090,53 @@ try:
     import sglang
     print(f"SGLang module loaded: {{sglang}}")
 
+    # =========================================================================
+    # COMMIT PROOF: Log expected and actual commit to /opt/sglang_commit.txt
+    # =========================================================================
+    from pathlib import Path
+    print(f"[COMMIT PROOF] Writing commit proof to /opt/sglang_commit.txt...")
+    commit_proof_lines = [
+        f"Expected commit: {{HUMAN_COMMIT}}",
+        f"Phase: human",
+        f"Timestamp: {{time.strftime('%Y-%m-%d %H:%M:%S')}}",
+    ]
+
+    # Try to get actual git commit from sglang installation
+    sglang_path = sglang.__path__[0] if hasattr(sglang, '__path__') else None
+    if sglang_path:
+        repo_root = str(Path(sglang_path).parent.parent) if sglang_path else None
+        if repo_root and os.path.exists(os.path.join(repo_root, ".git")):
+            try:
+                git_result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_root, capture_output=True, text=True, timeout=10
+                )
+                if git_result.returncode == 0:
+                    actual_commit = git_result.stdout.strip()
+                    commit_proof_lines.append(f"Actual git commit: {{actual_commit}}")
+                    if actual_commit.startswith(HUMAN_COMMIT[:8]):
+                        commit_proof_lines.append("Status: MATCH")
+                    else:
+                        commit_proof_lines.append(f"Status: MISMATCH (expected {{HUMAN_COMMIT[:8]}}, got {{actual_commit[:8]}})")
+            except Exception as git_err:
+                commit_proof_lines.append(f"Git check error: {{git_err}}")
+        else:
+            commit_proof_lines.append("No .git directory found (installed from wheel/pip)")
+
+    # Also check sglang version if available
+    if hasattr(sglang, "__version__"):
+        commit_proof_lines.append(f"SGLang version: {{sglang.__version__}}")
+
+    # Write commit proof file
+    try:
+        with open("/opt/sglang_commit.txt", "w") as f:
+            f.write("\\n".join(commit_proof_lines) + "\\n")
+        print(f"[COMMIT PROOF] Written to /opt/sglang_commit.txt")
+        for line in commit_proof_lines:
+            print(f"[COMMIT PROOF]   {{line}}")
+    except Exception as write_err:
+        print(f"[COMMIT PROOF] Warning: Could not write commit proof: {{write_err}}")
+
     # Extract settings from command
     tp_size = extract_tp_from_command(PERF_COMMAND)
     print(f"Tensor parallelism: {{tp_size}}")
@@ -2712,6 +2759,54 @@ try:
     import sglang
     print(f"SGLang module loaded: {{sglang}}")
 
+    # =========================================================================
+    # COMMIT PROOF: Log expected and actual commit to /opt/sglang_commit.txt
+    # =========================================================================
+    print(f"[COMMIT PROOF] Writing commit proof to /opt/sglang_commit.txt...")
+    commit_proof_lines = [
+        f"Expected human commit: {{HUMAN_COMMIT}}",
+        f"Expected base commit: {{BASE_COMMIT}}",
+        f"Phase: 3-way benchmark",
+        f"Timestamp: {{time.strftime('%Y-%m-%d %H:%M:%S')}}",
+    ]
+
+    # Try to get actual git commit from sglang installation
+    if sglang_path:
+        git_dir = str(Path(sglang_path).parent.parent)
+        if os.path.exists(os.path.join(git_dir, ".git")):
+            try:
+                git_result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=git_dir, capture_output=True, text=True, timeout=10
+                )
+                if git_result.returncode == 0:
+                    actual_commit = git_result.stdout.strip()
+                    commit_proof_lines.append(f"Actual git commit (Docker image): {{actual_commit}}")
+                    if actual_commit.startswith(HUMAN_COMMIT[:8]):
+                        commit_proof_lines.append("Docker image matches: HUMAN commit")
+                    elif actual_commit.startswith(BASE_COMMIT[:8]):
+                        commit_proof_lines.append("Docker image matches: BASE commit")
+                    else:
+                        commit_proof_lines.append(f"Docker image commit: UNKNOWN ({{actual_commit[:8]}})")
+            except Exception as git_err:
+                commit_proof_lines.append(f"Git check error: {{git_err}}")
+        else:
+            commit_proof_lines.append("No .git directory found (installed from wheel/pip)")
+
+    # Also check sglang version if available
+    if hasattr(sglang, "__version__"):
+        commit_proof_lines.append(f"SGLang version: {{sglang.__version__}}")
+
+    # Write commit proof file
+    try:
+        with open("/opt/sglang_commit.txt", "w") as f:
+            f.write("\\n".join(commit_proof_lines) + "\\n")
+        print(f"[COMMIT PROOF] Written to /opt/sglang_commit.txt")
+        for line in commit_proof_lines:
+            print(f"[COMMIT PROOF]   {{line}}")
+    except Exception as write_err:
+        print(f"[COMMIT PROOF] Warning: Could not write commit proof: {{write_err}}")
+
     # Extract tensor parallelism from command
     tp_size = extract_tp_from_command(PERF_COMMAND)
     print(f"Tensor parallelism: {{tp_size}}")
@@ -3325,6 +3420,55 @@ print(f"=" * 60)
 try:
     sglang_path = find_sglang_path()
     print(f"SGLang path: {{sglang_path}}")
+
+    # =========================================================================
+    # COMMIT PROOF: Log expected and actual commit to /opt/sglang_commit.txt
+    # =========================================================================
+    print(f"[COMMIT PROOF] Writing commit proof to /opt/sglang_commit.txt...")
+    commit_proof_lines = [
+        f"Expected commit: {{COMMIT}}",
+        f"Phase: {{PHASE}}",
+        f"Timestamp: {{time.strftime('%Y-%m-%d %H:%M:%S')}}",
+    ]
+
+    # Try to get actual git commit from sglang installation
+    if sglang_path:
+        repo_root = str(Path(sglang_path).parent.parent) if sglang_path else None
+        if repo_root and os.path.exists(os.path.join(repo_root, ".git")):
+            try:
+                git_result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_root, capture_output=True, text=True, timeout=10
+                )
+                if git_result.returncode == 0:
+                    actual_commit = git_result.stdout.strip()
+                    commit_proof_lines.append(f"Actual git commit: {{actual_commit}}")
+                    if actual_commit.startswith(COMMIT[:8]):
+                        commit_proof_lines.append("Status: MATCH")
+                    else:
+                        commit_proof_lines.append(f"Status: MISMATCH (expected {{COMMIT[:8]}}, got {{actual_commit[:8]}})")
+            except Exception as git_err:
+                commit_proof_lines.append(f"Git check error: {{git_err}}")
+        else:
+            commit_proof_lines.append("No .git directory found (installed from wheel/pip)")
+
+    # Also check sglang version if available
+    try:
+        import sglang
+        if hasattr(sglang, "__version__"):
+            commit_proof_lines.append(f"SGLang version: {{sglang.__version__}}")
+    except:
+        pass
+
+    # Write commit proof file
+    try:
+        with open("/opt/sglang_commit.txt", "w") as f:
+            f.write("\\n".join(commit_proof_lines) + "\\n")
+        print(f"[COMMIT PROOF] Written to /opt/sglang_commit.txt")
+        for line in commit_proof_lines:
+            print(f"[COMMIT PROOF]   {{line}}")
+    except Exception as write_err:
+        print(f"[COMMIT PROOF] Warning: Could not write commit proof: {{write_err}}")
 
     # =========================================================================
     # SEPARATE DOCKER IMAGE APPROACH (cleaner than reverse-patch)
