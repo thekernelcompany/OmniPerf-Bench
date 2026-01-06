@@ -4,6 +4,9 @@ Local Docker Benchmark Runner for vLLM commits.
 
 Runs benchmarks inside pre-built Docker containers for commits that failed on Modal.
 Supports serving, throughput, and latency benchmark types.
+
+Benchmark scripts are obtained by cloning the vLLM repo at the specific commit
+(approach #2) for better reproducibility compared to raw GitHub URL downloads.
 """
 
 import json
@@ -156,12 +159,13 @@ def run_serving_benchmark(commit_hash: str, model: str, perf_command: str,
     # Install deps
     pip install aiohttp pandas datasets -q
 
-    # Get benchmark scripts
-    mkdir -p /opt/benchmarks && cd /opt/benchmarks
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/benchmark_serving.py" -o benchmark_serving.py 2>/dev/null || true
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/backend_request_func.py" -o backend_request_func.py 2>/dev/null || true
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/benchmark_dataset.py" -o benchmark_dataset.py 2>/dev/null || true
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/benchmark_utils.py" -o benchmark_utils.py 2>/dev/null || true
+    # Clone vLLM repo at specific commit for benchmark scripts (approach #2 - more reproducible)
+    cd /opt
+    git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>/dev/null || true
+    cd vllm_bench
+    git fetch --depth 1 origin $COMMIT 2>/dev/null || true
+    git checkout $COMMIT 2>/dev/null || git checkout -f HEAD
+    cd /opt/vllm_bench/benchmarks
 
     # Start server
     cd /
@@ -189,7 +193,7 @@ def run_serving_benchmark(commit_hash: str, model: str, perf_command: str,
     fi
 
     # Run benchmark
-    cd /opt/benchmarks
+    cd /opt/vllm_bench/benchmarks
     python3 benchmark_serving.py {bench_args} --port 8000 2>&1
 
     kill $SERVER_PID 2>/dev/null || true
@@ -267,11 +271,15 @@ def run_throughput_benchmark(commit_hash: str, model: str, perf_command: str,
     set -e
     COMMIT="{commit_hash}"
 
-    # Get benchmark script
-    mkdir -p /opt/benchmarks && cd /opt/benchmarks
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/benchmark_throughput.py" -o benchmark_throughput.py 2>/dev/null || true
+    # Clone vLLM repo at specific commit for benchmark scripts (approach #2 - more reproducible)
+    cd /opt
+    git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>/dev/null || true
+    cd vllm_bench
+    git fetch --depth 1 origin $COMMIT 2>/dev/null || true
+    git checkout $COMMIT 2>/dev/null || git checkout -f HEAD
 
     # Run benchmark directly (no server needed)
+    cd /opt/vllm_bench/benchmarks
     python3 benchmark_throughput.py {bench_args} 2>&1
     '''
 
@@ -330,11 +338,15 @@ def run_latency_benchmark(commit_hash: str, model: str, perf_command: str,
     set -e
     COMMIT="{commit_hash}"
 
-    # Get benchmark script
-    mkdir -p /opt/benchmarks && cd /opt/benchmarks
-    curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/benchmark_latency.py" -o benchmark_latency.py 2>/dev/null || true
+    # Clone vLLM repo at specific commit for benchmark scripts (approach #2 - more reproducible)
+    cd /opt
+    git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>/dev/null || true
+    cd vllm_bench
+    git fetch --depth 1 origin $COMMIT 2>/dev/null || true
+    git checkout $COMMIT 2>/dev/null || git checkout -f HEAD
 
     # Run benchmark directly
+    cd /opt/vllm_bench/benchmarks
     python3 benchmark_latency.py {bench_args} 2>&1
     '''
 
