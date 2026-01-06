@@ -538,6 +538,7 @@ Examples:
     parser.add_argument("--agent-only", action="store_true", help="Only benchmark agent commit (requires agent patch)")
     parser.add_argument("--parallel", action="store_true", help="Run 3-way benchmark in parallel (3 GPUs, ~3x faster)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without running")
+    parser.add_argument("--perf-command", type=str, help="Override perf_command from dataset")
 
     args = parser.parse_args()
 

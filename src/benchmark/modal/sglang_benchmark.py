@@ -1204,6 +1204,11 @@ def _extract_server_args(command: str) -> List[str]:
         args.extend(["--quantization", quant_match.group(1)])
     if "--disable-radix-cache" in command:
         args.append("--disable-radix-cache")
+    # Support --disable-radix and --enable-overlap (PR #1738)
+    if "--disable-radix" in command and "--disable-radix-cache" not in command:
+        args.append("--disable-radix-cache")  # --disable-radix maps to --disable-radix-cache
+    if "--enable-overlap" in command:
+        args.append("--enable-overlap-schedule")  # --enable-overlap maps to --enable-overlap-schedule
     return args
 
 
