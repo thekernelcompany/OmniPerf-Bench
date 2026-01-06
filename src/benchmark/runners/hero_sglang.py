@@ -242,7 +242,7 @@ def check_docker_image_exists(commit: str) -> bool:
     import urllib.request
     import urllib.error
 
-    SGLANG_DOCKER_REPO = "ayushnangia16/sglang-docker"
+    SGLANG_DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker"
 
     for tag in [commit[:40], commit[:12], commit[:8]]:
         url = f"https://hub.docker.com/v2/repositories/{SGLANG_DOCKER_REPO}/tags/{tag}"

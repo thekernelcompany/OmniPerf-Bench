@@ -11,10 +11,10 @@ Docker images: ayushnangia16/nvidia-sglang-docker:{commit_hash}
 
 Usage:
     # Deploy the Modal app
-    modal deploy src/benchmark/modal/sglang_benchmark.py
+    modal deploy src/benchmark/cloud_modal/sglang_benchmark.py
 
     # Run a 3-way benchmark
-    modal run src/benchmark/modal/sglang_benchmark.py::run_3way_benchmark_docker \\
+    modal run src/benchmark/cloud_modal/sglang_benchmark.py::run_3way_benchmark_docker \\
         --human-commit "abc123" --base-commit "def456" \\
         --perf-command "..." --model "..."
 """
@@ -79,7 +79,7 @@ def log(phase: str, message: str, level: str = "INFO"):
 app = modal.App("sglang-benchmark")
 
 # Docker image repository for SGLang commits
-SGLANG_DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker"
+SGLANG_DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker" # do not change
 SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
 
 # Volume for caching models
@@ -1204,11 +1204,6 @@ def _extract_server_args(command: str) -> List[str]:
         args.extend(["--quantization", quant_match.group(1)])
     if "--disable-radix-cache" in command:
         args.append("--disable-radix-cache")
-    # Support --disable-radix and --enable-overlap (PR #1738)
-    if "--disable-radix" in command and "--disable-radix-cache" not in command:
-        args.append("--disable-radix-cache")  # --disable-radix maps to --disable-radix-cache
-    if "--enable-overlap" in command:
-        args.append("--enable-overlap-schedule")  # --enable-overlap maps to --enable-overlap-schedule
     return args
 
 
@@ -3717,7 +3712,7 @@ def run_3way_benchmark_docker_parallel(
     sandbox_timeout = gpu_cfg["timeout"]
 
     # Spawn all phases using deployed Modal Functions
-    # REQUIREMENT: Must deploy first with 'modal deploy src/benchmark/modal/sglang_benchmark.py'
+    # REQUIREMENT: Must deploy first with 'modal deploy src/benchmark/cloud_modal/sglang_benchmark.py'
     print(f"\n[MODAL] Looking up deployed benchmark functions...")
 
     try:
@@ -3728,8 +3723,8 @@ def run_3way_benchmark_docker_parallel(
         print(f"[MODAL] Found all deployed functions (baseline, human, agent)")
     except modal.exception.NotFoundError as e:
         print(f"[MODAL] ERROR: Function not deployed!")
-        print(f"[MODAL] Run: modal deploy src/benchmark/modal/sglang_benchmark.py")
-        result["error"] = f"Modal app not deployed. Run: modal deploy src/benchmark/modal/sglang_benchmark.py (missing: {e})"
+        print(f"[MODAL] Run: modal deploy src/benchmark/cloud_modal/sglang_benchmark.py")
+        result["error"] = f"Modal app not deployed. Run: modal deploy src/benchmark/cloud_modal/sglang_benchmark.py (missing: {e})"
         result["duration_s"] = time.time() - start_time
         return result
 
