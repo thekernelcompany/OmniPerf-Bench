@@ -190,8 +190,11 @@ def run_serving_benchmark(commit_hash: str, model: str, perf_command: str,
     COMMIT="{commit_hash}"
     MODEL="{model}"
 
+    # Install uv for faster package management
+    pip install uv -q
+
     # Install deps
-    pip install aiohttp pandas datasets -q
+    uv pip install aiohttp pandas datasets -q --system
 
     # Clone vLLM repo at specific commit for benchmark scripts (approach #2 - more reproducible)
     cd /opt
@@ -502,19 +505,22 @@ def run_baseline_serving_benchmark(human_commit: str, parent_commit: str, model:
     cd vllm_baseline
     git checkout $PARENT_COMMIT
 
+    # Install uv for faster package management
+    pip install uv -q
+
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    pip uninstall vllm -y
+    uv pip uninstall vllm -y --system
 
     # Build with H100 optimization only (SM 9.0)
     export TORCH_CUDA_ARCH_LIST="9.0"
     export MAX_JOBS=8
-    pip install -e . --no-build-isolation 2>&1 | tail -20
+    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
 
     # Install benchmark deps
-    pip install aiohttp pandas datasets -q
+    uv pip install aiohttp pandas datasets -q --system
 
     echo "=== Starting vLLM server ==="
     python3 -m vllm.entrypoints.openai.api_server \\
@@ -633,12 +639,15 @@ def run_baseline_throughput_benchmark(human_commit: str, parent_commit: str, mod
     cd vllm_baseline
     git checkout $PARENT_COMMIT
 
+    # Install uv for faster package management
+    pip install uv -q
+
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    pip uninstall vllm -y
+    uv pip uninstall vllm -y --system
 
     export TORCH_CUDA_ARCH_LIST="9.0"
     export MAX_JOBS=8
-    pip install -e . --no-build-isolation 2>&1 | tail -20
+    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
@@ -715,12 +724,15 @@ def run_baseline_latency_benchmark(human_commit: str, parent_commit: str, model:
     cd vllm_baseline
     git checkout $PARENT_COMMIT
 
+    # Install uv for faster package management
+    pip install uv -q
+
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    pip uninstall vllm -y
+    uv pip uninstall vllm -y --system
 
     export TORCH_CUDA_ARCH_LIST="9.0"
     export MAX_JOBS=8
-    pip install -e . --no-build-isolation 2>&1 | tail -20
+    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
