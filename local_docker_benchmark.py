@@ -34,6 +34,13 @@ OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
 BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
 BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping.json")
 
+# Agent patches configuration
+AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
+
+# Baseline image caching - once built, save and reuse
+BASELINE_IMAGE_PREFIX = "vllm-baseline-built"  # Local cache prefix
+
 # Commits that need fixed images (from previous analysis)
 FIXED_IMAGE_COMMITS = {
     "015069b0", "22dd9c27", "67da5720", "d55e446d", "e493e485",  # aimv2 fix
@@ -66,8 +73,48 @@ class BenchmarkResult:
     raw_output: Optional[str] = None
 
 
+def check_baseline_image_exists(parent_commit: str) -> bool:
+    """Check if a pre-built baseline image exists locally."""
+    image_tag = f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
+    result = subprocess.run(
+        ['docker', 'images', '-q', image_tag],
+        capture_output=True, text=True, timeout=10
+    )
+    return bool(result.stdout.strip())
+
+
+def get_baseline_image(parent_commit: str) -> str:
+    """Get the baseline image tag."""
+    return f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
+
+
+def save_baseline_image(container_id: str, parent_commit: str) -> bool:
+    """Commit a container with built vLLM as a reusable baseline image."""
+    image_tag = f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
+    try:
+        result = subprocess.run(
+            ['docker', 'commit', container_id, image_tag],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0:
+            print(f"  Saved baseline image: {image_tag}")
+            return True
+        else:
+            print(f"  Failed to save baseline image: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"  Error saving baseline image: {e}")
+        return False
+
+
 def get_hf_token() -> str:
     """Get HuggingFace token."""
+    # First try reading from token file directly
+    token_file = Path.home() / ".cache" / "huggingface" / "token"
+    if token_file.exists():
+        return token_file.read_text().strip()
+
+    # Fallback to huggingface_hub
     try:
         result = subprocess.run(
             ["python3", "-c", "from huggingface_hub import get_token; print(get_token())"],
@@ -85,15 +132,38 @@ def get_docker_image(commit_short: str, commit_full: str) -> str:
     return f"{DOCKER_IMAGE_PREFIX}:{commit_full}"
 
 
-def load_baseline_mapping() -> List[Dict[str, Any]]:
+def load_baseline_mapping(mapping_file: Path = None) -> List[Dict[str, Any]]:
     """Load baseline benchmark mapping (human commit -> parent commit)."""
-    if not BASELINE_MAPPING_FILE.exists():
-        print(f"ERROR: Baseline mapping file not found: {BASELINE_MAPPING_FILE}")
+    file_path = mapping_file if mapping_file else BASELINE_MAPPING_FILE
+    if not file_path.exists():
+        print(f"ERROR: Baseline mapping file not found: {file_path}")
         print("Run the mapping generator first or create the file.")
         return []
 
-    with open(BASELINE_MAPPING_FILE) as f:
+    with open(file_path) as f:
         return json.load(f)
+
+
+def load_agent_patch_mapping() -> Dict[str, Path]:
+    """Map human commits to their agent patch paths."""
+    mapping = {}
+    if not AGENT_PATCHES_DIR.exists():
+        print(f"WARNING: Agent patches directory not found: {AGENT_PATCHES_DIR}")
+        return mapping
+
+    for patch_dir in AGENT_PATCHES_DIR.glob("vllm_core-*"):
+        journal_file = patch_dir / "journal.json"
+        if journal_file.exists():
+            try:
+                with open(journal_file) as f:
+                    journal = json.load(f)
+                human_commit = journal["commits"]["human"][:8]
+                patch_file = patch_dir / "model_patch.diff"
+                if patch_file.exists() and patch_file.stat().st_size > 0:
+                    mapping[human_commit] = patch_file
+            except Exception as e:
+                print(f"WARNING: Failed to load {journal_file}: {e}")
+    return mapping
 
 
 def load_commits_to_run() -> List[Dict[str, Any]]:
@@ -184,6 +254,7 @@ def run_serving_benchmark(commit_hash: str, model: str, perf_command: str,
 
     # Extract just the benchmark args (after benchmark_serving.py)
     bench_args = re.sub(r'python\s+benchmarks/benchmark_serving\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -303,6 +374,7 @@ def run_throughput_benchmark(commit_hash: str, model: str, perf_command: str,
 
     # Extract benchmark args
     bench_args = re.sub(r'python\s+benchmarks/benchmark_throughput\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -370,6 +442,7 @@ def run_latency_benchmark(commit_hash: str, model: str, perf_command: str,
 
     # Extract benchmark args
     bench_args = re.sub(r'python\s+benchmarks/benchmark_latency\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -463,7 +536,7 @@ def save_result(result: BenchmarkResult, output_dir: Path = None):
 
 
 def run_baseline_serving_benchmark(human_commit: str, parent_commit: str, model: str,
-                                   perf_command: str, hf_token: str, timeout: int = 3600) -> BenchmarkResult:
+                                   perf_command: str, hf_token: str, timeout: int = 10800) -> BenchmarkResult:
     """Run a baseline serving benchmark by building vLLM from source at parent commit.
 
     Uses the human Docker image as base (has CUDA runtime, PyTorch, FlashAttn),
@@ -489,6 +562,7 @@ def run_baseline_serving_benchmark(human_commit: str, parent_commit: str, model:
 
     # Extract benchmark args
     bench_args = re.sub(r'python\s+benchmarks/benchmark_serving\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -497,24 +571,48 @@ def run_baseline_serving_benchmark(human_commit: str, parent_commit: str, model:
 
     echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
     apt-get update -qq
-    apt-get install -y -qq cuda-toolkit-12-4
+    apt-get install -y -qq cuda-toolkit-12-4 git
 
     echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
     cd /opt
-    git clone https://github.com/vllm-project/vllm.git vllm_baseline
+    # Retry git clone up to 3 times (network can be flaky)
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
     cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
     git checkout $PARENT_COMMIT
 
     # Install uv for faster package management
     pip install uv -q
 
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    uv pip uninstall vllm -y --system
+    uv pip uninstall vllm --system || true
 
     # Build with H100 optimization only (SM 9.0)
     export TORCH_CUDA_ARCH_LIST="9.0"
-    export MAX_JOBS=8
-    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
+    export MAX_JOBS=32  # Increased for RAM headroom, NVCC_THREADS=2 = 16 effective jobs
+    export NVCC_THREADS=2  # Multi-threaded nvcc compilation
+    # Install build dependencies first
+    uv pip install setuptools wheel packaging ninja cmake --system
+    # Use regular pip for build since it can see system torch (uv can't)
+    pip install -e . --no-build-isolation 2>&1
+
+    # Fix aimv2 config registration conflict with newer transformers (both ovis.py and ovis2.py)
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    # Fix pyairports dependency for older vLLM with outlines
+    echo "Installing pyairports..."
+    pip install pyairports --no-cache-dir 2>&1 || echo "pyairports install warning (may be ok)"
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
@@ -613,7 +711,7 @@ def run_baseline_serving_benchmark(human_commit: str, parent_commit: str, model:
 
 
 def run_baseline_throughput_benchmark(human_commit: str, parent_commit: str, model: str,
-                                      perf_command: str, hf_token: str, timeout: int = 3600) -> BenchmarkResult:
+                                      perf_command: str, hf_token: str, timeout: int = 10800) -> BenchmarkResult:
     """Run a baseline throughput benchmark by building vLLM from source at parent commit."""
     start_time = time.time()
 
@@ -624,6 +722,7 @@ def run_baseline_throughput_benchmark(human_commit: str, parent_commit: str, mod
     bench_args = re.sub(r'python\s+benchmarks/benchmark_throughput\.py\s*', '', perf_command)
     # Also handle vllm bench throughput format
     bench_args = re.sub(r'vllm\s+bench\s+throughput\s*', '', bench_args)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -631,26 +730,53 @@ def run_baseline_throughput_benchmark(human_commit: str, parent_commit: str, mod
 
     echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
     apt-get update -qq
-    apt-get install -y -qq cuda-toolkit-12-4
+    apt-get install -y -qq cuda-toolkit-12-4 git
 
     echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
     cd /opt
-    git clone https://github.com/vllm-project/vllm.git vllm_baseline
+    # Retry git clone up to 3 times (network can be flaky)
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
     cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
     git checkout $PARENT_COMMIT
 
     # Install uv for faster package management
     pip install uv -q
 
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    uv pip uninstall vllm -y --system
+    uv pip uninstall vllm --system || true
 
     export TORCH_CUDA_ARCH_LIST="9.0"
-    export MAX_JOBS=8
-    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
+    export MAX_JOBS=32  # Increased for RAM headroom, NVCC_THREADS=2 = 16 effective jobs
+    export NVCC_THREADS=2  # Multi-threaded nvcc compilation
+    # Install build dependencies first
+    uv pip install setuptools wheel packaging ninja cmake --system
+    # Use regular pip for build since it can see system torch (uv can't)
+    pip install -e . --no-build-isolation 2>&1
+
+    # Fix aimv2 config registration conflict with newer transformers (both ovis.py and ovis2.py)
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    # Fix pyairports dependency for older vLLM with outlines
+    echo "Installing pyairports..."
+    pip install pyairports --no-cache-dir 2>&1 || echo "pyairports install warning (may be ok)"
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+
+    # Install benchmark dependencies
+    pip install aiohttp pandas datasets -q
 
     echo "=== Running throughput benchmark ==="
     cd /opt/vllm_baseline/benchmarks
@@ -701,7 +827,7 @@ def run_baseline_throughput_benchmark(human_commit: str, parent_commit: str, mod
 
 
 def run_baseline_latency_benchmark(human_commit: str, parent_commit: str, model: str,
-                                   perf_command: str, hf_token: str, timeout: int = 3600) -> BenchmarkResult:
+                                   perf_command: str, hf_token: str, timeout: int = 10800) -> BenchmarkResult:
     """Run a baseline latency benchmark by building vLLM from source at parent commit."""
     start_time = time.time()
 
@@ -709,6 +835,7 @@ def run_baseline_latency_benchmark(human_commit: str, parent_commit: str, model:
     docker_image = get_docker_image(human_short, human_commit)
 
     bench_args = re.sub(r'python\s+benchmarks/benchmark_latency\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
 
     docker_cmd = f'''
     set -e
@@ -716,26 +843,53 @@ def run_baseline_latency_benchmark(human_commit: str, parent_commit: str, model:
 
     echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
     apt-get update -qq
-    apt-get install -y -qq cuda-toolkit-12-4
+    apt-get install -y -qq cuda-toolkit-12-4 git
 
     echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
     cd /opt
-    git clone https://github.com/vllm-project/vllm.git vllm_baseline
+    # Retry git clone up to 3 times (network can be flaky)
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
     cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
     git checkout $PARENT_COMMIT
 
     # Install uv for faster package management
     pip install uv -q
 
     echo "=== Uninstalling human vLLM and building baseline from source ==="
-    uv pip uninstall vllm -y --system
+    uv pip uninstall vllm --system || true
 
     export TORCH_CUDA_ARCH_LIST="9.0"
-    export MAX_JOBS=8
-    uv pip install -e . --no-build-isolation --system 2>&1 | tail -20
+    export MAX_JOBS=32  # Increased for RAM headroom, NVCC_THREADS=2 = 16 effective jobs
+    export NVCC_THREADS=2  # Multi-threaded nvcc compilation
+    # Install build dependencies first
+    uv pip install setuptools wheel packaging ninja cmake --system
+    # Use regular pip for build since it can see system torch (uv can't)
+    pip install -e . --no-build-isolation 2>&1
+
+    # Fix aimv2 config registration conflict with newer transformers (both ovis.py and ovis2.py)
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    # Fix pyairports dependency for older vLLM with outlines
+    echo "Installing pyairports..."
+    pip install pyairports --no-cache-dir 2>&1 || echo "pyairports install warning (may be ok)"
 
     echo "=== Verifying baseline vLLM installation ==="
     python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+
+    # Install benchmark dependencies
+    pip install aiohttp pandas datasets -q
 
     echo "=== Running latency benchmark ==="
     cd /opt/vllm_baseline/benchmarks
@@ -781,14 +935,468 @@ def run_baseline_latency_benchmark(human_commit: str, parent_commit: str, model:
         )
 
 
+def build_baseline_image_only(human_commit: str, parent_commit: str, timeout: int = 10800) -> bool:
+    """Build a clean baseline image (no benchmarks, no patches).
+
+    This creates a pristine baseline image that can be reused for multiple benchmarks.
+    Call this before running benchmarks to pre-build images.
+    """
+    if check_baseline_image_exists(parent_commit):
+        print(f"  Baseline image already exists: {get_baseline_image(parent_commit)}")
+        return True
+
+    human_short = human_commit[:8]
+    docker_image = get_docker_image(human_short, human_commit)
+    container_name = f"baseline-build-{parent_commit[:12]}"
+
+    build_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+
+    echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-12-4 git
+
+    echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
+    cd /opt
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
+    cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
+    git checkout $PARENT_COMMIT
+
+    pip install uv -q
+
+    echo "=== Uninstalling human vLLM and building baseline from source ==="
+    uv pip uninstall vllm --system || true
+    uv pip install setuptools wheel packaging ninja cmake --system
+
+    export TORCH_CUDA_ARCH_LIST="9.0"
+    export MAX_JOBS=32  # Increased for RAM headroom, NVCC_THREADS=2 = 16 effective jobs
+    export NVCC_THREADS=2  # Multi-threaded nvcc compilation
+    pip install -e . --no-build-isolation 2>&1
+
+    # Fix aimv2 config registration conflict (both ovis.py and ovis2.py)
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    # Fix pyairports dependency for older vLLM with outlines
+    echo "Installing pyairports..."
+    pip install pyairports --no-cache-dir 2>&1 || echo "pyairports install warning (may be ok)"
+
+    echo "=== Verifying baseline vLLM installation ==="
+    python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+
+    # Install benchmark deps
+    pip install aiohttp pandas datasets --no-cache-dir
+
+    echo "BUILD_SUCCESS"
+    '''
+
+    print(f"  Building clean baseline image for parent {parent_commit[:8]}...")
+
+    try:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        result = subprocess.run(
+            [
+                'docker', 'run',
+                '--name', container_name,
+                '--gpus', 'all',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                docker_image,
+                '-c', build_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+
+        if "BUILD_SUCCESS" in output:
+            print(f"  Build succeeded - committing clean image...")
+            if save_baseline_image(container_name, parent_commit):
+                subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+                return True
+
+        print(f"  Build failed: {output[-2000:]}")
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return False
+
+    except subprocess.TimeoutExpired:
+        print(f"  Build timed out after {timeout}s")
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return False
+    except Exception as e:
+        print(f"  Build error: {e}")
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return False
+
+
+def run_combined_baseline_agent_serving(human_commit: str, parent_commit: str, model: str,
+                                        perf_command: str, agent_patch_path: Path,
+                                        hf_token: str, timeout: int = 10800) -> tuple:
+    """Run baseline benchmark, then apply agent patch and run again (no rebuild needed).
+
+    Returns tuple of (baseline_result, agent_result).
+    Agent patches are Python-only, so no rebuild is required.
+
+    CACHING: If baseline was built before, reuse it (skip 20+ min build time).
+    Must call build_baseline_image_only() first to ensure clean cached image.
+    """
+    start_time = time.time()
+
+    human_short = human_commit[:8]
+
+    # Check if we have a pre-built baseline image (saves 20+ min build time)
+    use_cached = check_baseline_image_exists(parent_commit)
+    if use_cached:
+        docker_image = get_baseline_image(parent_commit)
+        print(f"  Using cached baseline image: {docker_image}")
+    else:
+        docker_image = get_docker_image(human_short, human_commit)
+        print(f"  No cached baseline - will build from source")
+
+    # Adjust perf_command for random dataset
+    perf_command = re.sub(r'--dataset-name\s+sharegpt', '--dataset-name random', perf_command)
+    perf_command = re.sub(r'--dataset-name\s+sonnet', '--dataset-name random', perf_command)
+    perf_command = re.sub(r'--dataset\s+\S+\.json', '', perf_command)
+
+    if '--dataset-name' not in perf_command and '--dataset-path' not in perf_command:
+        perf_command += ' --dataset-name random'
+
+    if '--dataset-name random' in perf_command and '--random-input-len' not in perf_command:
+        perf_command += ' --random-input-len 256 --random-output-len 64'
+
+    bench_args = re.sub(r'python\s+benchmarks/benchmark_serving\.py\s*', '', perf_command)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)  # Strip --dtype (not supported in older vLLM)
+
+    # Build steps - only needed if not using cached image
+    build_steps = f'''
+    echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-12-4 git
+
+    echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
+    cd /opt
+    # Retry git clone up to 3 times (network can be flaky)
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
+    cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
+    git checkout $PARENT_COMMIT
+
+    pip install uv -q
+
+    echo "=== Uninstalling human vLLM and building baseline from source ==="
+    uv pip uninstall vllm --system || true
+
+    # Install build dependencies
+    uv pip install setuptools wheel packaging ninja cmake --system
+
+    export TORCH_CUDA_ARCH_LIST="9.0"
+    export MAX_JOBS=32  # Increased for RAM headroom, NVCC_THREADS=2 = 16 effective jobs
+    export NVCC_THREADS=2  # Multi-threaded nvcc compilation
+    echo "=== Building vLLM from source ==="
+    # Use regular pip for build since it can see system torch (uv can't)
+    pip install -e . --no-build-isolation 2>&1
+
+    # Fix aimv2 config registration conflict with newer transformers (both ovis.py and ovis2.py)
+    echo "=== Patching compatibility issues ==="
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+            echo "Patched aimv2 registration in $ovis_file"
+        fi
+    done
+
+    # Fix pyairports dependency for older vLLM with outlines
+    echo "Installing pyairports..."
+    pip install pyairports --no-cache-dir 2>&1 || echo "pyairports install warning (may be ok)"
+
+    echo "=== Verifying baseline vLLM installation ==="
+    python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+    echo "BUILD_SUCCESS"
+
+    # Install benchmark deps using pip (not uv) to ensure venv compatibility
+    pip install aiohttp pandas datasets -q
+    '''
+
+    # For cached image, skip build entirely
+    cached_setup = '''
+    echo "=== Using cached baseline image (skipping build) ==="
+    # Install benchmark deps using pip to ensure venv compatibility
+    pip install aiohttp pandas datasets -q
+    '''
+
+    docker_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+    MODEL="{model}"
+
+    {cached_setup if use_cached else build_steps}
+
+    # ============ BASELINE BENCHMARK ============
+    echo "=== Starting vLLM server for BASELINE benchmark ==="
+    python3 -m vllm.entrypoints.openai.api_server \\
+        --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+    SERVER_PID=$!
+
+    for i in $(seq 1 300); do
+        if curl -s http://localhost:8000/v1/models 2>/dev/null | grep -q "model"; then
+            echo "BASELINE_SERVER_READY_AFTER=${{i}}s"
+            break
+        fi
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "BASELINE_SERVER_CRASHED"
+            exit 1
+        fi
+        sleep 1
+    done
+
+    if ! curl -s http://localhost:8000/v1/models > /dev/null 2>&1; then
+        echo "BASELINE_SERVER_TIMEOUT"
+        exit 1
+    fi
+
+    echo "=== Running BASELINE benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_serving.py {bench_args} --port 8000 2>&1 | tee /tmp/baseline_output.txt
+    echo "BASELINE_BENCHMARK_DONE"
+
+    # Stop baseline server
+    kill $SERVER_PID 2>/dev/null || true
+    sleep 2
+
+    # ============ AGENT BENCHMARK ============
+    echo "=== Applying agent patch (Python-only, no rebuild needed) ==="
+    cd /opt/vllm_baseline
+    if git apply --check /agent_patch.diff 2>/dev/null; then
+        git apply /agent_patch.diff
+        echo "AGENT_PATCH_APPLIED"
+    else
+        echo "AGENT_PATCH_FAILED"
+        cat /tmp/baseline_output.txt
+        exit 0
+    fi
+
+    echo "=== Starting vLLM server for AGENT benchmark ==="
+    python3 -m vllm.entrypoints.openai.api_server \\
+        --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+    SERVER_PID=$!
+
+    for i in $(seq 1 300); do
+        if curl -s http://localhost:8000/v1/models 2>/dev/null | grep -q "model"; then
+            echo "AGENT_SERVER_READY_AFTER=${{i}}s"
+            break
+        fi
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "AGENT_SERVER_CRASHED"
+            cat /tmp/baseline_output.txt
+            exit 0
+        fi
+        sleep 1
+    done
+
+    if ! curl -s http://localhost:8000/v1/models > /dev/null 2>&1; then
+        echo "AGENT_SERVER_TIMEOUT"
+        cat /tmp/baseline_output.txt
+        exit 0
+    fi
+
+    echo "=== Running AGENT benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_serving.py {bench_args} --port 8000 2>&1 | tee /tmp/agent_output.txt
+    echo "AGENT_BENCHMARK_DONE"
+
+    kill $SERVER_PID 2>/dev/null || true
+
+    # Output both results
+    echo "=== BASELINE OUTPUT ==="
+    cat /tmp/baseline_output.txt
+    echo "=== AGENT OUTPUT ==="
+    cat /tmp/agent_output.txt
+    '''
+
+    # Container name for potential caching
+    container_name = f"baseline-build-{parent_commit[:12]}"
+
+    try:
+        # Remove any existing container with same name
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        result = subprocess.run(
+            [
+                'docker', 'run',
+                '--name', container_name,  # Named container for caching
+                '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', '/root/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{agent_patch_path}:/agent_patch.diff:ro',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                docker_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        # NOTE: We do NOT cache from combined benchmark because agent patch modifies files.
+        # Use build_baseline_image_only() to pre-build clean baseline images.
+
+        # Clean up container
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        # Parse baseline metrics
+        baseline_output = ""
+        agent_output = ""
+        if "=== BASELINE OUTPUT ===" in output and "=== AGENT OUTPUT ===" in output:
+            parts = output.split("=== BASELINE OUTPUT ===")
+            if len(parts) > 1:
+                baseline_agent = parts[1].split("=== AGENT OUTPUT ===")
+                baseline_output = baseline_agent[0] if len(baseline_agent) > 0 else ""
+                agent_output = baseline_agent[1] if len(baseline_agent) > 1 else ""
+
+        baseline_metrics = parse_serving_metrics(baseline_output or output)
+        agent_metrics = parse_serving_metrics(agent_output) if "AGENT_BENCHMARK_DONE" in output else {}
+
+        # Create baseline result
+        baseline_status = 'success' if baseline_metrics else 'error'
+        if 'BASELINE_SERVER_CRASHED' in output:
+            baseline_status = 'error'
+            baseline_error = 'Server crashed during startup'
+        elif 'BASELINE_SERVER_TIMEOUT' in output:
+            baseline_status = 'error'
+            baseline_error = 'Server startup timeout'
+        elif not baseline_metrics:
+            baseline_error = 'No metrics in output'
+        else:
+            baseline_error = None
+
+        baseline_result = BenchmarkResult(
+            commit_hash=parent_commit, status=baseline_status, benchmark_type='serving',
+            model=model, duration_s=duration, error=baseline_error,
+            raw_output=baseline_output[-10000:] if baseline_output else output[-10000:],
+            **baseline_metrics
+        )
+
+        # Create agent result
+        agent_result = None
+        if "AGENT_PATCH_APPLIED" in output:
+            agent_status = 'success' if agent_metrics else 'error'
+            if 'AGENT_SERVER_CRASHED' in output:
+                agent_status = 'error'
+                agent_error = 'Server crashed after patch'
+            elif 'AGENT_SERVER_TIMEOUT' in output:
+                agent_status = 'error'
+                agent_error = 'Server startup timeout after patch'
+            elif not agent_metrics:
+                agent_error = 'No metrics in agent output'
+            else:
+                agent_error = None
+
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status=agent_status, benchmark_type='serving',
+                model=model, duration_s=duration, error=agent_error,
+                raw_output=agent_output[-10000:] if agent_output else "",
+                **agent_metrics
+            )
+        elif "AGENT_PATCH_FAILED" in output:
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status='error', benchmark_type='serving',
+                model=model, duration_s=duration, error='Agent patch failed to apply',
+                raw_output=""
+            )
+
+        return (baseline_result, agent_result)
+
+    except subprocess.TimeoutExpired:
+        # Clean up container on timeout
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(
+                commit_hash=parent_commit, status='timeout', benchmark_type='serving',
+                model=model, duration_s=timeout, error=f'Benchmark timed out after {timeout}s'
+            ),
+            None
+        )
+    except Exception as e:
+        # Clean up container on error
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(
+                commit_hash=parent_commit, status='error', benchmark_type='serving',
+                model=model, duration_s=time.time() - start_time, error=str(e)
+            ),
+            None
+        )
+
+
+def save_agent_result(result: BenchmarkResult, human_commit: str, mapping_entry: dict):
+    """Save agent benchmark result."""
+    AGENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    result_file = AGENT_OUTPUT_DIR / f"{human_commit}_agent_result.json"
+
+    result_data = {
+        'human_commit': human_commit,
+        'human_commit_full': mapping_entry['human_commit_full'],
+        'parent_commit': mapping_entry['parent_commit'],
+        'status': result.status,
+        'benchmark_type': result.benchmark_type,
+        'model': result.model,
+        'duration_s': result.duration_s,
+        'error': result.error,
+        'ttft_mean': result.ttft_mean,
+        'ttft_median': result.ttft_median,
+        'ttft_p99': result.ttft_p99,
+        'tpot_mean': result.tpot_mean,
+        'tpot_median': result.tpot_median,
+        'tpot_p99': result.tpot_p99,
+        'itl_mean': result.itl_mean,
+        'itl_median': result.itl_median,
+        'itl_p99': result.itl_p99,
+        'throughput_req_s': result.throughput_req_s,
+        'throughput_tok_s': result.throughput_tok_s,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    with open(result_file, 'w') as f:
+        json.dump(result_data, f, indent=2)
+    print(f"  Agent result saved to {result_file}")
+
+
 def run_baseline_benchmarks(args):
     """Run baseline benchmarks for commits in baseline_benchmark_mapping.json."""
     print("Loading baseline mapping...")
-    mapping = load_baseline_mapping()
+    mapping_file = Path(args.mapping) if args.mapping else None
+    mapping = load_baseline_mapping(mapping_file)
     if not mapping:
         return
 
     print(f"Found {len(mapping)} commits in baseline mapping")
+
+    # Load agent patch mapping
+    print("Loading agent patch mapping...")
+    agent_patches = load_agent_patch_mapping()
+    print(f"Found {len(agent_patches)} agent patches")
 
     # Filter by commit if specified
     if args.commit:
@@ -806,9 +1414,11 @@ def run_baseline_benchmarks(args):
         print(f"Limited to {len(mapping)} commits")
 
     if args.dry_run:
-        print("\nDry run - would run baseline benchmarks for:")
+        print("\nDry run - would run baseline + agent benchmarks for:")
         for m in mapping:
-            print(f"  {m['human_commit_short']} -> parent {m['parent_commit'][:8]}")
+            human_short = m['human_commit_short']
+            has_patch = human_short in agent_patches
+            print(f"  {human_short} -> parent {m['parent_commit'][:8]} {'[+AGENT]' if has_patch else ''}")
             print(f"    Model: {m.get('model', 'N/A')}")
             print(f"    Type: {m.get('benchmark_type', 'unknown')}")
         return
@@ -842,8 +1452,27 @@ def run_baseline_benchmarks(args):
             print(f"  SKIP: Already have baseline result")
             continue
 
+        # Check if we have an agent patch for this commit
+        human_short = m['human_commit_short']
+        agent_patch = agent_patches.get(human_short)
+
+        # Pre-build clean baseline image if needed (before any benchmarks or patches)
+        if btype == 'serving' and agent_patch:
+            if not check_baseline_image_exists(parent_commit):
+                print(f"  Pre-building clean baseline image...")
+                if not build_baseline_image_only(human_commit, parent_commit):
+                    print(f"  SKIP: Failed to build baseline image")
+                    continue
+
         # Run appropriate benchmark
-        if btype == 'serving':
+        agent_result = None
+        if btype == 'serving' and agent_patch:
+            # Use combined function for serving benchmarks with agent patches
+            print(f"  Running combined baseline + agent benchmark")
+            result, agent_result = run_combined_baseline_agent_serving(
+                human_commit, parent_commit, model, perf_command, agent_patch, hf_token
+            )
+        elif btype == 'serving':
             result = run_baseline_serving_benchmark(human_commit, parent_commit, model, perf_command, hf_token)
         elif btype == 'throughput':
             result = run_baseline_throughput_benchmark(human_commit, parent_commit, model, perf_command, hf_token)
@@ -876,32 +1505,45 @@ def run_baseline_benchmarks(args):
             'throughput_req_s': result.throughput_req_s,
             'throughput_tok_s': result.throughput_tok_s,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'raw_output': result.raw_output,  # Include for debugging
         }
         with open(result_file, 'w') as f:
             json.dump(result_data, f, indent=2)
-        print(f"  Saved to {result_file}")
+        print(f"  Baseline saved to {result_file}")
 
         results.append(result)
 
         if result.status == 'success':
-            print(f"  SUCCESS: {result.duration_s:.1f}s")
+            print(f"  BASELINE SUCCESS: {result.duration_s:.1f}s")
             if result.throughput_tok_s:
                 print(f"    Throughput: {result.throughput_tok_s:.2f} tok/s")
             if result.ttft_mean:
                 print(f"    TTFT: {result.ttft_mean:.2f}ms")
         else:
-            print(f"  {result.status.upper()}: {result.error}")
+            print(f"  BASELINE {result.status.upper()}: {result.error}")
+
+        # Save agent result if available
+        if agent_result:
+            save_agent_result(agent_result, human_short, m)
+            if agent_result.status == 'success':
+                print(f"  AGENT SUCCESS")
+                if agent_result.throughput_tok_s:
+                    print(f"    Throughput: {agent_result.throughput_tok_s:.2f} tok/s")
+                if agent_result.ttft_mean:
+                    print(f"    TTFT: {agent_result.ttft_mean:.2f}ms")
+            else:
+                print(f"  AGENT {agent_result.status.upper()}: {agent_result.error}")
 
     # Summary
     print("\n" + "="*50)
-    print("BASELINE BENCHMARK SUMMARY")
+    print("BASELINE + AGENT BENCHMARK SUMMARY")
     print("="*50)
     success = sum(1 for r in results if r.status == 'success')
     errors = sum(1 for r in results if r.status == 'error')
     timeouts = sum(1 for r in results if r.status == 'timeout')
-    print(f"Success: {success}/{len(results)}")
-    print(f"Errors: {errors}/{len(results)}")
-    print(f"Timeouts: {timeouts}/{len(results)}")
+    print(f"Baseline - Success: {success}/{len(results)}")
+    print(f"Baseline - Errors: {errors}/{len(results)}")
+    print(f"Baseline - Timeouts: {timeouts}/{len(results)}")
 
 
 def main():
@@ -915,6 +1557,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Show what would be run')
     parser.add_argument('--baseline', action='store_true',
                         help='Run baseline benchmarks (build vLLM from source at parent commit)')
+    parser.add_argument('--mapping', type=str, default=None,
+                        help='Path to baseline mapping JSON file (default: baseline_benchmark_mapping.json)')
     args = parser.parse_args()
 
     # If baseline mode, run baseline benchmarks instead
