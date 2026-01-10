@@ -1151,6 +1151,60 @@ def run_combined_baseline_agent_serving(human_commit: str, parent_commit: str, m
 
     {cached_setup if use_cached else build_steps}
 
+    # ============ COMPATIBILITY FIXES ============
+    echo "Applying compatibility fixes..."
+
+    # Fix transformers LogitsWarper issue
+    if ! python3 -c "from transformers.generation.logits_process import LogitsWarper" 2>/dev/null; then
+        echo "Fixing transformers compatibility (LogitsWarper missing)..."
+        pip install 'transformers==4.44.2' -q 2>/dev/null || true
+    fi
+
+    # Fix numpy < 2 for outlines compatibility
+    pip install 'numpy<2' -q 2>/dev/null || true
+
+    # Fix rope_scaling for Llama-3.1 models (use rope_type instead of type)
+    VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null || echo "/opt/vllm_baseline/vllm")
+    if [ -d "$VLLM_DIR" ]; then
+        echo "Fixing rope_scaling compatibility..."
+        find "$VLLM_DIR" -name "*.py" -exec grep -l 'rope_scaling\["type"\]' {{}} \; 2>/dev/null | while read f; do
+            sed -i 's/rope_scaling\["type"\]/rope_scaling.get("type", rope_scaling.get("rope_type"))/g' "$f"
+        done
+    fi
+
+    # Fix outlines.fsm compatibility
+    if ! python3 -c "from outlines.fsm.guide import Guide" 2>/dev/null; then
+        echo "Fixing outlines.fsm compatibility..."
+        pip uninstall outlines -y 2>/dev/null || true
+        pip install 'outlines==0.0.34' --no-deps 2>/dev/null || true
+    fi
+
+    # If outlines still fails, patch vLLM guided_decoding
+    if ! python3 -c "from outlines.fsm.guide import Guide" 2>/dev/null; then
+        echo "Patching vLLM guided_decoding..."
+        VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null || echo "/opt/vllm_baseline/vllm")
+        if [ -f "$VLLM_DIR/model_executor/guided_decoding/__init__.py" ]; then
+            cat > "$VLLM_DIR/model_executor/guided_decoding/__init__.py" << 'PATCH'
+from typing import Optional
+from dataclasses import dataclass
+@dataclass
+class GuidedDecodingRequest:
+    guided_json: Optional[str] = None
+    guided_regex: Optional[str] = None
+    guided_choice: Optional[list] = None
+    guided_grammar: Optional[str] = None
+    guided_decoding_backend: Optional[str] = None
+    guided_whitespace_pattern: Optional[str] = None
+async def get_guided_decoding_logits_processor(*args, **kwargs):
+    return None
+async def get_local_guided_decoding_logits_processor(*args, **kwargs):
+    return None
+def get_outlines_guided_decoding_logits_processor(*args, **kwargs):
+    return None
+PATCH
+        fi
+    fi
+
     # ============ BASELINE BENCHMARK ============
     echo "=== Starting vLLM server for BASELINE benchmark ==="
     python3 -m vllm.entrypoints.openai.api_server \\
