@@ -1,180 +1,192 @@
-# Claude Code vLLM Benchmarks
+# Claude Code vLLM Benchmark Results
 
-This directory contains benchmark results from running Claude Code (claude-sonnet-4) on vLLM performance optimization tasks.
+Benchmark results comparing **Claude Code** (AI agent) vs **Human developers** on vLLM performance optimization tasks.
 
-## Overview
+## Quick Start
 
-The benchmark evaluates Claude Code's ability to reproduce performance optimizations from real vLLM commits. For each commit:
+```bash
+# View results summary
+python upload_to_hf.py --dry-run
 
-1. **Baseline**: Run benchmark on parent commit (before optimization)
-2. **Human**: Run benchmark on the actual commit (human's optimization)
-3. **Agent**: Run benchmark with Claude Code's attempted optimization patch
+# Upload to HuggingFace
+python upload_to_hf.py --repo-id "Inferencebench/claude-code-vllm-benchmarks"
+```
 
 ## Results Summary
 
-- **Total commits tested**: 94
-- **Successful benchmarks**: 20 (with full 3-way comparison)
-- **Agent matched/exceeded human performance**: 75% (TPOT metric)
+| Metric | Value |
+|--------|-------|
+| Total commits | 94 |
+| Evaluable for Agent vs Human | 49 |
+| Agent matches or beats human | 65% |
+| Agent failure rate | 22% |
 
-## Running the Benchmarks
+See `COMPREHENSIVE_BENCHMARK_ANALYSIS.md` for detailed analysis.
 
-### Prerequisites
+---
 
-1. **Modal account**: Sign up at https://modal.com
-2. **HuggingFace token**: For model access
-3. **Python environment**:
-   ```bash
-   cd /home/ubuntu/OmniPerf-Bench
-   source .venv/bin/activate
-   ```
+## Directory Structure
 
-### Step 1: Deploy Modal App
-
-Deploy the benchmark infrastructure to Modal:
-
-```bash
-modal deploy src/eval/modal_benchmark.py
+```
+omniperf_results_3way_claude_code/
+│
+├── README.md                           # This file
+├── upload_to_hf.py                     # HuggingFace upload script
+├── COMPREHENSIVE_BENCHMARK_ANALYSIS.md # Main analysis document (START HERE)
+├── METRIC_ANALYSIS.md                  # Schema documentation
+│
+├── results/                            # All benchmark result data
+│   ├── modal/                          # Primary: Modal H100 pipeline
+│   │   └── <commit>/                   # Per-commit folders
+│   │       └── benchmark_result.json   # 3-way comparison result
+│   ├── separate_baseline/              # Separate pipeline: baseline runs
+│   ├── separate_agent/                 # Separate pipeline: human + agent runs
+│   └── docker/                         # Docker verification runs
+│
+├── exports/                            # Exported datasets
+│   ├── schema_v2_results.json          # Full results as JSON (v2 schema)
+│   ├── claude_code_vllm_benchmarks.jsonl
+│   ├── full_results.jsonl
+│   ├── merged_benchmarks.jsonl
+│   └── data/                           # Parquet exports
+│
+├── logs/                               # Execution logs
+│   ├── modal/                          # Modal run progress logs
+│   └── reruns/                         # Pipeline rerun logs (v1-v18)
+│
+└── archive/                            # Historical files (superseded)
+    ├── analysis/                       # Old analysis documents
+    └── operational/                    # Dated operational files
 ```
 
-This creates:
-- `omniperf-benchmark` app with GPU functions (H100:1, H100:2, H100:4, H100:8)
-- CPU-only build functions for wheel compilation
-- Model cache and build cache volumes
+---
 
-### Step 2: Run Single Benchmark
+## Key Files
 
-```python
-from src.eval.modal_benchmark import run_3way_modal_benchmark
+| File | Purpose |
+|------|---------|
+| `COMPREHENSIVE_BENCHMARK_ANALYSIS.md` | **Start here.** Complete analysis of all 96 commits with methodology, results, and limitations. |
+| `METRIC_ANALYSIS.md` | HuggingFace schema documentation. Explains serving vs standalone metrics. |
+| `upload_to_hf.py` | Script to upload results to HuggingFace. Supports dry-run mode. |
 
-result = run_3way_modal_benchmark(
-    baseline_wheel_url="https://vllm-wheels.s3.us-west-2.amazonaws.com/{parent_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl",
-    human_wheel_url="https://vllm-wheels.s3.us-west-2.amazonaws.com/{commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl",
-    agent_patch="<unified diff from agent>",
-    perf_command="python benchmarks/benchmark_serving.py --model meta-llama/Llama-3.1-8B-Instruct --backend vllm --num-prompts 100",
-    model="meta-llama/Llama-3.1-8B-Instruct",
-    gpu_config="H100:1",
-    base_commit="<parent_commit_hash>",
-    human_commit="<commit_hash>",
-)
-```
+---
 
-### Step 3: Run Batch Benchmarks
+## Benchmark Design
 
-Use the hero benchmark runner for batch processing:
+Each commit is benchmarked in a **3-way comparison**:
 
-```bash
-# Create commit plan
-python hero_benchmark_runner.py --dry-run
+| Version | Description |
+|---------|-------------|
+| **Baseline** | Performance before optimization (parent commit) |
+| **Human** | Performance with human's optimization (ground truth) |
+| **Agent** | Performance with Claude Code's optimization attempt |
 
-# Run all commits
-python hero_benchmark_runner.py
+### Benchmark Modes
 
-# Resume from specific commit
-python hero_benchmark_runner.py --start-from abc12345
-```
+| Mode | Metrics | Unit | Better |
+|------|---------|------|--------|
+| `serving` | TTFT, TPOT, ITL | milliseconds | Lower |
+| `standalone` | latency_avg, throughput | ms / tok/s | Lower / Higher |
 
-## Architecture
+A commit has **one mode**, never both.
 
-### Key Components
-
-1. **modal_benchmark.py**: Main benchmark infrastructure
-   - `run_3way_modal_benchmark()`: Entry point for 3-way comparison
-   - `build_vllm_cpu_only()`: Build wheels on cheap CPU instances
-   - `ensure_vllm_build_cached()`: Cache management for builds
-   - GPU benchmark functions (`run_3way_benchmark_1gpu`, etc.)
-
-2. **hero_benchmark_runner.py**: Batch runner
-   - Processes multiple commits from HuggingFace dataset
-   - Handles GPU configuration selection
-   - Saves incremental results
-
-### Build/Wheel System
-
-The system uses a 2-phase architecture:
-
-1. **Phase 1 (CPU)**: Build vLLM wheels on $0.20/hr CPU instances
-   - Wheels cached in Modal volume for reuse
-   - No GPU time wasted on compilation
-
-2. **Phase 2 (GPU)**: Run benchmarks on H100 instances
-   - Install pre-built wheels
-   - Execute benchmark commands
-   - Compare baseline/human/agent performance
-
-### Wheel URL Validation (Fix Applied)
-
-The system now validates S3 wheel URLs before use. If a wheel doesn't exist:
-- Triggers CPU build instead of failing
-- Caches built wheel in Modal volume
-- Uses Python overlay for old commits without wheels
-
-### Blocked Models
-
-The following models are blocked (too large/unstable):
-- DeepSeek-V3, DeepSeek-R1
-- Nemotron-4-340B
-- DBRX
-- Llama-4-Scout-17B-16E-Instruct
-
-### CLI Version Compatibility
-
-Old vLLM versions don't support new CLI arguments. The system automatically strips:
-- `--backend vllm`
-- `--enable-prefix-caching`
-- `--use-v2-block-manager`
-- And other version-specific arguments
+---
 
 ## Result Format
 
-Each benchmark result is saved as JSON:
+Each `results/modal/<commit>/benchmark_result.json` contains:
 
 ```json
 {
   "instance": {
     "commit_hash": "abc123...",
     "commit_subject": "[Perf] Optimization description",
-    "perf_command": "python benchmarks/benchmark_serving.py ..."
+    "perf_command": "vllm bench serve ..."
   },
   "result": {
     "status": "success",
-    "baseline_metrics": {"ttft_mean": 100.0, "tpot_mean": 10.0, ...},
-    "human_metrics": {"ttft_mean": 90.0, "tpot_mean": 9.0, ...},
-    "agent_metrics": {"ttft_mean": 92.0, "tpot_mean": 9.2, ...},
-    "human_improvement": {"ttft_mean": 10.0, "tpot_mean": 10.0},
-    "agent_improvement": {"ttft_mean": 8.0, "tpot_mean": 8.0},
-    "agent_vs_human": {"ttft_mean": -2.0, "tpot_mean": -2.0}
+    "benchmark_mode": "serving",
+    "baseline_metrics": {"ttft_mean": 100.0, "tpot_mean": 10.0},
+    "human_metrics": {"ttft_mean": 90.0, "tpot_mean": 9.0},
+    "agent_metrics": {"ttft_mean": 92.0, "tpot_mean": 9.2},
+    "human_improvement": {"ttft_mean": 10.0},
+    "agent_improvement": {"ttft_mean": 8.0},
+    "agent_vs_human": {"ttft_mean": -2.0}
   }
 }
 ```
 
-## Metrics Explained
+### Improvement Calculation
 
-- **TTFT (Time To First Token)**: Latency until first token generated
-- **TPOT (Time Per Output Token)**: Average inter-token latency
-- **ITL (Inter-Token Latency)**: Similar to TPOT
-- **Throughput**: Tokens per second
-
-Improvement percentages are calculated as:
 ```
 improvement = (baseline - optimized) / baseline * 100
 ```
 
-Positive values indicate improvement (lower is better for latency metrics).
+Positive = improvement (lower latency or higher throughput).
 
-## Troubleshooting
+---
 
-### "No wheel available and no ancestor wheel found"
-- S3 wheels don't exist for old commits
-- System will now auto-build from source (fix applied)
+## Data Sources
 
-### "unrecognized arguments: --backend vllm"
-- Old vLLM version doesn't support `--backend`
-- System now strips incompatible arguments (fix applied)
+### Modal Pipeline (Primary)
 
-### Server startup timeout
-- Default increased to 20 minutes
-- Large models may need more time to load weights
+- Location: `results/modal/<commit>/benchmark_result.json`
+- Infrastructure: Modal H100 GPUs
+- Reliability: **Gold standard** - same config for baseline/human/agent
+- Status: 94 commits processed
 
-### Container OOM/crash
-- Blocked models list prevents running known-problematic models
-- Check GPU memory requirements match model size
+### Separate Pipeline (Secondary)
+
+- Location: `results/separate_baseline/`, `results/separate_agent/`
+- Infrastructure: Local Docker on H100
+- Reliability: **Variable** - config may differ between runs
+- Issue: Some commits have model mismatch (Qwen baseline vs Llama human)
+
+---
+
+## HuggingFace Dataset
+
+Published at: **[Inferencebench/claude-code-vllm-benchmarks](https://huggingface.co/datasets/Inferencebench/claude-code-vllm-benchmarks)**
+
+### Schema v3 (Current)
+
+75 columns covering:
+- Commit metadata (hash, subject, PR URL)
+- Raw metrics (baseline/human/agent)
+- Improvement calculations
+- Agent metadata (name, model, date)
+
+See `METRIC_ANALYSIS.md` for full schema documentation.
+
+---
+
+## Reproducing Results
+
+### Prerequisites
+
+1. Modal account with H100 access
+2. HuggingFace token for model downloads
+3. Python environment with dependencies
+
+### Running Benchmarks
+
+```bash
+# From OmniPerf-Bench root
+source bench-env/bin/activate
+
+# Deploy Modal infrastructure
+modal deploy src/eval/modal_benchmark.py
+
+# Run benchmarks (see main repo README)
+```
+
+---
+
+## Limitations
+
+1. **Sample size**: 19 gold-standard 3-way comparisons, 49 total evaluable
+2. **Infrastructure failures**: 41% of commits failed due to vLLM version bugs, model issues, or timeouts
+3. **Model mismatch**: 8 commits from separate pipeline used different baseline models
+4. **Agent failures**: 22% of evaluable commits had agent patches that crashed or produced no output
+
+See `COMPREHENSIVE_BENCHMARK_ANALYSIS.md` Section "Data Quality Notes" for details.
