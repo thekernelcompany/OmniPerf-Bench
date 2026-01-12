@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Constants
 SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
-DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker"
+DOCKER_REPO = "shikhar481/sglang-images"
 CLAUDE_CODE_PATCHES_DIR = Path("perf-agents-bench/state/runs/sglang/claude_code")
 WORK_DIR = Path("/tmp/sglang_docker_build")
 
@@ -159,6 +159,10 @@ RUN pip install transformers>=4.40.0 huggingface_hub>=0.23.0 tokenizers>=0.19.0 
 # Install flashinfer (required for SGLang)
 RUN pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.4/
 
+# Install sgl-kernel from PyPI (contains deep_gemm and other CUDA kernels)
+# This is CRITICAL - without it, SGLang server crashes with "No module named 'deep_gemm'"
+RUN pip install sgl-kernel
+
 # Install SGLang from source
 WORKDIR /opt/sglang
 RUN pip install -e "python[all]" || pip install -e "python"
@@ -166,8 +170,9 @@ RUN pip install -e "python[all]" || pip install -e "python"
 # Install benchmark dependencies
 RUN pip install datasets pandas tqdm pybase64 Pillow
 
-# Verify installation
+# Verify installation (including sgl-kernel)
 RUN python -c "import sglang; print(f'SGLang version: {sglang.__version__}')"
+RUN python -c "import sgl_kernel; import deep_gemm; print('sgl-kernel and deep_gemm OK')"
 
 # Set working directory for benchmarks
 WORKDIR /workspace
