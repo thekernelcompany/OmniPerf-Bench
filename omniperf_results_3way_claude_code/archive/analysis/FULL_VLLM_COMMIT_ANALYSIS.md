@@ -1719,5 +1719,183 @@ omniperf_results_3way_claude_code/
 
 ---
 
-*3-way benchmark analysis completed: 2026-01-09*
+## Retry Analysis: What Can Still Be Fixed (2026-01-12)
+
+### Executive Summary
+
+After uploading Schema v4 to HuggingFace (96 rows, 76 columns), we analyzed remaining commits to determine what can be improved via retry.
+
+| Category | Count | Retryable? |
+|----------|-------|------------|
+| Complete 3-way (B+H+A) | 22 | ✅ Already done |
+| H+A only (usable for comparison) | 17 | ✅ Already usable |
+| Human only (agent failed) | 13 | **Partial** |
+| Agent only (human failed) | 5 | **Partial** |
+| No metrics | 39 | **Mostly NO** |
+
+---
+
+### ACTUALLY RETRYABLE (4 commits)
+
+These are **transient failures** that can be solved with a simple retry:
+
+| Commit | Model | Issue | Action |
+|--------|-------|-------|--------|
+| **ccf02fcb** | ibm-ai-platform/Bamba-9B | Broken pipe | Retry agent benchmark |
+| **e7b20426** | 01-ai/Yi-1.5-9B-Chat | Broken pipe | Retry agent benchmark |
+| **67da5720** | Qwen/Qwen2.5-7B-Instruct | Broken pipe | Full retry |
+| **9f1710f1** | deepseek-ai/DeepSeek-V2-Lite-Chat | Never ran on Modal | Full run needed |
+
+**Expected gain: 4 more complete evaluations**
+
+---
+
+### NOT RETRYABLE (Fundamental Issues)
+
+#### 1. Wheel Not Found (4 commits)
+
+These fail because the parent commit's vLLM wheel doesn't exist on S3:
+
+| Commit | Model | Missing Parent Wheel |
+|--------|-------|---------------------|
+| 660470e5 | Meta-Llama-3-8B-Instruct | `8d59dbb00044` |
+| 9ed82e70 | Meta-Llama-3-8B-Instruct | `51f8aa90ad40` |
+| ad8d696a | Meta-Llama-3-8B-Instruct | `3d925165f2b1` |
+| d7740ea4 | Meta-Llama-3-8B-Instruct | `cc466a32903d` |
+
+**Why NOT retryable:** Simple retry will produce same error. Requires:
+- Building Docker images locally, OR
+- Finding/building ancestor wheels, OR
+- Manual wheel compilation
+
+#### 2. Baseline Failed - V1 Engine Issues (5 commits)
+
+These fail due to fundamental `vllm_flash_attn.fa_utils` / CUDA TMA incompatibilities:
+
+| Commit | Model | Error |
+|--------|-------|-------|
+| 2deb029d | Meta-Llama-3-8B-Instruct | baseline_failed |
+| 35fad35a | Meta-Llama-3-8B-Instruct | No baseline metrics |
+| 83450458 | Meta-Llama-3-8B-Instruct | No baseline metrics |
+| 93e5f3c5 | Meta-Llama-3-8B-Instruct | No baseline metrics |
+| 9d72daf4 | Meta-Llama-3-8B-Instruct | No baseline metrics |
+
+**Why NOT retryable:** These commits have V1 engine code that requires `fa_utils.py` which wasn't packaged in the Docker images. Same error will recur on retry.
+
+#### 3. Version Bug #8791 (5 commits)
+
+These fail due to a **known vLLM port binding bug** in versions 0.6.3-0.6.4:
+
+| Commit | vLLM Version | PR Description |
+|--------|--------------|----------------|
+| 25ebed2f | 0.6.4.post2.dev375 | Cache np arange for input prep |
+| 88693683 | 0.6.4.post2.dev368 | Optimize evictor v1/v2 performance |
+| 9323a315 | 0.6.4.post2.dev218 | XGrammar guided decoding |
+| b2e0ad3b | 0.6.3.post2.dev398 | Reduce peak memory usage |
+| f092153f | 0.6.4.post2.dev330 | Persistent buffers for input prep |
+
+**Why NOT retryable:** These are **legitimate performance PRs** but the vLLM version has a regression that prevents serving benchmarks. Would require patching vLLM source code.
+
+#### 4. Latency/Throughput Benchmarks - No TPOT (4 commits)
+
+These succeeded but used latency/throughput benchmark mode (not serving):
+
+| Commit | Model | Mode |
+|--------|-------|------|
+| 3b61cb45 | Llama-3.1-8B-Instruct | latency |
+| 6dd94dbe | Meta-Llama-3-8B | latency |
+| 8c1e77fb | Llama-3.1-8B-Instruct | latency |
+| ce6bf3a2 | google/gemma-2b | throughput |
+
+**Why NOT retryable:** These are NOT failures. They intentionally used different benchmark modes that don't produce TPOT/TTFT metrics. The benchmarks succeeded as designed.
+
+#### 5. Large Models - Multi-GPU Required (13 commits)
+
+These require 2-8 H100 GPUs:
+
+| Commit | Model | GPU Requirement |
+|--------|-------|-----------------|
+| 0d243f2a | Mixtral-8x7B-Instruct-v0.1 | 8x7B MoE |
+| 0ec82edd | Qwen3-30B-A3B | 30B params |
+| 21d93c14 | Mixtral-8x7B-v0.1 | 8x7B MoE |
+| 310aca88 | Meta-Llama-3-70B | 70B params |
+| 379da6dc | Meta-Llama-3-70B | 70B params |
+| 7661e92e | Nemotron-4-340B-Instruct | 340B params |
+| 8aa1485f | Llama-4-Scout-17B-16E | 17B x 16 experts |
+| bd6028d6 | Llama-4-Scout-17B-16E-FP8 | 17B x 16 experts |
+| c0569dbc | Qwen3-30B-A3B-FP8 | 30B params |
+| dae68969 | DeepSeek-R1 | 671B+ MoE |
+| dcc6cfb9 | Qwen3-30B-A3B-FP8 | 30B params |
+| eefbf4a6 | Qwen3-30B-A3B-FP8 | 30B params |
+| fb0acb6c | DeepSeek-R1 | 671B+ MoE |
+
+**Why NOT retryable:** Would require multi-GPU infrastructure (2-16 H100s). Not a code fix.
+
+---
+
+### Detailed Failure Analysis for Human-Only Commits (13)
+
+| Commit | Model | Modal Status | Fixable? | Reason |
+|--------|-------|--------------|----------|--------|
+| 2deb029d | unknown | baseline_failed | NO | V1 engine issue |
+| 35fad35a | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
+| 3b61cb45 | Llama-3.1-8B-Instruct | success | NO | Latency mode (not failure) |
+| 660470e5 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
+| 6dd94dbe | Meta-Llama-3-8B | success | NO | Latency mode (not failure) |
+| 8c1e77fb | Llama-3.1-8B-Instruct | success | NO | Latency mode (not failure) |
+| 9ed82e70 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
+| ad8d696a | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
+| **ccf02fcb** | Bamba-9B | exception | **YES** | Broken pipe - retry |
+| ce6bf3a2 | gemma-2b | success | NO | Throughput mode (not failure) |
+| d7740ea4 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
+| **e7b20426** | Yi-1.5-9B-Chat | exception | **YES** | Broken pipe - retry |
+| **9f1710f1** | DeepSeek-V2-Lite-Chat | N/A | **YES** | Never ran on Modal |
+
+---
+
+### Detailed Failure Analysis for Agent-Only Commits (5)
+
+| Commit | Model | Modal Status | Fixable? | Reason |
+|--------|-------|--------------|----------|--------|
+| **67da5720** | Qwen2.5-7B-Instruct | exception | **YES** | Broken pipe - retry |
+| 6d646d08 | Meta-Llama-3-8B | error | NO | Wheel not found |
+| 83450458 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
+| 93e5f3c5 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
+| 9d72daf4 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
+
+---
+
+### Bottom Line: Retry These 4 Commits
+
+```bash
+# Broken pipe failures (transient network errors)
+ccf02fcb  ibm-ai-platform/Bamba-9B             # Has human data, retry agent
+e7b20426  01-ai/Yi-1.5-9B-Chat                 # Has human data, retry agent
+67da5720  Qwen/Qwen2.5-7B-Instruct             # Full retry needed
+
+# Never ran on Modal
+9f1710f1  deepseek-ai/DeepSeek-V2-Lite-Chat    # Full Modal run needed
+```
+
+**Everything else requires infrastructure changes** (building wheels, patching vLLM, multi-GPU setup) - NOT solvable by simple retry.
+
+---
+
+### Summary by Failure Category
+
+| Category | Count | Action |
+|----------|-------|--------|
+| **Retry (broken pipe)** | 3 | Re-run on Modal |
+| **Never ran** | 1 | Run on Modal |
+| Wheel not found | 5 | Build Docker images locally |
+| V1 engine issues | 5 | Patch fa_utils.py in images |
+| Version bug #8791 | 5 | Skip (vLLM regression) |
+| Latency/throughput mode | 4 | N/A (not failures) |
+| Multi-GPU required | 13 | Multi-GPU infrastructure |
+
+**Total retryable: 4 commits (4.2% of 96)**
+
+---
+
+*Retry analysis completed: 2026-01-12*
 *Analysis by: Claude Code*
