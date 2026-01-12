@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,77 @@ SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
 DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker"
 CLAUDE_CODE_PATCHES_DIR = Path("perf-agents-bench/state/runs/sglang/claude_code")
 WORK_DIR = Path("/tmp/sglang_docker_build")
+
+# Default torch version fallback
+DEFAULT_TORCH_VERSION = "2.5.1"
+
+
+def get_torch_version_for_commit(repo_path: Path, commit: str) -> str:
+    """
+    Auto-detect torch version from commit's sgl-kernel/pyproject.toml.
+    Falls back to python/pyproject.toml if sgl-kernel doesn't specify.
+
+    Args:
+        repo_path: Path to the SGLang repository
+        commit: Commit hash to check
+
+    Returns:
+        Torch version string (e.g., "2.5.1")
+    """
+    # Try sgl-kernel/pyproject.toml first (build requirements)
+    result = subprocess.run(
+        ["git", "show", f"{commit}:sgl-kernel/pyproject.toml"],
+        cwd=repo_path, capture_output=True, text=True, timeout=30
+    )
+    if result.returncode == 0:
+        content = result.stdout
+        # Look for torch version in build-system requires
+        for line in content.split('\n'):
+            if 'torch' in line.lower():
+                # Match patterns like: torch==2.5.1, torch>=2.5.1, "torch==2.5.1"
+                match = re.search(r'torch[>=<]+([0-9.]+)', line)
+                if match:
+                    version = match.group(1)
+                    print(f"  Detected torch=={version} from sgl-kernel/pyproject.toml")
+                    return version
+
+    # Fall back to python/pyproject.toml (SGLang's runtime requirements)
+    result = subprocess.run(
+        ["git", "show", f"{commit}:python/pyproject.toml"],
+        cwd=repo_path, capture_output=True, text=True, timeout=30
+    )
+    if result.returncode == 0:
+        content = result.stdout
+        for line in content.split('\n'):
+            # Match "torch==X.X.X" in dependencies
+            if '"torch==' in line:
+                match = re.search(r'torch==([0-9.]+)', line)
+                if match:
+                    version = match.group(1)
+                    print(f"  Detected torch=={version} from python/pyproject.toml")
+                    return version
+
+    print(f"  Using default torch=={DEFAULT_TORCH_VERSION}")
+    return DEFAULT_TORCH_VERSION
+
+
+def get_flashinfer_index_for_torch(torch_version: str) -> str:
+    """
+    Get the flashinfer wheel index URL for a given torch version.
+
+    Args:
+        torch_version: Torch version string (e.g., "2.5.1")
+
+    Returns:
+        Flashinfer wheel index URL
+    """
+    # Extract major.minor version
+    parts = torch_version.split('.')
+    major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else "2.5"
+
+    # Map to flashinfer index
+    # Note: flashinfer may not have wheels for all torch versions
+    return f"https://flashinfer.ai/whl/cu124/torch{major_minor}/"
 
 # Build configuration
 # Using a simpler Dockerfile for benchmarking (not the full production Dockerfile)

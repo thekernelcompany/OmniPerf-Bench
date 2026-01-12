@@ -1,0 +1,76 @@
+# Dockerfile for SGLang commit 9c088829ee2a28263f36d0814fde448c6090b5bc
+# sgl-kernel: 0.1.0, torch: >=2.5.1 (using 2.5.1)
+# Also works for parent commit: 005aad32ad45ce27d73fd39aa1f7e9ba5d8ebb8f
+
+ARG CUDA_VERSION=12.4.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+
+ARG COMMIT_HASH=9c088829ee2a28263f36d0814fde448c6090b5bc
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH="${PATH}:/usr/local/cuda/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda/lib64" \
+    MAX_JOBS=8 \
+    CMAKE_BUILD_PARALLEL_LEVEL=8
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3-pip \
+    git curl wget build-essential cmake ninja-build \
+    libopenmpi-dev libnuma-dev \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install pip and build dependencies
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && pip install scikit-build-core ninja cmake uv numpy
+
+# Install PyTorch 2.5.1 (sgl-kernel 0.1.0 requires >=2.5.1)
+RUN pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# Clone SGLang at specific commit
+WORKDIR /opt
+RUN git clone https://github.com/sgl-project/sglang.git sglang \
+    && cd sglang \
+    && git checkout ${COMMIT_HASH} \
+    && git submodule update --init --recursive || true
+
+# BUILD sgl-kernel FROM SOURCE (the key fix!)
+WORKDIR /opt/sglang/sgl-kernel
+RUN pip install -e . --no-build-isolation -v 2>&1 | tee /tmp/sgl_kernel_build.log || \
+    (echo "sgl-kernel build failed, trying with fresh scikit-build-core" && \
+     pip install --force-reinstall scikit-build-core && \
+     pip install -e . -v)
+
+# Note: sgl_kernel import requires GPU driver (libcuda.so.1) - will be verified at runtime
+
+# Install flashinfer for torch 2.5
+WORKDIR /opt/sglang
+RUN pip install flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.5/ || \
+    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/ || \
+    echo "Warning: flashinfer installation failed"
+
+# Install SGLang runtime dependencies (quote version specifiers to avoid shell interpretation)
+RUN pip install "transformers>=4.40.0" "huggingface_hub>=0.23.0" "tokenizers>=0.19.0" \
+    "accelerate>=0.30.0" "numpy<2.0" requests aiohttp \
+    triton packaging xgrammar pydantic fastapi uvicorn vllm || true
+
+# Install SGLang from source
+RUN pip install -e "python[srt]" || pip install -e "python"
+
+# Install benchmark dependencies
+RUN pip install datasets pandas tqdm pybase64 Pillow
+
+# Verify SGLang and torch installation (sgl_kernel verification requires GPU runtime)
+RUN python -c "import sglang; print(f'SGLang version: {sglang.__version__}')" && \
+    python -c "import torch; print(f'torch: {torch.__version__}')"
+
+WORKDIR /workspace
+RUN cp -r /opt/sglang/python/sglang/bench_* /workspace/ 2>/dev/null || true
+RUN cp -r /opt/sglang/benchmark* /workspace/ 2>/dev/null || true
+RUN cp -r /opt/sglang/benchmarks /workspace/ 2>/dev/null || true
+
+CMD ["python", "-c", "import sglang; import sgl_kernel; print(f'SGLang {sglang.__version__} with sgl_kernel ready')"]
