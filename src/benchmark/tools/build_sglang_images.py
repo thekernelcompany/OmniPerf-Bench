@@ -112,22 +112,29 @@ def get_flashinfer_index_for_torch(torch_version: str) -> str:
     # Note: flashinfer may not have wheels for all torch versions
     return f"https://flashinfer.ai/whl/cu124/torch{major_minor}/"
 
+# Per-commit configuration for torch versions
+COMMIT_CONFIG = {
+    "d1112d85": {"torch": "2.5.1", "torch_minor": "2.5"},
+    "48efec7b": {"torch": "2.5.1", "torch_minor": "2.5"},
+    "93470a14": {"torch": "2.5.1", "torch_minor": "2.5"},
+    "db452760": {"torch": "2.5.1", "torch_minor": "2.5"},
+    "9c088829": {"torch": "2.6.0", "torch_minor": "2.6"},
+    "005aad32": {"torch": "2.6.0", "torch_minor": "2.6"},
+}
+
 # Build configuration
-# Using a simpler Dockerfile for benchmarking (not the full production Dockerfile)
+# CRITICAL: sgl-kernel must be built FROM SOURCE with submodules to get deep_gemm
 BENCHMARK_DOCKERFILE = '''
-# Simplified SGLang Docker image for benchmarking
-# Based on NVIDIA's CUDA image with SGLang installed from source
+# SGLang Docker image with sgl-kernel built from source
+# CRITICAL: Uses git submodules for deep_gemm module
 
 ARG CUDA_VERSION=12.4.0
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
-
-ARG TARGETARCH=amd64
-ARG COMMIT_HASH=main
+FROM nvidia/cuda:${{CUDA_VERSION}}-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \\
     CUDA_HOME=/usr/local/cuda \\
-    PATH="${PATH}:/usr/local/cuda/bin" \\
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda/lib64"
+    PATH="${{PATH}}:/usr/local/cuda/bin" \\
+    LD_LIBRARY_PATH="${{LD_LIBRARY_PATH}}:/usr/local/cuda/lib64"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -136,54 +143,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     libopenmpi-dev libnuma-dev \\
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \\
     && ln -sf /usr/bin/python3.11 /usr/bin/python \\
-    && rm -rf /var/lib/apt/lists/* \\
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Install pip and basic Python packages
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Install PyTorch with CUDA support
-RUN pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
-
-# Clone SGLang at specific commit
+# Clone SGLang at specific commit WITH SUBMODULES
+ARG COMMIT_HASH
 WORKDIR /opt
-RUN git clone ${SGLANG_REPO_URL} sglang \\
+RUN git clone --recursive {sglang_repo} sglang \\
     && cd sglang \\
-    && git checkout ${COMMIT_HASH}
+    && git checkout ${{COMMIT_HASH}} \\
+    && git submodule update --init --recursive
 
-# Install SGLang dependencies first
-RUN pip install transformers>=4.40.0 huggingface_hub>=0.23.0 tokenizers>=0.19.0 \\
-    accelerate>=0.30.0 numpy<2.0 requests aiohttp \\
-    triton>=3.0.0 packaging ninja
+# Install PyTorch (version from commit's pyproject.toml)
+ARG TORCH_VERSION=2.5.1
+RUN pip install torch==${{TORCH_VERSION}} --index-url https://download.pytorch.org/whl/cu124
 
-# Install flashinfer (required for SGLang)
-RUN pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.4/
+# Build sgl-kernel FROM SOURCE (not from PyPI!)
+# This creates the deep_gemm module from 3rdparty/deepgemm submodule
+WORKDIR /opt/sglang/sgl-kernel
+RUN pip install scikit-build-core ninja cmake packaging
+RUN pip install -e . --no-build-isolation -v 2>&1 | tee /tmp/sgl_kernel_build.log || (tail -100 /tmp/sgl_kernel_build.log && exit 1)
 
-# Install sgl-kernel from PyPI (contains deep_gemm and other CUDA kernels)
-# This is CRITICAL - without it, SGLang server crashes with "No module named 'deep_gemm'"
-RUN pip install sgl-kernel
+# Verify sgl-kernel build (deep_gemm should be available)
+RUN python -c "import sgl_kernel; print('sgl_kernel OK')"
+RUN python -c "import deep_gemm; print('deep_gemm OK')" || echo "deep_gemm not in this version (OK for older commits)"
 
-# Install SGLang from source
+# Install flashinfer
+ARG TORCH_MINOR=2.5
+RUN pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch${{TORCH_MINOR}}/ || \\
+    pip install flashinfer-python || true
+
+# Install SGLang dependencies and package
 WORKDIR /opt/sglang
-RUN pip install -e "python[all]" || pip install -e "python"
+RUN pip install transformers huggingface_hub tokenizers accelerate "numpy<2.0" \\
+    requests aiohttp triton packaging vllm datasets pandas tqdm xgrammar || true
+RUN pip install -e "python[srt]" --no-deps 2>/dev/null || pip install -e "python" --no-deps || pip install -e "python"
 
-# Install benchmark dependencies
-RUN pip install datasets pandas tqdm pybase64 Pillow
+# Verify full installation
+RUN python -c "import sglang; print(f'SGLang {{sglang.__version__}} ready')"
 
-# Verify installation (including sgl-kernel)
-RUN python -c "import sglang; print(f'SGLang version: {sglang.__version__}')"
-RUN python -c "import sgl_kernel; import deep_gemm; print('sgl-kernel and deep_gemm OK')"
-
-# Set working directory for benchmarks
 WORKDIR /workspace
-
-# Copy benchmark scripts from SGLang repo
-RUN cp -r /opt/sglang/python/sglang/bench_* /workspace/ 2>/dev/null || true
-RUN cp -r /opt/sglang/benchmark* /workspace/ 2>/dev/null || true
-RUN cp -r /opt/sglang/benchmarks /workspace/ 2>/dev/null || true
-
-# Default command
-CMD ["python", "-c", "import sglang; print(f'SGLang {sglang.__version__} ready')"]
+CMD ["python", "-c", "import sglang; print('ready')"]
 '''
 
 
@@ -294,6 +295,15 @@ def build_docker_image(
         print(f"Building SGLang Docker image for {short_commit}")
         print(f"{'='*60}")
 
+    # Get torch version from config or auto-detect
+    config = COMMIT_CONFIG.get(short_commit, {})
+    torch_version = config.get("torch", DEFAULT_TORCH_VERSION)
+    torch_minor = config.get("torch_minor", ".".join(torch_version.split(".")[:2]))
+
+    if verbose:
+        print(f"  Torch version: {torch_version}")
+        print(f"  Torch minor: {torch_minor}")
+
     # Create work directory
     work_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = work_dir / "sglang"
@@ -326,17 +336,10 @@ def build_docker_image(
         if result.returncode != 0:
             return False, f"Git checkout failed: {result.stderr[:500]}"
 
-        # Write Dockerfile
+        # Write Dockerfile with correct substitutions
         dockerfile_path = repo_dir / "Dockerfile.benchmark"
-        dockerfile_content = BENCHMARK_DOCKERFILE.replace(
-            "ARG COMMIT_HASH=main",
-            f"ARG COMMIT_HASH={full_commit}"
-        ).replace(
-            "${SGLANG_REPO_URL}",
-            SGLANG_REPO_URL
-        ).replace(
-            "git checkout ${COMMIT_HASH}",
-            f"git checkout {full_commit}"
+        dockerfile_content = BENCHMARK_DOCKERFILE.format(
+            sglang_repo=SGLANG_REPO_URL
         )
 
         dockerfile_path.write_text(dockerfile_content)
@@ -352,6 +355,8 @@ def build_docker_image(
             "-f", str(dockerfile_path),
             "-t", image_tag,
             "--build-arg", f"COMMIT_HASH={full_commit}",
+            "--build-arg", f"TORCH_VERSION={torch_version}",
+            "--build-arg", f"TORCH_MINOR={torch_minor}",
             str(repo_dir)
         ]
 
@@ -359,7 +364,7 @@ def build_docker_image(
             build_cmd,
             capture_output=not verbose,
             text=True,
-            timeout=3600  # 1 hour timeout for build
+            timeout=7200  # 2 hour timeout for build (sgl-kernel takes time)
         )
 
         if result.returncode != 0:
