@@ -32,12 +32,16 @@ BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
 RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/results/docker")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Claude Code patches directory
+CLAUDE_CODE_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+
 # Commits to rerun with fixed configurations
 COMMITS_TO_RERUN = {
     '2deb029d': {
         'full_hash': '2deb029d115dadd012ce5ea70487a207cb025493',
         'parent_hash': '029c71de11bc3bcf84a1b3cf9d91e79ab6949799',
         'baseline_image': None,  # No pre-built baseline, need to build from source
+        'agent_patch': str(CLAUDE_CODE_PATCHES_DIR / 'vllm_core-0011' / 'model_patch.diff'),
         'perf_command': 'python3 benchmarks/benchmark_prefix_caching.py --model neuralmagic/Meta-Llama-3-8B-Instruct-FP8 --output-len 200 --enable-prefix-caching --use-v2-block-manager',
         'model': 'neuralmagic/Meta-Llama-3-8B-Instruct-FP8',
         'subject': '[Performance][BlockManagerV2] Mark prefix cache block as computed after schedule (#7822)',
@@ -49,6 +53,7 @@ COMMITS_TO_RERUN = {
         'full_hash': '9f1710f1ace3535920c0bb6d4cc329c36289080e',
         'parent_hash': 'e642ec962cf2283f9aa44492727e6efc17a32129',
         'baseline_image': 'shikhar481/vllm_fixed_human_images:baseline-e642ec962cf2',  # Pre-built baseline available!
+        'agent_patch': str(CLAUDE_CODE_PATCHES_DIR / 'vllm_core-0056' / 'model_patch.diff'),
         'perf_command': 'python benchmarks/benchmark_serving.py --model deepseek-ai/DeepSeek-V2-Lite-Chat --random-input-len 8192 --random-output-len 64 --dataset-name random --num-prompts 20 --request-rate 1',
         'model': 'deepseek-ai/DeepSeek-V2-Lite-Chat',
         'subject': 'Fix mla prefill context performance (#13897)',
@@ -781,14 +786,236 @@ python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
         )
 
 
+def run_agent_benchmark(
+    commit_short: str,
+    config: Dict[str, Any],
+    hf_token: str,
+    timeout: int = 1800,
+) -> BenchmarkResult:
+    """
+    Run agent benchmark by applying patch to baseline image.
+
+    Key insight: Apply agent patch to installed vLLM files in-place (no rebuild needed).
+    This works because agent patches are typically pure Python changes.
+    """
+    start_time = time.time()
+
+    # Need baseline image for agent benchmark
+    if not config.get('baseline_image'):
+        return BenchmarkResult(
+            commit_hash=commit_short, status="error", benchmark_type=config['benchmark_type'],
+            model=config['model'], duration_s=time.time() - start_time, version="agent",
+            error="No baseline image available - cannot run agent benchmark"
+        )
+
+    # Check agent patch exists
+    agent_patch_path = config.get('agent_patch')
+    if not agent_patch_path or not Path(agent_patch_path).exists():
+        return BenchmarkResult(
+            commit_hash=commit_short, status="error", benchmark_type=config['benchmark_type'],
+            model=config['model'], duration_s=time.time() - start_time, version="agent",
+            error=f"Agent patch not found: {agent_patch_path}"
+        )
+
+    # Read patch content
+    with open(agent_patch_path) as f:
+        patch_content = f.read()
+
+    image = config['baseline_image']
+    model = config['model']
+    benchmark_type = config['benchmark_type']
+    perf_command = config['perf_command']
+    parent_commit = config['parent_hash']
+
+    print(f"  Using baseline image: {image}")
+    print(f"  Applying agent patch: {agent_patch_path}")
+
+    if not pull_docker_image(image):
+        return BenchmarkResult(
+            commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+            model=model, duration_s=time.time() - start_time, version="agent",
+            error=f"Failed to pull baseline image {image}"
+        )
+
+    # Build benchmark command based on type
+    if benchmark_type == "serving":
+        bench_args = re.sub(r'python3?\s+benchmarks/benchmark_serving\.py\s*', '', perf_command)
+        benchmark_cmd = f'''
+# Start vLLM server
+echo "=== Starting vLLM server (with agent patch) ==="
+python3 -m vllm.entrypoints.openai.api_server \\
+    --model $MODEL --port 8000 --max-model-len 16384 --disable-log-requests 2>&1 &
+SERVER_PID=$!
+
+# Wait for server
+echo "Waiting for server..."
+for i in $(seq 1 300); do
+    if curl -s http://localhost:8000/v1/models 2>/dev/null | grep -q "model"; then
+        echo "SERVER_READY after ${{i}}s"
+        break
+    fi
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "SERVER_CRASHED"
+        exit 1
+    fi
+    sleep 1
+done
+
+if ! curl -s http://localhost:8000/v1/models > /dev/null 2>&1; then
+    echo "SERVER_TIMEOUT"
+    exit 1
+fi
+
+# Run benchmark
+echo "=== Running serving benchmark ==="
+cd /opt/vllm_bench/benchmarks
+python3 benchmark_serving.py {bench_args} --port 8000 2>&1
+echo "=== BENCHMARK_COMPLETE ==="
+kill $SERVER_PID 2>/dev/null || true
+'''
+    else:  # prefix_caching
+        bench_args = re.sub(r'python3?\s+benchmarks/benchmark_prefix_caching\.py\s*', '', perf_command)
+        benchmark_cmd = f'''
+# Run benchmark directly (no server needed)
+echo "=== Running prefix_caching benchmark ==="
+cd /opt/vllm_bench/benchmarks
+python3 benchmark_prefix_caching.py {bench_args} 2>&1
+echo "=== BENCHMARK_COMPLETE ==="
+'''
+
+    # Docker command that applies patch in-place to installed vLLM
+    docker_cmd = f'''
+set -e
+MODEL="{model}"
+COMMIT="{parent_commit}"
+
+echo "=== AGENT BENCHMARK: Applying patch to installed vLLM ==="
+
+# Find vLLM install location (suppress vLLM's INFO logs with VLLM_LOGGING_LEVEL)
+export VLLM_LOGGING_LEVEL=ERROR
+VLLM_PARENT=$(python3 -c "import os; import vllm; print(os.path.dirname(vllm.__path__[0]))" 2>/dev/null)
+unset VLLM_LOGGING_LEVEL
+echo "vLLM installed at: $VLLM_PARENT/vllm"
+
+# Write patch to temp file
+cat > /tmp/agent_patch.diff << 'PATCH_EOF'
+{patch_content}
+PATCH_EOF
+
+# Apply patch in-place (no rebuild needed for Python files)
+echo "Applying agent patch..."
+cd "$VLLM_PARENT"
+patch -p1 --verbose < /tmp/agent_patch.diff
+echo "Patch applied successfully!"
+
+# Verify patch was applied
+python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+
+# Install benchmark deps
+pip install aiohttp pandas datasets -q 2>/dev/null || true
+
+# Clone vLLM repo at parent commit for benchmark scripts
+cd /opt
+git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>/dev/null || true
+cd vllm_bench
+git fetch --depth 1 origin $COMMIT 2>/dev/null || true
+git checkout $COMMIT 2>/dev/null || git checkout -f HEAD
+
+# CRITICAL: Remove the vllm/ directory to prevent it from shadowing the patched installed vLLM
+rm -rf /opt/vllm_bench/vllm
+echo "Removed vllm_bench/vllm to ensure patched installed vLLM is used"
+
+{benchmark_cmd}
+'''
+
+    print(f"  Running agent benchmark (baseline + patch)...")
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm', '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', '/root/.cache/huggingface:/root/.cache/huggingface',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                image, '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        duration = time.time() - start_time
+        raw_output = result.stdout + result.stderr
+
+        if "SERVER_CRASHED" in raw_output:
+            return BenchmarkResult(
+                commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+                model=model, duration_s=duration, version="agent",
+                error="Server crashed after applying agent patch", raw_output=raw_output[-8000:]
+            )
+
+        if "SERVER_TIMEOUT" in raw_output:
+            return BenchmarkResult(
+                commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+                model=model, duration_s=duration, version="agent",
+                error="Server startup timeout after applying agent patch", raw_output=raw_output[-8000:]
+            )
+
+        if "FAILED" in raw_output and "patch" in raw_output.lower():
+            return BenchmarkResult(
+                commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+                model=model, duration_s=duration, version="agent",
+                error="Failed to apply agent patch", raw_output=raw_output[-8000:]
+            )
+
+        if benchmark_type == "serving":
+            metrics = parse_serving_metrics(raw_output)
+        else:
+            metrics = parse_prefix_caching_metrics(raw_output)
+
+        if "BENCHMARK_COMPLETE" not in raw_output:
+            return BenchmarkResult(
+                commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+                model=model, duration_s=duration, version="agent",
+                error="Benchmark did not complete", metrics=metrics,
+                raw_output=raw_output[-8000:]
+            )
+
+        if not metrics:
+            return BenchmarkResult(
+                commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+                model=model, duration_s=duration, version="agent",
+                error="No metrics in output", raw_output=raw_output[-8000:]
+            )
+
+        return BenchmarkResult(
+            commit_hash=commit_short, status="success", benchmark_type=benchmark_type,
+            model=model, duration_s=duration, version="agent",
+            metrics=metrics, raw_output=raw_output[-8000:]
+        )
+
+    except subprocess.TimeoutExpired:
+        return BenchmarkResult(
+            commit_hash=commit_short, status="timeout", benchmark_type=benchmark_type,
+            model=model, duration_s=timeout, version="agent",
+            error=f"Timeout after {timeout}s"
+        )
+    except Exception as e:
+        return BenchmarkResult(
+            commit_hash=commit_short, status="error", benchmark_type=benchmark_type,
+            model=model, duration_s=time.time() - start_time, version="agent",
+            error=str(e)
+        )
+
+
 def run_3way_benchmark(
     commit_short: str,
     config: Dict[str, Any],
     hf_token: str,
     dry_run: bool = False,
-    human_only: bool = False
+    human_only: bool = False,
+    agent_only: bool = False
 ) -> Dict[str, BenchmarkResult]:
-    """Run all versions: baseline and human (agent would need patch application)."""
+    """Run all versions: baseline, human, and agent."""
     results = {}
 
     print(f"\n{'='*60}")
@@ -798,16 +1025,24 @@ def run_3way_benchmark(
     print(f"Benchmark type: {config['benchmark_type']}")
     print(f"{'='*60}")
 
-    versions = ["human"] if human_only else ["baseline", "human"]
+    # Determine which versions to run
+    if agent_only:
+        versions = ["agent"]
+    elif human_only:
+        versions = ["human"]
+    else:
+        versions = ["baseline", "human", "agent"]
 
     if dry_run:
         for version in versions:
             print(f"\n[{version.upper()}]")
             print(f"  [DRY RUN] Would run: {config['perf_command']}")
             if version == "baseline":
-                print(f"  [DRY RUN] Would build from source at parent: {config['parent_hash'][:8]}")
-            else:
+                print(f"  [DRY RUN] Baseline image: {config.get('baseline_image', 'BUILD FROM SOURCE')}")
+            elif version == "human":
                 print(f"  [DRY RUN] Image: {HUMAN_IMAGE_PREFIX}:{config['full_hash']}")
+            elif version == "agent":
+                print(f"  [DRY RUN] Baseline image + patch: {config.get('agent_patch', 'N/A')}")
             results[version] = BenchmarkResult(
                 commit_hash=commit_short, status="dry_run",
                 benchmark_type=config['benchmark_type'], model=config['model'],
@@ -820,7 +1055,9 @@ def run_3way_benchmark(
     for version in versions:
         print(f"\n[{version.upper()}]")
 
-        if benchmark_type == "serving":
+        if version == "agent":
+            result = run_agent_benchmark(commit_short, config, hf_token)
+        elif benchmark_type == "serving":
             result = run_serving_benchmark(commit_short, config, version, hf_token)
         else:  # prefix_caching
             result = run_prefix_caching_benchmark(commit_short, config, version, hf_token)
@@ -866,7 +1103,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help="Don't actually run benchmarks")
     parser.add_argument('--commit', type=str, help="Run only this commit (e.g., 2deb029d)")
     parser.add_argument('--skip-gpu-check', action='store_true', help="Skip Docker GPU check")
-    parser.add_argument('--human-only', action='store_true', help="Skip baseline (faster)")
+    parser.add_argument('--human-only', action='store_true', help="Run only human benchmark")
+    parser.add_argument('--agent-only', action='store_true', help="Run only agent benchmark (applies patch to baseline)")
     args = parser.parse_args()
 
     # Check Docker GPU access
@@ -896,7 +1134,8 @@ def main():
     all_results = {}
     for commit_short, config in commits_to_run.items():
         results = run_3way_benchmark(commit_short, config, hf_token,
-                                     dry_run=args.dry_run, human_only=args.human_only)
+                                     dry_run=args.dry_run, human_only=args.human_only,
+                                     agent_only=args.agent_only)
         all_results[commit_short] = results
 
         if not args.dry_run:
