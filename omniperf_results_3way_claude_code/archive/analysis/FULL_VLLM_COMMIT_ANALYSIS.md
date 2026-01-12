@@ -1719,183 +1719,128 @@ omniperf_results_3way_claude_code/
 
 ---
 
-## Retry Analysis: What Can Still Be Fixed (2026-01-12)
+## Retry Analysis: What Can Still Be Fixed (2026-01-12) - CORRECTED
 
-### Executive Summary
+### ⚠️ Correction Notice
 
-After uploading Schema v4 to HuggingFace (96 rows, 76 columns), we analyzed remaining commits to determine what can be improved via retry.
+**Previous analysis was WRONG.** After cross-referencing with `COMPREHENSIVE_BENCHMARK_ANALYSIS.md`, several commits I marked as "retryable" are actually **already evaluable** as agent failures.
 
-| Category | Count | Retryable? |
-|----------|-------|------------|
-| Complete 3-way (B+H+A) | 22 | ✅ Already done |
-| H+A only (usable for comparison) | 17 | ✅ Already usable |
-| Human only (agent failed) | 13 | **Partial** |
-| Agent only (human failed) | 5 | **Partial** |
-| No metrics | 39 | **Mostly NO** |
+### Executive Summary (Per COMPREHENSIVE_BENCHMARK_ANALYSIS.md)
 
----
-
-### ACTUALLY RETRYABLE (4 commits)
-
-These are **transient failures** that can be solved with a simple retry:
-
-| Commit | Model | Issue | Action |
-|--------|-------|-------|--------|
-| **ccf02fcb** | ibm-ai-platform/Bamba-9B | Broken pipe | Retry agent benchmark |
-| **e7b20426** | 01-ai/Yi-1.5-9B-Chat | Broken pipe | Retry agent benchmark |
-| **67da5720** | Qwen/Qwen2.5-7B-Instruct | Broken pipe | Full retry |
-| **9f1710f1** | deepseek-ai/DeepSeek-V2-Lite-Chat | Never ran on Modal | Full run needed |
-
-**Expected gain: 4 more complete evaluations**
+| Category | Count | Status |
+|----------|-------|--------|
+| Valid 3-way (B+H+A) | 19 | ✅ Already evaluable |
+| H+A only (Separate) | 12 | ✅ Already evaluable |
+| Model mismatch (A vs H valid) | 7 | ✅ Already evaluable |
+| Agent failures (Modal B+H) | 6 | ✅ Already evaluable |
+| Agent failures (Separate H-only) | 5 | ✅ Already evaluable |
+| **TOTAL EVALUABLE** | **49** | ✅ No retry needed |
+| Non-evaluable | 47 | See breakdown below |
 
 ---
 
-### NOT RETRYABLE (Fundamental Issues)
+### ❌ My Previous Errors
 
-#### 1. Wheel Not Found (4 commits)
+| My Claim | Reality | Why I Was Wrong |
+|----------|---------|-----------------|
+| `ccf02fcb` - retry agent | **Already evaluable** | Human: 1152.28 tok/s, Agent: "No metrics" = Agent FAILED (valid outcome) |
+| `e7b20426` - retry agent | **Already evaluable** | Human: 2774.95 tok/s, Agent: "No metrics" = Agent FAILED (valid outcome) |
+| `67da5720` - full retry | **AGENT_ONLY** | Has Agent: 4694.1 tok/s, Human FAILED (not retryable) |
+| `9f1710f1` - run on Modal | **Correct** | Human: 2408.0 tok/s, Agent file completely missing |
 
-These fail because the parent commit's vLLM wheel doesn't exist on S3:
-
-| Commit | Model | Missing Parent Wheel |
-|--------|-------|---------------------|
-| 660470e5 | Meta-Llama-3-8B-Instruct | `8d59dbb00044` |
-| 9ed82e70 | Meta-Llama-3-8B-Instruct | `51f8aa90ad40` |
-| ad8d696a | Meta-Llama-3-8B-Instruct | `3d925165f2b1` |
-| d7740ea4 | Meta-Llama-3-8B-Instruct | `cc466a32903d` |
-
-**Why NOT retryable:** Simple retry will produce same error. Requires:
-- Building Docker images locally, OR
-- Finding/building ancestor wheels, OR
-- Manual wheel compilation
-
-#### 2. Baseline Failed - V1 Engine Issues (5 commits)
-
-These fail due to fundamental `vllm_flash_attn.fa_utils` / CUDA TMA incompatibilities:
-
-| Commit | Model | Error |
-|--------|-------|-------|
-| 2deb029d | Meta-Llama-3-8B-Instruct | baseline_failed |
-| 35fad35a | Meta-Llama-3-8B-Instruct | No baseline metrics |
-| 83450458 | Meta-Llama-3-8B-Instruct | No baseline metrics |
-| 93e5f3c5 | Meta-Llama-3-8B-Instruct | No baseline metrics |
-| 9d72daf4 | Meta-Llama-3-8B-Instruct | No baseline metrics |
-
-**Why NOT retryable:** These commits have V1 engine code that requires `fa_utils.py` which wasn't packaged in the Docker images. Same error will recur on retry.
-
-#### 3. Version Bug #8791 (5 commits)
-
-These fail due to a **known vLLM port binding bug** in versions 0.6.3-0.6.4:
-
-| Commit | vLLM Version | PR Description |
-|--------|--------------|----------------|
-| 25ebed2f | 0.6.4.post2.dev375 | Cache np arange for input prep |
-| 88693683 | 0.6.4.post2.dev368 | Optimize evictor v1/v2 performance |
-| 9323a315 | 0.6.4.post2.dev218 | XGrammar guided decoding |
-| b2e0ad3b | 0.6.3.post2.dev398 | Reduce peak memory usage |
-| f092153f | 0.6.4.post2.dev330 | Persistent buffers for input prep |
-
-**Why NOT retryable:** These are **legitimate performance PRs** but the vLLM version has a regression that prevents serving benchmarks. Would require patching vLLM source code.
-
-#### 4. Latency/Throughput Benchmarks - No TPOT (4 commits)
-
-These succeeded but used latency/throughput benchmark mode (not serving):
-
-| Commit | Model | Mode |
-|--------|-------|------|
-| 3b61cb45 | Llama-3.1-8B-Instruct | latency |
-| 6dd94dbe | Meta-Llama-3-8B | latency |
-| 8c1e77fb | Llama-3.1-8B-Instruct | latency |
-| ce6bf3a2 | google/gemma-2b | throughput |
-
-**Why NOT retryable:** These are NOT failures. They intentionally used different benchmark modes that don't produce TPOT/TTFT metrics. The benchmarks succeeded as designed.
-
-#### 5. Large Models - Multi-GPU Required (13 commits)
-
-These require 2-8 H100 GPUs:
-
-| Commit | Model | GPU Requirement |
-|--------|-------|-----------------|
-| 0d243f2a | Mixtral-8x7B-Instruct-v0.1 | 8x7B MoE |
-| 0ec82edd | Qwen3-30B-A3B | 30B params |
-| 21d93c14 | Mixtral-8x7B-v0.1 | 8x7B MoE |
-| 310aca88 | Meta-Llama-3-70B | 70B params |
-| 379da6dc | Meta-Llama-3-70B | 70B params |
-| 7661e92e | Nemotron-4-340B-Instruct | 340B params |
-| 8aa1485f | Llama-4-Scout-17B-16E | 17B x 16 experts |
-| bd6028d6 | Llama-4-Scout-17B-16E-FP8 | 17B x 16 experts |
-| c0569dbc | Qwen3-30B-A3B-FP8 | 30B params |
-| dae68969 | DeepSeek-R1 | 671B+ MoE |
-| dcc6cfb9 | Qwen3-30B-A3B-FP8 | 30B params |
-| eefbf4a6 | Qwen3-30B-A3B-FP8 | 30B params |
-| fb0acb6c | DeepSeek-R1 | 671B+ MoE |
-
-**Why NOT retryable:** Would require multi-GPU infrastructure (2-16 H100s). Not a code fix.
+**Agent "failure" IS a valid benchmark outcome** - it means the agent could not replicate human optimization. These commits are ALREADY counted in the n=49 evaluable.
 
 ---
 
-### Detailed Failure Analysis for Human-Only Commits (13)
+### ACTUALLY RETRYABLE (2 commits only)
 
-| Commit | Model | Modal Status | Fixable? | Reason |
-|--------|-------|--------------|----------|--------|
-| 2deb029d | unknown | baseline_failed | NO | V1 engine issue |
-| 35fad35a | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
-| 3b61cb45 | Llama-3.1-8B-Instruct | success | NO | Latency mode (not failure) |
-| 660470e5 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
-| 6dd94dbe | Meta-Llama-3-8B | success | NO | Latency mode (not failure) |
-| 8c1e77fb | Llama-3.1-8B-Instruct | success | NO | Latency mode (not failure) |
-| 9ed82e70 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
-| ad8d696a | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
-| **ccf02fcb** | Bamba-9B | exception | **YES** | Broken pipe - retry |
-| ce6bf3a2 | gemma-2b | success | NO | Throughput mode (not failure) |
-| d7740ea4 | Llama-3.1-8B-Instruct | error | NO | Wheel not found |
-| **e7b20426** | Yi-1.5-9B-Chat | exception | **YES** | Broken pipe - retry |
-| **9f1710f1** | DeepSeek-V2-Lite-Chat | N/A | **YES** | Never ran on Modal |
+Per COMPREHENSIVE_BENCHMARK_ANALYSIS.md "HUMAN_ONLY" section, only 2 commits have missing agent runs:
+
+| Commit | Human Throughput | Agent Status | Retryable? |
+|--------|------------------|--------------|------------|
+| `2deb029d` | 3094.8 tok/s | File completely missing | 🔶 MAYBE |
+| `9f1710f1` | 2408.0 tok/s | File completely missing | 🔶 MAYBE |
+
+**Note:** `2a052011` also appears in HUMAN_ONLY but its human ALSO failed (no metrics), so it's not retryable.
+
+**Expected gain: +1-2 evaluable commits (49 → 50-51)**
 
 ---
 
-### Detailed Failure Analysis for Agent-Only Commits (5)
+### NOT RETRYABLE - Already Evaluable as Agent Failures
 
-| Commit | Model | Modal Status | Fixable? | Reason |
-|--------|-------|--------------|----------|--------|
-| **67da5720** | Qwen2.5-7B-Instruct | exception | **YES** | Broken pipe - retry |
-| 6d646d08 | Meta-Llama-3-8B | error | NO | Wheel not found |
-| 83450458 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
-| 93e5f3c5 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
-| 9d72daf4 | Llama-3.1-8B-Instruct | baseline_failed | NO | V1 engine issue |
+These commits are **NOT retryable because they already have valid outcomes**:
+
+| Commit | Human | Agent Status | Outcome |
+|--------|-------|--------------|---------|
+| `35fad35a` | 3172.7 tok/s | Server crashed after patch | Agent FAILED ✅ |
+| `ad8d696a` | 2382.5 tok/s | Server crashed after patch | Agent FAILED ✅ |
+| `660470e5` | 2250.3 tok/s | No metrics in output | Agent FAILED ✅ |
+| `ccf02fcb` | 1152.3 tok/s | No metrics in output | Agent FAILED ✅ |
+| `e7b20426` | 2774.9 tok/s | No metrics in output | Agent FAILED ✅ |
+
+**These contribute to the 22% agent failure rate in the n=49 evaluable dataset.**
 
 ---
 
-### Bottom Line: Retry These 4 Commits
+### NOT RETRYABLE - Agent Only (Human Failed)
+
+These commits have agent data but human benchmark failed - retry would produce same human failure:
+
+| Commit | Agent Throughput | Human Failure Reason |
+|--------|------------------|---------------------|
+| `67da5720` | 4694.1 tok/s | Human benchmark failed |
+| `6d646d08` | 2380.4 tok/s | Human benchmark failed |
+| `83450458` | 3314.1 tok/s | Timed out after 600s |
+| `93e5f3c5` | 3706.7 tok/s | Server crashed |
+| `9d72daf4` | 3673.8 tok/s | Server crashed |
+
+**These are NOT retryable** - the human benchmark has fundamental issues at these commits.
+
+---
+
+### NOT RETRYABLE - Infrastructure/Version Issues (47 commits)
+
+Refer to `COMPREHENSIVE_BENCHMARK_ANALYSIS.md` sections:
+- **INFRASTRUCTURE** (12): Server crashes, exceptions
+- **DOCKER_ONLY** (11): Wrong model (opt-125m)
+- **VERSION_BUG** (5): vLLM API incompatibility
+- **BASELINE_FAILED** (4): Modal baseline server failed
+- **MULTI_GPU** (3): Requires 2+ H100s
+- **EDGE_CASE** (2): Unusual metric modes
+- **WRONG_HARDWARE** (2): Requires AMD MI300
+- **NO_BENCHMARK** (1): CI commit, no perf_command
+- **SERVER_CRASH** (1): All versions crash
+- Plus remaining single-metric and baseline-only commits
+
+---
+
+### Bottom Line
 
 ```bash
-# Broken pipe failures (transient network errors)
-ccf02fcb  ibm-ai-platform/Bamba-9B             # Has human data, retry agent
-e7b20426  01-ai/Yi-1.5-9B-Chat                 # Has human data, retry agent
-67da5720  Qwen/Qwen2.5-7B-Instruct             # Full retry needed
-
-# Never ran on Modal
-9f1710f1  deepseek-ai/DeepSeek-V2-Lite-Chat    # Full Modal run needed
+# ONLY these 2 commits are potentially retryable:
+2deb029d  neuralmagic/Meta-Llama-3-8B-Instruct-FP8  # Human: 3094.8, agent never ran
+9f1710f1  deepseek-ai/DeepSeek-V2-Lite-Chat         # Human: 2408.0, agent never ran
 ```
 
-**Everything else requires infrastructure changes** (building wheels, patching vLLM, multi-GPU setup) - NOT solvable by simple retry.
+**Everything else is either:**
+1. Already evaluable (n=49)
+2. Fundamentally broken (infrastructure/version issues)
+3. Agent-only with failed human benchmark
+
+**Cost-benefit:** ~$3 for 2 agent reruns, ~60% success rate, expected +1-2 evaluable commits.
 
 ---
 
-### Summary by Failure Category
+### Cross-Reference
 
-| Category | Count | Action |
-|----------|-------|--------|
-| **Retry (broken pipe)** | 3 | Re-run on Modal |
-| **Never ran** | 1 | Run on Modal |
-| Wheel not found | 5 | Build Docker images locally |
-| V1 engine issues | 5 | Patch fa_utils.py in images |
-| Version bug #8791 | 5 | Skip (vLLM regression) |
-| Latency/throughput mode | 4 | N/A (not failures) |
-| Multi-GPU required | 13 | Multi-GPU infrastructure |
-
-**Total retryable: 4 commits (4.2% of 96)**
+This analysis aligns with `COMPREHENSIVE_BENCHMARK_ANALYSIS.md`:
+- Section "Agent Patch Failures" - correctly identifies 11 agent failures as evaluable
+- Section "Non-Evaluable Commits" - 47 commits with detailed breakdown
+- Section "Retry Recommendations" - recommends n=49 is already sufficient
 
 ---
 
-*Retry analysis completed: 2026-01-12*
+*Retry analysis CORRECTED: 2026-01-12*
+*Cross-referenced with COMPREHENSIVE_BENCHMARK_ANALYSIS.md*
 *Analysis by: Claude Code*
