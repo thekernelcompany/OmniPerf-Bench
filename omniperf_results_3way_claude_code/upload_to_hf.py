@@ -5,8 +5,9 @@ Upload Claude Code vLLM benchmark results to HuggingFace.
 This script collects all benchmark results from the omniperf_results_3way_claude_code/results
 directory and uploads them to HuggingFace as a dataset.
 
-Schema v4: Merged Modal + Separate pipeline data (76 columns).
-- Added data_source column for provenance tracking
+Schema v5: Merged Modal + Separate + Docker pipeline data (76 columns).
+- data_source column tracks provenance: modal, separate, merged, docker
+- Docker results (local reruns) have highest priority
 - Merges Separate pipeline data to fill gaps in Modal results
 """
 
@@ -258,6 +259,175 @@ def collect_benchmark_results(results_dir: str, agent_name: str = None, agent_mo
     return results
 
 
+def collect_docker_results(docker_dir: str, agent_name: str = None, agent_model: str = None) -> list[dict]:
+    """Collect benchmark results from the Docker pipeline (local reruns).
+
+    The Docker pipeline stores results in commit folders with this structure:
+    - docker/{commit}/benchmark_result.json
+
+    Args:
+        docker_dir: Path to results/docker directory
+        agent_name: Name of the agent
+        agent_model: Model used by the agent
+    """
+    results = []
+    agent_name = agent_name or DEFAULT_AGENT_NAME
+    agent_model = agent_model or DEFAULT_AGENT_MODEL
+
+    docker_path = Path(docker_dir)
+    if not docker_path.exists():
+        return results
+
+    for result_file in docker_path.glob("*/benchmark_result.json"):
+        try:
+            with open(result_file) as f:
+                data = json.load(f)
+
+            commit = data.get("commit", result_file.parent.name)
+            timestamp = data.get("timestamp", "")
+            benchmark_date = timestamp[:10] if timestamp else None
+
+            # Docker format: results.baseline/human/agent
+            results_data = data.get("results", {})
+            baseline_data = results_data.get("baseline", {})
+            human_data = results_data.get("human", {})
+            agent_data = results_data.get("agent", {})
+
+            # Determine benchmark mode from the data
+            benchmark_type = baseline_data.get("benchmark_type") or human_data.get("benchmark_type", "unknown")
+
+            # Build row with Schema v4 format
+            row = {
+                "commit_hash": baseline_data.get("commit_hash") or human_data.get("commit_hash") or commit,
+                "commit_short": commit[:8],
+                "commit_subject": None,  # Not in Docker format
+                "repo": "vllm-project/vllm",
+                "perf_command": None,  # Not in Docker format
+                "files_changed": [],
+                "pr_url": None,
+                "models": [],
+                "parent_commit": None,
+                "gpu_config": "H100:1",  # Docker runs on local H100
+                "benchmark_mode": benchmark_type,
+                "agent_name": agent_name,
+                "agent_model": agent_model,
+                "benchmark_date": benchmark_date,
+                "model": baseline_data.get("model") or human_data.get("model"),
+                "has_agent_patch": bool(agent_data),
+                "patch_path": None,
+                "data_source": "docker",
+
+                # Initialize all metric columns to None
+                "baseline_ttft_mean": None, "baseline_ttft_median": None, "baseline_ttft_p99": None,
+                "baseline_tpot_mean": None, "baseline_tpot_median": None, "baseline_tpot_p99": None,
+                "baseline_itl_mean": None, "baseline_itl_median": None, "baseline_itl_p99": None,
+                "baseline_latency_avg": None, "baseline_throughput": None,
+                "human_ttft_mean": None, "human_ttft_median": None, "human_ttft_p99": None,
+                "human_tpot_mean": None, "human_tpot_median": None, "human_tpot_p99": None,
+                "human_itl_mean": None, "human_itl_median": None, "human_itl_p99": None,
+                "human_latency_avg": None, "human_throughput": None,
+                "agent_ttft_mean": None, "agent_ttft_median": None, "agent_ttft_p99": None,
+                "agent_tpot_mean": None, "agent_tpot_median": None, "agent_tpot_p99": None,
+                "agent_itl_mean": None, "agent_itl_median": None, "agent_itl_p99": None,
+                "agent_latency_avg": None, "agent_throughput": None,
+
+                # Improvement metrics
+                "human_improvement_ttft_mean": None, "human_improvement_tpot_mean": None,
+                "human_improvement_itl_mean": None, "agent_improvement_ttft_mean": None,
+                "agent_improvement_tpot_mean": None, "agent_improvement_itl_mean": None,
+                "agent_vs_human_ttft_mean": None, "agent_vs_human_tpot_mean": None,
+                "agent_vs_human_itl_mean": None, "human_improvement_ttft_median": None,
+                "human_improvement_ttft_p99": None, "agent_improvement_ttft_median": None,
+                "agent_improvement_ttft_p99": None, "agent_vs_human_ttft_median": None,
+                "agent_vs_human_ttft_p99": None, "human_improvement_latency_avg": None,
+                "human_improvement_throughput": None, "agent_improvement_latency_avg": None,
+                "agent_improvement_throughput": None, "agent_vs_human_latency_avg": None,
+                "agent_vs_human_throughput": None,
+
+                "baseline_raw": baseline_data.get("raw_output"),
+                "human_raw": human_data.get("raw_output"),
+                "agent_raw": agent_data.get("raw_output"),
+                "test_script": None,
+            }
+
+            # Map metrics based on benchmark type
+            def map_docker_metrics(metrics: dict, prefix: str):
+                """Map Docker metrics to Schema v4 format."""
+                if not metrics:
+                    return
+                # Serving benchmark metrics
+                if "ttft_mean" in metrics:
+                    row[f"{prefix}_ttft_mean"] = metrics.get("ttft_mean")
+                    row[f"{prefix}_ttft_median"] = metrics.get("ttft_median")
+                    row[f"{prefix}_ttft_p99"] = metrics.get("ttft_p99")
+                    row[f"{prefix}_tpot_mean"] = metrics.get("tpot_mean")
+                    row[f"{prefix}_tpot_median"] = metrics.get("tpot_median")
+                    row[f"{prefix}_tpot_p99"] = metrics.get("tpot_p99")
+                    row[f"{prefix}_itl_mean"] = metrics.get("itl_mean")
+                    row[f"{prefix}_itl_median"] = metrics.get("itl_median")
+                    row[f"{prefix}_itl_p99"] = metrics.get("itl_p99")
+                    row[f"{prefix}_throughput"] = metrics.get("output_throughput")
+                # Prefix caching benchmark metrics
+                elif "warmup_time_s" in metrics:
+                    # Map warmup_time to latency (in ms)
+                    row[f"{prefix}_latency_avg"] = metrics.get("warmup_time_s", 0) * 1000
+                    row[f"{prefix}_throughput"] = metrics.get("output_throughput")
+
+            map_docker_metrics(baseline_data.get("metrics", {}), "baseline")
+            map_docker_metrics(human_data.get("metrics", {}), "human")
+            map_docker_metrics(agent_data.get("metrics", {}), "agent")
+
+            # Calculate improvement metrics if we have baseline data
+            def calc_improvement(baseline_val, target_val):
+                """Calculate % improvement (positive = better)."""
+                if baseline_val and target_val and baseline_val > 0:
+                    # For latency/time metrics: lower is better
+                    return ((baseline_val - target_val) / baseline_val) * 100
+                return None
+
+            def calc_throughput_improvement(baseline_val, target_val):
+                """Calculate throughput % improvement (higher = better)."""
+                if baseline_val and target_val and baseline_val > 0:
+                    return ((target_val - baseline_val) / baseline_val) * 100
+                return None
+
+            # Human improvements
+            if row.get("baseline_ttft_mean") and row.get("human_ttft_mean"):
+                row["human_improvement_ttft_mean"] = calc_improvement(row["baseline_ttft_mean"], row["human_ttft_mean"])
+            if row.get("baseline_tpot_mean") and row.get("human_tpot_mean"):
+                row["human_improvement_tpot_mean"] = calc_improvement(row["baseline_tpot_mean"], row["human_tpot_mean"])
+            if row.get("baseline_latency_avg") and row.get("human_latency_avg"):
+                row["human_improvement_latency_avg"] = calc_improvement(row["baseline_latency_avg"], row["human_latency_avg"])
+            if row.get("baseline_throughput") and row.get("human_throughput"):
+                row["human_improvement_throughput"] = calc_throughput_improvement(row["baseline_throughput"], row["human_throughput"])
+
+            # Agent improvements
+            if row.get("baseline_ttft_mean") and row.get("agent_ttft_mean"):
+                row["agent_improvement_ttft_mean"] = calc_improvement(row["baseline_ttft_mean"], row["agent_ttft_mean"])
+            if row.get("baseline_tpot_mean") and row.get("agent_tpot_mean"):
+                row["agent_improvement_tpot_mean"] = calc_improvement(row["baseline_tpot_mean"], row["agent_tpot_mean"])
+            if row.get("baseline_latency_avg") and row.get("agent_latency_avg"):
+                row["agent_improvement_latency_avg"] = calc_improvement(row["baseline_latency_avg"], row["agent_latency_avg"])
+            if row.get("baseline_throughput") and row.get("agent_throughput"):
+                row["agent_improvement_throughput"] = calc_throughput_improvement(row["baseline_throughput"], row["agent_throughput"])
+
+            # Agent vs Human
+            if row.get("human_ttft_mean") and row.get("agent_ttft_mean"):
+                row["agent_vs_human_ttft_mean"] = calc_improvement(row["human_ttft_mean"], row["agent_ttft_mean"])
+            if row.get("human_tpot_mean") and row.get("agent_tpot_mean"):
+                row["agent_vs_human_tpot_mean"] = calc_improvement(row["human_tpot_mean"], row["agent_tpot_mean"])
+            if row.get("human_throughput") and row.get("agent_throughput"):
+                row["agent_vs_human_throughput"] = calc_throughput_improvement(row["human_throughput"], row["agent_throughput"])
+
+            results.append(row)
+
+        except Exception as e:
+            print(f"Error processing Docker result {result_file}: {e}")
+            continue
+
+    return results
+
+
 def collect_separate_results(separate_dir: str, agent_name: str = None, agent_model: str = None) -> list[dict]:
     """Collect benchmark results from the Separate pipeline (baseline + human + agent files).
 
@@ -404,22 +574,32 @@ def collect_separate_results(separate_dir: str, agent_name: str = None, agent_mo
     return results
 
 
-def merge_results(modal_results: list[dict], separate_results: list[dict]) -> list[dict]:
-    """Merge Modal + Separate pipeline data. Modal takes priority.
+def merge_results(modal_results: list[dict], separate_results: list[dict], docker_results: list[dict] = None) -> list[dict]:
+    """Merge Modal + Separate + Docker pipeline data. Priority: Docker > Modal > Separate.
 
     Strategy:
     1. All Modal results are included (data_source="modal")
     2. For Modal results without metrics, fill from Separate if available (data_source="merged")
     3. Separate-only commits are added (data_source="separate")
+    4. Docker results replace failed Modal results (data_source="docker")
 
     Note: Uses short commit hash (first 8 chars) for matching since Modal uses full hash
     and Separate uses short hash in filenames.
     """
     merged = {}
+    docker_results = docker_results or []
 
     def short_hash(commit: str) -> str:
         """Normalize to short hash for matching."""
         return commit[:8] if commit else ""
+
+    def has_valid_metrics(row: dict) -> bool:
+        """Check if a row has valid benchmark metrics."""
+        return (
+            row.get("baseline_ttft_mean") is not None or
+            row.get("baseline_throughput") is not None or
+            row.get("baseline_latency_avg") is not None
+        )
 
     # Add all Modal results, indexed by short hash
     for r in modal_results:
@@ -437,12 +617,8 @@ def merge_results(modal_results: list[dict], separate_results: list[dict]) -> li
         commit_key = short_hash(commit)
         if commit_key in merged:
             modal_row = merged[commit_key]
-            # Check if Modal has no metrics (baseline_ttft_mean and baseline_throughput both None)
-            has_modal_metrics = (
-                modal_row.get("baseline_ttft_mean") is not None or
-                modal_row.get("baseline_throughput") is not None
-            )
-            if not has_modal_metrics:
+            # Check if Modal has no metrics
+            if not has_valid_metrics(modal_row):
                 # Fill metrics from Separate
                 metric_keys = [k for k in r.keys() if k.startswith(("baseline_", "human_", "agent_")) and k not in ("baseline_raw", "human_raw", "agent_raw")]
                 for metric_key in metric_keys:
@@ -451,6 +627,29 @@ def merge_results(modal_results: list[dict], separate_results: list[dict]) -> li
                 modal_row["data_source"] = "merged"
         else:
             # New commit from Separate only
+            merged[commit_key] = r.copy()
+
+    # Process Docker results - highest priority, replaces failed Modal/Separate results
+    for r in docker_results:
+        commit = r.get("commit_hash")
+        if not commit:
+            continue
+
+        commit_key = short_hash(commit)
+        if commit_key in merged:
+            existing_row = merged[commit_key]
+            # Docker replaces if it has metrics and existing doesn't, OR if Docker has full 3-way data
+            docker_has_metrics = has_valid_metrics(r)
+            existing_has_metrics = has_valid_metrics(existing_row)
+
+            if docker_has_metrics and (not existing_has_metrics or r.get("has_agent_patch")):
+                # Keep metadata from existing, but replace metrics with Docker data
+                for key in r.keys():
+                    if r.get(key) is not None:
+                        existing_row[key] = r[key]
+                existing_row["data_source"] = "docker"
+        else:
+            # New commit from Docker only
             merged[commit_key] = r.copy()
 
     return list(merged.values())
@@ -499,19 +698,20 @@ Each row represents a benchmark run for a specific vLLM commit, comparing:
 - **modal**: Data from Modal H100 pipeline (primary, same config for B/H/A)
 - **separate**: Data from Separate pipeline only (human + agent files)
 - **merged**: Modal metadata with Separate metrics (fills gaps in Modal)
+- **docker**: Data from local Docker reruns (highest priority, replaces failed Modal)
 
 ## Infrastructure
 All benchmarks were run on H100 GPUs.
 
 ## Schema Version
-v4 - Merged Modal + Separate pipeline data (76 columns). Added data_source column.
+v5 - Merged Modal + Separate + Docker pipeline data (76 columns). Added Docker rerun support.
 """
 
     # Push to hub
     dataset.push_to_hub(
         repo_id,
         token=token,
-        commit_message=f"Upload Claude Code vLLM benchmark results ({len(results)} commits) - Schema v4"
+        commit_message=f"Upload Claude Code vLLM benchmark results ({len(results)} commits) - Schema v5"
     )
 
     print(f"Successfully uploaded {len(results)} benchmark results to {repo_id}")
@@ -558,6 +758,10 @@ Examples:
                         help=f"Model used by the agent (default: {DEFAULT_AGENT_MODEL})")
     parser.add_argument("--merge-separate", action="store_true",
                         help="Merge Separate pipeline data to fill gaps in Modal results")
+    parser.add_argument("--merge-docker", action="store_true",
+                        help="Merge Docker pipeline data (local reruns) - highest priority")
+    parser.add_argument("--merge-all", action="store_true",
+                        help="Merge all data sources: Modal + Separate + Docker")
     args = parser.parse_args()
 
     # Get token (check env var, then HuggingFace cache)
@@ -582,8 +786,14 @@ Examples:
     )
     print(f"  Modal results: {len(modal_results)}")
 
-    # Optionally merge with Separate pipeline data
-    if args.merge_separate:
+    # Optionally merge with other data sources
+    merge_separate = args.merge_separate or args.merge_all
+    merge_docker = args.merge_docker or args.merge_all
+
+    separate_results = []
+    docker_results = []
+
+    if merge_separate:
         separate_dir = script_dir / "results"
         print(f"\nCollecting Separate pipeline results from {separate_dir}...")
         separate_results = collect_separate_results(
@@ -593,8 +803,19 @@ Examples:
         )
         print(f"  Separate results: {len(separate_results)}")
 
-        print("\nMerging Modal + Separate results...")
-        results = merge_results(modal_results, separate_results)
+    if merge_docker:
+        docker_dir = script_dir / "results" / "docker"
+        print(f"\nCollecting Docker pipeline results from {docker_dir}...")
+        docker_results = collect_docker_results(
+            str(docker_dir),
+            agent_name=args.agent_name,
+            agent_model=args.agent_model
+        )
+        print(f"  Docker results: {len(docker_results)}")
+
+    if merge_separate or merge_docker:
+        print("\nMerging all data sources...")
+        results = merge_results(modal_results, separate_results, docker_results)
 
         # Count by data source
         source_counts = {}
