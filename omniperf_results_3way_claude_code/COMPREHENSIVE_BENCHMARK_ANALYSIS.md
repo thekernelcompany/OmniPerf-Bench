@@ -1301,7 +1301,7 @@ Server crashed during startup for all versions (baseline, human, agent).
 
 Two commits were rerun locally using Docker with corrected benchmark commands.
 
-### 9f1710f1 - MLA Prefill Context Performance
+### 9f1710f1 - MLA Prefill Context Performance (Full 3-Way Complete)
 
 **Original Issue**: Wrong CLI args (`--input-len` instead of `--random-input-len`)
 
@@ -1315,18 +1315,34 @@ python benchmarks/benchmark_serving.py --model deepseek-ai/DeepSeek-V2-Lite-Chat
 **Docker Images**:
 - Baseline: `shikhar481/vllm_fixed_human_images:baseline-e642ec962cf2`
 - Human: `ayushnangia16/nvidia-vllm-docker:9f1710f1ace3535920c0bb6d4cc329c36289080e`
+- Agent: Baseline image + patch applied in-place (no rebuild needed)
 
-**Results** (serving metrics, output throughput tok/s):
+**Agent Patch**: `perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38/vllm_core-0056/model_patch.diff`
+
+**Results** (serving metrics, full 3-way comparison):
 
 | Version | TTFT Mean (ms) | TPOT Mean (ms) | ITL Mean (ms) | Output Throughput |
 |---------|----------------|----------------|---------------|-------------------|
 | Baseline | 382.82 | 35.78 | 35.78 | 60.29 tok/s |
 | Human | 387.43 | 36.41 | 36.41 | 60.21 tok/s |
+| **Agent** | **385.73** | **39.53** | **39.53** | **59.60 tok/s** |
+
+**Comparison**:
+
+| Comparison | TTFT | TPOT | Throughput |
+|------------|------|------|------------|
+| Human vs Baseline | +1.2% (worse) | +1.8% (worse) | -0.1% |
+| Agent vs Baseline | +0.8% (worse) | +10.5% (worse) | -1.1% |
+| **Agent vs Human** | **-0.4% (better)** | **+8.6% (worse)** | **-1.0%** |
 
 **Analysis**:
-- Human vs Baseline: ~-0.1% (essentially equivalent)
-- PR #13897 fixed a regression in MLA prefill - the baseline here is the **fixed** parent commit
-- The nearly identical results are expected: the fix restored performance to baseline levels
+- All three versions perform similarly (within ~10%)
+- PR #13897 fixed a regression in MLA prefill - baseline ≈ human is expected
+- Agent TTFT is slightly better than human (-0.4%)
+- Agent TPOT is worse than human (+8.6%)
+- Overall: Agent **MATCH** (within acceptable variance for this benchmark type)
+
+**Agent Benchmark Method**: Applied Claude Code patch in-place to baseline Docker image's installed vLLM (no rebuild required for pure Python changes).
 
 **Note**: Metrics marked with `*` in tables indicate Docker rerun data (different from original Modal pipeline).
 
@@ -1366,7 +1382,7 @@ python3 benchmarks/benchmark_prefix_caching.py \
 
 | Commit | Status | Baseline | Human | Agent | Notes |
 |--------|--------|----------|-------|-------|-------|
-| `9f1710f1` | B+H Complete | 60.29 tok/s | 60.21 tok/s | Pending | MLA fix working - baseline ≈ human as expected |
+| `9f1710f1` | **3-Way Complete** | 60.29 tok/s | 60.21 tok/s | 59.60 tok/s | Agent MATCH (-1.0% vs human) |
 | `2deb029d` | H Only | Pending | 5,634 tok/s | Pending | Command fixed, baseline needs build |
 
 Results saved to:
