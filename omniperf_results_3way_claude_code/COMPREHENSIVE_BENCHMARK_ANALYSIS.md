@@ -1348,7 +1348,7 @@ python benchmarks/benchmark_serving.py --model deepseek-ai/DeepSeek-V2-Lite-Chat
 
 ---
 
-### 2deb029d - BlockManagerV2 Prefix Caching
+### 2deb029d - BlockManagerV2 Prefix Caching (Full 3-Way Complete)
 
 **Original Issue**: Brackets left in command (`[--use-v2-block-manager]` invalid syntax)
 
@@ -1359,22 +1359,37 @@ python3 benchmarks/benchmark_prefix_caching.py \
     --output-len 200 --enable-prefix-caching --use-v2-block-manager
 ```
 
-**Docker Image**:
+**Docker Images**:
+- Baseline: `shikhar481/vllm_fixed_human_images:baseline-029c71de11bc`
 - Human: `ayushnangia16/nvidia-vllm-docker:2deb029d115dadd012ce5ea70487a207cb025493`
-- Baseline: Pending build (no pre-built image available)
+- Agent: Baseline image + patch applied in-place
 
-**Results** (prefix_caching benchmark):
+**Agent Patch**: `perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38/vllm_core-0011/model_patch.diff`
 
-| Version | Warmup Time | Run Time | Input Throughput | Output Throughput |
-|---------|-------------|----------|------------------|-------------------|
-| Human | 3.78s | 3.61s | 18,170 tok/s | 5,634 tok/s |
+**Results** (prefix_caching benchmark, full 3-way comparison):
+
+| Version | Warmup Time | Generate Time | Input Throughput | Output Throughput |
+|---------|-------------|---------------|------------------|-------------------|
+| Baseline | 5.33s | 3.59s | 18,291 tok/s | 5,671 tok/s |
+| Human | 3.77s | 3.58s | 18,337 tok/s | 5,686 tok/s |
+| **Agent** | **5.23s** | **3.57s** | **18,418 tok/s** | **5,711 tok/s** |
+
+**Comparison** (warmup time - lower is better):
+
+| Comparison | Warmup Time | Generate Time | Output Throughput |
+|------------|-------------|---------------|-------------------|
+| Human vs Baseline | **-29.3%** (faster) | -0.3% | +0.3% |
+| Agent vs Baseline | -1.8% | -0.7% | +0.7% |
+| **Agent vs Human** | **+38.9% (slower)** | -0.4% | +0.4% |
 
 **Analysis**:
-- Human benchmark completed successfully
-- Baseline needs to be built from source (parent commit: `029c71de`)
-- Full comparison pending baseline availability
+- **Human optimization SUCCESS**: PR #7822 reduced prefix cache block warmup by 29.3%
+- **Agent FAILED to capture the optimization**: Agent warmup (5.23s) is similar to baseline (5.33s)
+- Generate phase and throughput are equivalent across all versions
+- The human optimization specifically targeted the BlockManagerV2 prefix caching initialization
+- **Outcome: Agent LOSS** - Agent did not replicate the human optimization
 
-**Status**: Human only (baseline pending)
+**Agent Benchmark Method**: Applied Claude Code patch in-place to baseline Docker image's installed vLLM.
 
 ---
 
@@ -1383,7 +1398,7 @@ python3 benchmarks/benchmark_prefix_caching.py \
 | Commit | Status | Baseline | Human | Agent | Notes |
 |--------|--------|----------|-------|-------|-------|
 | `9f1710f1` | **3-Way Complete** | 60.29 tok/s | 60.21 tok/s | 59.60 tok/s | Agent MATCH (-1.0% vs human) |
-| `2deb029d` | H Only | Pending | 5,634 tok/s | Pending | Command fixed, baseline needs build |
+| `2deb029d` | **3-Way Complete** | warmup 5.33s | warmup 3.77s | warmup 5.23s | **Agent LOSS** (+38.9% vs human) |
 
 Results saved to:
 - `/root/OmniPerf-Bench/omniperf_results_3way_claude_code/results/docker/9f1710f1/benchmark_result.json`

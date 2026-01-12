@@ -40,7 +40,7 @@ COMMITS_TO_RERUN = {
     '2deb029d': {
         'full_hash': '2deb029d115dadd012ce5ea70487a207cb025493',
         'parent_hash': '029c71de11bc3bcf84a1b3cf9d91e79ab6949799',
-        'baseline_image': None,  # No pre-built baseline, need to build from source
+        'baseline_image': 'shikhar481/vllm_fixed_human_images:baseline-029c71de11bc',  # Pre-built baseline available!
         'agent_patch': str(CLAUDE_CODE_PATCHES_DIR / 'vllm_core-0011' / 'model_patch.diff'),
         'perf_command': 'python3 benchmarks/benchmark_prefix_caching.py --model neuralmagic/Meta-Llama-3-8B-Instruct-FP8 --output-len 200 --enable-prefix-caching --use-v2-block-manager',
         'model': 'neuralmagic/Meta-Llama-3-8B-Instruct-FP8',
@@ -144,32 +144,59 @@ def parse_serving_metrics(output: str) -> Dict[str, Any]:
 
 
 def parse_prefix_caching_metrics(output: str) -> Dict[str, Any]:
-    """Parse metrics from benchmark_prefix_caching.py output."""
+    """Parse metrics from benchmark_prefix_caching.py output.
+
+    The benchmark outputs two phases:
+    1. Warm up phase: Tests prefix cache initialization
+    2. Generate phase: Tests actual generation with prefix caching
+
+    Format:
+    ------warm up------
+    Processed prompts: 100%|...| 100/100 [..., est. speed input: X.XX toks/s, output: X.XX toks/s]
+    cost time X.XX
+    ------start generating------
+    Processed prompts: 100%|...| 100/100 [..., est. speed input: X.XX toks/s, output: X.XX toks/s]
+    cost time X.XX
+    """
     metrics = {}
 
-    # Look for elapsed time patterns
-    elapsed_match = re.search(r'elapsed[:\s]+([\d.]+)\s*(?:s|sec)', output, re.IGNORECASE)
-    if elapsed_match:
-        metrics['elapsed_time_s'] = float(elapsed_match.group(1))
+    # Split by phases to capture both
+    warmup_section = ""
+    generate_section = ""
 
-    # Look for throughput
-    throughput_match = re.search(r'throughput[:\s]+([\d.]+)', output, re.IGNORECASE)
-    if throughput_match:
-        metrics['throughput'] = float(throughput_match.group(1))
+    if "------warm up------" in output and "------start generating------" in output:
+        parts = output.split("------start generating------")
+        warmup_section = parts[0].split("------warm up------")[-1] if "------warm up------" in parts[0] else ""
+        generate_section = parts[1] if len(parts) > 1 else ""
 
-    # Look for tokens/s
-    tokens_match = re.search(r'([\d.]+)\s*tokens?/s', output, re.IGNORECASE)
-    if tokens_match:
-        metrics['tokens_per_s'] = float(tokens_match.group(1))
+    # Capture warmup cost time
+    warmup_time_match = re.search(r'cost time ([\d.]+)', warmup_section)
+    if warmup_time_match:
+        metrics['warmup_time_s'] = float(warmup_time_match.group(1))
 
-    # Look for timing info
-    for pattern_name, pattern in [
-        ('time_s', r'time[:\s]+([\d.]+)\s*s'),
-        ('latency_ms', r'latency[:\s]+([\d.]+)\s*ms'),
-    ]:
-        match = re.search(pattern, output, re.IGNORECASE)
-        if match:
-            metrics[pattern_name] = float(match.group(1))
+    # Capture generate cost time
+    generate_time_match = re.search(r'cost time ([\d.]+)', generate_section)
+    if generate_time_match:
+        metrics['generate_time_s'] = float(generate_time_match.group(1))
+
+    # Capture final throughput from generate phase (the 100% completed line)
+    # Format: est. speed input: X.XX toks/s, output: X.XX toks/s
+    input_tput_match = re.search(r'est\. speed input: ([\d.]+) toks/s', generate_section)
+    if input_tput_match:
+        metrics['input_throughput'] = float(input_tput_match.group(1))
+
+    output_tput_match = re.search(r'output: ([\d.]+) toks/s', generate_section)
+    if output_tput_match:
+        metrics['output_throughput'] = float(output_tput_match.group(1))
+
+    # Fallback: try to find any cost time if sections not found
+    if not metrics:
+        all_cost_times = re.findall(r'cost time ([\d.]+)', output)
+        if len(all_cost_times) >= 2:
+            metrics['warmup_time_s'] = float(all_cost_times[0])
+            metrics['generate_time_s'] = float(all_cost_times[1])
+        elif len(all_cost_times) == 1:
+            metrics['generate_time_s'] = float(all_cost_times[0])
 
     return metrics
 
