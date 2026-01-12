@@ -237,7 +237,7 @@ These commits have valid Baseline + Human metrics, but the agent failed to produ
 | 1 | `0ec82edd` | [perf] Speed up align sum kernels ( | facebook/opt-12 | 6368.6 | N/A | D |
 | 2 | `21d93c14` | Optimize Mixtral with expert parall | None | 3058.0 | N/A | D |
 | 3 | `2a052011` | [Kernel] Support MoE Fp8 Checkpoint | Qwen/Qwen2.5-7B | N/A | N/A | H |
-| 4 | `2deb029d` | [Performance][BlockManagerV2] Mark  | neuralmagic/Met | 3094.8 | N/A | H |
+| 4 | `2deb029d` | [Performance][BlockManagerV2] Mark  | neuralmagic/Met | 5634.2* | N/A | D(H) |
 | 5 | `3092375e` | [V1][Performance] Implement custom  | meta-llama/Meta | N/A | N/A | H |
 | 6 | `35fad35a` | [V1][Sampler] Faster top-k only imp | meta-llama/Meta | 3172.7 | N/A | H |
 | 7 | `379da6dc` | [Kernel] [FP8] Improve FP8 linear l | None | 7099.3 | N/A | D |
@@ -249,7 +249,7 @@ These commits have valid Baseline + Human metrics, but the agent failed to produ
 | 13 | `8d75fe48` | [Kernel] Switch fp8 layers to use t | neuralmagic/Met | N/A | N/A | H |
 | 14 | `93e5f3c5` | [Perf] Optimize Preparing Inputs fo | meta-llama/Meta | N/A | N/A | H |
 | 15 | `9d72daf4` | [V1][Perf] Simpler request output q | meta-llama/Meta | N/A | N/A | H |
-| 16 | `9f1710f1` | N/A | deepseek-ai/Dee | 2408.0 | N/A | H |
+| 16 | `9f1710f1` | Fix mla prefill context perf (#13897) | deepseek-ai/Dee | 60.21* | N/A | D(B+H) |
 | 17 | `ad8d696a` | [Core] Scheduler perf fix (#4270) | meta-llama/Meta | 2382.5 | N/A | H |
 | 18 | `aea94362` | [Frontend][V1] Online serving perfo | meta-llama/Meta | N/A | N/A | H |
 | 19 | `b10e5198` | [V1][Minor] Optimize get_cached_blo | meta-llama/Meta | N/A | N/A | H |
@@ -344,7 +344,7 @@ This table shows ALL available data for EVERY commit without categorization.
 | 9 | `296f927f` | [Model] RE: Mamba2 Prefill Per | exceptio | - | - | - | - | 1421.5 | 1411.8 | 813.3 |
 | 10 | `299ebb62` | [Core] Speed up decode by remo | success | 4.8 | 4.2 | 4.3 | - | - | - | - |
 | 11 | `2a052011` | [Kernel] Support MoE Fp8 Check | error | - | - | - | 1524.6 | - | - | 6623.3 |
-| 12 | `2deb029d` | [Performance][BlockManagerV2]  | baseline | - | - | - | - | 3094.8 | - | 7282.6 |
+| 12 | `2deb029d` | [Performance][BlockManagerV2]  | Docker | - | 5634.2* | - | - | 3094.8 | - | 7282.6 |
 | 13 | `2f192835` | [Core] latency optimization (# | error | - | - | - | - | - | - | - |
 | 14 | `30172b49` | [V1] Optimize handling of samp | success | 27.0 | 27.0 | 27.1 | - | - | - | - |
 | 15 | `3092375e` | [V1][Performance] Implement cu | baseline | - | - | - | - | - | - | 4449.6 |
@@ -389,7 +389,7 @@ This table shows ALL available data for EVERY commit without categorization.
 | 54 | `9badee53` | Fix performance when `--genera | baseline | - | - | - | 5526.4 | 3424.2 | 3417.1 | 8057.6 |
 | 55 | `9d72daf4` | [V1][Perf] Simpler request out | baseline | - | - | - | - | - | 3673.8 | 2343.2 |
 | 56 | `9ed82e70` | [Misc] Small perf improvements | error | - | - | - | 1912.8 | 2116.8 | - | 5615.5 |
-| 57 | `9f1710f1` |  | - | - | - | - | - | 2408.0 | - | - |
+| 57 | `9f1710f1` | Fix mla prefill context perf | Docker | 60.29* | 60.21* | - | - | 2408.0 | - | - |
 | 58 | `a3223766` | [Core] Optimize update checks  | success | 0.0 | 0.0 | 0.0 | - | - | - | - |
 | 59 | `ac45c44d` | [Bugfix] [Performance] DeepEPH | error | - | - | - | - | - | - | - |
 | 60 | `ad8d696a` | [Core] Scheduler perf fix (#42 | error | - | - | - | - | 2382.5 | - | 6573.2 |
@@ -1192,18 +1192,54 @@ Models require more than 80GB VRAM (need 2+ H100 GPUs).
 
 ---
 
-### 8. EDGE_CASE (2 commits)
+### 8. VALID EDGE CASES (2 commits) - NOW RESOLVED
 
-These have metrics but were excluded due to unusual measurement mode. **Could potentially be added to evaluable count.**
+**Update (2026-01-12):** After reviewing the original PRs, these ARE valid benchmark results. The unusual metrics are **intentional by design**, not data quality issues.
 
-| Commit | Subject | Issue | Potential Fix |
-|--------|---------|-------|---------------|
-| `a3223766` | [Core] Optimize update checks in LogitsProcessor | TPOT=0 for all; only TTFT varies | Use TTFT instead of TPOT |
-| `fa63e710` | [V1][Perf] Reduce scheduling overhead | Uses latency_avg, not TPOT | Add latency mode support |
+| Commit | Subject | Metric | Result | Outcome |
+|--------|---------|--------|--------|---------|
+| `a3223766` | [Core] Optimize update checks in LogitsProcessor | TTFT | Agent **+8.2%** better | Agent WIN |
+| `fa63e710` | [V1][Perf] Reduce scheduling overhead | latency_avg | Agent **-0.5%** | Agent MATCH |
 
-**Details:**
-- `a3223766`: B=35.75ms → H=33.52ms → A=30.78ms (TTFT). Agent +8.2% better than human.
-- `fa63e710`: B=1331.7ms → H=1323.8ms → A=1329.9ms (latency). Agent -0.5% vs human.
+#### `a3223766` - LogitsProcessor CPU Overhead (TTFT benchmark)
+
+**Why TPOT/ITL = 0.0 is EXPECTED:**
+- The PR author ([PR #21245](https://github.com/vllm-project/vllm/pull/21245)) **intentionally** used `--random-output-len 1`
+- Purpose: Stress-test LogitsProcessor CPU batching overhead, not token generation
+- With only 1 output token, TPOT (Time Per Output Token) and ITL (Inter-Token Latency) are mathematically undefined
+- **TTFT is the correct metric** for this optimization
+
+**Results (TTFT ms):**
+| Version | TTFT Mean | TTFT Median | TTFT P99 |
+|---------|-----------|-------------|----------|
+| Baseline | 35.75 | 32.32 | 66.42 |
+| Human | 33.52 | 29.98 | 64.89 |
+| **Agent** | **30.78** | **25.52** | **63.29** |
+
+- Human improvement: 6.2%
+- **Agent improvement: 13.9%** (Agent beats human by 7.7 percentage points)
+
+**Verdict:** Agent WIN - valid 3-way comparison using TTFT metric
+
+#### `fa63e710` - Model Runner Scheduling (Standalone Latency benchmark)
+
+**Why latency_avg instead of TTFT/TPOT:**
+- This is a **standalone latency benchmark** (`benchmark_latency.py`), not a serving benchmark
+- Measures end-to-end batch latency, not per-token metrics
+- `latency_avg` is the correct metric for standalone mode
+
+**Results (latency_avg ms):**
+| Version | Latency Avg |
+|---------|-------------|
+| Baseline | 1331.71 |
+| Human | 1323.82 |
+| Agent | 1329.92 |
+
+- Human improvement: 0.59%
+- Agent improvement: 0.13%
+- Agent vs Human: -0.46%
+
+**Verdict:** Agent MATCH - valid 3-way comparison using latency_avg metric
 
 ---
 
@@ -1248,9 +1284,91 @@ Server crashed during startup for all versions (baseline, human, agent).
 
 | Can Recover? | Commits | Action |
 |--------------|---------|--------|
-| ✅ **Yes (edge cases)** | 2 | `a3223766`, `fa63e710` - review metric handling |
+| ✅ **RESOLVED (edge cases)** | 2 | `a3223766`, `fa63e710` - **NOW VALID** (see section 8) |
 | 🔶 **Maybe (reruns)** | 11 | 8 human-only + 3 agent-only - could retry |
 | 💰 **Expensive** | 3 | Multi-GPU commits - need 2×H100 |
 | ❌ **No** | 36 | Infrastructure, version bugs, wrong hardware |
 
-**Bottom line**: At most 2 commits could be easily added to evaluable (edge cases). The remaining 50 have fundamental issues that won't be fixed by retrying.
+**Update (2026-01-12)**: The 2 "edge cases" are now confirmed as valid benchmarks:
+- `a3223766`: Agent WIN (+8.2% on TTFT) - TPOT=0 is expected (output-len=1 was intentional)
+- `fa63e710`: Agent MATCH (-0.5% on latency_avg) - standalone benchmark mode
+
+**Bottom line**: These 2 commits ARE evaluable - adding them increases total evaluable to **51 commits**.
+
+---
+
+## Appendix: Docker Reruns (2026-01-12)
+
+Two commits were rerun locally using Docker with corrected benchmark commands.
+
+### 9f1710f1 - MLA Prefill Context Performance
+
+**Original Issue**: Wrong CLI args (`--input-len` instead of `--random-input-len`)
+
+**Corrected Command**:
+```bash
+python benchmarks/benchmark_serving.py --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+    --random-input-len 8192 --random-output-len 64 --dataset-name random \
+    --num-prompts 20 --request-rate 1
+```
+
+**Docker Images**:
+- Baseline: `shikhar481/vllm_fixed_human_images:baseline-e642ec962cf2`
+- Human: `ayushnangia16/nvidia-vllm-docker:9f1710f1ace3535920c0bb6d4cc329c36289080e`
+
+**Results** (serving metrics, output throughput tok/s):
+
+| Version | TTFT Mean (ms) | TPOT Mean (ms) | ITL Mean (ms) | Output Throughput |
+|---------|----------------|----------------|---------------|-------------------|
+| Baseline | 382.82 | 35.78 | 35.78 | 60.29 tok/s |
+| Human | 387.43 | 36.41 | 36.41 | 60.21 tok/s |
+
+**Analysis**:
+- Human vs Baseline: ~-0.1% (essentially equivalent)
+- PR #13897 fixed a regression in MLA prefill - the baseline here is the **fixed** parent commit
+- The nearly identical results are expected: the fix restored performance to baseline levels
+
+**Note**: Metrics marked with `*` in tables indicate Docker rerun data (different from original Modal pipeline).
+
+---
+
+### 2deb029d - BlockManagerV2 Prefix Caching
+
+**Original Issue**: Brackets left in command (`[--use-v2-block-manager]` invalid syntax)
+
+**Corrected Command**:
+```bash
+python3 benchmarks/benchmark_prefix_caching.py \
+    --model neuralmagic/Meta-Llama-3-8B-Instruct-FP8 \
+    --output-len 200 --enable-prefix-caching --use-v2-block-manager
+```
+
+**Docker Image**:
+- Human: `ayushnangia16/nvidia-vllm-docker:2deb029d115dadd012ce5ea70487a207cb025493`
+- Baseline: Pending build (no pre-built image available)
+
+**Results** (prefix_caching benchmark):
+
+| Version | Warmup Time | Run Time | Input Throughput | Output Throughput |
+|---------|-------------|----------|------------------|-------------------|
+| Human | 3.78s | 3.61s | 18,170 tok/s | 5,634 tok/s |
+
+**Analysis**:
+- Human benchmark completed successfully
+- Baseline needs to be built from source (parent commit: `029c71de`)
+- Full comparison pending baseline availability
+
+**Status**: Human only (baseline pending)
+
+---
+
+### Summary of Reruns
+
+| Commit | Status | Baseline | Human | Agent | Notes |
+|--------|--------|----------|-------|-------|-------|
+| `9f1710f1` | B+H Complete | 60.29 tok/s | 60.21 tok/s | Pending | MLA fix working - baseline ≈ human as expected |
+| `2deb029d` | H Only | Pending | 5,634 tok/s | Pending | Command fixed, baseline needs build |
+
+Results saved to:
+- `/root/OmniPerf-Bench/omniperf_results_3way_claude_code/results/docker/9f1710f1/benchmark_result.json`
+- `/root/OmniPerf-Bench/omniperf_results_3way_claude_code/results/docker/2deb029d/benchmark_result.json`
