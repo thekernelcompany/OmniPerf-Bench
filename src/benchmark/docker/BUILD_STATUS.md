@@ -6,14 +6,252 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 ## Build Status Summary
 
-| Commit | Type | Model | torch | Status | Notes |
-|--------|------|-------|-------|--------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **SUCCESS** | Rebuilt with deep_gemm fix (2025-01-13) |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **SUCCESS** | Rebuilt with deep_gemm fix (2025-01-13) |
-| 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | Requires deleted sgl-project/flashinfer fork |
-| db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **SUCCESS** | Built with FA3 disabled, pushed to DockerHub |
-| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **SUCCESS** | Built with FA3 disabled, pushed to DockerHub |
+| Commit | Type | Model | torch | Build | Runtime | Notes |
+|--------|------|-------|-------|-------|---------|-------|
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **SUCCESS** | **BROKEN** | torchao 0.15.0 requires torch.int1 (torch 2.6+) |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **SUCCESS** | **BROKEN** | torchao 0.15.0 requires torch.int1 (torch 2.6+) |
+| 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
+| db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
+| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **SUCCESS** | **BROKEN** | Missing runtime deps (IPython, orjson, uvicorn) |
+| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **SUCCESS** | **BROKEN** | Missing runtime deps (IPython, orjson, uvicorn) |
+
+## Runtime Testing Results (2026-01-13)
+
+### Test Environment
+- Ubuntu 22.04.5 LTS
+- NVIDIA H100 PCIe (81GB)
+- Docker 28.2.2 with NVIDIA Container Toolkit 1.18.1
+- CUDA 12.6 (host) / 12.4.1 (containers)
+
+### Import Verification (ALL PASS)
+
+All 4 built images have sgl_kernel and deep_gemm importable:
+
+```
+d1112d85: torch=2.5.1+cu124, sgl_kernel=FOUND, deep_gemm=FOUND
+48efec7b: torch=2.5.1+cu124, sgl_kernel=FOUND, deep_gemm=FOUND
+9c088829: torch=2.6.0+cu124, sgl_kernel=FOUND, deep_gemm=FOUND
+005aad32: torch=2.6.0+cu124, sgl_kernel=FOUND, deep_gemm=FOUND
+```
+
+### Server Startup Tests (ALL FAIL)
+
+#### d1112d85 / 48efec7b (torch 2.5.1)
+
+**Error:** torchao version mismatch
+```
+AttributeError: module 'torch' has no attribute 'int1'
+```
+
+**Root Cause:** torchao 0.15.0 was installed, which requires `torch.int1` only available in torch 2.6+.
+
+**Fix Required:** Either:
+1. Downgrade torchao to 0.14.x compatible with torch 2.5.1, OR
+2. Upgrade torch to 2.6.0
+
+#### 9c088829 / 005aad32 (torch 2.6.0)
+
+**Error:** Missing runtime dependencies
+```
+ModuleNotFoundError: No module named 'IPython'
+ModuleNotFoundError: No module named 'orjson'
+ModuleNotFoundError: No module named 'uvicorn'
+```
+
+**Additional Issue:** Installing missing packages via pip causes segfault due to ABI mismatch between PyPI sglang packages and source-built sgl_kernel.
+
+**Fix Required:** Rebuild images with full `sglang[srt]` dependencies installed BEFORE building sgl_kernel from source.
+
+### 3-Way Benchmark Results
+
+All benchmark phases failed due to server startup crashes:
+
+```
+d1112d85:
+  baseline: [FAIL] Server crashed during startup (torchao.int1 error)
+  human: [FAIL] Server crashed during startup
+  agent: [FAIL] Server crashed during startup
+
+9c088829 (with runtime deps installed):
+  Model loaded successfully ✓
+  KV cache allocated ✓
+  Inference: [FAIL] Segfault in Triton JIT compiler
+```
+
+### Root Cause Analysis
+
+| Image | torch | triton | Issue |
+|-------|-------|--------|-------|
+| d1112d85 | 2.5.1 | 3.1.0 | torchao 0.15.0 requires torch.int1 (torch 2.6+) |
+| 9c088829 | 2.6.0 | 3.2.0 | Segfault in triton code_generator.py during inference |
+
+### Required Fixes for Rebuild
+
+**For d1112d85/48efec7b (torch 2.5.1):**
+```dockerfile
+# Pin torchao to version compatible with torch 2.5.1
+RUN pip install "torchao<0.15"
+```
+
+**For 9c088829/005aad32 (torch 2.6.0):**
+```dockerfile
+# Install ALL runtime dependencies before sgl-kernel build
+RUN pip install compressed-tensors datasets decord fastapi hf_transfer huggingface_hub \
+    interegular "llguidance>=0.7.11,<0.8.0" modelscope ninja orjson packaging pillow \
+    "prometheus-client>=0.20.0" psutil pydantic pynvml python-multipart "pyzmq>=25.1.2" \
+    "soundfile==0.13.1" "torchao>=0.7.0" uvicorn uvloop "xgrammar==0.1.17" IPython \
+    setproctitle "outlines>=0.0.44,<=0.1.11" partial_json_parser einops sse-starlette \
+    httptools msgspec
+
+# May need to pin triton version for compatibility
+RUN pip install "triton==3.1.0"  # or test with 3.2.0 after other fixes
+```
+
+---
+
+## Rebuild Instructions (2026-01-13)
+
+### Summary: Dockerfile vs Docker Image Status
+
+| Commit | Dockerfile Status | Docker Image Status | Action Required |
+|--------|-------------------|---------------------|-----------------|
+| d1112d85 | **FIXED** (torchao<0.15 already added) | **STALE** (built from old Dockerfile) | Rebuild only |
+| 48efec7b | **FIXED** (uses same Dockerfile) | **STALE** (built from old Dockerfile) | Rebuild only |
+| 9c088829 | **NEEDS UPDATE** (missing runtime deps) | **STALE** | Update Dockerfile + Rebuild |
+| 005aad32 | **NEEDS UPDATE** (uses same Dockerfile) | **STALE** | Update Dockerfile + Rebuild |
+
+### d1112d85 / 48efec7b (torch 2.5.1) - REBUILD ONLY
+
+The `Dockerfile.d1112d85` already contains the fix:
+```dockerfile
+# CRITICAL: Pin torchao<0.15 for torch 2.5.1 compatibility (0.15+ requires torch.int1 from torch 2.6+)
+RUN pip install "torchao<0.15" "transformers>=4.40.0" ...
+```
+
+**Why images are broken:** The Docker images on DockerHub were built from an **older version** of the Dockerfile before this fix was added. The current Dockerfile is correct.
+
+**Rebuild commands:**
+```bash
+cd /path/to/OmniPerf-Bench/src/benchmark/docker/sglang_commits
+
+# Build d1112d85
+DOCKER_BUILDKIT=0 docker build \
+  -f Dockerfile.d1112d85 \
+  -t shikhar481/sglang-images:d1112d8548eb13c842900b3a8d622345f9737759 \
+  .
+
+# Build 48efec7b (same Dockerfile, different commit arg)
+DOCKER_BUILDKIT=0 docker build \
+  -f Dockerfile.d1112d85 \
+  --build-arg COMMIT_HASH=48efec7b052354865aa2f0605a5bf778721f3cbb \
+  -t shikhar481/sglang-images:48efec7b052354865aa2f0605a5bf778721f3cbb \
+  .
+
+# Push to DockerHub
+docker push shikhar481/sglang-images:d1112d8548eb13c842900b3a8d622345f9737759
+docker push shikhar481/sglang-images:48efec7b052354865aa2f0605a5bf778721f3cbb
+```
+
+### 9c088829 / 005aad32 (torch 2.6.0) - UPDATE DOCKERFILE + REBUILD
+
+The `Dockerfile.9c088829` needs the following changes:
+
+**Problem 1: Missing runtime dependencies**
+
+Current (broken):
+```dockerfile
+RUN pip install "transformers>=4.40.0" "huggingface_hub>=0.23.0" "tokenizers>=0.19.0" \
+    "accelerate>=0.30.0" "numpy<2.0" requests aiohttp \
+    triton packaging xgrammar pydantic fastapi uvicorn vllm || true
+```
+
+Fixed (add ALL runtime deps):
+```dockerfile
+# Install ALL runtime dependencies BEFORE sgl-kernel build
+# NOTE: Do NOT install vllm - it will upgrade torch and break sgl-kernel ABI!
+RUN pip install "torchao>=0.7.0,<0.15" "transformers>=4.40.0" "huggingface_hub>=0.23.0" \
+    "tokenizers>=0.19.0" "accelerate>=0.30.0" "numpy<2.0" requests aiohttp \
+    triton packaging xgrammar pydantic fastapi uvicorn uvloop httptools \
+    orjson setproctitle IPython pyzmq pillow psutil compressed-tensors \
+    python-multipart sse-starlette interegular "outlines>=0.0.44,<=0.1.11" \
+    partial_json_parser einops msgspec prometheus-client decord soundfile \
+    cuda-python hf_transfer modelscope pynvml datasets pandas tqdm pybase64 || true
+```
+
+**Problem 2: Triton segfault during inference**
+
+The torch 2.6.0 images crash with a segfault in Triton's JIT compiler during the first inference request. This may be due to triton 3.2.0 incompatibility.
+
+Potential fix (add before sgl-kernel build):
+```dockerfile
+# Pin triton to 3.1.0 for stability (3.2.0 causes segfaults)
+RUN pip install "triton==3.1.0"
+```
+
+**Problem 3: SGLang install overwrites sgl-kernel**
+
+Current (problematic):
+```dockerfile
+RUN pip install -e "python[srt]" || pip install -e "python"
+```
+
+Fixed (use --no-deps to prevent overwriting source-built sgl-kernel):
+```dockerfile
+RUN pip install -e "python[srt]" --no-deps || pip install -e "python" --no-deps
+```
+
+**Rebuild commands (after updating Dockerfile):**
+```bash
+cd /path/to/OmniPerf-Bench/src/benchmark/docker/sglang_commits
+
+# Build 9c088829
+DOCKER_BUILDKIT=0 docker build \
+  -f Dockerfile.9c088829 \
+  -t shikhar481/sglang-images:9c088829ee2a28263f36d0814fde448c6090b5bc \
+  .
+
+# Build 005aad32 (same Dockerfile, different commit arg)
+DOCKER_BUILDKIT=0 docker build \
+  -f Dockerfile.9c088829 \
+  --build-arg COMMIT_HASH=005aad32ad45ce27d73fd39aa1f7e9ba5d8ebb8f \
+  -t shikhar481/sglang-images:005aad32ad45ce27d73fd39aa1f7e9ba5d8ebb8f \
+  .
+
+# Push to DockerHub
+docker push shikhar481/sglang-images:9c088829ee2a28263f36d0814fde448c6090b5bc
+docker push shikhar481/sglang-images:005aad32ad45ce27d73fd39aa1f7e9ba5d8ebb8f
+```
+
+### Post-Rebuild Verification
+
+After rebuilding, verify each image:
+
+```bash
+# 1. Check imports (should all pass)
+for commit in d1112d85 48efec7b 9c088829 005aad32; do
+  echo "=== $commit ==="
+  docker run --rm --gpus all shikhar481/sglang-images:${commit}* python -c "
+import importlib.util
+import torch
+for mod in ['sgl_kernel', 'deep_gemm']:
+    spec = importlib.util.find_spec(mod)
+    print(f'{mod}: found={spec is not None}')
+print(f'torch: {torch.__version__}')
+import torchao; print(f'torchao: {torchao.__version__}')
+"
+done
+
+# 2. Test server startup (quick smoke test)
+docker run --rm --gpus all -p 30000:30000 \
+  -e HF_TOKEN=<your_token> \
+  shikhar481/sglang-images:d1112d8548eb13c842900b3a8d622345f9737759 \
+  python -m sglang.launch_server --model google/gemma-2-2b-it --port 30000
+
+# 3. Test inference (in another terminal)
+curl http://localhost:30000/generate -d '{"text": "Hello", "max_new_tokens": 10}'
+```
+
+---
 
 ## Full Commit Hashes
 
@@ -371,4 +609,4 @@ docker push shikhar481/sglang-images:<COMMIT_HASH>
 
 ---
 
-*Last updated: 2025-01-13*
+*Last updated: 2026-01-13*
