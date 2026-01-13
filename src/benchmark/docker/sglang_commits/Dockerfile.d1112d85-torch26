@@ -1,0 +1,100 @@
+# Dockerfile for SGLang commit d1112d8548eb13c842900b3a8d622345f9737759
+# SGLang: 0.4.4.post1, sgl-kernel: 0.0.5.post2
+# EXPERIMENTAL: Using torch 2.6.0 to get triton 3.2.0 (fix H100 segfault)
+#
+# Rationale:
+#   - torch 2.5.1 bundles triton 3.1.0 which segfaults on H100/SM90
+#   - torch 2.6.0 bundles triton 3.2.0 which may fix this
+#   - sgl-kernel 0.0.5.post2 uses setup.py (no FA3/SM90 build issues)
+#
+# Version compatibility:
+#   torch==2.6.0, torchao==0.12.0, vllm>=0.6.4.post1,<=0.7.2, transformers==4.48.3
+
+ARG CUDA_VERSION=12.4.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+
+ARG COMMIT_HASH=d1112d8548eb13c842900b3a8d622345f9737759
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH="${PATH}:/usr/local/cuda/bin" \
+    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda/lib64" \
+    MAX_JOBS=8 \
+    CMAKE_BUILD_PARALLEL_LEVEL=8
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3-pip \
+    git curl wget build-essential cmake ninja-build \
+    libopenmpi-dev libnuma-dev \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Install pip and build dependencies
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && pip install scikit-build-core ninja cmake uv numpy
+
+# CRITICAL CHANGE: Install PyTorch 2.6.0 (instead of 2.5.1)
+# This gives us triton 3.2.0 which may fix the H100 segfault
+RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Clone SGLang at specific commit (d1112d85 = sgl-kernel 0.0.5.post2)
+WORKDIR /opt
+RUN git clone https://github.com/sgl-project/sglang.git sglang \
+    && cd sglang \
+    && git checkout ${COMMIT_HASH} \
+    && git submodule update --init --recursive || true
+
+# BUILD sgl-kernel FROM SOURCE
+# sgl-kernel 0.0.5.post2 uses setup.py (not CMake) - no FA3 issues!
+WORKDIR /opt/sglang/sgl-kernel
+RUN pip install . --no-build-isolation -v 2>&1 | tee /tmp/sgl_kernel_build.log || \
+    (echo "sgl-kernel build failed, trying with fresh scikit-build-core" && \
+     pip install --force-reinstall scikit-build-core && \
+     pip install . -v)
+
+# Note: sgl_kernel import requires GPU driver (libcuda.so.1) - verified at runtime
+
+# Install flashinfer for torch 2.6 (CHANGED from torch 2.5)
+WORKDIR /opt/sglang
+RUN pip install flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.6/ || \
+    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.6/ || \
+    echo "Warning: flashinfer installation failed, SGLang may fall back to other backends"
+
+# Install SGLang runtime dependencies
+# torchao==0.12.0 is compatible with both torch 2.5.x and 2.6.x
+# CRITICAL: Do NOT install vllm - it forces torch 2.5.1 which brings triton 3.1.0 (segfaults on H100)
+RUN pip install "torchao==0.12.0" "transformers==4.48.3" \
+    "huggingface_hub>=0.23.0" "tokenizers>=0.19.0" "accelerate>=0.30.0" "numpy<2.0" \
+    requests aiohttp packaging xgrammar pydantic fastapi uvicorn uvloop httptools \
+    orjson setproctitle IPython pyzmq pillow psutil compressed-tensors \
+    python-multipart sse-starlette interegular "outlines>=0.0.44,<=0.1.11" \
+    partial_json_parser einops msgspec pyairports pycountry || true
+
+# NOTE: Skipping vllm installation - it forces torch 2.5.1 + triton 3.1.0 which segfaults on H100
+# SGLang may have reduced functionality without vllm, but we need triton 3.2.0 for H100 compatibility
+
+# Verify torch 2.6.0 and triton 3.2.0 are intact
+RUN python -c "import torch; v=torch.__version__; assert '2.6' in v, f'torch version wrong: {v}'; print(f'torch: {v}')" && \
+    python -c "import triton; v=triton.__version__; assert '3.2' in v, f'triton version wrong: {v}'; print(f'triton: {v}')"
+
+# Install SGLang from source (sgl-kernel already installed)
+RUN pip install -e "python[srt]" --no-deps || pip install -e "python" --no-deps
+
+# Install remaining dependencies
+RUN pip install datasets pandas tqdm pybase64 Pillow hf_transfer modelscope pynvml \
+    prometheus-client decord soundfile cuda-python || true
+
+# Verify installation
+RUN python -c "import sglang; print(f'SGLang version: {sglang.__version__}')" && \
+    python -c "import torch; print(f'torch: {torch.__version__}')" && \
+    python -c "import triton; print(f'triton: {triton.__version__}')"
+
+WORKDIR /workspace
+RUN cp -r /opt/sglang/python/sglang/bench_* /workspace/ 2>/dev/null || true
+RUN cp -r /opt/sglang/benchmark* /workspace/ 2>/dev/null || true
+RUN cp -r /opt/sglang/benchmarks /workspace/ 2>/dev/null || true
+
+CMD ["python", "-c", "import sglang; import sgl_kernel; print(f'SGLang {sglang.__version__} with sgl_kernel ready')"]

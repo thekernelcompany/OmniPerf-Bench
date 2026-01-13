@@ -17,6 +17,54 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 ---
 
+## EXPERIMENTAL FIX: torch 2.6.0 + triton 3.2.0 (2026-01-13)
+
+### New Experimental Image
+
+**Image:** `shikhar481/sglang-images:d1112d85-torch26-novllm`
+**Digest:** sha256:2d8fe1b35ad08080205c4c2863a468853f5adac87566360241b6a51f03772869
+
+### Configuration
+
+| Component | Version |
+|-----------|---------|
+| torch | 2.6.0+cu124 |
+| triton | 3.2.0 |
+| sgl-kernel | 0.0.5.post2 |
+| torchao | 0.12.0 |
+| sglang | 0.4.4.post1 |
+| deep_gemm | present |
+| vllm | **NOT INSTALLED** |
+
+### Key Changes from Original d1112d85
+
+1. **torch 2.6.0** instead of 2.5.1 - gives us triton 3.2.0
+2. **No vllm** - vllm 0.7.2 forces torch 2.5.1 + triton 3.1.0, which segfaults
+3. **sgl-kernel 0.0.5.post2 builds successfully** with torch 2.6.0
+
+### Why This Might Work
+
+- sgl-kernel 0.0.5.post2 uses `setup.py` (not CMake with FA3)
+- No FA3/SM90 build issues
+- triton 3.2.0 paired with torch 2.6.0 may fix the H100 segfault
+
+### Dockerfile
+
+`src/benchmark/docker/sglang_commits/Dockerfile.d1112d85-torch26`
+
+### Test This Image
+
+```bash
+docker run --rm --gpus all -p 30000:30000 \
+  -e HF_TOKEN=<your_token> \
+  shikhar481/sglang-images:d1112d85-torch26-novllm \
+  python -m sglang.launch_server --model google/gemma-2-2b-it --port 30000
+```
+
+**Expected outcome:** Server should start AND handle inference without triton segfault.
+
+---
+
 ## Issue #1: Triton 3.1.0 Segfault on H100 (BLOCKING)
 
 ### Symptoms
@@ -38,15 +86,16 @@ File "triton/compiler/compiler.py", line 113 in make_ir
 | 3.1.0 | **SEGFAULT** in code_generator.py:223 (bundled with torch 2.5.1) |
 | 3.2.0 | `TypeError: must be called with a dataclass type or instance` (API incompatible) |
 
-### Potential Fix (UNTESTED)
+### Root Cause Analysis
 
-torch 2.6.0 bundles triton 3.2.0. The hypothesis:
-- triton 3.2.0 with torch 2.6.0 might fix the segfault
-- But: will sgl-kernel 0.0.5.post2 build with torch 2.6.0?
+The triton 3.1.0 segfault occurs because triton 3.2.0 API is NOT backward compatible with torch 2.5.1.
+The only way to use triton 3.2.0 is with torch 2.6.0.
 
-**This is a circular problem:**
-- torch 2.5.1: sgl-kernel builds ✓, but triton segfaults ✗
-- torch 2.6.0: triton 3.2.0 might work, but sgl-kernel build is untested
+### Solution: torch 2.6.0 + no vllm
+
+- torch 2.6.0 bundles triton 3.2.0 natively
+- vllm 0.7.2 CANNOT be used - it forces torch 2.5.1
+- sgl-kernel 0.0.5.post2 builds successfully with torch 2.6.0
 
 ---
 
