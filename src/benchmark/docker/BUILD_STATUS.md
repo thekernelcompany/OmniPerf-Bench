@@ -23,21 +23,31 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 Successfully ran 3-way benchmark using `torch_native` backend workaround.
 
-| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | ITL Mean | E2E Latency |
-|-------|--------|--------------------|-------------------|-----------|----------|-------------|
-| **Baseline** | 48efec7b | 1.20 req/s | 268.21 tok/s | 1118.73 ms | 129.22 ms | 29818.9 ms |
-| **Human** | d1112d85 | 1.18 req/s | 263.96 tok/s | 1159.03 ms | 132.26 ms | 30537.3 ms |
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | TTFT Median | TTFT P99 | ITL Mean | ITL Median | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|-------------|----------|----------|------------|-------------|
+| **Baseline** | 48efec7b | 1.20 req/s | 268.21 tok/s | 1118.73 ms | 801.55 ms | 5134.72 ms | 129.22 ms | 112.44 ms | 29818.9 ms |
+| **Human** | d1112d85 | 1.18 req/s | 263.96 tok/s | 1159.03 ms | 937.09 ms | 5455.85 ms | 132.26 ms | 115.81 ms | 30537.3 ms |
 
 **Human vs Baseline:**
-- Request throughput: -1.7%
-- Output throughput: -1.6%
-- TTFT: +3.6% (worse)
-- ITL: +2.4% (worse)
+- Request throughput: -1.7% (worse)
+- Output throughput: -1.6% (worse)
+- Input throughput: -1.6% (worse)
+- TTFT mean: +3.6% (worse)
+- TTFT median: +16.9% (worse)
+- ITL mean: +2.4% (worse)
+- E2E latency: +2.4% (worse)
 
-**Notes:**
-- Using `torch_native` backend instead of `flashinfer` (required to avoid triton segfault)
-- Results may differ from PR author's original testing which likely used flashinfer
-- 100 prompts benchmark - results have some variance
+**Benchmark Configuration:**
+- Model: `google/gemma-2-2b`
+- Prompts: 100
+- Backend: `torch_native` (not flashinfer - required workaround)
+- Results saved to: `/ephemeral/omniperf_results_3way_sglang_local/d1112d85/`
+
+**Important Notes:**
+- Using `torch_native` backend instead of `flashinfer` (required to avoid triton segfault on H100)
+- Results may differ significantly from PR author's original testing which likely used flashinfer backend
+- The human commit (d1112d85) shows slightly worse performance than baseline in this configuration
+- This could be due to the torch_native backend not benefiting from the optimization, or measurement variance
 
 ---
 
@@ -122,15 +132,17 @@ But this doesn't help benchmark commit d1112d85 since it's a completely differen
 
 ### Hardware Compatibility
 
-| GPU | Architecture | d1112d85 Compatible? |
-|-----|--------------|---------------------|
-| H100 | SM90 (Hopper) | **NO** - triton segfault |
-| A100 | SM80 (Ampere) | Likely YES (untested) |
-| A10/A30 | SM80 (Ampere) | Likely YES (untested) |
+| GPU | Architecture | d1112d85 Compatible? | Notes |
+|-----|--------------|---------------------|-------|
+| H100 | SM90 (Hopper) | **YES** (with workaround) | Requires torch_native backend |
+| A100 | SM80 (Ampere) | Likely YES | flashinfer should work natively |
+| A10/A30 | SM80 (Ampere) | Likely YES | flashinfer should work natively |
 
-### Decision
+### Decision (UPDATED)
 
-**SKIP d1112d85/48efec7b** for H100 3-way benchmarking. The PR author (PR #2797) didn't specify their GPU, but likely used A100 where triton 3.1.0 works.
+~~**SKIP d1112d85/48efec7b** for H100 3-way benchmarking.~~
+
+**RESOLVED**: Successfully ran 3-way benchmark on H100 using `torch_native` backend workaround. See benchmark results above.
 
 ---
 
@@ -281,16 +293,69 @@ Attempted runtime replacement of triton in d1112d85 container:
 
 ---
 
-## Next Steps to Test
+## BUGS FOUND AND FIXED (2026-01-13)
 
-1. **Option A: Try torch 2.6.0 with d1112d85**
-   - Modify Dockerfile.d1112d85 to use torch 2.6.0
-   - See if sgl-kernel 0.0.5.post2 builds
-   - Test if triton 3.2.0 fixes the H100 segfault
+### Bug #1: Benchmark Script sed Command Corruption
 
-2. **Option B: Try official SGLang image**
-   - Test `lmsysorg/sglang:latest` on H100
-   - See what torch/triton versions they use
+**Location:** `scripts/runners/local_docker_sglang_benchmark.py`
+
+**Symptom:** Benchmark failed with Python SyntaxError:
+```
+File "/opt/sglang/python/sglang/srt/layers/quantization/fp8_kernel.py", line 39
+    try:\n    import deep_gemm\nexcept ImportError:\n    deep_gemm = None
+         ^
+SyntaxError: unexpected character after line continuation character
+```
+
+**Root Cause:** The sed command was using `\\n` which inserted literal backslash-n characters instead of actual newlines:
+```bash
+# BROKEN - inserts literal \n characters
+sed -i 's/import deep_gemm/try:\\n    import deep_gemm\\nexcept ImportError:\\n    deep_gemm = None/' "$FP8_FILE"
+```
+
+**Fix:** Replaced sed with Python-based patching that:
+1. First checks if `deep_gemm` is already available (skips patching if so)
+2. Uses Python string operations with `chr(10)` for proper newline insertion
+
+**Commit:** `c47fd6bb` - fix(sglang): Fix benchmark script for H100 triton workaround
+
+### Bug #2: Missing H100 Workaround Flags
+
+**Location:** `scripts/runners/local_docker_sglang_benchmark.py`
+
+**Symptom:** Server crashed during startup due to triton JIT segfault
+
+**Root Cause:** Benchmark script was not using the H100 workaround flags discovered during manual testing
+
+**Fix:** Added the following flags to the benchmark script:
+- `--dtype float16`
+- `--attention-backend torch_native`
+- `--sampling-backend pytorch`
+- `--disable-cuda-graph`
+- `--disable-radix-cache`
+- `TORCH_COMPILE_DISABLE=1`
+- `TORCHDYNAMO_DISABLE=1`
+
+---
+
+## Next Steps (UPDATED)
+
+### Completed
+- [x] d1112d85/48efec7b benchmark on H100 (with torch_native workaround)
+- [x] Fixed benchmark script bugs
+
+### Pending
+1. **Test newer SGLang commits** from ayushnangia/vllm-docker-build (torch 2.6.0+, triton 3.2.0+)
+   - These may work with flashinfer backend (not requiring workaround)
+   - Commits: 1acca3a2, 021f76e4, 136c6e04, 3212c2ad
+
+2. **Test on A100** (if available)
+   - d1112d85/48efec7b should work with flashinfer backend natively
+   - Would provide comparison to H100 torch_native results
+
+3. **Run agent phase benchmarks**
+   - Current results only include baseline and human phases
+   - Agent patches need to be prepared and tested
 
 ---
 
@@ -378,3 +443,64 @@ src/benchmark/docker/vllm_commits/
 | 021f76e4 | 0.4.7 | 0.1.7 | 2.7.1 | 3.3.1 | 0.2.6.post1 (source) |
 | 136c6e04 | 0.4.9 | 0.2.4 | 2.7.1 | 3.3.1 | 0.2.7.post1 (source) |
 | 3212c2ad | 0.4.9.post4 | 0.2.7 | 2.7.1 | 3.3.1 | 0.2.9rc1 (source) |
+
+---
+
+## Changelog
+
+### 2026-01-13 (Session 2)
+
+**Benchmark Testing and Bug Fixes**
+
+1. **Debugged benchmark script failures**
+   - Initial benchmark runs failed with "Server crashed during startup"
+   - Manual docker tests worked fine with same configuration
+   - Root cause: sed command in benchmark script corrupting Python files
+
+2. **Fixed sed command bug**
+   - Old code: `sed -i 's/import deep_gemm/try:\\n...'` (inserts literal `\n`)
+   - New code: Python-based patching with `chr(10)` for proper newlines
+   - Also added check to skip patching if `deep_gemm` already available
+
+3. **Fixed missing H100 workaround flags in benchmark script**
+   - Added `--dtype float16`, `--attention-backend torch_native`, etc.
+   - Added environment variables `TORCH_COMPILE_DISABLE=1`, `TORCHDYNAMO_DISABLE=1`
+
+4. **Successfully ran 3-way benchmark**
+   - Baseline (48efec7b): 268.21 tok/s, TTFT 1118.73ms
+   - Human (d1112d85): 263.96 tok/s, TTFT 1159.03ms
+   - Human shows -1.6% throughput vs baseline (with torch_native backend)
+
+5. **Commits pushed**
+   - `c47fd6bb` - fix(sglang): Fix benchmark script for H100 triton workaround
+
+### 2026-01-13 (Session 1)
+
+**H100 Workaround Discovery**
+
+1. **Identified triton segfault root cause**
+   - flashinfer backend triggers triton JIT compilation
+   - triton 3.0.0-3.2.0 have MLIR threading bugs (triton-lang/triton#3882)
+   - Crashes occur during `ast_to_ttir` in code_generator.py
+
+2. **Found working configuration**
+   - Use `torch_native` backend instead of flashinfer
+   - This bypasses triton JIT entirely
+   - Server starts and handles inference successfully
+
+3. **Tested various configurations**
+   - torch 2.5.1 + triton 3.0.0/3.1.0: SEGFAULT
+   - torch 2.5.1 + triton 2.3.1: API incompatible
+   - torch 2.5.1 + triton 3.2.0: API incompatible
+   - torch 2.6.0 + triton 3.2.0 + vllm 0.8.0: SEGFAULT (still uses flashinfer)
+   - torch_native backend: WORKS
+
+4. **Verified official SGLang image**
+   - `lmsysorg/sglang:latest` works on H100
+   - Uses torch 2.9.1 + triton 3.5.1 (much newer versions)
+
+### Earlier Sessions
+
+- Built Docker images for d1112d85, 48efec7b, 9c088829, 005aad32
+- Discovered sgl-kernel build failures for newer commits (FA3 SM90 issues)
+- Built images from ayushnangia/vllm-docker-build with alternative approach
