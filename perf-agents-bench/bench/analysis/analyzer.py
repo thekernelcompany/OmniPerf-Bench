@@ -607,38 +607,88 @@ class SoftMetricsAnalyzer:
                     analysis_model=self.model,
                 )
 
+            # Handle case where LLM returns a list instead of dict
+            # Try to find a dict in the list, or merge list items if they're all dicts
+            if isinstance(json_data, list):
+                logger.warning(f"Patch quality JSON is a list with {len(json_data)} items, attempting to extract dict")
+                merged_dict = {}
+                for item in json_data:
+                    if isinstance(item, dict):
+                        merged_dict.update(item)
+                if merged_dict:
+                    json_data = merged_dict
+                    logger.info(f"Merged list items into dict with keys: {list(json_data.keys())}")
+                else:
+                    logger.warning("Could not extract dict from list, returning empty analysis")
+                    usage = response.get("usage", {})
+                    return PatchQualityAnalysis(
+                        human_patch_available=True,
+                        analysis_model=self.model,
+                        analysis_tokens=usage.get("total_tokens", 0),
+                    )
+
+            # Debug: Log what keys were returned
+            if isinstance(json_data, dict):
+                logger.debug(f"Patch quality JSON keys: {list(json_data.keys())}")
+            else:
+                logger.warning(f"Patch quality JSON is still not a dict after processing, got: {type(json_data)}")
+                usage = response.get("usage", {})
+                return PatchQualityAnalysis(
+                    human_patch_available=True,
+                    analysis_model=self.model,
+                    analysis_tokens=usage.get("total_tokens", 0),
+                )
+
+            # Helper to safely get dict (handles cases where LLM returns list instead of dict)
+            def safe_dict(data: Any, key: str, default: dict = None) -> dict:
+                """Get a dict value, returning empty dict if value is not a dict."""
+                if default is None:
+                    default = {}
+                val = data.get(key, default) if isinstance(data, dict) else default
+                return val if isinstance(val, dict) else default
+
+            # Helper to safely get string (handles None values from JSON null)
+            def safe_str(data: dict, key: str, default: str = "") -> str:
+                """Get a string value, returning default if value is None or not a string."""
+                val = data.get(key, default)
+                return val if isinstance(val, str) else default
+
             # Parse task analysis
-            task_data = json_data.get("task_analysis", {})
+            task_data = safe_dict(json_data, "task_analysis")
             task_analysis = None
             if task_data:
                 task_analysis = TaskAnalysis(
-                    domain=task_data.get("domain", "unknown"),
-                    complexity=task_data.get("complexity", "unknown"),
-                    description=task_data.get("description", ""),
+                    domain=safe_str(task_data, "domain", "unknown"),
+                    complexity=safe_str(task_data, "complexity", "unknown"),
+                    description=safe_str(task_data, "description", ""),
                 )
 
             # Parse bottleneck target
-            bt_data = json_data.get("bottleneck_target", {})
+            bt_data = safe_dict(json_data, "bottleneck_target")
             bottleneck_target = None
             if bt_data:
                 try:
-                    category = BottleneckTargetCategory(bt_data.get("category", "other"))
+                    category = BottleneckTargetCategory(safe_str(bt_data, "category", "other"))
                 except ValueError:
                     category = BottleneckTargetCategory.OTHER
                 bottleneck_target = BottleneckTargetAnalysis(
                     category=category,
-                    human_target=bt_data.get("human_target", ""),
-                    agent_target=bt_data.get("agent_target", ""),
-                    discussion=bt_data.get("discussion", ""),
+                    human_target=safe_str(bt_data, "human_target", ""),
+                    agent_target=safe_str(bt_data, "agent_target", ""),
+                    discussion=safe_str(bt_data, "discussion", ""),
                 )
 
             # Parse optimization techniques
-            ot_data = json_data.get("optimization_techniques", {})
+            ot_data = safe_dict(json_data, "optimization_techniques")
             optimization_techniques = None
             if ot_data:
-                def parse_techniques(techniques: List[str]) -> List[OptimizationTechnique]:
+                def parse_techniques(techniques) -> List[OptimizationTechnique]:
                     result = []
+                    if not isinstance(techniques, list):
+                        return result
                     for t in techniques:
+                        if not isinstance(t, str):
+                            continue
                         try:
                             result.append(OptimizationTechnique(t))
                         except ValueError:
@@ -648,67 +698,80 @@ class SoftMetricsAnalyzer:
                 optimization_techniques = OptimizationTechniqueAnalysis(
                     human_techniques=parse_techniques(ot_data.get("human_techniques", [])),
                     agent_techniques=parse_techniques(ot_data.get("agent_techniques", [])),
-                    technique_overlap=ot_data.get("technique_overlap", False),
-                    discussion=ot_data.get("discussion", ""),
+                    technique_overlap=bool(ot_data.get("technique_overlap", False)),
+                    discussion=safe_str(ot_data, "discussion", ""),
                 )
 
             # Parse approach comparison
-            ac_data = json_data.get("approach_comparison", {})
+            ac_data = safe_dict(json_data, "approach_comparison")
             approach_comparison = None
             if ac_data:
                 try:
-                    category = PatchApproachCategory(ac_data.get("category", "other"))
+                    category = PatchApproachCategory(safe_str(ac_data, "category", "other"))
                 except ValueError:
                     category = PatchApproachCategory.OTHER
                 approach_comparison = ApproachComparisonAnalysis(
                     category=category,
-                    discussion=ac_data.get("discussion", ""),
+                    discussion=safe_str(ac_data, "discussion", ""),
                 )
 
             # Parse speedup likelihood
-            sl_data = json_data.get("speedup_likelihood", {})
+            sl_data = safe_dict(json_data, "speedup_likelihood")
             speedup_likelihood = None
             if sl_data:
                 try:
-                    category = SpeedupLikelihood(sl_data.get("category", "other"))
+                    category = SpeedupLikelihood(safe_str(sl_data, "category", "other"))
                 except ValueError:
                     category = SpeedupLikelihood.OTHER
                 speedup_likelihood = SpeedupLikelihoodAnalysis(
                     category=category,
-                    discussion=sl_data.get("discussion", ""),
+                    discussion=safe_str(sl_data, "discussion", ""),
                 )
 
             # Parse failure mode
-            fm_data = json_data.get("failure_mode", {})
+            fm_data = safe_dict(json_data, "failure_mode")
             failure_mode = None
             if fm_data:
                 try:
-                    category = PatchFailureMode(fm_data.get("category", "other"))
+                    category = PatchFailureMode(safe_str(fm_data, "category", "other"))
                 except ValueError:
                     category = PatchFailureMode.OTHER
                 failure_mode = FailureModeAnalysis(
                     category=category,
-                    discussion=fm_data.get("discussion", ""),
+                    discussion=safe_str(fm_data, "discussion", ""),
                 )
 
             # Parse observations
-            obs_data = json_data.get("observations", {})
+            obs_data = safe_dict(json_data, "observations")
             observations = None
             if obs_data:
+                # Helper to safely get list of strings
+                def safe_str_list(data: dict, key: str) -> List[str]:
+                    val = data.get(key, [])
+                    if not isinstance(val, list):
+                        return []
+                    return [str(item) for item in val if item is not None]
+
                 observations = PatchObservations(
-                    key_differences=obs_data.get("key_differences", []),
-                    agent_strengths=obs_data.get("agent_strengths", []),
-                    agent_weaknesses=obs_data.get("agent_weaknesses", []),
-                    benchmark_needed=obs_data.get("benchmark_needed", ""),
+                    key_differences=safe_str_list(obs_data, "key_differences"),
+                    agent_strengths=safe_str_list(obs_data, "agent_strengths"),
+                    agent_weaknesses=safe_str_list(obs_data, "agent_weaknesses"),
+                    benchmark_needed=safe_str(obs_data, "benchmark_needed", ""),
                 )
 
             # Parse library failure
-            lf_data = json_data.get("library_failure", {})
+            lf_data = safe_dict(json_data, "library_failure")
             library_failure = None
             if lf_data:
+                # Safely get responsible_libraries as list of strings
+                resp_libs = lf_data.get("responsible_libraries", [])
+                if not isinstance(resp_libs, list):
+                    resp_libs = []
+                resp_libs = [str(lib) for lib in resp_libs if lib is not None]
+
                 library_failure = LibraryFailureAnalysis(
-                    responsible_libraries=lf_data.get("responsible_libraries", []),
-                    failure_reason=lf_data.get("failure_reason", ""),
+                    responsible_libraries=resp_libs,
+                    failure_reason=safe_str(lf_data, "failure_reason", ""),
                 )
 
             # Get token usage
@@ -747,21 +810,47 @@ class SoftMetricsAnalyzer:
             logger.warning("Could not extract JSON from LLM response")
             return QualitativeScores(), CategoricalMetrics(), FreeFormAnalysis()
 
+        # Helper to safely get dict (handles cases where LLM returns list instead of dict)
+        def safe_get_dict(data: Any, key: str, default: dict = None) -> dict:
+            if default is None:
+                default = {}
+            if not isinstance(data, dict):
+                return default
+            val = data.get(key, default)
+            return val if isinstance(val, dict) else default
+
+        # Helper to safely get string
+        def safe_get_str(data: dict, key: str, default: str = "") -> str:
+            if not isinstance(data, dict):
+                return default
+            val = data.get(key, default)
+            return val if isinstance(val, str) else default
+
+        # Helper to safely get list
+        def safe_get_list(data: dict, key: str, default: list = None) -> list:
+            if default is None:
+                default = []
+            if not isinstance(data, dict):
+                return default
+            val = data.get(key, default)
+            return val if isinstance(val, list) else default
+
         # Parse quality scores
-        scores_data = json_data.get("quality_scores", {})
+        scores_data = safe_get_dict(json_data, "quality_scores")
 
         def build_quality_score(key: str) -> QualityScore:
-            data = scores_data.get(key, {})
-            if isinstance(data, dict):
+            data = safe_get_dict(scores_data, key)
+            if data:
                 # Extract sub-scores
                 sub_scores = {k: float(v) for k, v in data.items()
                               if k not in ["score", "justification"] and isinstance(v, (int, float))}
+                score_val = data.get("score", 0)
                 return QualityScore(
-                    score=float(data.get("score", 0)),
+                    score=float(score_val) if score_val is not None else 0.0,
                     sub_scores=sub_scores,
-                    justification=data.get("justification", ""),
+                    justification=safe_get_str(data, "justification", ""),
                 )
-            return QualityScore(score=float(data) if data else 0.0)
+            return QualityScore(score=0.0)
 
         qualitative = QualitativeScores(
             code_understanding=build_quality_score("code_understanding"),
@@ -771,22 +860,22 @@ class SoftMetricsAnalyzer:
         )
 
         # Parse categorical metrics
-        cat_data = json_data.get("categorical", {})
+        cat_data = safe_get_dict(json_data, "categorical")
 
         # Map string to enum safely
-        approach = cat_data.get("approach_category", "unknown")
+        approach = safe_get_str(cat_data, "approach_category", "unknown")
         try:
             approach_enum = ApproachCategory(approach)
         except ValueError:
             approach_enum = ApproachCategory.UNKNOWN
 
-        tool_pattern = cat_data.get("tool_usage_pattern", "unknown")
+        tool_pattern = safe_get_str(cat_data, "tool_usage_pattern", "unknown")
         try:
             tool_enum = ToolUsagePattern(tool_pattern)
         except ValueError:
             tool_enum = ToolUsagePattern.UNKNOWN
 
-        failure = cat_data.get("failure_category", "none")
+        failure = safe_get_str(cat_data, "failure_category", "none")
         try:
             failure_enum = FailureCategory(failure)
         except ValueError:
@@ -799,20 +888,20 @@ class SoftMetricsAnalyzer:
         )
 
         # Parse free-form analysis
-        analysis_data = json_data.get("detailed_analysis", {})
-        recommendations_data = json_data.get("recommendations", {})
+        analysis_data = safe_get_dict(json_data, "detailed_analysis")
+        recommendations_data = safe_get_dict(json_data, "recommendations")
 
         free_form = FreeFormAnalysis(
-            summary=analysis_data.get("summary", ""),
-            key_decisions=analysis_data.get("key_decisions", []),
-            optimization_techniques=analysis_data.get("optimization_techniques", []),
-            missed_opportunities=analysis_data.get("missed_opportunities", []),
-            error_recovery_strategy=analysis_data.get("error_recovery_strategy", ""),
-            strengths=analysis_data.get("strengths", []),
-            weaknesses=analysis_data.get("weaknesses", []),
+            summary=safe_get_str(analysis_data, "summary", ""),
+            key_decisions=safe_get_list(analysis_data, "key_decisions"),
+            optimization_techniques=safe_get_list(analysis_data, "optimization_techniques"),
+            missed_opportunities=safe_get_list(analysis_data, "missed_opportunities"),
+            error_recovery_strategy=safe_get_str(analysis_data, "error_recovery_strategy", ""),
+            strengths=safe_get_list(analysis_data, "strengths"),
+            weaknesses=safe_get_list(analysis_data, "weaknesses"),
             recommendations=(
-                recommendations_data.get("prompting_improvements", []) +
-                recommendations_data.get("capability_additions", [])
+                safe_get_list(recommendations_data, "prompting_improvements") +
+                safe_get_list(recommendations_data, "capability_additions")
             ),
         )
 
