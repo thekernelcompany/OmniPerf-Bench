@@ -257,6 +257,7 @@ python3 -m sglang.launch_server \\
     --model-path {model} \\
     --port {port} \\
     --host 127.0.0.1 \\
+    --disable-cuda-graph \\
     --log-level warning 2>&1 &
 SERVER_PID=$!
 

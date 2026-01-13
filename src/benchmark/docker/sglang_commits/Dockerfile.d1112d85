@@ -1,9 +1,13 @@
 # Dockerfile for SGLang commit d1112d8548eb13c842900b3a8d622345f9737759
-# SGLang: 0.4.4.post1, sgl-kernel: 0.0.5.post2, torch: 2.5.1
+# SGLang: 0.4.4.post1, sgl-kernel: 0.0.5.post2, torch: 2.6.0
 # Also works for parent commit: 48efec7b052354865aa2f0605a5bf778721f3cbb
 #
+# CRITICAL: Using torch 2.6.0 instead of 2.5.1 because:
+#   - torch 2.5.1 bundles triton 3.1.0 which has an MLIR segfault bug on H100/SM90 GPUs
+#   - torch 2.6.0 bundles triton 3.2.0 which fixes the segfault
+#
 # Version compatibility (from pytorch/ao#2919 and pyproject.toml):
-#   torch==2.5.1, torchao==0.12.0, vllm>=0.6.4.post1,<=0.7.2, transformers==4.48.3
+#   torch==2.6.0, torchao==0.12.0, vllm>=0.6.4.post1,<=0.7.2, transformers==4.48.3
 
 ARG CUDA_VERSION=12.4.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
@@ -31,8 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m pip install --upgrade pip setuptools wheel \
     && pip install scikit-build-core ninja cmake uv numpy
 
-# Install PyTorch 2.5.1 (required for sgl-kernel 0.0.5.post2)
-RUN pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch 2.6.0 (required for H100/SM90 - triton 3.2.0 fixes MLIR segfault)
+RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Clone SGLang at specific commit
 WORKDIR /opt
@@ -51,15 +55,15 @@ RUN pip install . --no-build-isolation -v 2>&1 | tee /tmp/sgl_kernel_build.log |
 
 # Note: sgl_kernel import requires GPU driver (libcuda.so.1) - will be verified at runtime
 
-# Install flashinfer for torch 2.5
+# Install flashinfer for torch 2.6
 WORKDIR /opt/sglang
-RUN pip install flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.5/ || \
-    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/ || \
+RUN pip install flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.6/ || \
+    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.6/ || \
     echo "Warning: flashinfer installation failed, SGLang may fall back to other backends"
 
 # Install SGLang runtime dependencies
 # Versions from pyproject.toml and pytorch/ao#2919 compatibility table:
-#   - torchao==0.12.0: Official compatible version for torch 2.5.x (see https://github.com/pytorch/ao/issues/2919)
+#   - torchao==0.12.0: Official compatible version for torch 2.5-2.7 (see https://github.com/pytorch/ao/issues/2919)
 #   - vllm>=0.6.4.post1,<=0.7.2: Required by SGLang 0.4.4.post1
 #   - transformers==4.48.3: Pinned in pyproject.toml
 RUN pip install "torchao==0.12.0" "transformers==4.48.3" "vllm>=0.6.4.post1,<=0.7.2" \
