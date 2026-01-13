@@ -223,6 +223,81 @@ Attempted runtime replacement of triton in d1112d85 container:
 
 ---
 
+## NEW: vLLM-style Builds (2026-01-13)
+
+Based on analysis of [ayushnangia/vllm-docker-build](https://github.com/ayushnangia/vllm-docker-build/tree/revolution/fixed-dockerfiles), testing their approach with newer SGLang versions and sgl-kernel from PyPI.
+
+### Key Differences from Our Approach
+
+| Aspect | Our Approach | vLLM-style |
+|--------|--------------|------------|
+| sgl-kernel | Build from source | **PyPI wheel** |
+| flashinfer | Pre-built wheel | **Build from source** |
+| Python | 3.11 | 3.10 |
+| deep_gemm | ✓ included | ✗ may be missing |
+
+### New Commits - BUILT AND PUSHED (2026-01-13)
+
+| Date | Commit | SGLang | torch | triton | sgl-kernel | Status |
+|------|--------|--------|-------|--------|------------|--------|
+| 2025-05-02 | 1acca3a2 | 0.4.6.post2 | 2.6.0 (cu124) | 3.2.0 | 0.1.1 (PyPI) | ✓ BUILT |
+| 2025-05-02 | 6ea1e6ac | 0.4.6.post2 | 2.6.0 (cu124) | 3.2.0 | 0.1.1 (PyPI) | ✓ BUILT |
+| 2025-07-08 | 136c6e04 | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 (PyPI) | ✓ BUILT |
+| 2025-07-08 | a37e1247 | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 (PyPI) | ✓ BUILT |
+
+### Image Digests (vLLM-style)
+
+| Commit | Image Tag | Digest |
+|--------|-----------|--------|
+| 1acca3a2 | `1acca3a2-vllm-style` | sha256:4568bda8298a3bafbaa4551e641cff4c2bde3e60f73593e8e4af89d26fb33c8d |
+| 6ea1e6ac | `6ea1e6ac-vllm-style` | sha256:dbc22924b940275260e907505ef3bba700378cf80688bfbf3a9ef89785c729ab |
+| 136c6e04 | `136c6e04-vllm-style` | sha256:3a1e3e253874323fe62890a91ade5cc4ac6c3c1bd37cffea32e9e3fec504e6fe |
+| a37e1247 | `a37e1247-vllm-style` | sha256:8f264d1bfebc21ab657278682e8cc11e3f749087e98945da6164ffedf0e2f517 |
+
+### Test These Images
+
+**Priority 1 - torch 2.6.0 + triton 3.2.0 (proper CUDA match):**
+```bash
+# 2025-05-02 commits - RECOMMENDED (proper cu124 matching)
+docker run --rm --gpus all -p 30000:30000 -e HF_TOKEN=<token> \
+  shikhar481/sglang-images:1acca3a2-vllm-style \
+  python -m sglang.launch_server --model google/gemma-2-2b-it --port 30000
+```
+
+**Priority 2 - torch 2.7.1 + triton 3.3.1 (newer triton):**
+```bash
+# 2025-07-08 commits - noted as "WORKING" in original repo
+docker run --rm --gpus all -p 30000:30000 -e HF_TOKEN=<token> \
+  shikhar481/sglang-images:136c6e04-vllm-style \
+  python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+```
+
+### Notes from Original Repo
+
+- **2025-05-02**: Baseline builds, unknown status
+- **2025-06-11**: Benchmarks hung indefinitely on Modal (skipped)
+- **2025-07-08**: **WORKING** - text models work, VLM issues only
+- **2025-07-26**: InternVL model not supported in that SGLang version (skipped)
+
+### CUDA Version Consideration
+
+- **2025-05-02 (torch 2.6.0)**: Has cu124 wheels - **PROPER MATCH** with base image
+- **2025-07-08 (torch 2.7.1)**: Only has cu126 wheels - CUDA mismatch with base image
+
+**Recommendation**: Prioritize 2025-05-02 builds (torch 2.6.0 cu124) as they have proper CUDA matching.
+
+### Dockerfiles
+
+```
+src/benchmark/docker/vllm_commits/
+├── Dockerfile.1acca3a2  # 2025-05-02, torch 2.6.0
+├── Dockerfile.6ea1e6ac  # 2025-05-02, torch 2.6.0 (parent)
+├── Dockerfile.136c6e04  # 2025-07-08, torch 2.7.1
+└── Dockerfile.a37e1247  # 2025-07-08, torch 2.7.1 (parent)
+```
+
+---
+
 ## Reference: Dependency Versions
 
 From pyproject.toml and pytorch/ao#2919:
@@ -231,3 +306,5 @@ From pyproject.toml and pytorch/ao#2919:
 |--------|--------|------------|-------|---------|------|
 | d1112d85 | 0.4.4.post1 | 0.0.5.post2 | 2.5.1 | 0.12.0 | 0.6.4-0.7.2 |
 | 9c088829 | 0.4.5.post3 | 0.0.9.post2 | 2.6.0 | 0.12.0 | not needed |
+| 1acca3a2 | 0.4.6.post2 | 0.1.1 | 2.6.0 | >=0.9.0 | not installed |
+| 136c6e04 | 0.4.9 | 0.2.4 | 2.7.1 | 0.9.0 | not installed |

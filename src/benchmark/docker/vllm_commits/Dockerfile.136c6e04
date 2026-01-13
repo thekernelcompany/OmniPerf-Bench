@@ -1,0 +1,131 @@
+# SGLang Docker image for commit 136c6e0431c2067c3a2a98ad2c77fc89a9cb98e7
+# Date: 2025-07-08
+# SGLang version: 0.4.9
+# torch: 2.7.1, flashinfer_python: 0.2.7.post1, sgl-kernel: 0.2.4
+#
+# Source: ayushnangia/vllm-docker-build (2025-07-08) - noted as "working"
+# Adapted for our build environment
+#
+# NOTE: torch 2.7.1 only has cu126 wheels (no cu124), hence CUDA version mismatch
+# with base image. This is intentional - following the working configuration.
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build arguments
+ARG MAX_JOBS=8
+ARG TORCH_CUDA_ARCH_LIST="9.0"
+ARG COMMIT_HASH=136c6e0431c2067c3a2a98ad2c77fc89a9cb98e7
+
+# Environment variables
+ENV TORCH_CUDA_ARCH_LIST="9.0"
+ENV MAX_JOBS=8
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="${PATH}:/usr/local/cuda/bin"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda/lib64"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    wget \
+    vim \
+    cmake \
+    ninja-build \
+    software-properties-common \
+    python3.10 \
+    python3.10-dev \
+    python3.10-venv \
+    python3-pip \
+    libibverbs-dev \
+    libopenmpi-dev \
+    libnuma-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1
+
+# Upgrade pip and install build tools
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Install torch 2.7.1 with CUDA 12.6 (only available option for torch 2.7.1)
+RUN pip3 install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+
+# Install sgl-kernel 0.2.4 from PyPI (working configuration)
+RUN pip3 install sgl-kernel==0.2.4
+
+# Install core dependencies (from pyproject.toml for SGLang 0.4.9)
+RUN pip3 install \
+    outlines==0.1.11 \
+    transformers==4.53.0 \
+    torchao==0.9.0 \
+    timm==1.0.16 \
+    xgrammar==0.1.19 \
+    soundfile==0.13.1 \
+    blobfile==3.0.0 \
+    einops \
+    partial_json_parser \
+    cuda-python \
+    "numpy<2.0" \
+    packaging \
+    ninja \
+    scipy
+
+# Install web framework dependencies
+RUN pip3 install \
+    fastapi \
+    uvicorn \
+    pydantic \
+    typing_extensions \
+    pyzmq \
+    python-multipart \
+    uvloop \
+    orjson \
+    msgspec
+
+# Install remaining dependencies
+RUN pip3 install \
+    huggingface_hub datasets pillow psutil pynvml \
+    aiohttp requests tqdm setproctitle \
+    IPython interegular "prometheus-client>=0.20.0" \
+    "llguidance>=0.7.11,<0.8.0" compressed-tensors \
+    hf_transfer modelscope build decord pybase64 || true
+
+# Build and install flashinfer 0.2.7.post1 from source (no prebuilt wheels for torch 2.7.1)
+WORKDIR /sgl-workspace
+RUN git clone --recursive https://github.com/flashinfer-ai/flashinfer.git && \
+    cd flashinfer && \
+    git checkout v0.2.7.post1 && \
+    git submodule update --init --recursive && \
+    MAX_JOBS=${MAX_JOBS} TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+    pip3 install -e . --no-build-isolation && \
+    rm -rf .git
+
+# Clone SGLang repo and checkout exact commit
+RUN git clone https://github.com/sgl-project/sglang.git sglang && \
+    cd sglang && \
+    git checkout ${COMMIT_HASH}
+
+# Verify checkout
+RUN cd /sgl-workspace/sglang && \
+    ACTUAL=$(git rev-parse HEAD) && \
+    echo "Checked out: $ACTUAL"
+
+# Install SGLang with --no-deps
+WORKDIR /sgl-workspace/sglang/python
+RUN pip3 install -e . --no-deps
+
+# For openbmb/MiniCPM models
+RUN pip3 install datamodel_code_generator || true
+
+# Verify installation
+RUN python3 -c "import sglang; print(f'SGLang version: {sglang.__version__}')" && \
+    python3 -c "import torch; print(f'torch: {torch.__version__}')" && \
+    python3 -c "import triton; print(f'triton: {triton.__version__}')"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
