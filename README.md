@@ -558,6 +558,110 @@ python performance_analyzer.py  # Analyze performance patterns
 python generate_test_generators.py  # Create new test generators
 ```
 
+## 📊 3-Way Agent Benchmarks
+
+The 3-way benchmark runner compares performance across three configurations:
+1. **Baseline**: Parent commit before optimization (pre-built Docker image)
+2. **Human**: Human-authored optimized commit (pre-built Docker image)
+3. **Agent**: AI agent's patch applied to baseline
+
+### Prerequisites
+
+- NVIDIA GPU (H100 80GB recommended)
+- Docker with NVIDIA runtime
+- Pre-built baseline images at `shikhar481/vllm_fixed_human_images:baseline-<parent_commit>`
+- Agent patches in `perf-agents-bench/state/runs/vllm/<agent>/`
+
+### Running Agent Benchmarks
+
+```bash
+cd /root/OmniPerf-Bench
+
+# Run benchmarks for a specific agent type
+python scripts/runners/run_3way_benchmarks.py \
+    --agent-type <agent_type> \
+    --agent-only \
+    --timeout 900
+
+# Available agent types:
+#   codex_gpt5    - Codex GPT-5 agent patches
+#   trae_gpt5     - TRAE GPT-5 agent patches
+#   trae_sonnet45 - TRAE Sonnet 4.5 agent patches
+#   claude_code   - Claude Code agent patches
+```
+
+### Agent Configuration
+
+The script uses the following agent patch directories:
+
+| Agent Type | Patch Directory |
+|------------|-----------------|
+| `codex_gpt5` | `perf-agents-bench/state/runs/vllm/codex/gpt-5/` |
+| `trae_gpt5` | `perf-agents-bench/state/runs/vllm/trae/gpt-5/` |
+| `trae_sonnet45` | `perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45/` |
+| `claude_code` | `perf-agents-bench/state/runs/vllm/claude_code/default/` |
+
+### Output
+
+Results are saved to `omniperf_results_3way_<agent>/results/` with one JSON file per commit:
+
+```json
+{
+  "human_commit": "8-char hash",
+  "human_commit_full": "full 40-char hash",
+  "parent_commit": "baseline commit hash",
+  "model": "HuggingFace model name",
+  "status": "success|error|timeout",
+  "error": "error message or null",
+  "duration_s": 123.45,
+  "metrics": {
+    "request_throughput_req_s": 50.0,
+    "output_token_throughput_tok_s": 3200.0
+  },
+  "timestamp": "2026-01-13 12:00:00"
+}
+```
+
+### CLI Options
+
+```bash
+python scripts/runners/run_3way_benchmarks.py --help
+
+Options:
+  --agent-type TYPE    Agent type to benchmark (required)
+  --agent-only         Run only agent benchmarks (skip human)
+  --human-only         Run only human benchmarks (skip agent)
+  --timeout SECONDS    Benchmark timeout (default: 600)
+  --limit N            Process only first N commits
+  --commit HASH        Process only specific commit
+  --skip-existing      Skip commits with existing results
+```
+
+### Example: Full Agent Benchmark Suite
+
+```bash
+# Run all three agents sequentially
+for agent in codex_gpt5 trae_gpt5 trae_sonnet45; do
+    echo "Running $agent benchmarks..."
+    python scripts/runners/run_3way_benchmarks.py \
+        --agent-type $agent \
+        --agent-only \
+        --timeout 900
+done
+
+# Check results
+for agent in codex trae_gpt5 trae_sonnet45; do
+    dir="omniperf_results_3way_${agent}/results"
+    total=$(ls $dir/*_agent_result.json 2>/dev/null | wc -l)
+    success=$(grep -l '"status": "success"' $dir/*_agent_result.json 2>/dev/null | wc -l)
+    echo "$agent: $success/$total successful"
+done
+```
+
+### Benchmark Results Summary
+
+See `AGENT_BENCHMARK_RESULTS.md` for detailed analysis of completed benchmark runs.
+
 ## 🔄 resuming trae pipeline with filtered commits
 
 ### Quick Start: Resume Pipeline
