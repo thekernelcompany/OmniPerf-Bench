@@ -20,6 +20,25 @@ from typing import Optional, Dict, Any
 # Configuration
 HUMAN_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
+PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/exports/full_results.jsonl")
+
+# Agent configurations - paths to agent patch directories
+AGENT_CONFIGS = {
+    "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
+    "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
+    "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",
+    "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
+}
+
+# Output directories per agent type
+AGENT_OUTPUT_DIRS = {
+    "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
+    "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
+    "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
+    "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+}
+
+# Default (for backward compatibility)
 RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code")
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping_complete.json")
@@ -32,6 +51,85 @@ def get_hf_token() -> str:
     if token_file.exists():
         return token_file.read_text().strip()
     return ""
+
+
+def load_perf_data() -> Dict[str, dict]:
+    """Load perf_command, model, gpu_config from full_results.jsonl."""
+    perf_data = {}
+    if not PERF_DATA_FILE.exists():
+        print(f"WARNING: Perf data file not found: {PERF_DATA_FILE}")
+        return perf_data
+
+    with open(PERF_DATA_FILE) as f:
+        for line in f:
+            try:
+                data = json.loads(line.strip())
+                commit = data.get('commit_hash', '')[:8]
+                if commit and data.get('perf_command'):
+                    perf_data[commit] = {
+                        'perf_command': data['perf_command'],
+                        'model': data.get('model', 'unknown'),
+                        'gpu_config': data.get('gpu_config', 'H100:1'),
+                        'commit_hash_full': data.get('commit_hash', '')
+                    }
+            except json.JSONDecodeError:
+                continue
+    return perf_data
+
+
+def build_benchmark_mapping(agent_patches_dir: Path, perf_data: Dict[str, dict]) -> Dict[str, dict]:
+    """Build benchmark mapping by combining agent patches with perf data.
+
+    Returns dict mapping human_commit_short -> {
+        human_commit_short, human_commit_full, parent_commit, parent_short,
+        perf_command, model, gpu_config, patch_path
+    }
+    """
+    mapping = {}
+
+    if not agent_patches_dir.exists():
+        print(f"WARNING: Agent patches directory not found: {agent_patches_dir}")
+        return mapping
+
+    # Walk through all timestamp directories to find run_summary.json files
+    for root, dirs, files in os.walk(agent_patches_dir):
+        if 'run_summary.json' in files and 'model_patch.diff' in files:
+            summary_path = Path(root) / 'run_summary.json'
+            patch_path = Path(root) / 'model_patch.diff'
+
+            try:
+                with open(summary_path) as f:
+                    summary = json.load(f)
+
+                human_commit = summary.get('commits', {}).get('human', '')
+                parent_commit = summary.get('commits', {}).get('pre', '')
+
+                if not human_commit or not parent_commit:
+                    continue
+
+                human_short = human_commit[:8]
+
+                # Check if we have perf data for this commit
+                if human_short not in perf_data:
+                    continue
+
+                # Only keep first patch found for each commit (latest run dir is usually sorted last)
+                if human_short in mapping:
+                    continue
+
+                mapping[human_short] = {
+                    'human_commit_short': human_short,
+                    'human_commit_full': human_commit,
+                    'parent_commit': parent_commit,
+                    'parent_short': parent_commit[:12],
+                    'patch_path': str(patch_path),
+                    **perf_data[human_short]
+                }
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"WARNING: Failed to parse {summary_path}: {e}")
+                continue
+
+    return mapping
 
 
 def load_mapping() -> Dict[str, dict]:
@@ -855,8 +953,13 @@ def save_result(result: dict, commit_short: str, result_type: str, commit_info: 
 
 
 def main():
+    global AGENT_OUTPUT_DIR, AGENT_PATCHES_DIR
+
     import argparse
     parser = argparse.ArgumentParser(description='Run 3-way benchmarks for vLLM commits')
+    parser.add_argument('--agent-type', type=str, choices=list(AGENT_CONFIGS.keys()),
+                        default='claude_code',
+                        help='Agent type to benchmark (default: claude_code)')
     parser.add_argument('--commits', type=str, nargs='+',
                         help='Specific commits to run (short hash)')
     parser.add_argument('--human-only', action='store_true',
@@ -867,18 +970,45 @@ def main():
                         help='Show what would be run')
     parser.add_argument('--timeout', type=int, default=900,
                         help='Timeout per benchmark in seconds')
+    parser.add_argument('--use-legacy-mapping', action='store_true',
+                        help='Use legacy baseline_benchmark_mapping_complete.json')
     args = parser.parse_args()
 
-    # Default commits (8 ready commits)
-    default_commits = ['3476ed08', '3a243095', '6ce01f30', '7c01f706',
-                       '80aa7e91', '89a84b0b', '8bc68e19', '8d75fe48']
+    # Set agent-specific paths
+    agent_type = args.agent_type
+    AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench") / AGENT_CONFIGS[agent_type]
+    AGENT_OUTPUT_DIR = AGENT_OUTPUT_DIRS[agent_type] / "results"
 
-    commits = args.commits if args.commits else default_commits
+    print(f"=== Agent Type: {agent_type} ===")
+    print(f"Agent patches dir: {AGENT_PATCHES_DIR}")
+    print(f"Output dir: {AGENT_OUTPUT_DIR}")
 
+    # Load configuration
     print("Loading configuration...")
-    mapping = load_mapping()
-    agent_patches = load_agent_patches()
+
+    if args.use_legacy_mapping:
+        # Legacy mode for backward compatibility
+        mapping = load_mapping()
+        agent_patches = load_agent_patches()
+    else:
+        # New mode: build mapping from perf_data + run_summary.json
+        perf_data = load_perf_data()
+        print(f"Loaded perf data for {len(perf_data)} commits")
+
+        mapping = build_benchmark_mapping(AGENT_PATCHES_DIR, perf_data)
+        print(f"Built mapping for {len(mapping)} commits")
+
+        # Agent patches are now embedded in the mapping (patch_path field)
+        agent_patches = {k: Path(v['patch_path']) for k, v in mapping.items()}
+
     hf_token = get_hf_token()
+
+    # Determine commits to run
+    if args.commits:
+        commits = args.commits
+    else:
+        # Run all commits in mapping
+        commits = list(mapping.keys())
 
     if not hf_token:
         print("WARNING: No HuggingFace token found. Gated models will fail.")
