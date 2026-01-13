@@ -8,8 +8,8 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | sgl-kernel | Runtime on H100 | Notes |
 |--------|------|-------|-------|------------|-----------------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | ✓ builds | **SKIPPED** | H100 incompatible - triton segfault |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | ✓ builds | **SKIPPED** | H100 incompatible - triton segfault |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | ✓ builds | **WORKS** | Requires torch_native backend (see below) |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | ✓ builds | **WORKS** | Requires torch_native backend (see below) |
 | 93470a14 | human | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
 | 9c088829 | human | Llama-3.1-8B | 2.6.0 | ✗ missing | untested | FA3 SM90 build failure |
@@ -17,11 +17,58 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 ---
 
-## CONCLUSION: d1112d85/48efec7b Cannot Run on H100
+## WORKING CONFIGURATION FOUND! (2026-01-13)
 
-### Summary
+### Solution
 
-SGLang commit d1112d85 (0.4.4.post1) is **incompatible with H100 GPUs**. After extensive testing, we confirmed there is no working configuration.
+SGLang commit d1112d85 **CAN run on H100** with specific flags that avoid triton JIT compilation:
+
+```bash
+docker run --rm --gpus all \
+  -e HF_TOKEN="$HF_TOKEN" \
+  -e TORCH_COMPILE_DISABLE=1 \
+  -e TORCHDYNAMO_DISABLE=1 \
+  -p 30000:30000 \
+  shikhar481/sglang-images:d1112d8548eb13c842900b3a8d622345f9737759 \
+  python -m sglang.launch_server \
+    --model google/gemma-2-2b-it \
+    --port 30000 \
+    --dtype float16 \
+    --attention-backend torch_native \
+    --sampling-backend pytorch \
+    --disable-radix-cache \
+    --disable-cuda-graph \
+    --host 0.0.0.0
+```
+
+### Key Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--dtype float16` | Avoid BFloat16 (sgl_kernel doesn't support it) |
+| `--attention-backend torch_native` | Avoid flashinfer (triggers triton JIT segfault) |
+| `--sampling-backend pytorch` | Avoid flashinfer sampling |
+| `--disable-cuda-graph` | Avoid CUDA graph capture issues |
+| `--disable-radix-cache` | Additional stability |
+| `TORCH_COMPILE_DISABLE=1` | Disable torch.compile |
+| `TORCHDYNAMO_DISABLE=1` | Disable torch dynamo |
+
+### Test Result
+
+```json
+{"text":" \n\nI am trying to create a simple website using HTML, CSS, and",
+ "meta_info":{"finish_reason":{"type":"length","length":16},
+              "prompt_tokens":2,"completion_tokens":16,
+              "e2e_latency":1.248}}
+```
+
+### Root Cause
+
+The triton segfault was caused by **flashinfer** backend which triggers triton JIT compilation. The triton 3.1.0 compiler has MLIR bugs that crash on H100. Using `torch_native` backends avoids triton entirely.
+
+---
+
+## PREVIOUS ANALYSIS (for reference)
 
 ### What We Tested
 
