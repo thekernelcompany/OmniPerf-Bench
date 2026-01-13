@@ -8,42 +8,82 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | Build | Runtime | Notes |
 |--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | Ready | torchao<0.15 pinned, rebuilt 2026-01-13 |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | Ready | torchao<0.15 pinned, rebuilt 2026-01-13 |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
 | 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | Ready | Fixed vllm/deps, rebuilt 2026-01-13 |
-| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | Ready | Fixed vllm/deps, rebuilt 2026-01-13 |
+| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
+| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
 
-## Successful Rebuild Results (2026-01-13)
+## Critical Issue: torchao 0.14.1 Still Broken (2026-01-13)
 
-All 4 images were successfully rebuilt and pushed to DockerHub with the following fixes:
+### Problem
 
-### Docker Image Digests (New)
+The rebuilt images with `torchao<0.15` installed torchao 0.14.1, but **0.14.1 ALSO has `torch.int1` references** in `quant_primitives.py`:
 
-| Commit | Digest |
-|--------|--------|
-| d1112d85 | sha256:c26de79cad633d367bb69f7499f379f0df22f56cc618204f013b0e4df55dd277 |
-| 48efec7b | sha256:9ff8e3faa8c280347c465063d6b6956f007c4fe2ba218c72a863dd6a5cbdbf52 |
-| 9c088829 | sha256:4e732fd09e8459f5a493cb1e4c0df4df784f77785647dd5c81566f7a0ca1272f |
-| 005aad32 | sha256:ec327a99be8d34c65b4ce0d6192f15d8ede741483f64ba43440c90dfb8b96b4d |
+```python
+# /usr/local/lib/python3.11/dist-packages/torchao/quantization/quant_primitives.py
+# Line 97: # torch.int1 to torch.int7 will be added to PyTorch 2.6
+# Line 175:     torch.int1: (-(2**0), 2**0 - 1),
+# Line 186:     torch.int1: 1,
+```
 
-### Verified Configurations
+This causes the import chain to fail:
+```
+transformers → quantizers/auto.py → quantizer_torchao.py → torchao → FAIL (torch.int1)
+```
 
-| Commit | torch | torchao | sglang |
+### Error
+```
+AttributeError: module 'torch' has no attribute 'int1'
+```
+
+### Required Fix
+
+Pin torchao to version **0.6.1 or earlier** (before int1-int7 support was added):
+
+```dockerfile
+# WRONG (0.14.1 still has torch.int1):
+pip install "torchao<0.15"
+
+# CORRECT (no torch.int1 references):
+pip install "torchao<=0.6.1"
+```
+
+### Rebuild Required
+
+All 4 images need to be rebuilt with `torchao<=0.6.1` instead of `torchao<0.15`.
+
+---
+
+## Previous Rebuild Results (2026-01-13)
+
+Images were rebuilt but still broken due to incorrect torchao version pin.
+
+### Docker Image Digests (Broken)
+
+| Commit | Digest | Status |
+|--------|--------|--------|
+| d1112d85 | sha256:c26de79cad633d367bb69f7499f379f0df22f56cc618204f013b0e4df55dd277 | BROKEN |
+| 48efec7b | sha256:9ff8e3faa8c280347c465063d6b6956f007c4fe2ba218c72a863dd6a5cbdbf52 | BROKEN |
+| 9c088829 | sha256:4e732fd09e8459f5a493cb1e4c0df4df784f77785647dd5c81566f7a0ca1272f | BROKEN |
+| 005aad32 | sha256:ec327a99be8d34c65b4ce0d6192f15d8ede741483f64ba43440c90dfb8b96b4d | BROKEN |
+
+### Configurations (Still Broken)
+
+| Commit | torch | torchao | Status |
 |--------|-------|---------|--------|
-| d1112d85 | 2.5.1+cu124 | 0.14.1 | 0.4.4.post1 |
-| 48efec7b | 2.5.1+cu124 | 0.14.1 | 0.4.4.post1 |
-| 9c088829 | 2.5.1+cu124 | 0.14.1 | 0.4.5.post3 |
-| 005aad32 | 2.5.1+cu124 | 0.14.1 | 0.4.5.post3 |
+| d1112d85 | 2.5.1+cu124 | 0.14.1 | torch.int1 error |
+| 48efec7b | 2.5.1+cu124 | 0.14.1 | torch.int1 error |
+| 9c088829 | 2.5.1+cu124 | 0.14.1 | torch.int1 error |
+| 005aad32 | 2.5.1+cu124 | 0.14.1 | torch.int1 error |
 
-### Dockerfile Fixes Applied
+### What Was Fixed (Insufficient)
 
-**For all images:**
-1. Pinned `torchao<0.15` (0.15+ requires `torch.int1` from torch 2.6+)
-2. Removed vllm from dependencies (was upgrading torch and breaking sgl-kernel ABI)
-3. Added `--no-deps` to sglang install to prevent overwriting source-built sgl-kernel
-4. Added all runtime dependencies explicitly (IPython, orjson, uvicorn, etc.)
+1. Pinned `torchao<0.15` - **NOT ENOUGH** (0.14.1 also broken)
+2. Removed vllm from dependencies
+3. Added `--no-deps` to sglang install
+4. Added all runtime dependencies explicitly
 
 ---
 
