@@ -8,12 +8,48 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | Build | Runtime | Notes |
 |--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **NEEDS REBUILD** | BROKEN | Need torchao 0.12.0 + vllm |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **NEEDS REBUILD** | BROKEN | Need torchao 0.12.0 + vllm |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **SUCCESS** | READY | torchao 0.12.0 + vllm 0.7.2 |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **SUCCESS** | READY | torchao 0.12.0 + vllm 0.7.2 |
 | 93470a14 | human | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **NEEDS REBUILD** | BROKEN | Need torch 2.6.0 + torchao 0.12.0 |
-| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **NEEDS REBUILD** | BROKEN | Need torch 2.6.0 + torchao 0.12.0 |
+| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **SUCCESS** | READY | torch 2.6.0 + torchao 0.12.0 |
+| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **SUCCESS** | READY | torch 2.6.0 + torchao 0.12.0 |
+
+## SUCCESSFUL REBUILD: torchao 0.12.0 (2026-01-13)
+
+### All 4 Images Rebuilt and Pushed to DockerHub
+
+**Docker Image Digests (WORKING):**
+
+| Commit | Digest |
+|--------|--------|
+| d1112d85 | sha256:339d024e8f0df4c4f440948ff1a6ca2b77e8b42b6fd8a0516795c51d61d9d559 |
+| 48efec7b | sha256:e72e01c337dfbe3112d7a174587766ced2adb4ac5aed331103a2c6d1a3f0084f |
+| 9c088829 | sha256:294195edec4f70f1aefd7d3f65da8e401971f11a1a82f5e88e73b15c5a6574f0 |
+| 005aad32 | sha256:f8ba68b5a837e2a22747077777d8ff059c07b6ba994a138608cf67169110e05d |
+
+### Verified Configurations
+
+**d1112d85 / 48efec7b (torch 2.5.1):**
+```
+torch: 2.5.1+cu124
+torchao: 0.12.0
+transformers: 4.48.3
+vllm: 0.7.2
+sglang: 0.4.4.post1
+ALL IMPORTS SUCCESSFUL!
+```
+
+**9c088829 / 005aad32 (torch 2.6.0):**
+```
+torch: 2.6.0+cu124
+torchao: 0.12.0
+transformers: 4.57.5
+sglang: 0.4.5.post3
+ALL IMPORTS SUCCESSFUL!
+```
+
+---
 
 ## CRITICAL FIX FOUND: torchao 0.12.0 (2026-01-13)
 
