@@ -4,23 +4,24 @@
 
 Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Images build sgl-kernel FROM SOURCE with git submodules to include the `deep_gemm` module (not available in PyPI versions).
 
-## Build Status Summary
+## Current Status (2026-01-13)
 
-| Commit | Type | Model | torch | Build | Runtime | Notes |
-|--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1→2.6.0 | **NEEDS REBUILD** | **H100 BROKEN** | triton 3.1.0 segfault on H100 |
-| 48efec7b | parent | gemma-2-2b | 2.5.1→2.6.0 | **NEEDS REBUILD** | **H100 BROKEN** | triton 3.1.0 segfault on H100 |
-| 93470a14 | human | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| db452760 | parent | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.6.0 | SUCCESS | **MISSING sgl_kernel** | FA3 build failure (SM90 issue) |
-| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | SUCCESS | **MISSING sgl_kernel** | FA3 build failure (SM90 issue) |
+| Commit | Type | Model | torch | sgl-kernel | Runtime on H100 | Notes |
+|--------|------|-------|-------|------------|-----------------|-------|
+| d1112d85 | human | gemma-2-2b | 2.5.1 | ✓ builds | **SEGFAULT** | triton 3.1.0 bug |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | ✓ builds | **SEGFAULT** | triton 3.1.0 bug |
+| 93470a14 | human | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
+| db452760 | parent | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
+| 9c088829 | human | Llama-3.1-8B | 2.6.0 | ✗ missing | untested | FA3 SM90 build failure |
+| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | ✗ missing | untested | FA3 SM90 build failure |
 
-## CRITICAL FIX #2: Triton 3.1.0 H100 Segfault (2026-01-13)
+---
 
-### Root Cause
+## Issue #1: Triton 3.1.0 Segfault on H100 (BLOCKING)
 
-torch 2.5.1 bundles triton 3.1.0, which has an MLIR code generator bug that causes segfaults on H100/SM90 GPUs:
+### Symptoms
 
+Server starts but crashes on first inference request:
 ```
 Fatal Python error: Segmentation fault
 File "triton/compiler/code_generator.py", line 223 in __init__
@@ -28,31 +29,82 @@ File "triton/compiler/code_generator.py", line 1294 in ast_to_ttir
 File "triton/compiler/compiler.py", line 113 in make_ir
 ```
 
-### Tested Triton Versions
+### Tested Triton Versions (all with torch 2.5.1)
 
-| Triton | torch | Result on H100 |
-|--------|-------|----------------|
-| 2.3.1 | 2.5.1 | Missing `tl.cast` API - incompatible |
-| 3.0.0 | 2.5.1 | **SEGFAULT** in code_generator.py |
-| 3.1.0 | 2.5.1 | **SEGFAULT** in code_generator.py |
-| 3.2.0 | 2.5.1 | Incompatible (dataclass API change) |
-| **3.2.0** | **2.6.0** | **WORKS** - fixes the segfault |
+| Triton | Result |
+|--------|--------|
+| 2.3.1 | `AttributeError: module 'triton.language' has no attribute 'cast'` |
+| 3.0.0 | **SEGFAULT** in code_generator.py:223 |
+| 3.1.0 | **SEGFAULT** in code_generator.py:223 (bundled with torch 2.5.1) |
+| 3.2.0 | `TypeError: must be called with a dataclass type or instance` (API incompatible) |
 
-### The Fix
+### Potential Fix (UNTESTED)
 
-**Upgrade torch from 2.5.1 to 2.6.0** which bundles triton 3.2.0 with the H100 fix.
+torch 2.6.0 bundles triton 3.2.0. The hypothesis:
+- triton 3.2.0 with torch 2.6.0 might fix the segfault
+- But: will sgl-kernel 0.0.5.post2 build with torch 2.6.0?
 
-Updated `Dockerfile.d1112d85`:
-- Changed `torch==2.5.1` → `torch==2.6.0`
-- Changed flashinfer `torch2.5` → `torch2.6`
+**This is a circular problem:**
+- torch 2.5.1: sgl-kernel builds ✓, but triton segfaults ✗
+- torch 2.6.0: triton 3.2.0 might work, but sgl-kernel build is untested
 
 ---
 
-## Previous Build: torchao 0.12.0 (2026-01-13)
+## Issue #2: sgl-kernel Build Failure (9c088829/005aad32)
 
-### Images Built (torch 2.5.1 - BROKEN ON H100)
+### Symptoms
 
-**Docker Image Digests:**
+sgl-kernel 0.0.9.post2 fails to build with FA3 SM90 errors:
+```
+error: template parameter 'Is_local' is not a type
+```
+
+### Root Cause
+
+FlashAttention 3 code in sgl-kernel 0.0.9.post2 requires SM90 (Hopper) at compile time, but Docker build environment has no GPU.
+
+---
+
+## What Was Tested
+
+### 1. Import Verification (PASSED)
+
+**d1112d85 / 48efec7b:**
+```
+torch: 2.5.1+cu124
+torchao: 0.12.0
+transformers: 4.48.3
+vllm: 0.7.2
+sglang: 0.4.4.post1
+sgl_kernel: ✓ present
+```
+
+**9c088829 / 005aad32:**
+```
+torch: 2.6.0+cu124
+torchao: 0.12.0
+sglang: 0.4.5.post3
+sgl_kernel: ✗ MISSING
+```
+
+### 2. Runtime on H100 (FAILED)
+
+Tested d1112d85/48efec7b images on H100 (SM90):
+- Server starts successfully
+- Crashes on first inference with triton segfault
+- Tested with: `--disable-cuda-graph`, `--dtype float16`, various env vars
+- All configurations crash
+
+### 3. Triton Version Testing
+
+Attempted runtime replacement of triton in d1112d85 container:
+- triton 2.3.1: API incompatible
+- triton 3.0.0: same segfault
+- triton 3.2.0: torch 2.5.1 incompatible
+
+---
+
+## Docker Image Digests
 
 | Commit | Digest |
 |--------|--------|
@@ -61,48 +113,26 @@ Updated `Dockerfile.d1112d85`:
 | 9c088829 | sha256:294195edec4f70f1aefd7d3f65da8e401971f11a1a82f5e88e73b15c5a6574f0 |
 | 005aad32 | sha256:f8ba68b5a837e2a22747077777d8ff059c07b6ba994a138608cf67169110e05d |
 
-**Note**: These images pass import tests but crash at runtime on H100 due to triton 3.1.0 segfault.
+---
 
-### Verified Configurations
+## Next Steps to Test
 
-**d1112d85 / 48efec7b (torch 2.5.1):**
-```
-torch: 2.5.1+cu124
-torchao: 0.12.0
-transformers: 4.48.3
-vllm: 0.7.2
-sglang: 0.4.4.post1
-ALL IMPORTS SUCCESSFUL!
-RUNTIME: SEGFAULT on H100 (triton 3.1.0 bug)
-```
+1. **Option A: Try torch 2.6.0 with d1112d85**
+   - Modify Dockerfile.d1112d85 to use torch 2.6.0
+   - See if sgl-kernel 0.0.5.post2 builds
+   - Test if triton 3.2.0 fixes the H100 segfault
 
-**9c088829 / 005aad32 (torch 2.6.0):**
-```
-torch: 2.6.0+cu124
-torchao: 0.12.0
-transformers: 4.57.5
-sglang: 0.4.5.post3
-IMPORTS: FAIL - sgl_kernel missing (FA3 build failure)
-```
+2. **Option B: Try official SGLang image**
+   - Test `lmsysorg/sglang:latest` on H100
+   - See what torch/triton versions they use
 
 ---
 
-## Correct Configurations (for H100)
+## Reference: Dependency Versions
 
-| Commit | SGLang | torch | torchao | vllm | transformers | triton |
-|--------|--------|-------|---------|------|--------------|--------|
-| d1112d85 | 0.4.4.post1 | **2.6.0** | 0.12.0 | 0.6.4-0.7.2 | 4.48.3 | 3.2.0 |
-| 48efec7b | 0.4.4.post1 | **2.6.0** | 0.12.0 | 0.6.4-0.7.2 | 4.48.3 | 3.2.0 |
-| 9c088829 | 0.4.5.post3 | **2.6.0** | 0.12.0 | Not needed | >=4.40.0 | 3.2.0 |
-| 005aad32 | 0.4.5.post3 | **2.6.0** | 0.12.0 | Not needed | >=4.40.0 | 3.2.0 |
+From pyproject.toml and pytorch/ao#2919:
 
-**Note**: torch 2.6.0 is required for H100/SM90 because triton 3.2.0 fixes the MLIR segfault bug.
-
-### Dockerfiles Updated
-
-- `Dockerfile.d1112d85`: **torch 2.6.0** (H100 fix), torchao 0.12.0, vllm 0.6.4-0.7.2, transformers 4.48.3, flashinfer torch2.6
-- `Dockerfile.9c088829`: torch 2.6.0, torchao 0.12.0, flashinfer torch2.6
-
-### Rebuild Required
-
-Images d1112d85/48efec7b need rebuild with torch 2.6.0 for H100 support.
+| Commit | SGLang | sgl-kernel | torch | torchao | vllm |
+|--------|--------|------------|-------|---------|------|
+| d1112d85 | 0.4.4.post1 | 0.0.5.post2 | 2.5.1 | 0.12.0 | 0.6.4-0.7.2 |
+| 9c088829 | 0.4.5.post3 | 0.0.9.post2 | 2.6.0 | 0.12.0 | not needed |
