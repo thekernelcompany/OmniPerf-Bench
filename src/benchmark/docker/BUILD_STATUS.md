@@ -17,6 +17,30 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 ---
 
+## 3-WAY BENCHMARK RESULTS (2026-01-13)
+
+### d1112d85 / 48efec7b (gemma-2-2b)
+
+Successfully ran 3-way benchmark using `torch_native` backend workaround.
+
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | ITL Mean | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|----------|-------------|
+| **Baseline** | 48efec7b | 1.20 req/s | 268.21 tok/s | 1118.73 ms | 129.22 ms | 29818.9 ms |
+| **Human** | d1112d85 | 1.18 req/s | 263.96 tok/s | 1159.03 ms | 132.26 ms | 30537.3 ms |
+
+**Human vs Baseline:**
+- Request throughput: -1.7%
+- Output throughput: -1.6%
+- TTFT: +3.6% (worse)
+- ITL: +2.4% (worse)
+
+**Notes:**
+- Using `torch_native` backend instead of `flashinfer` (required to avoid triton segfault)
+- Results may differ from PR author's original testing which likely used flashinfer
+- 100 prompts benchmark - results have some variance
+
+---
+
 ## WORKING CONFIGURATION FOUND! (2026-01-13)
 
 ### Solution

@@ -185,10 +185,30 @@ if ! python3 -c "import sgl_kernel" 2>/dev/null; then
 fi
 
 # Patch fp8_kernel.py to make deep_gemm import optional (it's not on PyPI)
-echo "Patching fp8_kernel.py to make deep_gemm optional..."
-FP8_FILE=$(python3 -c "import sglang, os; print(os.path.join(os.path.dirname(sglang.__file__), 'srt/layers/quantization/fp8_kernel.py'))" 2>/dev/null)
-if [ -f "$FP8_FILE" ]; then
-    sed -i 's/import deep_gemm/try:\\n    import deep_gemm\\nexcept ImportError:\\n    deep_gemm = None  # Optional module not installed/' "$FP8_FILE" 2>/dev/null || true
+# Only patch if deep_gemm is not already available
+if ! python3 -c "import deep_gemm" 2>/dev/null; then
+    echo "deep_gemm not found, patching fp8_kernel.py..."
+    python3 << 'PYEOF'
+import os
+try:
+    import sglang
+    fp8_path = os.path.join(os.path.dirname(sglang.__file__), 'srt/layers/quantization/fp8_kernel.py')
+    if os.path.exists(fp8_path):
+        with open(fp8_path, 'r') as f:
+            content = f.read()
+        if 'import deep_gemm' in content and 'try:' not in content.split('import deep_gemm')[0][-20:]:
+            patch_text = "try:\\n    import deep_gemm\\nexcept ImportError:\\n    deep_gemm = None"
+            new_content = content.replace('import deep_gemm', patch_text.replace('\\n', chr(10)))
+            with open(fp8_path, 'w') as f:
+                f.write(new_content)
+            print("Patched fp8_kernel.py")
+        else:
+            print("fp8_kernel.py already patched or different format")
+except Exception as ex:
+    print("Patch skipped: " + str(ex))
+PYEOF
+else
+    echo "deep_gemm already available, skipping patch"
 fi
 
 '''
@@ -253,11 +273,20 @@ cd /workspace
 # === Start SGLang Server ===
 echo "Starting SGLang server..."
 
+# H100 workaround: Use torch_native backend to avoid triton JIT segfault
+# See BUILD_STATUS.md for details
+export TORCH_COMPILE_DISABLE=1
+export TORCHDYNAMO_DISABLE=1
+
 python3 -m sglang.launch_server \\
     --model-path {model} \\
     --port {port} \\
     --host 127.0.0.1 \\
+    --dtype float16 \\
+    --attention-backend torch_native \\
+    --sampling-backend pytorch \\
     --disable-cuda-graph \\
+    --disable-radix-cache \\
     --log-level warning 2>&1 &
 SERVER_PID=$!
 
@@ -353,11 +382,14 @@ def run_docker_benchmark(
     )
 
     # Docker command
+    # H100 workaround: Set env vars to disable torch compile/dynamo (triton segfault)
     docker_cmd = [
         "docker", "run", "--rm",
         "--gpus", "all",
         "-e", f"HF_TOKEN={hf_token}",
         "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}",
+        "-e", "TORCH_COMPILE_DISABLE=1",
+        "-e", "TORCHDYNAMO_DISABLE=1",
         "-v", "/root/.cache/huggingface:/root/.cache/huggingface",
         "--shm-size=16g",
         "--entrypoint", "bash",
