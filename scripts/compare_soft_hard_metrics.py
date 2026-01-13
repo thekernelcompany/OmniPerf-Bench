@@ -272,7 +272,7 @@ def load_hard_metrics(dataset_name: str = HARD_METRICS_DATASET) -> Dict[str, Har
             agent_vs_baseline = ((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
-                status=row['status'],
+                status=row.get('status', 'completed'),
                 metric_type="throughput",
                 baseline_value=baseline_val,
                 human_value=human_val,
@@ -295,7 +295,7 @@ def load_hard_metrics(dataset_name: str = HARD_METRICS_DATASET) -> Dict[str, Har
             agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
-                status=row['status'],
+                status=row.get('status', 'completed'),
                 metric_type="ttft",
                 baseline_value=baseline_val,
                 human_value=human_val,
@@ -318,8 +318,54 @@ def load_hard_metrics(dataset_name: str = HARD_METRICS_DATASET) -> Dict[str, Har
             agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
 
             hard_metrics[commit_hash] = HardMetrics(
-                status=row['status'],
+                status=row.get('status', 'completed'),
                 metric_type="tpot",
+                baseline_value=baseline_val,
+                human_value=human_val,
+                agent_value=agent_val,
+                agent_vs_human_pct=diff_pct,
+                human_vs_baseline_pct=human_vs_baseline,
+                agent_vs_baseline_pct=agent_vs_baseline,
+            )
+            continue
+
+        # Check for ITL metrics (lower is better)
+        if row.get('agent_itl_mean') is not None and row.get('human_itl_mean') is not None:
+            baseline_val = row.get('baseline_itl_mean')
+            human_val = row['human_itl_mean']
+            agent_val = row['agent_itl_mean']
+            # Invert so positive means agent is better (lower ITL)
+            diff_pct = -((agent_val - human_val) / human_val) * 100 if human_val != 0 else 0
+            # For ITL, lower is better, so invert (positive = improved)
+            human_vs_baseline = -((human_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+            agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+
+            hard_metrics[commit_hash] = HardMetrics(
+                status=row.get('status', 'completed'),
+                metric_type="itl",
+                baseline_value=baseline_val,
+                human_value=human_val,
+                agent_value=agent_val,
+                agent_vs_human_pct=diff_pct,
+                human_vs_baseline_pct=human_vs_baseline,
+                agent_vs_baseline_pct=agent_vs_baseline,
+            )
+            continue
+
+        # Check for latency_avg metrics (lower is better) - standalone mode
+        if row.get('agent_latency_avg') is not None and row.get('human_latency_avg') is not None:
+            baseline_val = row.get('baseline_latency_avg')
+            human_val = row['human_latency_avg']
+            agent_val = row['agent_latency_avg']
+            # Invert so positive means agent is better (lower latency)
+            diff_pct = -((agent_val - human_val) / human_val) * 100 if human_val != 0 else 0
+            # For latency, lower is better, so invert (positive = improved)
+            human_vs_baseline = -((human_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+            agent_vs_baseline = -((agent_val - baseline_val) / baseline_val) * 100 if baseline_val else None
+
+            hard_metrics[commit_hash] = HardMetrics(
+                status=row.get('status', 'completed'),
+                metric_type="latency",
                 baseline_value=baseline_val,
                 human_value=human_val,
                 agent_value=agent_val,
