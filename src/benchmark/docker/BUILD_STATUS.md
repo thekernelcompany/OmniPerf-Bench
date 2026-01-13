@@ -8,14 +8,46 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | Build | Runtime | Notes |
 |--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **SUCCESS** | **BROKEN** | torchao 0.15.0 requires torch.int1 (torch 2.6+) |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **SUCCESS** | **BROKEN** | torchao 0.15.0 requires torch.int1 (torch 2.6+) |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | Ready | torchao<0.15 pinned, rebuilt 2026-01-13 |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | Ready | torchao<0.15 pinned, rebuilt 2026-01-13 |
 | 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **SUCCESS** | **BROKEN** | Missing runtime deps (IPython, orjson, uvicorn) |
-| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **SUCCESS** | **BROKEN** | Missing runtime deps (IPython, orjson, uvicorn) |
+| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | Ready | Fixed vllm/deps, rebuilt 2026-01-13 |
+| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | Ready | Fixed vllm/deps, rebuilt 2026-01-13 |
 
-## Runtime Testing Results (2026-01-13)
+## Successful Rebuild Results (2026-01-13)
+
+All 4 images were successfully rebuilt and pushed to DockerHub with the following fixes:
+
+### Docker Image Digests (New)
+
+| Commit | Digest |
+|--------|--------|
+| d1112d85 | sha256:c26de79cad633d367bb69f7499f379f0df22f56cc618204f013b0e4df55dd277 |
+| 48efec7b | sha256:9ff8e3faa8c280347c465063d6b6956f007c4fe2ba218c72a863dd6a5cbdbf52 |
+| 9c088829 | sha256:4e732fd09e8459f5a493cb1e4c0df4df784f77785647dd5c81566f7a0ca1272f |
+| 005aad32 | sha256:ec327a99be8d34c65b4ce0d6192f15d8ede741483f64ba43440c90dfb8b96b4d |
+
+### Verified Configurations
+
+| Commit | torch | torchao | sglang |
+|--------|-------|---------|--------|
+| d1112d85 | 2.5.1+cu124 | 0.14.1 | 0.4.4.post1 |
+| 48efec7b | 2.5.1+cu124 | 0.14.1 | 0.4.4.post1 |
+| 9c088829 | 2.5.1+cu124 | 0.14.1 | 0.4.5.post3 |
+| 005aad32 | 2.5.1+cu124 | 0.14.1 | 0.4.5.post3 |
+
+### Dockerfile Fixes Applied
+
+**For all images:**
+1. Pinned `torchao<0.15` (0.15+ requires `torch.int1` from torch 2.6+)
+2. Removed vllm from dependencies (was upgrading torch and breaking sgl-kernel ABI)
+3. Added `--no-deps` to sglang install to prevent overwriting source-built sgl-kernel
+4. Added all runtime dependencies explicitly (IPython, orjson, uvicorn, etc.)
+
+---
+
+## Previous Runtime Testing Results (2026-01-13)
 
 ### Test Environment
 - Ubuntu 22.04.5 LTS
