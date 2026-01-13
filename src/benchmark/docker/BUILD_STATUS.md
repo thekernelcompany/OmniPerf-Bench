@@ -8,16 +8,72 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | Build | Runtime | Notes |
 |--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
-| 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
-| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **NEEDS REBUILD** | BROKEN | Need torchao 0.12.0 + vllm |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **NEEDS REBUILD** | BROKEN | Need torchao 0.12.0 + vllm |
+| 93470a14 | human | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
+| db452760 | parent | Llama-3.1-8B | N/A | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
+| 9c088829 | human | Llama-3.1-8B | 2.6.0 | **NEEDS REBUILD** | BROKEN | Need torch 2.6.0 + torchao 0.12.0 |
+| 005aad32 | parent | Llama-3.1-8B | 2.6.0 | **NEEDS REBUILD** | BROKEN | Need torch 2.6.0 + torchao 0.12.0 |
 
-## Successful Rebuild with torchao 0.6.1 (2026-01-13)
+## CRITICAL FIX FOUND: torchao 0.12.0 (2026-01-13)
 
-All 4 images rebuilt with `torchao<=0.6.1` (no torch.int1 references).
+### Root Cause Analysis
+
+The previous fix (`torchao<=0.6.1`) was incomplete. The images had multiple issues:
+
+1. **d1112d85/48efec7b**: Missing vllm (required by SGLang 0.4.4.post1), transformers version conflicts
+2. **9c088829/005aad32**: Wrong torch version (2.5.1 instead of 2.6.0), sgl-kernel build failed
+
+### The Fix: Official pytorch/ao Compatibility Table
+
+From [pytorch/ao#2919](https://github.com/pytorch/ao/issues/2919):
+
+| torchao version | torch version |
+|----------------|---------------|
+| 0.15.0 | 2.9.1 |
+| 0.14.1 | 2.9.0 |
+| 0.13.0 | 2.8.0 |
+| **0.12.0** | **2.7.1, 2.6.0, 2.5.0** |
+
+**torchao 0.12.0** is the correct version for both torch 2.5.1 AND torch 2.6.0!
+
+### Verified Working Configuration
+
+Tested locally with runtime dependencies:
+```
+torch: 2.5.1+cu124
+torchao: 0.12.0
+transformers: 4.48.3
+vllm: 0.7.2
+sglang: 0.4.4.post1
+launch_server: OK
+ALL IMPORTS SUCCESSFUL!
+```
+
+### Correct Configurations (from pyproject.toml)
+
+| Commit | SGLang | torch | torchao | vllm | transformers |
+|--------|--------|-------|---------|------|--------------|
+| d1112d85 | 0.4.4.post1 | 2.5.1 | 0.12.0 | 0.6.4-0.7.2 | 4.48.3 |
+| 48efec7b | 0.4.4.post1 | 2.5.1 | 0.12.0 | 0.6.4-0.7.2 | 4.48.3 |
+| 9c088829 | 0.4.5.post3 | **2.6.0** | 0.12.0 | Not needed | >=4.40.0 |
+| 005aad32 | 0.4.5.post3 | **2.6.0** | 0.12.0 | Not needed | >=4.40.0 |
+
+### Dockerfiles Updated
+
+Both Dockerfiles have been updated with correct versions:
+- `Dockerfile.d1112d85`: torch 2.5.1, torchao 0.12.0, vllm 0.6.4-0.7.2, transformers 4.48.3
+- `Dockerfile.9c088829`: torch 2.6.0, torchao 0.12.0, flashinfer torch2.6
+
+### Rebuild Required
+
+All 4 images need to be rebuilt with the updated Dockerfiles.
+
+---
+
+## Previous Attempt: torchao 0.6.1 (2026-01-13) - INSUFFICIENT
+
+All 4 images rebuilt with `torchao<=0.6.1` but still broken due to missing vllm and wrong torch versions.
 
 ### Docker Image Digests (Working)
 
