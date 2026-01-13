@@ -8,12 +8,58 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | sgl-kernel | Runtime on H100 | Notes |
 |--------|------|-------|-------|------------|-----------------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | ✓ builds | **SEGFAULT** | triton 3.1.0 bug |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | ✓ builds | **SEGFAULT** | triton 3.1.0 bug |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | ✓ builds | **SKIPPED** | H100 incompatible - triton segfault |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | ✓ builds | **SKIPPED** | H100 incompatible - triton segfault |
 | 93470a14 | human | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | N/A | SKIPPED | N/A | Requires deleted flashinfer fork |
 | 9c088829 | human | Llama-3.1-8B | 2.6.0 | ✗ missing | untested | FA3 SM90 build failure |
 | 005aad32 | parent | Llama-3.1-8B | 2.6.0 | ✗ missing | untested | FA3 SM90 build failure |
+
+---
+
+## CONCLUSION: d1112d85/48efec7b Cannot Run on H100
+
+### Summary
+
+SGLang commit d1112d85 (0.4.4.post1) is **incompatible with H100 GPUs**. After extensive testing, we confirmed there is no working configuration.
+
+### What We Tested
+
+| Configuration | Result |
+|---------------|--------|
+| torch 2.5.1 + triton 3.1.0 | SEGFAULT in `code_generator.py:223` |
+| torch 2.5.1 + triton 3.0.0 | SEGFAULT (same location) |
+| torch 2.5.1 + triton 2.3.1 | API incompatible (`tl.cast` missing) |
+| torch 2.5.1 + triton 3.2.0 | API incompatible with torch 2.5.1 |
+| torch 2.6.0 + triton 3.2.0 | SEGFAULT (different location, same root cause) |
+| torch 2.6.0 + vllm 0.8.0 + triton 3.2.0 | SEGFAULT |
+
+### Root Cause
+
+1. **Triton MLIR bug** (triton-lang/triton#3882): Triton 3.0.0-3.2.0 have threading bugs in the MLIR code generator that cause segfaults on H100 (SM90)
+2. **SGLang 0.4.4.post1 kernel code** triggers this bug during JIT compilation
+3. **Only triton 3.5.1+** (with torch 2.9.1+) fixes the issue, but that requires SGLang 0.5.7+ which is a different codebase
+
+### Official SGLang Image Works
+
+We verified `lmsysorg/sglang:latest` runs fine on H100:
+- torch: 2.9.1+cu129
+- triton: 3.5.1
+- sglang: 0.5.7
+
+But this doesn't help benchmark commit d1112d85 since it's a completely different version.
+
+### Hardware Compatibility
+
+| GPU | Architecture | d1112d85 Compatible? |
+|-----|--------------|---------------------|
+| H100 | SM90 (Hopper) | **NO** - triton segfault |
+| A100 | SM80 (Ampere) | Likely YES (untested) |
+| A10/A30 | SM80 (Ampere) | Likely YES (untested) |
+
+### Decision
+
+**SKIP d1112d85/48efec7b** for H100 3-way benchmarking. The PR author (PR #2797) didn't specify their GPU, but likely used A100 where triton 3.1.0 works.
 
 ---
 
