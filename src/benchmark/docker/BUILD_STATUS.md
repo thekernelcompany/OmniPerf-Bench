@@ -49,6 +49,13 @@ Successfully ran 3-way benchmark using `torch_native` backend workaround.
 - The human commit (d1112d85) shows slightly worse performance than baseline in this configuration
 - This could be due to the torch_native backend not benefiting from the optimization, or measurement variance
 
+**PR Investigation (PR #2797):**
+- Commit d1112d85 corresponds to SGLang PR #2797
+- PR author did not specify which GPU was used for testing
+- PR used `google/gemma-2-2b` model (same as our benchmark)
+- The optimization may only show benefits with flashinfer backend (not torch_native)
+- A100 GPUs (SM80) likely work with flashinfer without the triton segfault issue
+
 ---
 
 ## WORKING CONFIGURATION FOUND! (2026-01-13)
