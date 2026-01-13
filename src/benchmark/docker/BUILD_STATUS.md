@@ -8,14 +8,49 @@ Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Im
 
 | Commit | Type | Model | torch | Build | Runtime | Notes |
 |--------|------|-------|-------|-------|---------|-------|
-| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
-| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
+| d1112d85 | human | gemma-2-2b | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
+| 48efec7b | parent | gemma-2-2b | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
 | 93470a14 | human | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
 | db452760 | parent | Llama-3.1-8B | 2.5.1 | **SKIPPED** | N/A | Requires deleted sgl-project/flashinfer fork |
-| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
-| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | **BROKEN** | torchao 0.14.1 still has torch.int1 refs |
+| 9c088829 | human | Llama-3.1-8B | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
+| 005aad32 | parent | Llama-3.1-8B | 2.5.1 | **REBUILT** | **READY** | torchao 0.6.1, rebuilt 2026-01-13 |
 
-## Critical Issue: torchao 0.14.1 Still Broken (2026-01-13)
+## Successful Rebuild with torchao 0.6.1 (2026-01-13)
+
+All 4 images rebuilt with `torchao<=0.6.1` (no torch.int1 references).
+
+### Docker Image Digests (Working)
+
+| Commit | Digest |
+|--------|--------|
+| d1112d85 | sha256:1ef9a6be8b5112b53a3bf8f8b0b360b4c0dfefca4e400a8973a7fe499dc264a5 |
+| 48efec7b | sha256:aff1d25d9b055fc55a529af2392c463c3cd4dd527244146f8b21aacc240c31d6 |
+| 9c088829 | sha256:46636a33a6f2d93e6314cb86720953f0c61681a45979dd5afb7daa2fb527dfea |
+| 005aad32 | sha256:fe9dbf17d0d285c3fe619f34341b8cb66237fd37602aa476e3760263ee795e02 |
+
+### Verified Configurations
+
+| Commit | torch | torchao | sglang |
+|--------|-------|---------|--------|
+| d1112d85 | 2.5.1+cu124 | 0.6.1 | 0.4.4.post1 |
+| 48efec7b | 2.5.1+cu124 | 0.6.1 | 0.4.4.post1 |
+| 9c088829 | 2.5.1+cu124 | 0.6.1 | 0.4.5.post3 |
+| 005aad32 | 2.5.1+cu124 | 0.6.1 | 0.4.5.post3 |
+
+### Import Verification (ALL PASS)
+
+```
+$ docker run --rm shikhar481/sglang-images:d1112d85... python -c "import torch; import torchao; import transformers; import sglang; print('All imports successful!')"
+torch: 2.5.1+cu124
+torchao: 0.6.1
+transformers: 4.57.4
+sglang: 0.4.4.post1
+All imports successful!
+```
+
+---
+
+## Previous Issue: torchao 0.14.1 Still Broken (2026-01-13)
 
 ### Problem
 
