@@ -209,8 +209,109 @@ AGENT_CONFIGS = {
 4. **Smaller models had higher success rates** (1B-8B parameters vs 70B+)
 5. **Single H100 80GB is insufficient** for some large models (DeepSeek-R1, Llama-3-70B)
 
+---
+
+## Schema Analysis: Latency Metrics Gap (2026-01-14)
+
+### Critical Finding
+
+**The current agent benchmarks do NOT capture latency metrics (TTFT/TPOT/ITL).** They only capture throughput metrics.
+
+This was verified through exhaustive grep searches across all 279 result files (93 commits × 3 agents):
+
+| Search Term | Files Found |
+|-------------|-------------|
+| `ttft` (case-insensitive) | **0** |
+| `tpot` (case-insensitive) | **0** |
+| `itl` (case-insensitive) | **0** |
+| `latency` (case-insensitive) | **0** |
+| `p99` / `p95` / `percentile` | 0 (in metrics) |
+
+### Metrics Actually Collected
+
+```
+Total unique metric keys found: 2
+
+  output_token_throughput_tok_s (47 occurrences)
+  request_throughput_req_s (47 occurrences)
+```
+
+47 total = 12 (Codex) + 22 (TRAE GPT5) + 13 (TRAE Sonnet4.5)
+
+### Benchmark Output Format
+
+Every successful agent run produces this output (no latency data):
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     100
+Benchmark duration (s):                  1.88
+Total input tokens:                      20000
+Total generated tokens:                  6400
+Request throughput (req/s):              53.17
+Output token throughput (tok/s):         3402.63
+==================================================
+```
+
+### Comparison with Claude Code (Schema v5)
+
+| Aspect | Claude Code (Modal/Separate) | Codex/TRAE Agents |
+|--------|------------------------------|-------------------|
+| **TTFT metrics** | ✅ mean/median/p99 | ❌ None |
+| **TPOT metrics** | ✅ mean/median/p99 | ❌ None |
+| **ITL metrics** | ✅ mean/median/p99 | ❌ None |
+| **Throughput** | ✅ Yes | ✅ Yes |
+| **Benchmark command** | `vllm bench serve --request-rate 1 --random-input-len 1000 --random-output-len 100` | Simplified serving benchmark |
+| **Input tokens** | 1000 random | 200 fixed |
+| **Output tokens** | 100 random | 64 fixed |
+| **Schema columns** | 76 columns | ~40 usable |
+
+### Claude Code `separate_agent` Format (Full Metrics)
+
+For reference, Claude Code's separate pipeline captures full metrics:
+
+```json
+{
+  "metrics": {
+    "mean_ttft_ms": 13.48,
+    "median_ttft_ms": 11.06,
+    "p99_ttft_ms": 29.20,
+    "mean_tpot_ms": 3.89,
+    "median_tpot_ms": 3.89,
+    "p99_tpot_ms": 4.04,
+    "mean_itl_ms": 3.89,
+    "median_itl_ms": 3.88,
+    "p99_itl_ms": 4.25,
+    "request_throughput_req_s": 0.96,
+    "output_token_throughput_tok_s": 198.29
+  }
+}
+```
+
+### Impact on HuggingFace Upload
+
+The current agent results **cannot** be uploaded to Schema v5 format without:
+1. Re-running benchmarks with full latency metrics, OR
+2. Creating a simplified throughput-only schema
+
+### Recommendation
+
+To enable apples-to-apples comparison with Claude Code benchmarks:
+
+```bash
+# Re-run with latency metrics using vllm bench serve
+vllm bench serve --model <MODEL> --request-rate 1 --num-prompts 100 \
+    --random-input-len 1000 --random-output-len 100 \
+    --tokenizer <MODEL> --ignore-eos
+```
+
+This command outputs full metrics: `ttft_mean`, `ttft_median`, `ttft_p99`, `tpot_mean`, `tpot_median`, `tpot_p99`, `itl_mean`, `itl_median`, `itl_p99`.
+
+---
+
 ## Next Steps
 
+- [ ] **Re-run benchmarks with latency metrics** (recommended for Schema v5 compatibility)
 - [ ] Export results to HuggingFace datasets
 - [ ] Compare agent vs human performance on successful benchmarks
 - [ ] Analyze patch quality differences between agents
