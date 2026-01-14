@@ -4,6 +4,78 @@
 
 Building Docker images at `shikhar481/sglang-images` for SGLang benchmarking. Images build sgl-kernel FROM SOURCE with git submodules to include the `deep_gemm` module (not available in PyPI versions).
 
+---
+
+## ✅ VALIDATED 3-WAY BENCHMARK RESULTS (2026-01-14)
+
+**Methodology: CORRECT** - Used exact models and perf_commands from HuggingFace dataset `Ayushnangia/omniperf_v1`.
+
+### Configuration Summary
+
+| Commit | Optimization | Model | Backend | Special Config |
+|--------|--------------|-------|---------|----------------|
+| **1acca3a2** | FA3 (FlashAttention 3) | `meta-llama/Llama-3.1-8B-Instruct` | flashinfer | - |
+| **021f76e4** | LoRA | `meta-llama/Llama-3.1-8B-Instruct` | flashinfer | LoRA adapter + `--disable-radix-cache` |
+| **3212c2ad** | Tensor Transport | `OpenGVLab/InternVL2_5-8B` | flashinfer | VLM model |
+| **a37e1247** | pybase64 | `Qwen/Qwen2.5-VL-7B-Instruct` | flashinfer | VLM + MMMU dataset |
+
+### Results: Output Throughput (tok/s)
+
+| Commit | Optimization | Baseline | Human | Agent | Human Δ | Agent Δ |
+|--------|--------------|----------|-------|-------|---------|---------|
+| **1acca3a2** | FA3 | 1083.7 | 1085.6 | 1081.4 | +0.2% | -0.2% |
+| **021f76e4** | LoRA | 1058.9 | 1131.7 | 1055.9 | **+6.9%** ✅ | -0.3% |
+| **3212c2ad** | Tensor Transport | 3237.3 | 2936.0 | 3119.5 | **-9.3%** ❌ | -3.6% |
+| **a37e1247** | pybase64 | 3854.8 | 3856.0 | 3857.0 | +0.0% | +0.1% |
+
+### Results: TTFT Latency (ms, lower is better)
+
+| Commit | Baseline | Human | Agent | Human Δ | Agent Δ |
+|--------|----------|-------|-------|---------|---------|
+| **1acca3a2** | 917.8 | 938.4 | 992.7 | +2.2% | +8.2% |
+| **021f76e4** | 111.1 | 95.3 | 112.6 | **-14.1%** ✅ | +1.4% |
+| **3212c2ad** | 7685.5 | 8248.1 | 7641.8 | +7.3% ❌ | **-0.6%** ✅ |
+| **a37e1247** | 53.7 | 51.5 | 51.0 | **-4.1%** ✅ | **-5.0%** ✅ |
+
+### Key Findings
+
+1. **021f76e4 (LoRA)**: Human shows clear improvement (+6.9% throughput, -14.1% TTFT). Agent failed to replicate.
+2. **3212c2ad (VLM Tensor Transport)**: Human commit **regressed** performance (-9.3%). Agent outperformed human.
+3. **a37e1247 (pybase64)**: Agent slightly outperforms human (-5.0% vs -4.1% TTFT improvement).
+4. **1acca3a2 (FA3)**: All results within noise range (~0.2%).
+
+### Bugs Fixed During Benchmarking
+
+1. **Empty `lora_args` creating invalid bash** - Restructured script
+2. **Double backslash `\\\\` in f-strings** - Simplified string handling
+3. **LoRA requires `--disable-radix-cache`** - Added flag
+4. **LoRA adapter naming mismatch** - Used `lora=<path>` format
+5. **CUDA OOM from zombie containers** - Added cleanup before each phase
+
+### Results Location
+
+```
+/root/sglang-images/OmniPerf-Bench/results/sglang_v2/
+├── 1acca3a2/
+│   ├── baseline_result.json
+│   ├── human_result.json
+│   └── agent_result.json
+├── 021f76e4/
+│   ├── baseline_result.json
+│   ├── human_result.json
+│   └── agent_result.json
+├── 3212c2ad/
+│   ├── baseline_result.json
+│   ├── human_result.json
+│   └── agent_result.json
+└── a37e1247/
+    ├── baseline_result.json
+    ├── human_result.json
+    └── agent_result.json
+```
+
+---
+
 ## Current Status (2026-01-13)
 
 | Commit | Type | Model | torch | sgl-kernel | Runtime on H100 | Notes |
@@ -55,6 +127,198 @@ Successfully ran 3-way benchmark using `torch_native` backend workaround.
 - PR used `google/gemma-2-2b` model (same as our benchmark)
 - The optimization may only show benefits with flashinfer backend (not torch_native)
 - A100 GPUs (SM80) likely work with flashinfer without the triton segfault issue
+
+---
+
+## ⚠️ CRITICAL: BENCHMARK METHODOLOGY ISSUES (2026-01-14)
+
+### Executive Summary
+
+**Our benchmark results are INVALID.** We used wrong models and wrong benchmark commands for all commits.
+
+### What Went Wrong
+
+The Docker images are **correct** - they contain SGLang code at the right commits. However:
+1. **Models are NOT baked into images** - they're specified at runtime in the benchmark command
+2. **We used a generic benchmark command** with `gemma-2-2b` for all commits
+3. **The dataset specifies DIFFERENT models and commands** for each commit
+
+### Dataset vs Our Benchmark Comparison
+
+| Commit | What We Used | What Dataset Specifies | Why Our Results Are Invalid |
+|--------|--------------|------------------------|----------------------------|
+| **021f76e4** | `gemma-2-2b`, no LoRA | `Llama-3.1-8B-Instruct` + **LoRA adapter** | LoRA optimization has NO effect without LoRA |
+| **1acca3a2** | `gemma-2-2b`, torch_native | `Llama-3.1-8B-Instruct`, **FA3 backend** | FA3 optimization needs FlashAttention 3 |
+| **3212c2ad** | `gemma-2-2b` (text-only) | `OpenGVLab/InternVL2_5-8B` (**VLM**) | VLM optimization needs Vision-Language Model |
+| **a37e1247** | `gemma-2-2b` (text-only) | `Qwen/Qwen2.5-VL-7B-Instruct` + **MMMU dataset** | Multimodal optimization needs VLM + multimodal data |
+
+### Correct perf_commands from HuggingFace Dataset
+
+Source: `https://huggingface.co/datasets/Ayushnangia/omniperf_v1`
+
+```bash
+# 021f76e4 - LoRA optimization (REQUIRES LoRA adapter configured!)
+python3 -m sglang.bench_serving --backend sglang \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --num-prompt 480 --request-rate 8 --lora-name lora
+
+# 1acca3a2 - FA3 (FlashAttention 3) speed optimization
+python -m sglang.bench_serving --backend sglang \
+  --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 100
+
+# 3212c2ad - VLM tensor transport optimization
+python3 -m sglang.bench_serving --backend sglang \
+  --model OpenGVLab/InternVL2_5-8B
+
+# a37e1247 - Multimodal pybase64 optimization
+python3 -m sglang.bench_serving --backend sglang \
+  --model Qwen/Qwen2.5-VL-7B-Instruct \
+  --dataset-name mmmu --request-rate 10 --num-prompts 100
+```
+
+### Why Results Appeared Wrong
+
+| Commit | Our Result | Explanation |
+|--------|------------|-------------|
+| **021f76e4** | ~0% change | LoRA optimization has NO effect without LoRA adapter |
+| **a37e1247** | -6.3% regression | Multimodal (base64) optimization may hurt text-only workloads |
+| **1acca3a2** | +4.2% improvement | Some general speedup that also helps text (lucky accident) |
+| **3212c2ad** | +0.3% improvement | VLM tensor optimization shouldn't significantly affect text |
+
+### Key Insight: Images vs Runtime Configuration
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DOCKER IMAGE CONTAINS:                           │
+├─────────────────────────────────────────────────────────────────────┤
+│ ✓ SGLang code at specific commit                                    │
+│ ✓ Dependencies (torch, triton, flashinfer/sgl-kernel)               │
+│ ✓ Python environment                                                │
+│ ✗ NOT model weights (downloaded at runtime)                         │
+│ ✗ NOT benchmark configuration                                       │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                 SPECIFIED AT RUNTIME (benchmark cmd):               │
+├─────────────────────────────────────────────────────────────────────┤
+│ • Model to use (--model)                                            │
+│ • Backend (flashinfer/torch_native)                                 │
+│ • LoRA adapters (--lora-name)                                       │
+│ • Dataset (--dataset-name)                                          │
+│ • Request parameters (--num-prompts, --request-rate)                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### What Needs To Be Done
+
+1. **Re-run benchmarks** with correct perf_commands from dataset
+2. **Download correct models**: Llama-3.1-8B, InternVL2_5-8B, Qwen2.5-VL-7B
+3. **Configure LoRA** for 021f76e4 benchmark
+4. **Use flashinfer backend** (not torch_native workaround) where possible
+5. **Use multimodal datasets** (MMMU) for VLM commits
+
+### Docker Images Status
+
+The images at `shikhar481/sglang-images` are **VALID** and ready to use:
+
+| Image Tag | Status | Can Re-run With Correct Command |
+|-----------|--------|--------------------------------|
+| `1acca3a2-vllm-style` | ✅ Working | Yes - need Llama-3.1-8B + flashinfer |
+| `6ea1e6ac-vllm-style` | ✅ Working | Yes - need Llama-3.1-8B + flashinfer |
+| `021f76e4` | ✅ Working | Yes - need Llama-3.1-8B + LoRA |
+| `777688b8` | ✅ Working | Yes - need Llama-3.1-8B + LoRA |
+| `a37e1247-vllm-style` | ✅ Working | Yes - need Qwen2.5-VL + MMMU |
+| `136c6e04-vllm-style` | ✅ Working | Yes - need Qwen2.5-VL + MMMU |
+| `3212c2ad` | ✅ Working | Yes - need InternVL2_5-8B |
+| `53475674` | ✅ Working | Yes - need InternVL2_5-8B |
+
+---
+
+## ⚠️ INVALID BENCHMARK RESULTS (For Reference Only)
+
+The following results used **wrong models and commands**. They are preserved for reference but should NOT be used for performance analysis.
+
+### vLLM-style Builds (INVALID - Wrong Methodology)
+
+| Commit | Backend | Baseline (tok/s) | Human (tok/s) | Δ Throughput | Δ TTFT | Result | Why Invalid |
+|--------|---------|-----------------|---------------|--------------|--------|--------|-------------|
+| **1acca3a2** | torch_native | 236.06 | 246.05 | +4.2% | -5.3% | ? | Wrong model, wrong backend |
+| **021f76e4** | torch_native | 265.62 | 264.72 | -0.3% | +3.5% | ? | Wrong model, no LoRA |
+| **a37e1247** | torch_native | 260.28 | 243.81 | -6.3% | +9.3% | ? | Wrong model (not VLM) |
+| **3212c2ad** | flashinfer/fa3 | 2378.12 | 2386.16 | +0.3% | -4.8% | ? | Wrong model (not VLM) |
+
+**Original (invalid) notes:**
+- All tests used `google/gemma-2-2b` instead of correct models
+- 3212c2ad uses flashinfer backend (SGLang 0.4.9.post4 has a bug with torch_native + Gemma)
+- Results saved to: `/root/sglang-images/OmniPerf-Bench/results/sglang/`
+
+### 1acca3a2 / 6ea1e6ac (torch 2.6.0, triton 3.2.0, SGLang 0.4.6.post2)
+
+Using `torch_native` backend.
+
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | TTFT Median | TTFT P99 | ITL Mean | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|-------------|----------|----------|-------------|
+| **Baseline** | 6ea1e6ac | 1.06 req/s | 236.06 tok/s | 1506.08 ms | 1067.87 ms | 6235.32 ms | 148.12 ms | 34416.97 ms |
+| **Human** | 1acca3a2 | 1.10 req/s | 246.05 tok/s | 1426.90 ms | 1074.69 ms | 5750.40 ms | 141.59 ms | 33082.98 ms |
+
+**Human vs Baseline:**
+- Request throughput: **+3.8%** ✅
+- Output throughput: **+4.2%** ✅
+- TTFT mean: **-5.3%** ✅ (lower is better)
+- E2E latency: **-3.9%** ✅
+
+### 021f76e4 / 777688b8 (torch 2.7.1, triton 3.3.1, SGLang 0.4.7)
+
+Using `torch_native` backend.
+
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | TTFT Median | TTFT P99 | ITL Mean | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|-------------|----------|----------|-------------|
+| **Baseline** | 777688b8 | 1.19 req/s | 265.62 tok/s | 1267.57 ms | 884.69 ms | 5665.29 ms | 130.13 ms | 30261.28 ms |
+| **Human** | 021f76e4 | 1.19 req/s | 264.72 tok/s | 1312.46 ms | 960.74 ms | 5659.75 ms | 131.23 ms | 30407.22 ms |
+
+**Human vs Baseline:**
+- Request throughput: 0.0% (no change)
+- Output throughput: **-0.3%** (negligible)
+- TTFT mean: **+3.5%** (slightly worse)
+- E2E latency: +0.5% (negligible)
+
+### a37e1247 / 136c6e04 (torch 2.7.1, triton 3.3.1, SGLang 0.4.9)
+
+Using `torch_native` backend.
+
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | TTFT Median | TTFT P99 | ITL Mean | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|-------------|----------|----------|-------------|
+| **Baseline** | 136c6e04 | 1.17 req/s | 260.28 tok/s | 1266.22 ms | 955.16 ms | 5610.31 ms | 133.92 ms | 31020.54 ms |
+| **Human** | a37e1247 | 1.09 req/s | 243.81 tok/s | 1384.47 ms | 986.21 ms | 6232.50 ms | 149.65 ms | 34630.54 ms |
+
+**Human vs Baseline:**
+- Request throughput: **-6.8%** ❌
+- Output throughput: **-6.3%** ❌
+- TTFT mean: **+9.3%** ❌ (higher is worse)
+- E2E latency: +11.6% ❌
+
+**Note:** The human commit shows regression with torch_native backend. The optimization may be specific to flashinfer backend.
+
+### 3212c2ad / 53475674 (torch 2.7.1, triton 3.3.1, SGLang 0.4.9.post4)
+
+Using **flashinfer/fa3** backend (required - torch_native crashes on this version with Gemma).
+
+| Phase | Commit | Request Throughput | Output Throughput | TTFT Mean | TTFT Median | TTFT P99 | ITL Mean | E2E Latency |
+|-------|--------|--------------------|-------------------|-----------|-------------|----------|----------|-------------|
+| **Baseline** | 53475674 | 10.67 req/s | 2378.12 tok/s | 386.38 ms | 408.86 ms | 671.14 ms | 7.17 ms | 2002.22 ms |
+| **Human** | 3212c2ad | 10.70 req/s | 2386.16 tok/s | 367.67 ms | 373.05 ms | 639.35 ms | 7.12 ms | 1971.28 ms |
+
+**Human vs Baseline:**
+- Request throughput: **+0.3%** ✅
+- Output throughput: **+0.3%** ✅
+- TTFT mean: **-4.8%** ✅ (lower is better)
+- E2E latency: **-1.5%** ✅
+
+**Critical Bug Found:**
+- SGLang 0.4.9.post4 has a bug with `torch_native` backend + Gemma models
+- Error: `TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'` in `chunk_cache.py:89`
+- `attention_chunk_size` is `None` when it shouldn't be
+- Workaround: Use flashinfer/fa3 backend (works with triton 3.3.1 on H100)
 
 ---
 
@@ -352,9 +616,8 @@ sed -i 's/import deep_gemm/try:\\n    import deep_gemm\\nexcept ImportError:\\n 
 - [x] Fixed benchmark script bugs
 
 ### Pending
-1. **Test newer SGLang commits** from ayushnangia/vllm-docker-build (torch 2.6.0+, triton 3.2.0+)
-   - These may work with flashinfer backend (not requiring workaround)
-   - Commits: 1acca3a2, 021f76e4, 136c6e04, 3212c2ad
+1. ~~**Test newer SGLang commits** from ayushnangia/vllm-docker-build (torch 2.6.0+, triton 3.2.0+)~~
+   - **COMPLETED (2026-01-14)** - See benchmark results below
 
 2. **Test on A100** (if available)
    - d1112d85/48efec7b should work with flashinfer backend natively
@@ -386,8 +649,8 @@ Built from [ayushnangia/vllm-docker-build](https://github.com/ayushnangia/vllm-d
 | 2025-05-02 | 6ea1e6ac | parent | 0.4.6.post2 | 2.6.0 (cu124) | 3.2.0 | 0.1.1 | `6ea1e6ac-vllm-style` |
 | 2025-06-11 | 021f76e4 | human | **0.4.7** | 2.7.1 (cu126) | **3.3.1** | 0.1.7 | `021f76e4` |
 | 2025-06-11 | 777688b8 | parent | **0.4.7** | 2.7.1 (cu126) | **3.3.1** | 0.1.7 | `777688b8` |
-| 2025-07-08 | 136c6e04 | human | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 | `136c6e04-vllm-style` |
-| 2025-07-08 | a37e1247 | parent | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 | `a37e1247-vllm-style` |
+| 2025-07-08 | a37e1247 | human | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 | `a37e1247-vllm-style` |
+| 2025-07-08 | 136c6e04 | parent | 0.4.9 | 2.7.1 (cu126) | **3.3.1** | 0.2.4 | `136c6e04-vllm-style` |
 | 2025-07-26 | 3212c2ad | human | **0.4.9.post4** | 2.7.1 (cu126) | **3.3.1** | 0.2.7 | `3212c2ad` |
 | 2025-07-26 | 53475674 | parent | **0.4.9.post4** | 2.7.1 (cu126) | **3.3.1** | 0.2.7 | `53475674` |
 
@@ -454,6 +717,68 @@ src/benchmark/docker/vllm_commits/
 ---
 
 ## Changelog
+
+### 2026-01-14 (Session 2) - CRITICAL METHODOLOGY DISCOVERY
+
+**⚠️ DISCOVERED: All benchmark results are INVALID**
+
+1. **Analyzed HuggingFace dataset** (`Ayushnangia/omniperf_v1`)
+   - Found correct `perf_command` for each commit
+   - Each commit targets DIFFERENT models and configurations
+   - Our generic benchmark was fundamentally wrong
+
+2. **Key findings:**
+   - **Docker images are CORRECT** - contain SGLang at right commits
+   - **Models NOT baked into images** - specified at runtime
+   - **We used wrong benchmark commands** for all commits
+
+3. **What each commit actually needs:**
+   | Commit | Correct Model | Special Requirements |
+   |--------|---------------|---------------------|
+   | 021f76e4 | Llama-3.1-8B-Instruct | LoRA adapter |
+   | 1acca3a2 | Llama-3.1-8B-Instruct | FA3/flashinfer backend |
+   | 3212c2ad | OpenGVLab/InternVL2_5-8B | VLM model |
+   | a37e1247 | Qwen/Qwen2.5-VL-7B-Instruct | VLM + MMMU dataset |
+
+4. **Why our results were wrong:**
+   - Used `gemma-2-2b` for ALL commits (wrong)
+   - Used `torch_native` backend (some commits need flashinfer)
+   - Didn't use LoRA for LoRA optimization commit
+   - Didn't use VLM models for VLM optimization commits
+
+5. **Action needed:** Re-run with correct perf_commands from dataset
+
+---
+
+### 2026-01-14 (Session 1) - Benchmark Testing (NOW KNOWN INVALID)
+
+**vLLM-style Builds Benchmark Testing** (results invalid - wrong methodology)
+
+1. **Benchmarked all 4 new commit pairs on H100** (with wrong commands)
+   - 1acca3a2/6ea1e6ac: +4.2% (invalid - wrong model/backend)
+   - 021f76e4/777688b8: ~0% (invalid - no LoRA)
+   - a37e1247/136c6e04: -6.3% (invalid - not VLM)
+   - 3212c2ad/53475674: +0.3% (invalid - not VLM)
+
+2. **Discovered SGLang 0.4.9.post4 bug**
+   - torch_native backend crashes with Gemma models
+   - Error: `attention_chunk_size` is None in `chunk_cache.py`
+   - Workaround: Use flashinfer/fa3 backend (works with triton 3.3.1)
+
+3. **Updated benchmark script**
+   - Added `use_flashinfer` flag to commit configuration
+   - Allows per-commit backend selection
+   - 3212c2ad uses flashinfer, others use torch_native
+
+4. **Fixed human/parent label swap**
+   - Corrected a37e1247/136c6e04 labels based on journal.json
+   - a37e1247 is human, 136c6e04 is parent
+
+5. **Results saved to repo** (invalid but preserved)
+   - `/root/sglang-images/OmniPerf-Bench/results/sglang/`
+   - JSON files for baseline and human phases for all 4 commits
+
+---
 
 ### 2026-01-13 (Session 2)
 

@@ -33,17 +33,21 @@ from typing import Optional, Dict, Any, List
 
 # Configuration
 DOCKER_REPO = "shikhar481/sglang-images"
-RESULTS_DIR = Path("/ephemeral/omniperf_results_3way_sglang_local")
+# v2 results: re-run with correct models/perf_commands per HuggingFace dataset
+RESULTS_DIR = Path("/root/sglang-images/OmniPerf-Bench/results/sglang_v2")
 AGENT_PATCHES_BASE = Path("/root/sglang-images/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/claude_code")
 
 # Commit pairs to benchmark (human commit + parent commit)
+# image_suffix: appended to short hash for Docker image tag (e.g., "-vllm-style")
 COMMIT_PAIRS = [
+    # Original commits (torch 2.5.1, triton 3.1.0)
     {
         "human_commit": "d1112d8548eb13c842900b3a8d622345f9737759",
         "parent_commit": "48efec7b052354865aa2f0605a5bf778721f3cbb",
         "model": "google/gemma-2-2b",
         "perf_command": "python -m sglang.bench_serving --backend sglang --model google/gemma-2-2b --num-prompts 100",
         "agent_patch_dir": "sglang_064_d1112d85",
+        "image_suffix": "",  # Uses full commit hash
     },
     {
         "human_commit": "93470a14116a60fe5dd43f0599206e8ccabdc211",
@@ -51,6 +55,7 @@ COMMIT_PAIRS = [
         "model": "meta-llama/Llama-3.1-8B-Instruct",
         "perf_command": "python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 100",
         "agent_patch_dir": "sglang_043_93470a14",
+        "image_suffix": "",
     },
     {
         "human_commit": "9c088829ee2a28263f36d0814fde448c6090b5bc",
@@ -58,6 +63,67 @@ COMMIT_PAIRS = [
         "model": "meta-llama/Llama-3.1-8B-Instruct",
         "perf_command": "python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 100",
         "agent_patch_dir": "sglang_045_9c088829",
+        "image_suffix": "",
+    },
+    # ===========================================================================
+    # CORRECT COMMIT CONFIGS FROM HuggingFace dataset: Ayushnangia/omniperf_v1
+    # Each commit needs its specific model and perf_command!
+    # ===========================================================================
+
+    # Pair 1: May 2025 - FA3 (FlashAttention 3) optimization
+    # SGLang 0.4.6.post2, torch 2.6.0, triton 3.2.0
+    # Optimization: FA3 kernel improvements for Llama models
+    {
+        "human_commit": "1acca3a2c685221cdb181c2abda4f635e1ead435",
+        "parent_commit": "6ea1e6ac6e2fa949cebd1b4338f9bfb7036d14fe",
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "perf_command": "python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 100",
+        "agent_patch_dir": "sglang_006_1acca3a2",
+        "image_suffix": "-vllm-style",
+        "use_short_hash": True,
+        "use_flashinfer": True,  # FA3 optimization requires flashinfer
+    },
+    # Pair 2: Jun 2025 - LoRA optimization
+    # SGLang 0.4.7, torch 2.7.1, triton 3.3.1
+    # Optimization: LoRA adapter performance improvements
+    # REQUIRES: LoRA adapter algoprog/fact-generation-llama-3.1-8b-instruct-lora
+    {
+        "human_commit": "021f76e4f49861b2e9ea9ccff06a46d577e3c548",
+        "parent_commit": "777688b8929c877e4e28c2eac208d776abe4c3af",
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "perf_command": "python3 -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompt 480 --request-rate 8 --lora-name lora",
+        "agent_patch_dir": "sglang_000_021f76e4",
+        "image_suffix": "",
+        "use_short_hash": True,
+        "use_flashinfer": True,
+        "lora_adapter": "lora=algoprog/fact-generation-llama-3.1-8b-instruct-lora",  # Named LoRA adapter (name=path format)
+    },
+    # Pair 3: Jul 2025 - VLM pybase64 optimization
+    # SGLang 0.4.9, torch 2.7.1, triton 3.3.1
+    # Optimization: pybase64 image encoding for VLM models
+    # REQUIRES: MMMU dataset for multimodal benchmark
+    {
+        "human_commit": "a37e1247c183cff86a18f2ed1a075e40704b1c5e",
+        "parent_commit": "136c6e0431c2067c3a2a98ad2c77fc89a9cb98e7",
+        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "perf_command": "python3 -m sglang.bench_serving --backend sglang --model Qwen/Qwen2.5-VL-7B-Instruct --dataset-name mmmu --request-rate 10 --num-prompts 100",
+        "agent_patch_dir": "sglang_048_a37e1247",
+        "image_suffix": "-vllm-style",
+        "use_short_hash": True,
+        "use_flashinfer": True,
+    },
+    # Pair 4: Jul 2025 - VLM tensor transport optimization
+    # SGLang 0.4.9.post4, torch 2.7.1, triton 3.3.1
+    # Optimization: Tensor transport for VLM embedding outputs
+    {
+        "human_commit": "3212c2ad3f7e4fb473dc807b4b176020a778ed5b",
+        "parent_commit": "534756749ae4e664f762de2645a4f63ca2901bab",
+        "model": "OpenGVLab/InternVL2_5-8B",
+        "perf_command": "python3 -m sglang.bench_serving --backend sglang --model OpenGVLab/InternVL2_5-8B",
+        "agent_patch_dir": "sglang_020_3212c2ad",
+        "image_suffix": "",
+        "use_short_hash": True,
+        "use_flashinfer": True,  # VLM optimization requires flashinfer
     },
 ]
 
@@ -151,7 +217,9 @@ def parse_sglang_metrics(output: str) -> Dict[str, float]:
 
 def create_benchmark_script(model: str, perf_command: str, port: int = 30000,
                             agent_patch: Optional[str] = None,
-                            parent_commit: Optional[str] = None) -> str:
+                            parent_commit: Optional[str] = None,
+                            use_flashinfer: bool = False,
+                            lora_adapter: Optional[str] = None) -> str:
     """Create the benchmark script to run inside Docker container."""
 
     # Escape special characters in perf_command
@@ -268,10 +336,31 @@ fi
 cd /workspace
 '''
 
-    # Continue with benchmark execution
-    script += f'''
+    # Continue with benchmark execution - choose backend based on config
+    if use_flashinfer:
+        # Use default flashinfer/fa3 backend (works with triton 3.3.1 on H100)
+        # Required for SGLang 0.4.9.post4 which has a bug with torch_native + Gemma
+        lora_args = ""
+        if lora_adapter:
+            # LoRA requires --disable-radix-cache in SGLang
+            lora_args = f"--lora-paths {lora_adapter} --disable-radix-cache"
+        server_launch = f'''
 # === Start SGLang Server ===
-echo "Starting SGLang server..."
+echo "Starting SGLang server (flashinfer/fa3 backend)..."
+{f'echo "LoRA adapter: {lora_adapter}"' if lora_adapter else ''}
+
+python3 -m sglang.launch_server \\
+    --model-path {model} \\
+    --port {port} \\
+    --host 127.0.0.1 \\
+    {lora_args} \\
+    --log-level warning 2>&1 &
+SERVER_PID=$!'''
+    else:
+        # Use torch_native backend to avoid triton JIT segfault on older versions
+        server_launch = f'''
+# === Start SGLang Server ===
+echo "Starting SGLang server (torch_native backend)..."
 
 # H100 workaround: Use torch_native backend to avoid triton JIT segfault
 # See BUILD_STATUS.md for details
@@ -288,7 +377,12 @@ python3 -m sglang.launch_server \\
     --disable-cuda-graph \\
     --disable-radix-cache \\
     --log-level warning 2>&1 &
-SERVER_PID=$!
+SERVER_PID=$!'''
+
+    script += server_launch
+
+    # Continue with server wait and benchmark
+    script += f'''
 
 echo "Server PID: $SERVER_PID"
 
@@ -363,6 +457,8 @@ def run_docker_benchmark(
     agent_patch: Optional[str] = None,
     parent_commit: Optional[str] = None,
     timeout: int = 1800,  # 30 minutes
+    use_flashinfer: bool = False,
+    lora_adapter: Optional[str] = None,
 ) -> BenchmarkResult:
     """Run a benchmark inside a Docker container."""
     start_time = time.time()
@@ -379,6 +475,8 @@ def run_docker_benchmark(
         perf_command=perf_command,
         agent_patch=agent_patch,
         parent_commit=parent_commit,
+        use_flashinfer=use_flashinfer,
+        lora_adapter=lora_adapter,
     )
 
     # Docker command
@@ -390,7 +488,7 @@ def run_docker_benchmark(
         "-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}",
         "-e", "TORCH_COMPILE_DISABLE=1",
         "-e", "TORCHDYNAMO_DISABLE=1",
-        "-v", "/root/.cache/huggingface:/root/.cache/huggingface",
+        "-v", "/ephemeral/huggingface:/root/.cache/huggingface",
         "--shm-size=16g",
         "--entrypoint", "bash",
         docker_image,
@@ -489,12 +587,35 @@ def save_result(result: BenchmarkResult, commit_pair: dict):
     print(f"  Saved: {result_file}")
 
 
+def get_docker_image_tag(commit: str, image_suffix: str, use_short_hash: bool = False) -> str:
+    """Get Docker image tag for a commit.
+
+    Args:
+        commit: Full 40-char commit hash
+        image_suffix: Optional suffix like "-vllm-style"
+        use_short_hash: If True, use 8-char short hash; if False, use full hash
+
+    For vLLM-style builds: use short hash (8 chars) + optional suffix
+    For original builds: use full commit hash
+    """
+    if use_short_hash or image_suffix:
+        # vLLM-style: short hash + optional suffix (e.g., "1acca3a2-vllm-style" or "021f76e4")
+        return f"{commit[:8]}{image_suffix}"
+    else:
+        # Original: full commit hash
+        return commit
+
+
 def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = True) -> Dict[str, BenchmarkResult]:
     """Run full 3-way benchmark for a commit pair."""
     human_commit = commit_pair["human_commit"]
     parent_commit = commit_pair["parent_commit"]
     model = commit_pair["model"]
     perf_command = commit_pair["perf_command"]
+    image_suffix = commit_pair.get("image_suffix", "")
+    use_short_hash = commit_pair.get("use_short_hash", False)
+    use_flashinfer = commit_pair.get("use_flashinfer", False)
+    lora_adapter = commit_pair.get("lora_adapter", None)
     human_short = human_commit[:8]
     parent_short = parent_commit[:8]
 
@@ -503,13 +624,17 @@ def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = T
     print(f"# Model: {model}")
     print(f"# Human commit: {human_short}")
     print(f"# Parent commit: {parent_short}")
+    print(f"# Image suffix: {image_suffix or '(none)'}")
+    print(f"# Use short hash: {use_short_hash}")
     print(f"{'#'*60}")
 
     results = {}
 
     # Phase 1: BASELINE (parent commit)
     print(f"\n[1/3] BASELINE phase (parent: {parent_short})")
-    baseline_image = f"{DOCKER_REPO}:{parent_commit}"
+    baseline_tag = get_docker_image_tag(parent_commit, image_suffix, use_short_hash)
+    baseline_image = f"{DOCKER_REPO}:{baseline_tag}"
+    print(f"  Image: {baseline_image}")
     results["baseline"] = run_docker_benchmark(
         docker_image=baseline_image,
         phase="baseline",
@@ -517,13 +642,17 @@ def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = T
         model=model,
         perf_command=perf_command,
         hf_token=hf_token,
+        use_flashinfer=use_flashinfer,
+        lora_adapter=lora_adapter,
     )
     save_result(results["baseline"], commit_pair)
     print_result_summary(results["baseline"])
 
     # Phase 2: HUMAN (human commit)
     print(f"\n[2/3] HUMAN phase (human: {human_short})")
-    human_image = f"{DOCKER_REPO}:{human_commit}"
+    human_tag = get_docker_image_tag(human_commit, image_suffix, use_short_hash)
+    human_image = f"{DOCKER_REPO}:{human_tag}"
+    print(f"  Image: {human_image}")
     results["human"] = run_docker_benchmark(
         docker_image=human_image,
         phase="human",
@@ -531,6 +660,8 @@ def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = T
         model=model,
         perf_command=perf_command,
         hf_token=hf_token,
+        use_flashinfer=use_flashinfer,
+        lora_adapter=lora_adapter,
     )
     save_result(results["human"], commit_pair)
     print_result_summary(results["human"])
@@ -544,7 +675,9 @@ def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = T
             agent_patch_content = agent_patch_path.read_text()
             print(f"  Agent patch: {agent_patch_path}")
 
-            agent_image = f"{DOCKER_REPO}:{parent_commit}"
+            agent_tag = get_docker_image_tag(parent_commit, image_suffix, use_short_hash)
+            agent_image = f"{DOCKER_REPO}:{agent_tag}"
+            print(f"  Image: {agent_image}")
             results["agent"] = run_docker_benchmark(
                 docker_image=agent_image,
                 phase="agent",
@@ -554,6 +687,8 @@ def run_3way_benchmark(commit_pair: dict, hf_token: str, include_agent: bool = T
                 hf_token=hf_token,
                 agent_patch=agent_patch_content,
                 parent_commit=parent_commit,
+                use_flashinfer=use_flashinfer,
+                lora_adapter=lora_adapter,
             )
             save_result(results["agent"], commit_pair)
             print_result_summary(results["agent"])
@@ -666,10 +801,17 @@ def main():
     if args.dry_run:
         print("DRY RUN - Would run:")
         for i, cp in enumerate(commits_to_run, 1):
+            image_suffix = cp.get("image_suffix", "")
+            use_short_hash = cp.get("use_short_hash", False)
+            human_tag = get_docker_image_tag(cp["human_commit"], image_suffix, use_short_hash)
+            parent_tag = get_docker_image_tag(cp["parent_commit"], image_suffix, use_short_hash)
+
             print(f"\n[{i}/{len(commits_to_run)}] {cp['human_commit'][:8]}")
-            print(f"  Human: {DOCKER_REPO}:{cp['human_commit']}")
-            print(f"  Parent: {DOCKER_REPO}:{cp['parent_commit']}")
+            print(f"  Human image: {DOCKER_REPO}:{human_tag}")
+            print(f"  Parent image: {DOCKER_REPO}:{parent_tag}")
             print(f"  Model: {cp['model']}")
+            print(f"  Image suffix: {image_suffix or '(none)'}")
+            print(f"  Use short hash: {use_short_hash}")
             print(f"  Command: {cp['perf_command'][:80]}...")
 
             patch = find_agent_patch(cp["agent_patch_dir"])
