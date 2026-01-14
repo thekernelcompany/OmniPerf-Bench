@@ -1,25 +1,25 @@
 # Soft vs Hard Metrics Comparison Analysis
 
-**Generated:** 2026-01-13 11:46:32
+**Generated:** 2026-01-14 11:19:04
 
 ## Overview
 
 | Metric | Value |
 |--------|-------|
-| Soft metrics (vllm) | 90 |
+| Soft metrics (vllm) | 96 |
 | Hard metrics (HuggingFace) | 42 |
-| Matched commits | 37 |
-| **Prediction Accuracy** | **67.6%** (25/37) |
+| Matched commits | 39 |
+| **Prediction Accuracy** | **66.7%** (26/39) |
 
 ## Speedup Likelihood Distribution (Soft Metrics)
 
 | Category | Count | % |
 |----------|-------|---|
-| likely_ineffective | 40 | 44.4% |
-| likely_regression | 21 | 23.3% |
-| likely_similar | 19 | 21.1% |
-| likely_partial | 9 | 10.0% |
-| uncertain | 1 | 1.1% |
+| likely_ineffective | 41 | 42.7% |
+| likely_similar | 23 | 24.0% |
+| likely_regression | 21 | 21.9% |
+| likely_partial | 9 | 9.4% |
+| uncertain | 2 | 2.1% |
 
 
 ## Detailed Comparison
@@ -36,10 +36,12 @@
 | `bc7c4d206bbf` | ttft | 2435.9 | 2520.7 | 2454.7 | -3.5% | -0.8% | +2.6% | likely_ineffective | ✗ |
 | `30172b4947c5` | ttft | 1115.7 | 1103.5 | 1074.9 | +1.1% | +3.7% | +2.6% | likely_ineffective | ✗ |
 | `8a4e5c5f3c1d` | ttft | 898.6 | 924.7 | 908.6 | -2.9% | -1.1% | +1.7% | likely_partial | ✗ |
+| `22d33baca2c0` | throughput | 2046.9 | 3946.1 | 3984.8 | +92.8% | +94.7% | +1.0% | uncertain | ✗ |
 | `70b808fe1a63` | ttft | 59.8 | 58.7 | 58.2 | +1.8% | +2.7% | +0.9% | likely_partial | ✗ |
 | `cf2f084d56a1` | throughput | N/A | 2443.1 | 2451.8 | N/A | N/A | +0.4% | likely_regression | ✗ |
 | `310aca88c984` | throughput | 51.1 | 102.1 | 102.3 | +99.8% | +100.2% | +0.2% | likely_ineffective | ✓ |
 | `4c822298981a` | throughput | 102.1 | 153.2 | 153.5 | +50.0% | +50.3% | +0.2% | likely_ineffective | ✓ |
+| `61b8cea3b42f` | throughput | 74.9 | 75.0 | 75.0 | +0.1% | +0.1% | +0.0% | likely_ineffective | ✓ |
 | `015069b01741` | throughput | 198.3 | 198.3 | 198.3 | -0.0% | -0.0% | +0.0% | likely_similar | ✓ |
 | `f26c4aeecba4` | throughput | 818.8 | 818.9 | 818.7 | +0.0% | -0.0% | -0.0% | likely_ineffective | ✓ |
 | `9badee53decb` | throughput | N/A | 3424.2 | 3417.1 | N/A | N/A | -0.2% | likely_similar | ✓ |
@@ -69,13 +71,13 @@
 
 - **likely_similar**: 7/7 correct
 - **likely_partial**: 0/5 correct
-- **likely_ineffective**: 14/17 correct
+- **likely_ineffective**: 15/18 correct
 - **likely_regression**: 4/8 correct
 
 
 ## Key Findings
 
-1. **Good predictive accuracy** (67.6%): Soft metrics are reasonably reliable predictors of hard metric outcomes.
+1. **Good predictive accuracy** (66.7%): Soft metrics are reasonably reliable predictors of hard metric outcomes.
 2. **6 false negatives**: Soft metrics predicted failure but agent actually improved.
 3. **2 false positives**: Soft metrics predicted success but agent actually regressed.
 
@@ -84,27 +86,27 @@
 
 *Based on arxiv:2505.23671 Figure 7 methodology - categorizing model failures only*
 
-**Summary:** 90 total runs | 15 successes (16.7%) | 75 failures (83.3%)
+**Summary:** 96 total runs | 18 successes (18.8%) | 78 failures (81.2%)
 
-### Failure High-Level Distribution (n=75)
+### Failure High-Level Distribution (n=78)
 
 | Category | Count | % |
 |----------|-------|---|
-| Localization | 50 | 66.7% |
-| Mismanage Compute | 15 | 20.0% |
-| Avoid Complexity | 10 | 13.3% |
+| Localization | 51 | 65.4% |
+| Mismanage Compute | 17 | 21.8% |
+| Avoid Complexity | 10 | 12.8% |
 
 
 ### Failure Sub-Category Breakdown
 
 | Sub-Category | Count | % |
 |--------------|-------|---|
-| Misdiagnosed Bottlenecks | 50 | 66.7% |
-| Destructive/Runaway | 8 | 10.7% |
-| Wrong Abstraction Level | 7 | 9.3% |
-| Exploit-Heavy | 4 | 5.3% |
-| Lazy Optimization | 3 | 4.0% |
-| Explore-Heavy | 3 | 4.0% |
+| Misdiagnosed Bottlenecks | 51 | 65.4% |
+| Destructive/Runaway | 9 | 11.5% |
+| Wrong Abstraction Level | 7 | 9.0% |
+| Exploit-Heavy | 5 | 6.4% |
+| Lazy Optimization | 3 | 3.8% |
+| Explore-Heavy | 3 | 3.8% |
 
 
 ### Failure Category Definitions
@@ -133,49 +135,49 @@
 
 ## Success Analysis (Human vs Agent)
 
-**Total Successes:** 15 (16.7% success rate)
+**Total Successes:** 18 (18.8% success rate)
 
 ### Implementation Alignment
 
 | Category | Count | % | Description |
 |----------|-------|---|-------------|
-| core_match_extras | 10 | 66.7% | Got main optimization, added extra changes/noise |
-| identical | 5 | 33.3% | Agent produced exactly same code as human |
+| core_match_extras | 10 | 55.6% | Got main optimization, added extra changes/noise |
+| identical | 8 | 44.4% | Agent produced exactly same code as human |
 
 
 ### Agent Behavior Patterns
 
 | Pattern | Count | % |
 |---------|-------|---|
-| over_engineering | 6 | 40.0% |
-| diff_pollution | 5 | 33.3% |
-| scope_creep | 4 | 26.7% |
-| clean_patch | 4 | 26.7% |
+| diff_pollution | 7 | 38.9% |
+| over_engineering | 6 | 33.3% |
+| clean_patch | 5 | 27.8% |
+| scope_creep | 4 | 22.2% |
 
 
 ### Technique Distribution
 
 | Human Techniques | Count | Agent Techniques | Count |
 |------------------|-------|------------------|-------|
-| memory_optimization | 9 | memory_optimization | 13 |
-| lazy_computation | 7 | lazy_computation | 10 |
+| memory_optimization | 12 | memory_optimization | 16 |
+| lazy_computation | 9 | lazy_computation | 12 |
 | api_library | 6 | api_library | 7 |
 | batching | 4 | batching | 5 |
-| other | 2 | low_level | 4 |
-| algorithmic | 1 | compiler_optimization | 2 |
-| low_level | 1 | parallelization | 2 |
-| parallelization | 1 | other | 2 |
-|  |  | algorithmic | 1 |
+| algorithmic | 2 | low_level | 4 |
+| other | 2 | algorithmic | 2 |
+| low_level | 1 | compiler_optimization | 2 |
+| parallelization | 1 | parallelization | 2 |
+|  |  | other | 2 |
 
 
 ### Task Domains
 
 | Domain | Count | % |
 |--------|-------|---|
-| compute | 7 | 46.7% |
-| memory | 6 | 40.0% |
-| concurrency | 1 | 6.7% |
-| other | 1 | 6.7% |
+| memory | 9 | 50.0% |
+| compute | 7 | 38.9% |
+| concurrency | 1 | 5.6% |
+| other | 1 | 5.6% |
 
 
 ### Success Category Definitions
