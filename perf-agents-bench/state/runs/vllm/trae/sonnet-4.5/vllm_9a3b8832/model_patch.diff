@@ -1,0 +1,160 @@
+diff --git a/vllm/model_executor/layers/rotary_embedding.py b/vllm/model_executor/layers/rotary_embedding.py
+index 9de2338..9a23350 100644
+--- a/vllm/model_executor/layers/rotary_embedding.py
++++ b/vllm/model_executor/layers/rotary_embedding.py
+@@ -56,8 +56,14 @@ def _apply_rotary_emb_torch(
+     sin: torch.Tensor,
+     is_neox_style: bool,
+ ) -> torch.Tensor:
+-    cos = cos.unsqueeze(-2).to(x.dtype)
+-    sin = sin.unsqueeze(-2).to(x.dtype)
++    # Optimize: convert dtype once and unsqueeze in-place
++    if cos.dtype != x.dtype:
++        cos = cos.to(x.dtype)
++    if sin.dtype != x.dtype:
++        sin = sin.to(x.dtype)
++    cos = cos.unsqueeze(-2)
++    sin = sin.unsqueeze(-2)
++    
+     if is_neox_style:
+         x1, x2 = torch.chunk(x, 2, dim=-1)
+     else:
+@@ -152,21 +158,33 @@ class RotaryEmbedding(CustomOp):
+ 
+         query_shape = query.shape
+         query = query.view(num_tokens, -1, self.head_size)
+-        query_rot = query[..., :self.rotary_dim]
+-        query_pass = query[..., self.rotary_dim:]
+-        query_rot = _apply_rotary_emb_torch(query_rot, cos, sin,
+-                                            self.is_neox_style)
+-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
++        
++        # Optimize: avoid cat/reshape when rotary_dim == head_size
++        if self.rotary_dim == self.head_size:
++            query = _apply_rotary_emb_torch(query, cos, sin, self.is_neox_style)
++            query = query.reshape(query_shape)
++        else:
++            query_rot = query[..., :self.rotary_dim]
++            query_pass = query[..., self.rotary_dim:]
++            query_rot = _apply_rotary_emb_torch(query_rot, cos, sin,
++                                                self.is_neox_style)
++            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+ 
+         # key may be None in some cases, e.g. cross-layer KV sharing
+         if key is not None:
+             key_shape = key.shape
+             key = key.view(num_tokens, -1, self.head_size)
+-            key_rot = key[..., :self.rotary_dim]
+-            key_pass = key[..., self.rotary_dim:]
+-            key_rot = _apply_rotary_emb_torch(key_rot, cos, sin,
+-                                              self.is_neox_style)
+-            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
++            
++            # Optimize: avoid cat/reshape when rotary_dim == head_size
++            if self.rotary_dim == self.head_size:
++                key = _apply_rotary_emb_torch(key, cos, sin, self.is_neox_style)
++                key = key.reshape(key_shape)
++            else:
++                key_rot = key[..., :self.rotary_dim]
++                key_pass = key[..., self.rotary_dim:]
++                key_rot = _apply_rotary_emb_torch(key_rot, cos, sin,
++                                                  self.is_neox_style)
++                key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+         return query, key
+ 
+     def forward_cuda(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 520d8fb..929ff92 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -223,19 +223,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self._init_device_properties()
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+-        self.query_start_loc = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc = torch.empty(self.max_num_reqs + 1,
+                                            dtype=torch.int32,
+                                            device=self.device)
+-        self.seq_lens = torch.zeros(self.max_num_reqs,
++        self.seq_lens = torch.empty(self.max_num_reqs,
+                                     dtype=torch.int32,
+                                     device=self.device)
+-        self.slot_mapping = torch.zeros(self.max_num_tokens,
++        self.slot_mapping = torch.empty(self.max_num_tokens,
+                                         dtype=torch.int64,
+                                         device=self.device)
+ 
+@@ -254,10 +254,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # identical position IDs, making M-RoPE functionally equivalent to
+             # 1D-RoPE.
+             # See page 5 of https://arxiv.org/abs/2409.12191
+-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
++            self.mrope_positions = torch.empty((3, self.max_num_tokens + 1),
+                                                dtype=torch.int64,
+                                                device=self.device)
+-            self.mrope_positions_cpu = torch.zeros(
++            self.mrope_positions_cpu = torch.empty(
+                 (3, self.max_num_tokens + 1),
+                 dtype=torch.int64,
+                 device="cpu",
+@@ -266,7 +266,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Only relevant for models using ALiBi (e.g, MPT)
+         self.use_alibi = check_use_alibi(model_config)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -280,21 +280,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)
+@@ -2052,7 +2052,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # NOTE(woosuk): Here, we should use int32 because the sampler uses
+             # int32 for bonus_token_ids. If the dtype mismatches, re-compilation
+             # will occur at runtime.
+-            bonus_token_ids = torch.zeros(num_reqs,
++            bonus_token_ids = torch.empty(num_reqs,
+                                           device=self.device,
+                                           dtype=torch.int32)
+             self.rejection_sampler(
+@@ -2087,7 +2087,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         dummy_metadata = PoolingMetadata(
+             prompt_lens=torch.tensor([h.shape[0] for h in hidden_states_list],
+                                      device=self.device),
+-            prompt_token_ids=torch.zeros((num_reqs, req_num_tokens),
++            prompt_token_ids=torch.empty((num_reqs, req_num_tokens),
+                                          dtype=torch.int32,
+                                          device=self.device),
+             pooling_params=[PoolingParams()] * num_reqs)

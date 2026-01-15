@@ -1,0 +1,84 @@
+diff --git a/tests/v1/sample/test_rejection_sampler.py b/tests/v1/sample/test_rejection_sampler.py
+index 84139a4..3a6eafb 100644
+--- a/tests/v1/sample/test_rejection_sampler.py
++++ b/tests/v1/sample/test_rejection_sampler.py
+@@ -21,7 +21,8 @@ def create_logits_tensor(token_ids: list[list[int]],
+     """Helper function to create logits tensor that 
+        will produce desired token ids on argmax"""
+     num_total_tokens = sum(len(tokens) for tokens in token_ids)
+-    logits = torch.full((num_total_tokens, vocab_size), -100.0, device=DEVICE)
++    logits = torch.empty((num_total_tokens, vocab_size), device=DEVICE)
++    logits.fill_(-100.0)
+     start_loc = 0
+     for tokens in token_ids:
+         for j, token_id in enumerate(tokens):
+@@ -345,8 +346,10 @@ def estimate_rejection_sampling_pdf(
+                                             num_samples, k)
+ 
+     # Bonus tokens not used but required.
+-    bonus_token_ids = torch.zeros((1, 1), dtype=torch.int64,
+-                                  device=DEVICE).repeat(num_samples, 1)
++    bonus_token_ids = torch.empty((1, 1), dtype=torch.int64,
++                                  device=DEVICE)
++    bonus_token_ids.fill_(0)
++    bonus_token_ids = bonus_token_ids.repeat(num_samples, 1)
+ 
+     sampling_metadata = create_sampling_metadata(all_greedy=False)
+     output_token_ids = sampler(draft_token_ids.tolist(), draft_probs,
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 5601c62..4bf54db 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -133,9 +133,9 @@ class RejectionSampler(nn.Module):
+             # Generate mask with bonus token.
+             generate_mask = torch.cat([
+                 accept_mask,
+-                torch.zeros(accept_mask.size(0), 1, device=accept_mask.device)
++                torch.zeros(accept_mask.size(0), 1, dtype=torch.bool, device=accept_mask.device)
+             ],
+-                                      dim=1).to(torch.bool) & valid_mask
++                                      dim=1) & valid_mask
+             zeros_mask = (generate_mask == 0)
+             first_zero_idx = zeros_mask.float().argmax(dim=1)
+             # Figure out which rows actually contain at least one zero.
+@@ -204,16 +204,18 @@ class RejectionSampler(nn.Module):
+             # Generate mask with bonus tokens.
+             generate_mask = torch.cat([
+                 accept_mask,
+-                torch.zeros(batch_size, 1, device=accept_mask.device)
++                torch.zeros(batch_size, 1, dtype=torch.bool, device=accept_mask.device)
+             ],
+-                                      dim=1).to(torch.bool)
++                                      dim=1)
+             zeros_mask = (generate_mask == 0)
+             first_zero_idx = zeros_mask.float().argmax(dim=1)
++            invalid_column = torch.empty((batch_size, 1),
++                                        dtype=torch.int,
++                                        device=accept_mask.device)
++            invalid_column.fill_(INVALID_TOKEN_ID)
+             output_token_ids = torch.cat([
+                 accepted_token_ids,
+-                torch.full((batch_size, 1),
+-                           fill_value=INVALID_TOKEN_ID,
+-                           device=accept_mask.device)
++                invalid_column
+             ],
+                                          dim=1)
+             output_token_ids[torch.arange(batch_size),
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 6601538..4203854 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1281,8 +1281,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         logits = self.model.compute_logits(hidden_states, None)
+         num_reqs = logits.size(0)
+ 
+-        dummy_tensors = lambda v: torch.full(
+-            (num_reqs, ), v, device=self.device)
++        def dummy_tensors(v):
++            t = torch.empty((num_reqs, ), device=self.device)
++            t.fill_(v)
++            return t
+ 
+         dummy_metadata = SamplingMetadata(
+             temperature=dummy_tensors(0.5),

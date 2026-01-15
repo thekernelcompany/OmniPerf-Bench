@@ -1,0 +1,93 @@
+diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py
+index 3dd12e2..58086d7 100644
+--- a/vllm/core/evictor_v2.py
++++ b/vllm/core/evictor_v2.py
+@@ -1,6 +1,7 @@
+ import enum
++import heapq
+ from abc import ABC, abstractmethod
+-from typing import OrderedDict, Tuple
++from typing import Dict, List, Tuple
+ 
+ 
+ class EvictionPolicy(enum.Enum):
+@@ -76,7 +77,11 @@ class LRUEvictor(Evictor):
+     """
+ 
+     def __init__(self):
+-        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()
++        # Use regular dict for O(1) lookups instead of OrderedDict
++        self.free_table: Dict[int, BlockMetaData] = {}
++        # Min-heap for O(log n) eviction: (last_accessed, -num_hashed_tokens, block_id)
++        # Negative num_hashed_tokens to get max num_hashed_tokens with min-heap
++        self.heap: List[Tuple[float, int, int]] = []
+ 
+     def __contains__(self, block_id: int) -> bool:
+         return block_id in self.free_table
+@@ -85,36 +90,51 @@ class LRUEvictor(Evictor):
+         if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block = next(iter(self.free_table.values()))
+-        evicted_block_id = next(iter(self.free_table.keys()))
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block.last_accessed > block.last_accessed or (
+-                    evicted_block.last_accessed == block.last_accessed and
+-                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):
+-                evicted_block = block
+-                evicted_block_id = _id
++        # Pop from heap until we find a valid entry (lazy deletion)
++        while self.heap:
++            last_accessed, neg_num_hashed_tokens, block_id = heapq.heappop(
++                self.heap)
+ 
+-        self.free_table.pop(evicted_block_id)
++            # Check if this block is still in the free_table
++            if block_id not in self.free_table:
++                # This entry was removed or updated, skip it
++                continue
+ 
+-        return evicted_block_id, evicted_block.content_hash
++            metadata = self.free_table[block_id]
++            # Verify this heap entry matches current metadata (not stale from update)
++            if (metadata.last_accessed == last_accessed
++                    and metadata.num_hashed_tokens == -neg_num_hashed_tokens):
++                # Valid entry found, evict it
++                content_hash = metadata.content_hash
++                del self.free_table[block_id]
++                return block_id, content_hash
++
++        # Should not reach here if free_table is not empty
++        raise ValueError("No usable cache memory left")
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+             last_accessed: float):
+         self.free_table[block_id] = BlockMetaData(content_hash,
+                                                   num_hashed_tokens,
+                                                   last_accessed)
++        # Push to heap with negative num_hashed_tokens for max-heap behavior
++        heapq.heappush(self.heap,
++                       (last_accessed, -num_hashed_tokens, block_id))
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        # Update metadata in free_table
++        metadata = self.free_table[block_id]
++        metadata.last_accessed = last_accessed
++        # Push new entry to heap (old entry will be filtered out during evict)
++        heapq.heappush(self.heap,
++                       (last_accessed, -metadata.num_hashed_tokens, block_id))
+ 
+     def remove(self, block_id: int):
+         if block_id not in self.free_table:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
++        # Remove from free_table; stale heap entries will be filtered during evict
++        del self.free_table[block_id]
+ 
+     @property
+     def num_blocks(self) -> int:

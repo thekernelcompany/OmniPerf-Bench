@@ -1,0 +1,74 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 7978730..566bb21 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -699,7 +699,7 @@ def create_kv_caches_with_random(
+     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+ 
+     scale = head_size**-0.5
+-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
++    x = 16 // get_dtype_size(torch_dtype)
+     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+     key_caches: list[torch.Tensor] = []
+     for _ in range(num_layers):
+@@ -804,11 +804,24 @@ def make_tensor_with_pad(
+     np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+     padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+ 
+-    tensor = torch.from_numpy(padded_x).to(device)
+-    if pin_memory:
+-        tensor = tensor.pin_memory()
+-
+-    return tensor
++    cpu_tensor = torch.from_numpy(padded_x)
++    # Pin CPU memory before H2D copy only when targeting CUDA
++    if pin_memory and device is not None:
++        try:
++            dest = torch.device(device)
++        except (TypeError, ValueError):
++            dest = torch.device("cpu")
++        if dest.type == "cuda":
++            cpu_tensor = cpu_tensor.pin_memory()
++
++    if device is None:
++        return cpu_tensor
++
++    dest_device = torch.device(device)
++    if dest_device.type == "cuda":
++        return cpu_tensor.to(dest_device, non_blocking=pin_memory)
++    else:
++        return cpu_tensor.to(dest_device)
+ 
+ 
+ def async_tensor_h2d(
+@@ -818,13 +831,16 @@ def async_tensor_h2d(
+     pin_memory: bool,
+ ) -> torch.Tensor:
+     """Asynchronously create a tensor and copy it from host to device."""
+-    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+-    return t.to(device=target_device, non_blocking=True)
++    dest = torch.device(target_device)
++    do_pin = pin_memory and dest.type == "cuda"
++    t = torch.tensor(data, dtype=dtype, pin_memory=do_pin, device="cpu")
++    return t.to(device=dest, non_blocking=do_pin)
+ 
+ 
++@lru_cache(maxsize=None)
+ def get_dtype_size(dtype: torch.dtype) -> int:
+     """Get the size of the data type in bytes."""
+-    return torch.tensor([], dtype=dtype).element_size()
++    return torch.empty((), dtype=dtype).element_size()
+ 
+ 
+ # `collections` helpers
+@@ -1948,8 +1964,8 @@ class MemorySnapshot:
+         self.torch_peak = torch.cuda.memory_stats().get(
+             "allocated_bytes.all.peak", 0)
+ 
+-        self.cuda_memory = torch.cuda.mem_get_info(
+-        )[1] - torch.cuda.mem_get_info()[0]
++        free_total = torch.cuda.mem_get_info()
++        self.cuda_memory = free_total[1] - free_total[0]
+ 
+         # torch.cuda.memory_reserved() is how many bytes
+         # PyTorch gets from cuda (by calling cudaMalloc, etc.)

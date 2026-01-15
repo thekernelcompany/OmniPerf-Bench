@@ -1,0 +1,69 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d2053..201f52480 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -142,7 +142,8 @@ def _get_bin_counts_and_mask(
+     bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
++    # Use scalar 1 instead of creating a ones tensor for better performance
++    bin_counts.scatter_add_(1, tokens, 1)
+     bin_counts = bin_counts[:, :vocab_size]
+     mask = bin_counts > 0
+ 
+@@ -207,10 +208,17 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    # Optimize by using broadcasting instead of repeat - avoid unnecessary memory allocation
++    repetition_penalties_expanded = repetition_penalties[:, None]  # Shape: (num_seqs, 1)
++    # Create mask for tokens that should have penalties applied
++    penalty_mask = prompt_mask | output_mask
++    # Apply penalties only where needed using broadcasting
++    logits = torch.where(
++        penalty_mask,
++        torch.where(logits > 0, logits / repetition_penalties_expanded,
++                    logits * repetition_penalties_expanded),
++        logits
++    )
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+@@ -242,7 +250,9 @@ def _apply_top_k_top_p(
+     logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
++    # Optimize by specifying dtype for arange to match logits_idx dtype
+     src = torch.arange(logits_idx.shape[-1],
++                       dtype=logits_idx.dtype,
+                        device=logits_idx.device).expand_as(logits_idx)
+     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+                                                            index=logits_idx,
+@@ -678,8 +688,8 @@ def _get_ranks(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+                     Each element in the returned tensor represents the rank 
+                     of the chosen token in the input logprob tensor.
+     """
+-    vals = x[torch.arange(0, len(x), device=x.device, dtype=indices.dtype),
+-             indices]
++    # Optimize by using gather instead of advanced indexing with arange
++    vals = x.gather(1, indices.unsqueeze(1)).squeeze(1)
+     return (x > vals[:, None]).long().sum(1).add_(1)
+ 
+ 
+@@ -761,8 +771,9 @@ def _get_logprobs(
+         empty_prompt_logprob: Optional[PromptLogprobs] = None
+         return [empty_prompt_logprob], [empty_sampled_logprob]
+ 
+-    query_indices_gpu = torch.tensor(query_indices, device=logprobs.device)
+-    next_token_ids_gpu = torch.tensor(next_token_ids, device=logprobs.device)
++    # Optimize tensor creation by specifying dtype to avoid inference overhead
++    query_indices_gpu = torch.tensor(query_indices, dtype=torch.long, device=logprobs.device)
++    next_token_ids_gpu = torch.tensor(next_token_ids, dtype=torch.long, device=logprobs.device)
+ 
+     # (num_selected_query_tokens, num_logprobs). Note that query_indices can
+     # contain duplicates if beam search is enabled.

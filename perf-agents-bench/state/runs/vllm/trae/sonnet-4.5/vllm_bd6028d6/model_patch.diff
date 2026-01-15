@@ -1,0 +1,95 @@
+diff --git a/vllm/model_executor/models/llama4.py b/vllm/model_executor/models/llama4.py
+index 8785e9d..a518777 100644
+--- a/vllm/model_executor/models/llama4.py
++++ b/vllm/model_executor/models/llama4.py
+@@ -51,8 +51,12 @@ class Llama4MoE(nn.Module):
+         renormalize: bool,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
+-        router_scores = torch.sigmoid(router_scores.float()).to(
+-            hidden_states.dtype)
++        # Optimize: avoid intermediate float conversion if already in correct dtype
++        if router_scores.dtype == hidden_states.dtype:
++            router_scores = torch.sigmoid(router_scores)
++        else:
++            router_scores = torch.sigmoid(router_scores.float()).to(
++                hidden_states.dtype)
+         return (router_scores, router_indices.to(torch.int32))
+ 
+     def __init__(self,
+@@ -205,9 +209,10 @@ class Llama4Attention(nn.Module):
+         )
+ 
+     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
+-        floor = torch.floor((positions + 1.0) / self.floor_scale)
+-        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+-
++        # Optimize: fuse operations to reduce intermediate tensor allocations
++        # floor = torch.floor((positions + 1.0) / self.floor_scale)
++        # attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
++        attn_scale = torch.log(torch.floor((positions + 1.0) / self.floor_scale) + 1.0).mul_(self.attn_scale).add_(1.0)
+         return attn_scale.unsqueeze(-1)
+ 
+     def forward(
+@@ -221,10 +226,13 @@ class Llama4Attention(nn.Module):
+         if self.rotary_emb is not None:
+             q, k = self.rotary_emb(positions, q, k)
+         if self.qk_norm is not None:
++            # Optimize: cache original dtype to avoid repeated attribute access
++            q_dtype = q.dtype
+             q = q.reshape(-1, self.num_heads, self.head_dim)
+-            q = self.qk_norm(q.float()).reshape(-1, self.q_size).to(q.dtype)
++            q = self.qk_norm(q.float()).reshape(-1, self.q_size).to(q_dtype)
++            k_dtype = k.dtype
+             k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+-            k = self.qk_norm(k.float()).reshape(-1, self.kv_size).to(k.dtype)
++            k = self.qk_norm(k.float()).reshape(-1, self.kv_size).to(k_dtype)
+ 
+         # We are applying temperature tuning (https://arxiv.org/abs/2501.19399)
+         # to NoPE layers, where the inference-time temperature tuning function
+@@ -236,7 +244,8 @@ class Llama4Attention(nn.Module):
+         # and (before) attention.
+         if self.attn_temperature_tuning and self.nope:
+             attn_scale = self._get_attn_scale(positions)
+-            q = (q * attn_scale).to(q.dtype)
++            # Optimize: use in-place multiplication if possible, avoid redundant .to()
++            q = q * attn_scale
+         attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output
+@@ -371,10 +380,8 @@ class Llama4Model(LlamaModel):
+                 expert_map = self.layers[
+                     layer_idx].feed_forward.experts.expert_map
+                 if expert_map is not None:
+-                    local_expert_indices = (expert_map != -1) \
+-                                            .nonzero() \
+-                                            .flatten() \
+-                                            .to(new_loaded_weight.device)
++                    # Optimize: use nonzero(as_tuple=True)[0] instead of nonzero().flatten()
++                    local_expert_indices = (expert_map != -1).nonzero(as_tuple=True)[0].to(new_loaded_weight.device)
+                     new_loaded_weight = new_loaded_weight[local_expert_indices]
+                     expert_id = local_expert_indices[0].item()
+             else:
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index f197434..50a528c 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -470,7 +470,9 @@ def merge_multimodal_embeddings(
+         This updates ``inputs_embeds`` in place.
+     """
+     if isinstance(placeholder_token_id, list):
++        # Optimize: specify dtype to avoid implicit conversion
+         placeholder_token_id = torch.tensor(placeholder_token_id,
++                                            dtype=input_ids.dtype,
+                                             device=input_ids.device)
+         return _merge_multimodal_embeddings(
+             inputs_embeds,
+@@ -654,7 +656,7 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
+     ) -> IntermediateTensors:
+         return IntermediateTensors({
+             key:
+-            torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
++            torch.empty((batch_size, hidden_size), dtype=dtype, device=device)
+             for key in keys
+         })
+ 

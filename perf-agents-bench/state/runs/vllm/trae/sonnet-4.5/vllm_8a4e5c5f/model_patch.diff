@@ -1,0 +1,234 @@
+diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+index 4e82424..111488c 100644
+--- a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+@@ -102,15 +102,18 @@ async def handle_request():
+         global count
+         global prefill_instances
+         global prefill_cv
++        # Optimize: Cache list conversion and avoid repeated modulo operations
+         with prefill_cv:
+             prefill_list = list(prefill_instances.items())
+-            prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
++            prefill_idx = count % len(prefill_list)
++            prefill_addr, prefill_zmq_addr = prefill_list[prefill_idx]
+ 
+         global decode_instances
+         global decode_cv
+         with decode_cv:
+             decode_list = list(decode_instances.items())
+-            decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
++            decode_idx = count % len(decode_list)
++            decode_addr, decode_zmq_addr = decode_list[decode_idx]
+ 
+         print(
+             f"handle_request count: {count}, [HTTP:{prefill_addr}, "
+@@ -119,10 +122,8 @@ async def handle_request():
+         )
+         count += 1
+ 
+-        request_id = (
+-            f"___prefill_addr_{prefill_zmq_addr}___decode_addr_"
+-            f"{decode_zmq_addr}_{random_uuid()}"
+-        )
++        # Optimize: Use single f-string for request_id construction
++        request_id = f"___prefill_addr_{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_{random_uuid()}"
+ 
+         # finish prefill
+         async for _ in forward_request(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+index 52f589a..ab23e71 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+@@ -40,12 +40,14 @@ class ReqMeta:
+     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
+                   block_size: int) -> "ReqMeta":
+         valid_num_tokens = len(token_ids)
+-        token_ids_tensor = torch.tensor(token_ids)
+-        block_ids_tensor = torch.tensor(block_ids)
++        # Optimize: Use torch.as_tensor for faster conversion from lists
++        token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long)
++        block_ids_tensor = torch.as_tensor(block_ids, dtype=torch.long)
+         num_blocks = block_ids_tensor.shape[0]
+-        block_offsets = torch.arange(0, block_size)
+-        slot_mapping = block_offsets.reshape((1, block_size)) + \
+-                block_ids_tensor.reshape((num_blocks, 1)) * block_size
++        block_offsets = torch.arange(0, block_size, dtype=torch.long)
++        # Optimize: Use view instead of reshape when possible for zero-copy
++        slot_mapping = block_offsets.view(1, block_size) + \
++                block_ids_tensor.view(num_blocks, 1) * block_size
+         slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
+ 
+         return ReqMeta(
+@@ -192,21 +194,24 @@ class P2pNcclConnector(KVConnectorBase_V1):
+ 
+         # Load the KV for each request each layer
+         for request in metadata.requests:
++            # Optimize: Cache request_id to avoid repeated attribute access
++            request_id = request.request_id
++            slot_mapping = request.slot_mapping
+             for layer_name in forward_context.no_compile_layers:
+                 attn_layer = forward_context.no_compile_layers[layer_name]
+                 kv_cache_layer = attn_layer.kv_cache[ \
+                     forward_context.virtual_engine]
+ 
+-                kv_cache = self.p2p_nccl_engine.recv_tensor(
+-                    request.request_id + "#" + layer_name)
++                # Optimize: Use f-string for faster string concatenation
++                tensor_id = f"{request_id}#{layer_name}"
++                kv_cache = self.p2p_nccl_engine.recv_tensor(tensor_id)
+ 
+                 if kv_cache is None:
+-                    logger.warning("🚧src_kv_cache is None, %s",
+-                                   request.request_id)
++                    logger.warning("🚧src_kv_cache is None, %s", request_id)
+                     continue
+ 
+                 inject_kv_into_layer(kv_cache_layer, kv_cache,
+-                                     request.slot_mapping, request.request_id)
++                                     slot_mapping, request_id)
+ 
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         """Blocking until the KV for a specific layer is loaded into vLLM's
+@@ -260,10 +265,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
+         for request in connector_metadata.requests:
+             request_id = request.request_id
+             ip, port = self.parse_request_id(request_id, True)
+-            remote_address = ip + ":" + str(port + self._rank)
++            # Optimize: Use f-string for faster string concatenation
++            remote_address = f"{ip}:{port + self._rank}"
+             kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
+-            self.p2p_nccl_engine.send_tensor(request_id + "#" + layer_name,
+-                                             kv_cache, remote_address)
++            # Optimize: Use f-string for faster string concatenation
++            tensor_id = f"{request_id}#{layer_name}"
++            self.p2p_nccl_engine.send_tensor(tensor_id, kv_cache, remote_address)
+ 
+     def wait_for_save(self):
+         if self.is_producer:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+index 6c9ccb2..18910c0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+@@ -31,18 +31,18 @@ DEFAULT_MEM_POOL_SIZE_GB = 32
+ 
+ @contextmanager
+ def set_p2p_nccl_context(num_channels: str):
+-    original_values: dict[str, Any] = {}
+-    env_vars = [
++    # Optimize: Use tuple for immutable sequence (faster than list)
++    env_vars = (
+         'NCCL_MAX_NCHANNELS',
+         'NCCL_MIN_NCHANNELS',
+         'NCCL_CUMEM_ENABLE',
+         'NCCL_BUFFSIZE',
+         'NCCL_PROTO',  # LL,LL128,SIMPLE
+         'NCCL_ALGO',  # RING,TREE
+-    ]
++    )
+ 
+-    for var in env_vars:
+-        original_values[var] = os.environ.get(var)
++    # Optimize: Use dict comprehension for faster initialization
++    original_values = {var: os.environ.get(var) for var in env_vars}
+ 
+     logger.info("set_p2p_nccl_context, original_values: %s", original_values)
+ 
+@@ -52,9 +52,10 @@ def set_p2p_nccl_context(num_channels: str):
+         os.environ['NCCL_CUMEM_ENABLE'] = '1'
+         yield
+     finally:
+-        for var in env_vars:
+-            if original_values[var] is not None:
+-                os.environ[var] = original_values[var]
++        # Optimize: Iterate over items() to avoid double lookup
++        for var, value in original_values.items():
++            if value is not None:
++                os.environ[var] = value
+             else:
+                 os.environ.pop(var, None)
+ 
+@@ -369,24 +370,26 @@ class P2pNcclEngine:
+ 
+                     if data["ret"] == 0:
+                         comm, rank = self.comms[remote_address.decode()]
+-                        self._send(comm, tensor.to(self.device), rank ^ 1,
+-                                   self.send_stream)
++                        # Optimize: Only move tensor if it's not already on the device
++                        if tensor.device != self.device:
++                            tensor = tensor.to(self.device)
++                        self._send(comm, tensor, rank ^ 1, self.send_stream)
+                 else:
+                     logger.warning(
+                         "🚧Unexpected, Received message from %s, data:%s",
+                         remote_address, data)
+ 
+     def _have_sent_tensor_id(self, tensor_id: str):
+-        request_id = tensor_id.split('#')[0]
+-        if request_id not in self.send_request_id_to_tensor_ids:
+-            self.send_request_id_to_tensor_ids[request_id] = set()
+-        self.send_request_id_to_tensor_ids[request_id].add(tensor_id)
++        # Optimize: Use partition for faster string splitting
++        request_id = tensor_id.partition('#')[0]
++        # Optimize: Use setdefault to avoid double lookup
++        self.send_request_id_to_tensor_ids.setdefault(request_id, set()).add(tensor_id)
+ 
+     def _have_received_tensor_id(self, tensor_id: str):
+-        request_id = tensor_id.split('#')[0]
+-        if request_id not in self.recv_request_id_to_tensor_ids:
+-            self.recv_request_id_to_tensor_ids[request_id] = set()
+-        self.recv_request_id_to_tensor_ids[request_id].add(tensor_id)
++        # Optimize: Use partition for faster string splitting
++        request_id = tensor_id.partition('#')[0]
++        # Optimize: Use setdefault to avoid double lookup
++        self.recv_request_id_to_tensor_ids.setdefault(request_id, set()).add(tensor_id)
+ 
+     def _send_async(self):
+         while True:
+@@ -440,7 +443,10 @@ class P2pNcclEngine:
+                 response.decode())
+             return False
+ 
+-        self._send(comm, tensor.to(self.device), rank ^ 1, self.send_stream)
++        # Optimize: Only move tensor if it's not already on the device
++        if tensor.device != self.device:
++            tensor = tensor.to(self.device)
++        self._send(comm, tensor, rank ^ 1, self.send_stream)
+ 
+         if self.send_type == "PUT_ASYNC":
+             self._have_sent_tensor_id(tensor_id)
+@@ -462,20 +468,21 @@ class P2pNcclEngine:
+         """
+ 
+         # Clear the buffer upon request completion.
+-        for request_id in finished_req_ids:
+-            for layer_name in forward_context.no_compile_layers:
+-                tensor_id = request_id + "#" + layer_name
+-                if tensor_id in self.recv_store:
+-                    with self.recv_store_cv:
++        # Optimize: Use with statement once outside the loop
++        with self.recv_store_cv:
++            for request_id in finished_req_ids:
++                for layer_name in forward_context.no_compile_layers:
++                    # Optimize: Use f-string for faster string concatenation
++                    tensor_id = f"{request_id}#{layer_name}"
++                    if tensor_id in self.recv_store:
+                         tensor = self.recv_store.pop(tensor_id, None)
+-                        self.send_request_id_to_tensor_ids.pop(
+-                            request_id, None)
+-                        self.recv_request_id_to_tensor_ids.pop(
+-                            request_id, None)
+-                    addr = 0
+-                    if isinstance(tensor, tuple):
+-                        addr, _, _ = tensor
+-                        self.pool.free(addr)
++                        addr = 0
++                        if isinstance(tensor, tuple):
++                            addr, _, _ = tensor
++                            self.pool.free(addr)
++                # Optimize: Remove request tracking outside the layer loop
++                self.send_request_id_to_tensor_ids.pop(request_id, None)
++                self.recv_request_id_to_tensor_ids.pop(request_id, None)
+ 
+         # TODO:Retrieve requests that have already sent the KV cache.
+         finished_sending: set[str] = set()

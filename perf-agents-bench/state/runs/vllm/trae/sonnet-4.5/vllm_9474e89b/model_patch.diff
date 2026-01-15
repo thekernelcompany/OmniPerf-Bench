@@ -1,0 +1,103 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..35b7325 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -74,10 +74,11 @@ class BlockAllocator:
+             block.ref_count += 1
+             assert block.block_hash == block_hash
+             return block
+-        if block_hash not in self.cached_blocks:
+-            self.cached_blocks[block_hash] = self.allocate_block(
+-                block_hash, num_hashed_tokens)
+-        block = self.cached_blocks[block_hash]
++        # Use get() to avoid double dictionary lookup
++        block = self.cached_blocks.get(block_hash)
++        if block is None:
++            block = self.allocate_block(block_hash, num_hashed_tokens)
++            self.cached_blocks[block_hash] = block
+         assert block.block_hash == block_hash
+         block.ref_count += 1
+         return block
+@@ -108,7 +109,8 @@ class BlockAllocator:
+             assert not self.contains_block(block_hash)
+             old_hash = block.block_hash
+             block.block_hash = block_hash
+-            del self.cached_blocks[old_hash]
++            # Use pop to avoid double lookup
++            self.cached_blocks.pop(old_hash)
+             self.cached_blocks[block_hash] = block
+ 
+ 
+@@ -349,8 +351,8 @@ class BlockSpaceManager:
+             block_table = self.block_tables[seq.seq_id]
+ 
+             for cpu_block in block_table:
+-                if cpu_block in mapping:
+-                    gpu_block = mapping[cpu_block]
++                gpu_block = mapping.get(cpu_block)
++                if gpu_block is not None:
+                     gpu_block.ref_count += 1
+                 else:
+                     gpu_block = self.gpu_allocator.allocate(
+@@ -379,8 +381,8 @@ class BlockSpaceManager:
+             block_table = self.block_tables[seq.seq_id]
+ 
+             for gpu_block in block_table:
+-                if gpu_block in mapping:
+-                    cpu_block = mapping[gpu_block]
++                cpu_block = mapping.get(gpu_block)
++                if cpu_block is not None:
+                     cpu_block.ref_count += 1
+                 else:
+                     cpu_block = self.cpu_allocator.allocate(
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..e2b6adb 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -66,35 +66,21 @@ class LRUEvictor(Evictor):
+ 
+     # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
++        # Single-pass optimization: find block with lowest timestamp and highest num_hashed_tokens
+         evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
++        lowest_timestamp = float('inf')
++        highest_num_hashed_tokens = -1
++        
++        for block in self.free_table.values():
++            if (block.last_accessed < lowest_timestamp or 
++                (block.last_accessed == lowest_timestamp and 
++                 block.num_hashed_tokens > highest_num_hashed_tokens)):
+                 evicted_block = block
+-                break
++                lowest_timestamp = block.last_accessed
++                highest_num_hashed_tokens = block.num_hashed_tokens
+ 
+         assert evicted_block is not None
+ 

@@ -1,0 +1,128 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 7978730..2663871 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -15,6 +15,7 @@ import importlib.metadata
+ import importlib.util
+ import inspect
+ import ipaddress
++import itertools
+ import multiprocessing
+ import os
+ import re
+@@ -327,15 +328,12 @@ class PyObjectCache:
+         self._obj_builder = obj_builder
+         self._index = 0
+ 
+-        self._obj_cache = []
+-        for _ in range(128):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache = [self._obj_builder() for _ in range(128)]
+ 
+     def _grow_cache(self):
+         # Double the size of the cache
+         num_objs = len(self._obj_cache)
+-        for _ in range(num_objs):
+-            self._obj_cache.append(self._obj_builder())
++        self._obj_cache.extend([self._obj_builder() for _ in range(num_objs)])
+ 
+     def get_object(self):
+         """Returns a pre-allocated cached object. If there is not enough
+@@ -658,10 +656,10 @@ def create_kv_caches_with_random_flash(
+     key_value_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
+     scale = head_size**-0.5
+ 
+-    key_caches: list[torch.Tensor] = []
+-    value_caches: list[torch.Tensor] = []
++    key_caches: list[torch.Tensor] = [None] * num_layers  # type: ignore
++    value_caches: list[torch.Tensor] = [None] * num_layers  # type: ignore
+ 
+-    for _ in range(num_layers):
++    for i in range(num_layers):
+         key_value_cache = torch.empty(size=key_value_cache_shape,
+                                       dtype=torch_dtype,
+                                       device=device)
+@@ -672,8 +670,8 @@ def create_kv_caches_with_random_flash(
+         else:
+             raise ValueError(
+                 f"Does not support key cache of type {cache_dtype}")
+-        key_caches.append(key_value_cache[:, 0])
+-        value_caches.append(key_value_cache[:, 1])
++        key_caches[i] = key_value_cache[:, 0]
++        value_caches[i] = key_value_cache[:, 1]
+     return key_caches, value_caches
+ 
+ 
+@@ -699,10 +697,10 @@ def create_kv_caches_with_random(
+     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+ 
+     scale = head_size**-0.5
+-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
++    x = 16 // get_dtype_size(torch_dtype)
+     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+-    key_caches: list[torch.Tensor] = []
+-    for _ in range(num_layers):
++    key_caches: list[torch.Tensor] = [None] * num_layers  # type: ignore
++    for i in range(num_layers):
+         key_cache = torch.empty(size=key_cache_shape,
+                                 dtype=torch_dtype,
+                                 device=device)
+@@ -713,11 +711,11 @@ def create_kv_caches_with_random(
+         else:
+             raise ValueError(
+                 f"Does not support key cache of type {cache_dtype}")
+-        key_caches.append(key_cache)
++        key_caches[i] = key_cache
+ 
+     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
+-    value_caches: list[torch.Tensor] = []
+-    for _ in range(num_layers):
++    value_caches: list[torch.Tensor] = [None] * num_layers  # type: ignore
++    for i in range(num_layers):
+         value_cache = torch.empty(size=value_cache_shape,
+                                   dtype=torch_dtype,
+                                   device=device)
+@@ -728,7 +726,7 @@ def create_kv_caches_with_random(
+         else:
+             raise ValueError(
+                 f"Does not support value cache of type {cache_dtype}")
+-        value_caches.append(value_cache)
++        value_caches[i] = value_cache
+     return key_caches, value_caches
+ 
+ 
+@@ -778,10 +776,13 @@ def make_ndarray_with_pad(
+         # Unlike for most functions, map is faster than a genexpr over `len`
+         max_len = max(map(len, x), default=0)
+ 
+-    padded_x = np.full((len(x), max_len), pad, dtype=dtype)
+-    for ind, blocktb in enumerate(x):
+-        assert len(blocktb) <= max_len
+-        padded_x[ind, :len(blocktb)] = blocktb
++    num_rows = len(x)
++    padded_x = np.full((num_rows, max_len), pad, dtype=dtype)
++    for ind in range(num_rows):
++        blocktb = x[ind]
++        blocktb_len = len(blocktb)
++        assert blocktb_len <= max_len
++        padded_x[ind, :blocktb_len] = blocktb
+ 
+     return padded_x
+ 
+@@ -822,6 +823,7 @@ def async_tensor_h2d(
+     return t.to(device=target_device, non_blocking=True)
+ 
+ 
++@lru_cache(maxsize=32)
+ def get_dtype_size(dtype: torch.dtype) -> int:
+     """Get the size of the data type in bytes."""
+     return torch.tensor([], dtype=dtype).element_size()
+@@ -847,7 +849,7 @@ def is_list_of(
+ 
+ def flatten_2d_lists(lists: Iterable[Iterable[T]]) -> list[T]:
+     """Flatten a list of lists to a single list."""
+-    return [item for sublist in lists for item in sublist]
++    return list(itertools.chain.from_iterable(lists))
+ 
+ 
+ def full_groupby(values: Iterable[_V], *, key: Callable[[_V], _K]):

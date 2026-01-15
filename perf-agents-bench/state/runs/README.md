@@ -1,59 +1,51 @@
-# Benchmark Runs Summary
+# Agent Benchmark Runs
+
+Raw agent run data from benchmark evaluations.
 
 ## Directory Structure
 
 ```
 runs/
-├── vllm/
-│   ├── trae/
-│   │   ├── gpt-5/            (303 runs)
-│   │   ├── gpt-4o/           (18 runs)
-│   │   ├── o4-mini/          (1 run)
-│   │   └── claude-sonnet-45/ (181 runs)
-│   ├── openhands/
-│   │   └── gpt-5/            (7 runs)
-│   └── codex/
-│       ├── gpt-5/            (103 runs)
-│       └── gpt-4o/           (9 runs)
-└── sglang/
-    └── trae/
-        ├── gpt-5/            (131 runs)
-        └── claude-sonnet-45/ (80 runs)
+└── vllm/
+    ├── claude_code/sonnet-4.5/    # 96 runs
+    ├── codex/gpt-5/               # 99 runs
+    ├── trae/
+    │   ├── gpt-5/                 # 70 runs
+    │   └── sonnet-4.5/            # 91 runs
+    └── _misc/                     # Legacy/experimental
 ```
 
-## Model Breakdown by Repository
+## Naming Convention
 
-### vllm (622 total runs)
+All items use standardized commit-based naming:
 
-| Agent | Model | Runs |
-|-------|-------|------|
-| trae | gpt-5 | 303 |
-| trae | gpt-4o | 18 |
-| trae | o4-mini | 1 |
-| trae | claude-sonnet-45 | 181 |
-| openhands | gpt-5 | 7 |
-| codex | gpt-5 | 103 |
-| codex | gpt-4o | 9 |
+| Repository | Format | Example |
+|------------|--------|---------|
+| vLLM | `vllm_<commit>` | `vllm_015069b0` |
+| SGLang | `sglang_<commit>` | `sglang_021f76e4` |
 
-### sglang (211 total runs)
+The 8-character commit hash uniquely identifies each optimization task.
 
-| Agent | Model | Runs |
-|-------|-------|------|
-| trae | gpt-5 | 131 |
-| trae | claude-sonnet-45 | 80 |
+## Benchmark Run Dates
 
-## Model Details
+| Agent | Model | Runs | Run Date |
+|-------|-------|------|----------|
+| Claude Code | Sonnet 4.5 | 96 | 2025-12-22 |
+| Codex | GPT-5 | 99 | 2025-11-20 |
+| TRAE | GPT-5 | 70 | 2025-12-26 |
+| TRAE | Sonnet 4.5 | 91 | 2025-12-23 |
 
-| Model ID | Provider | Full Model Name |
-|----------|----------|-----------------|
-| gpt-5 | openai | gpt-5-2025-08-07 |
-| gpt-4o | openai | gpt-4o |
-| o4-mini | openai | o4-mini |
-| claude-sonnet-45 | bedrock | us.anthropic.claude-sonnet-4-5-20250929-v1:0 |
+## Per-Run Files
 
-## Notes
+| File | Description |
+|------|-------------|
+| `run_summary.json` | Execution metadata, status |
+| `trajectory.json` | Full agent interaction history |
+| `model_patch.diff` | Generated code changes |
+| `journal.json` | Task config, commit hashes |
+| `task.txt` | Original task prompt |
 
-- Model information extracted from `trajectory.json` (field: `model`) or `prediction.jsonl` (field: `model_name_or_path`)
-- Incomplete runs (missing journal.json or model_patch.diff) are stored in `../incomplete_runs/`
-- Directory structure: `{repo}/{agent}/{model}/{timestamp}/{task_id}/`
-- Total runs: 833 (622 vllm + 211 sglang)
+## See Also
+
+- [SOFT_METRICS_ANALYSIS.md](../../SOFT_METRICS_ANALYSIS.md) - Benchmark results
+- `../analysis/` - Soft metrics analysis outputs

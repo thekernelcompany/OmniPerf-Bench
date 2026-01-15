@@ -1,0 +1,126 @@
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index 5904ad1f1..1edaeae06 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -198,7 +198,7 @@ class Qwen2_5_VisionMLP(nn.Module):
+ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
+     """All-gather the input tensor interleavely across model parallel group."""
+     import torch.distributed as dist
+-    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(tp_size)]
++    gathered_tensors = [torch.empty_like(local_tensor) for _ in range(tp_size)]
+     dist.all_gather(gathered_tensors,
+                     local_tensor,
+                     group=parallel_state.get_tp_group().device_group)
+@@ -569,23 +569,29 @@ class Qwen2_5_VisionTransformer(nn.Module):
+ 
+     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+         pos_ids = []
++        device = grid_thw.device
+         for t, h, w in grid_thw:
+-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
++            h_val, w_val = int(h), int(w)
++            # Use arange with device specified to avoid device transfers
++            hpos_ids = torch.arange(h_val, device=device).unsqueeze(1).expand(-1, w_val)
++            wpos_ids = torch.arange(w_val, device=device).unsqueeze(0).expand(h_val, -1)
+             hpos_ids = hpos_ids.reshape(
+-                h // self.spatial_merge_size,
++                h_val // self.spatial_merge_size,
+                 self.spatial_merge_size,
+-                w // self.spatial_merge_size,
++                w_val // self.spatial_merge_size,
+                 self.spatial_merge_size,
+             ).permute(0, 2, 1, 3).flatten()
+             wpos_ids = wpos_ids.reshape(
+-                h // self.spatial_merge_size,
++                h_val // self.spatial_merge_size,
+                 self.spatial_merge_size,
+-                w // self.spatial_merge_size,
++                w_val // self.spatial_merge_size,
+                 self.spatial_merge_size,
+             ).permute(0, 2, 1, 3).flatten()
+-            pos_ids.append(
+-                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
++            # Stack and repeat in one operation
++            stacked_ids = torch.stack([hpos_ids, wpos_ids], dim=-1)
++            if t > 1:
++                stacked_ids = stacked_ids.repeat(int(t), 1)
++            pos_ids.append(stacked_ids)
+         pos_ids = torch.cat(pos_ids, dim=0)
+         max_grid_size = grid_thw[:, 1:].max()
+         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+@@ -593,39 +599,47 @@ class Qwen2_5_VisionTransformer(nn.Module):
+         return rotary_pos_emb
+ 
+     def get_window_index(self, grid_thw):
+-        window_index: list = []
+-        cu_window_seqlens: list = [0]
++        window_index_list: list = []
++        cu_window_seqlens_list: list = []
+         window_index_id = 0
+         vit_merger_window_size = (self.window_size //
+                                   self.spatial_merge_size // self.patch_size)
++        device = grid_thw.device
++        cu_offset = 0
+ 
+         for grid_t, grid_h, grid_w in grid_thw:
+-            llm_grid_h = grid_h // self.spatial_merge_size
+-            llm_grid_w = grid_w // self.spatial_merge_size
+-            index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
+-                grid_t, llm_grid_h, llm_grid_w)
++            llm_grid_h = int(grid_h) // self.spatial_merge_size
++            llm_grid_w = int(grid_w) // self.spatial_merge_size
++            grid_t_val = int(grid_t)
++            total_elements = grid_t_val * llm_grid_h * llm_grid_w
++            index = torch.arange(total_elements, device=device).reshape(
++                grid_t_val, llm_grid_h, llm_grid_w)
+             pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+             pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+             num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+             num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+             index_padded = F.pad(index, (0, pad_w, 0, pad_h), 'constant', -100)
+-            index_padded = index_padded.reshape(grid_t, num_windows_h,
++            index_padded = index_padded.reshape(grid_t_val, num_windows_h,
+                                                 vit_merger_window_size,
+                                                 num_windows_w,
+                                                 vit_merger_window_size)
+             index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
+-                grid_t, num_windows_h * num_windows_w, vit_merger_window_size,
++                grid_t_val, num_windows_h * num_windows_w, vit_merger_window_size,
+                 vit_merger_window_size)
+             seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+             index_padded = index_padded.reshape(-1)
+             index_new = index_padded[index_padded != -100]
+-            window_index.append(index_new + window_index_id)
+-            cu_seqlens_tmp = seqlens.cumsum(
+-                0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+-            cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+-            window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
+-        window_index = torch.cat(window_index, dim=0)
+-        return window_index, cu_window_seqlens
++            window_index_list.append(index_new + window_index_id)
++            cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit + cu_offset
++            cu_window_seqlens_list.append(cu_seqlens_tmp)
++            cu_offset = cu_seqlens_tmp[-1].item()
++            window_index_id += total_elements
++
++        window_index = torch.cat(window_index_list, dim=0)
++        cu_window_seqlens_tensor = torch.cat(cu_window_seqlens_list, dim=0)
++        # Prepend 0 to match expected format
++        cu_window_seqlens_list = [0] + cu_window_seqlens_tensor.tolist()
++        return window_index, cu_window_seqlens_list
+ 
+     def compute_attn_mask_seqlen(
+         self,
+@@ -848,9 +862,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
+                 raise ValueError(f"{name} should be 2D or batched 3D tensor. "
+                                  f"Got ndim: {mm_input.ndim} "
+                                  f"(shape={mm_input.shape})")
+-            return torch.concat(list(mm_input))
++            return torch.cat([mm_input[i] for i in range(mm_input.shape[0])], dim=0)
+         else:
+-            return torch.concat(mm_input)
++            return torch.cat(mm_input, dim=0)
+ 
+     def _parse_and_validate_image_input(
+             self, **kwargs: object) -> Optional[Qwen2_5_VLImageInputs]:

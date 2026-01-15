@@ -1,0 +1,133 @@
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index 0b0f52167..aa1b77424 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -531,14 +531,13 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
++                # Optimize: Use F.pad instead of creating zero tensor and cat
++                _chunk_cu_seq_lens_padded = torch.nn.functional.pad(
++                    _chunk_cu_seq_lens, (1, 0), value=0)
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=_chunk_cu_seq_lens_padded,
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -861,6 +860,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         assert prefill_metadata.chunked_context is not None
+ 
+         output = None
++        output_lse = None
++        # Preallocate buffers for merge operation to avoid repeated allocations
++        output_tmp = None
++        output_lse_tmp = None
++        # Preallocate buffers for concatenated k tensor
++        k_buffer = None
++        v_padded_buffer = None
+         iters = len(prefill_metadata.chunked_context.seq_tot)
+         workspace = prefill_metadata.chunked_context.workspace
+ 
+@@ -886,14 +892,33 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+             k_nope, v = kv_nope\
+                 .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+ 
+-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))),
+-                          dim=-1)
++            # Optimize: Preallocate k buffer on first iteration
++            k_pe_expanded = k_pe.expand((*k_nope.shape[:-1], -1))
++            qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
++            if k_buffer is None or k_buffer.shape[0] != toks:
++                k_buffer = torch.empty(
++                    (toks, self.num_heads, qk_head_dim),
++                    dtype=k_nope.dtype,
++                    device=k_nope.device
++                )
++            k_buffer[:toks, :, :self.qk_nope_head_dim] = k_nope
++            k_buffer[:toks, :, self.qk_nope_head_dim:] = k_pe_expanded
++            k = k_buffer[:toks]
+ 
+             # For MLA the v head dim is smaller than qk head dim so we pad
+             # out v with 0s to match the qk head dim
+-            v_padded = torch.nn.functional.pad(v,
+-                                               [0, q.shape[-1] - v.shape[-1]],
+-                                               value=0)
++            # Optimize: Preallocate v_padded buffer on first iteration
++            if v_padded_buffer is None or v_padded_buffer.shape[0] != toks:
++                v_padded_buffer = torch.empty(
++                    (toks, self.num_heads, q.shape[-1]),
++                    dtype=v.dtype,
++                    device=v.device
++                )
++            # Zero the padding region and copy v
++            v_padded_buffer[:toks, :, :v.shape[-1]] = v
++            if v.shape[-1] < q.shape[-1]:
++                v_padded_buffer[:toks, :, v.shape[-1]:].zero_()
++            v_padded = v_padded_buffer[:toks]
+ 
+             attn_output, attn_softmax_lse = self.flash_attn_varlen_func(
+                 q=q,
+@@ -912,8 +937,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                # Reuse preallocated buffers or create them on first merge
++                if output_tmp is None:
++                    output_tmp = torch.empty_like(output)
++                    output_lse_tmp = torch.empty_like(output_lse)
+                 merge_attn_states(
+                     output=output_tmp,
+                     output_lse=output_lse_tmp,
+@@ -922,8 +949,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                # Swap buffers instead of copying
++                output, output_tmp = output_tmp, output
++                output_lse, output_lse_tmp = output_lse_tmp, output_lse
+ 
+         return output, output_lse
+ 
+@@ -943,12 +971,28 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         k_nope, v = kv_nope\
+             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+ 
+-        k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
++        # Optimize: Use tensor slicing instead of cat to reduce allocations
++        k_pe_expanded = k_pe.expand((*k_nope.shape[:-1], -1))
++        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
++        k = torch.empty(
++            (*k_nope.shape[:-1], qk_head_dim),
++            dtype=k_nope.dtype,
++            device=k_nope.device
++        )
++        k[..., :self.qk_nope_head_dim] = k_nope
++        k[..., self.qk_nope_head_dim:] = k_pe_expanded
+ 
+         # For MLA the v head dim is smaller than qk head dim so we pad out
+         # v with 0s to match the qk head dim
+-        v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
+-                                           value=0)
++        # Optimize: Use torch.empty and slicing instead of pad
++        v_padded = torch.empty(
++            (*v.shape[:-1], q.shape[-1]),
++            dtype=v.dtype,
++            device=v.device
++        )
++        v_padded[..., :v.shape[-1]] = v
++        if v.shape[-1] < q.shape[-1]:
++            v_padded[..., v.shape[-1]:].zero_()
+ 
+         output = self.flash_attn_varlen_func(
+             q=q,

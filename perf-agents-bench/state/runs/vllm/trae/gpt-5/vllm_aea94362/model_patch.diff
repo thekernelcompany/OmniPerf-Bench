@@ -1,0 +1,161 @@
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 14e4134..8cf8b4a 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -2,6 +2,7 @@
+ # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+ import re
+ import time
++from functools import lru_cache
+ from argparse import Namespace
+ from typing import Any, Dict, List, Literal, Optional, Union
+ 
+@@ -46,15 +47,17 @@ class OpenAIBaseModel(BaseModel):
+     @classmethod
+     def __log_extra_fields__(cls, data):
+         if isinstance(data, dict):
+-            # Get all class field names and their potential aliases
+-            field_names = set()
+-            for field_name, field in cls.model_fields.items():
+-                field_names.add(field_name)
+-                if hasattr(field, 'alias') and field.alias:
+-                    field_names.add(field.alias)
+-
+-            # Compare against both field names and aliases
+-            extra_fields = data.keys() - field_names
++            # Cache field names and aliases per-model to avoid recomputation
++            names = getattr(cls, "_field_names_cache", None)
++            if names is None:
++                names = set(cls.model_fields.keys())
++                for field in cls.model_fields.values():
++                    alias = getattr(field, 'alias', None)
++                    if alias:
++                        names.add(alias)
++                setattr(cls, "_field_names_cache", names)
++
++            extra_fields = data.keys() - names
+             if extra_fields:
+                 logger.warning(
+                     "The following fields were present in the request "
+@@ -166,28 +169,37 @@ class LogitsProcessorConstructor(BaseModel):
+ LogitsProcessors = List[Union[str, LogitsProcessorConstructor]]
+ 
+ 
++
++@lru_cache(maxsize=128)
++def _get_compiled_pattern(pattern: str):
++    return re.compile(pattern)
++
++
+ def get_logits_processors(processors: Optional[LogitsProcessors],
+                           pattern: Optional[str]) -> Optional[List[Any]]:
+-    if processors and pattern:
++    compiled = _get_compiled_pattern(pattern) if pattern else None
++    if processors and compiled:
+         logits_processors = []
++        append_lp = logits_processors.append
++        resolve = resolve_obj_by_qualname
+         for processor in processors:
+-            qualname = processor if isinstance(processor,
+-                                               str) else processor.qualname
+-            if not re.match(pattern, qualname):
++            qualname = processor if isinstance(processor, str) else processor.qualname
++            if not compiled.match(qualname):
+                 raise ValueError(
+                     f"Logits processor '{qualname}' is not allowed by this "
+                     "server. See --logits-processor-pattern engine argument "
+                     "for more information.")
+             try:
+-                logits_processor = resolve_obj_by_qualname(qualname)
++                logits_processor = resolve(qualname)
+             except Exception as e:
+                 raise ValueError(
+                     f"Logits processor '{qualname}' could not be resolved: {e}"
+                 ) from e
+             if isinstance(processor, LogitsProcessorConstructor):
+-                logits_processor = logits_processor(*processor.args or [],
+-                                                    **processor.kwargs or {})
+-            logits_processors.append(logits_processor)
++                args = processor.args or []
++                kwargs = processor.kwargs or {}
++                logits_processor = logits_processor(*args, **kwargs)
++            append_lp(logits_processor)
+         return logits_processors
+     elif processors:
+         raise ValueError(
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1e68326..690753c 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -480,9 +480,12 @@ environment_variables: Dict[str, Callable[[], Any]] = {
+ 
+ 
+ def __getattr__(name: str):
+-    # lazy evaluation of environment variables
++    # lazy evaluation of environment variables with caching to avoid repeated env lookups
+     if name in environment_variables:
+-        return environment_variables[name]()
++        value = environment_variables[name]()
++        # Cache the computed value to speed up subsequent attribute access
++        globals()[name] = value
++        return value
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index b4d3e44..5124779 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -208,7 +208,10 @@ class AsyncLLM(EngineClient):
+             while True:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() if q.qsize() > 0 else await q.get()
++                try:
++                    out = q.get_nowait()
++                except asyncio.QueueEmpty:
++                    out = await q.get()
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 749f4f5..a8f8c87 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -11,7 +11,7 @@ from vllm.v1.engine.detokenizer import (DetokenizerOutput,
+ from vllm.v1.metrics.stats import IterationStats
+ 
+ 
+-@dataclass
++@dataclass(slots=True)
+ class OutputProcessorOutput:
+ 
+     request_outputs: List[RequestOutput]
+@@ -21,6 +21,8 @@ class OutputProcessorOutput:
+ 
+ class RequestState:
+ 
++    __slots__ = ("request_id", "prompt", "prompt_token_ids", "prompt_len", "detokenizer", "is_prefilling", "queue")
++
+     def __init__(
+         self,
+         request_id: str,
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 4545016..e397607 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -15,6 +15,14 @@ if TYPE_CHECKING:
+ 
+ class Request:
+ 
++    __slots__ = (
++        "request_id", "sampling_params", "eos_token_id", "metrics",
++        "lora_request", "status", "stop_reason", "max_tokens", "prompt",
++        "prompt_token_ids", "num_prompt_tokens", "_output_token_ids",
++        "_all_token_ids", "num_computed_tokens", "mm_positions",
++        "mm_inputs", "mm_hashes", "_kv_block_hashes",
++    )
++
+     def __init__(
+         self,
+         request_id: str,

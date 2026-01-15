@@ -1,0 +1,156 @@
+diff --git a/tests/basic_correctness/test_chunked_prefill.py b/tests/basic_correctness/test_chunked_prefill.py
+index fc6f829c3..f4bc57c55 100644
+--- a/tests/basic_correctness/test_chunked_prefill.py
++++ b/tests/basic_correctness/test_chunked_prefill.py
+@@ -189,7 +189,8 @@ def test_with_prefix_caching(
+     full_prompts = [f"{common_prompt}\n{p}" for p in unique_prompts]
+ 
+     max_num_batched_tokens = max_num_seqs = chunk_size
+-    outputs = {}  # type: ignore
++    # Optimize: Pre-allocate dict to avoid resize
++    outputs = {True: [], False: []}  # type: ignore
+     check_result = True
+     for enable in (True, False):
+         with vllm_runner(
+@@ -207,12 +208,12 @@ def test_with_prefix_caching(
+             # size is not a multiple of block size (16).
+             should_fail = chunk_size % 16 != 0 and enable
+             check_result &= not should_fail
+-            outputs[enable] = []
+             # Send the request one-by-one to ensure the cache is populated.
+             with pytest.raises(ValueError) if should_fail else nullcontext():
+                 for prompt in full_prompts:
+-                    outputs[enable] += vllm_model.generate_greedy([prompt],
+-                                                                  max_tokens)
++                    # Optimize: Use extend instead of += to avoid intermediate list
++                    outputs[enable].extend(vllm_model.generate_greedy([prompt],
++                                                                       max_tokens))
+ 
+     # Check results only if we did not expect a failure.
+     if check_result:
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4c2f71582..869b0953c 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -935,14 +935,12 @@ class Scheduler:
+         # Update waiting requests.
+         self.waiting.extendleft(running_scheduled.preempted)
+         # Update new running requests.
+-        if len(prefills.seq_groups) > 0:
+-            self.running.extend([s.seq_group for s in prefills.seq_groups])
++        # Optimize: Use generator expressions to avoid intermediate list allocation
++        self.running.extend(s.seq_group for s in prefills.seq_groups)
+ 
+         self.running.extend(running_scheduled.decode_seq_groups_list)
+ 
+-        if len(swapped_in.decode_seq_groups) > 0:
+-            self.running.extend(
+-                [s.seq_group for s in swapped_in.decode_seq_groups])
++        self.running.extend(s.seq_group for s in swapped_in.decode_seq_groups)
+ 
+         # Update swapped requests.
+         self.swapped.extend(running_scheduled.swapped_out)
+@@ -954,18 +952,18 @@ class Scheduler:
+         assert len(running_scheduled.prefill_seq_groups) == 0
+         assert len(swapped_in.prefill_seq_groups) == 0
+ 
+-        # Merge lists
++        # Optimize: Build scheduled_seq_groups using extend to avoid extra allocation
+         num_prefill_groups = len(prefills.seq_groups)
+-        if num_prefill_groups > 0:
+-            scheduled_seq_groups = prefills.seq_groups
+-            scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
+-        else:
+-            scheduled_seq_groups = running_scheduled.decode_seq_groups
++        scheduled_seq_groups = []
++        scheduled_seq_groups.extend(prefills.seq_groups)
++        scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
+         scheduled_seq_groups.extend(swapped_in.decode_seq_groups)
+ 
++        # Optimize: Build blocks_to_copy using extend instead of concatenation
+         blocks_to_copy = running_scheduled.blocks_to_copy
+         blocks_to_copy.extend(swapped_in.blocks_to_copy)
+ 
++        # Optimize: Build ignored_seq_groups using extend instead of concatenation
+         ignored_seq_groups = prefills.ignored_seq_groups
+         ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
+ 
+@@ -1028,33 +1026,41 @@ class Scheduler:
+         # Update waiting requests.
+         self.waiting.extendleft(running_scheduled.preempted)
+         # Update new running requests.
+-        self.running.extend([s.seq_group for s in prefills.seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in running_scheduled.decode_seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in running_scheduled.prefill_seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in swapped_in.decode_seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in swapped_in.prefill_seq_groups])
++        # Optimize: Use generator expressions and cached lists to reduce allocations
++        self.running.extend(s.seq_group for s in prefills.seq_groups)
++        self.running.extend(running_scheduled.decode_seq_groups_list)
++        self.running.extend(running_scheduled.prefill_seq_groups_list)
++        self.running.extend(s.seq_group for s in swapped_in.decode_seq_groups)
++        self.running.extend(s.seq_group for s in swapped_in.prefill_seq_groups)
+         # Update swapped requests.
+         self.swapped.extend(running_scheduled.swapped_out)
++
++        # Optimize: Build scheduled_seq_groups using extend instead of concatenation
++        scheduled_seq_groups = []
++        scheduled_seq_groups.extend(prefills.seq_groups)
++        scheduled_seq_groups.extend(running_scheduled.prefill_seq_groups)
++        scheduled_seq_groups.extend(swapped_in.prefill_seq_groups)
++        scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
++        scheduled_seq_groups.extend(swapped_in.decode_seq_groups)
++
++        # Optimize: Build blocks_to_copy using extend instead of concatenation
++        blocks_to_copy = running_scheduled.blocks_to_copy
++        blocks_to_copy.extend(swapped_in.blocks_to_copy)
++
++        # Optimize: Build ignored_seq_groups using extend instead of concatenation
++        ignored_seq_groups = prefills.ignored_seq_groups
++        ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
++
+         return SchedulerOutputs(
+-            scheduled_seq_groups=(prefills.seq_groups +
+-                                  running_scheduled.prefill_seq_groups +
+-                                  swapped_in.prefill_seq_groups +
+-                                  running_scheduled.decode_seq_groups +
+-                                  swapped_in.decode_seq_groups),
++            scheduled_seq_groups=scheduled_seq_groups,
+             num_prefill_groups=(len(prefills.seq_groups) +
+                                 len(swapped_in.prefill_seq_groups) +
+                                 len(running_scheduled.prefill_seq_groups)),
+             num_batched_tokens=budget.num_batched_tokens,
+             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
+             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
+-            blocks_to_copy=running_scheduled.blocks_to_copy +
+-            swapped_in.blocks_to_copy,
+-            ignored_seq_groups=prefills.ignored_seq_groups +
+-            swapped_in.infeasible_seq_groups,
++            blocks_to_copy=blocks_to_copy,
++            ignored_seq_groups=ignored_seq_groups,
+             num_lookahead_slots=running_scheduled.num_lookahead_slots,
+             running_queue_size=len(self.running),
+             preempted=(len(running_scheduled.preempted) +
+@@ -1119,13 +1125,11 @@ class Scheduler:
+ 
+             seq_group_metadata = self._seq_group_metadata_cache[
+                 self.cache_id].get_object()
+-            seq_group_metadata.seq_data.clear()
+-            seq_group_metadata.block_tables.clear()
+-
+-            # seq_id -> SequenceData
+-            seq_data: Dict[int, SequenceData] = {}
+-            # seq_id -> physical block numbers
+-            block_tables: Dict[int, List[int]] = {}
++            # Optimize: Reuse existing dicts instead of clearing and recreating
++            seq_data = seq_group_metadata.seq_data
++            seq_data.clear()
++            block_tables = seq_group_metadata.block_tables
++            block_tables.clear()
+ 
+             if seq_group.is_encoder_decoder():
+                 # Encoder associated with SequenceGroup

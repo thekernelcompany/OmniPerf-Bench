@@ -577,6 +577,7 @@ def analyze(
     repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Filter by repo (vllm, sglang)"),
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Filter by agent (trae, codex, openhands)"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Filter by model name"),
+    timestamp: Optional[str] = typer.Option(None, "--timestamp", "-t", help="Filter by timestamp (e.g., 2025-12-22_21-40-38)"),
     skip_llm: bool = typer.Option(False, "--skip-llm", help="Skip LLM analysis (quantitative only)"),
     cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Cache directory for LLM responses"),
     max_concurrent: int = typer.Option(3, "--max-concurrent", help="Maximum concurrent analyses"),
@@ -661,6 +662,7 @@ def analyze(
             repo_filter=repo,
             agent_filter=agent,
             model_filter=model,
+            timestamp_filter=timestamp,
         )
 
         if not item_dirs:

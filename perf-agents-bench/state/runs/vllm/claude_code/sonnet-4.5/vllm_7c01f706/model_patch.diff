@@ -1,0 +1,170 @@
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 13746cef2..5dc15d00e 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -129,10 +129,15 @@ class SequenceData:
+         # The number of tokens that are computed (that run against the model).
+         self._num_computed_tokens = 0
+         self._stage: SequenceStage = SequenceStage.PREFILL
++        # Cache for concatenated token ids
++        self._cached_token_ids: Optional[List[int]] = None
++        self._cached_token_ids_len = 0
+ 
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self.output_token_ids.append(token_id)
+         self.cumulative_logprob += logprob
++        # Invalidate cache
++        self._cached_token_ids = None
+ 
+     def get_len(self) -> int:
+         return len(self.output_token_ids) + len(self.prompt_token_ids)
+@@ -144,7 +149,12 @@ class SequenceData:
+         return len(self.output_token_ids)
+ 
+     def get_token_ids(self) -> List[int]:
+-        return self.prompt_token_ids + self.output_token_ids
++        # Cache the concatenated list to avoid repeated allocations
++        current_len = len(self.prompt_token_ids) + len(self.output_token_ids)
++        if self._cached_token_ids is None or self._cached_token_ids_len != current_len:
++            self._cached_token_ids = self.prompt_token_ids + self.output_token_ids
++            self._cached_token_ids_len = current_len
++        return self._cached_token_ids
+ 
+     def get_prefix_token_ids(
+             self, num_tokens: int
+@@ -152,9 +162,14 @@ class SequenceData:
+         """Get prefix tokens, and make the return value hashable"""
+         prompt_length = len(self.prompt_token_ids)
+         if num_tokens > prompt_length:
++            # Only create tuple for output tokens that are needed
++            output_end = num_tokens - prompt_length
+             return (self._prompt_token_ids_tuple,
+-                    tuple(self.output_token_ids[:num_tokens - prompt_length]))
++                    tuple(self.output_token_ids[:output_end]))
+         else:
++            # Reuse cached tuple when possible
++            if num_tokens == prompt_length:
++                return (self._prompt_token_ids_tuple, None)
+             return (self._prompt_token_ids_tuple[:num_tokens], None)
+ 
+     def get_num_computed_tokens(self) -> int:
+@@ -177,6 +192,8 @@ class SequenceData:
+         """
+         self._num_computed_tokens = 0
+         self._stage = SequenceStage.PREFILL
++        # Invalidate cache
++        self._cached_token_ids = None
+ 
+     def get_num_uncomputed_tokens(self) -> int:
+         """Return the number of prefill tokens that are not computed."""
+@@ -500,9 +517,14 @@ class SequenceGroup:
+         self,
+         status: Optional[SequenceStatus] = None,
+     ) -> List[Sequence]:
+-        return list(self.seqs_dict.values()) if status is None else [
+-            seq for seq in self.seqs_dict.values() if seq.status == status
+-        ]
++        if status is None:
++            return list(self.seqs_dict.values())
++        # Optimized list comprehension - avoid creating intermediate list
++        result = []
++        for seq in self.seqs_dict.values():
++            if seq.status == status:
++                result.append(seq)
++        return result
+ 
+     def is_encoder_decoder(self) -> bool:
+         return self.encoder_seq is not None
+@@ -511,22 +533,33 @@ class SequenceGroup:
+         return self.encoder_seq
+ 
+     def get_unfinished_seqs(self) -> List[Sequence]:
+-        return [
+-            seq for seq in self.seqs_dict.values() if not seq.is_finished()
+-        ]
++        # Optimized to avoid list comprehension overhead
++        result = []
++        for seq in self.seqs_dict.values():
++            if not seq.is_finished():
++                result.append(seq)
++        return result
+ 
+     def get_finished_seqs(self) -> List[Sequence]:
+-        return [seq for seq in self.seqs_dict.values() if seq.is_finished()]
++        # Optimized to avoid list comprehension overhead
++        result = []
++        for seq in self.seqs_dict.values():
++            if seq.is_finished():
++                result.append(seq)
++        return result
+ 
+     def update_num_computed_tokens(self, num_new_computed_tokens: int):
+         """Update number of tokens computed so far."""
++        # Optimized: avoid repeated attribute lookups
+         for seq in self.seqs_dict.values():
+             if not seq.is_finished():
+-                seq.data.update_num_computed_tokens(num_new_computed_tokens)
++                seq_data = seq.data
++                seq_data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+     def get_num_uncomputed_tokens(self) -> int:
++        # Optimized: iterate dict values directly, avoid get_seqs() call
+         num_uncomputed_tokens = 0
+-        for seq in self.get_seqs():
++        for seq in self.seqs_dict.values():
+             if not seq.is_finished():
+                 num_uncomputed_tokens += seq.data.get_num_uncomputed_tokens()
+         return num_uncomputed_tokens
+@@ -540,10 +573,20 @@ class SequenceGroup:
+         return len(self.get_seqs(status))
+ 
+     def num_unfinished_seqs(self) -> int:
+-        return len(self.get_unfinished_seqs())
++        # Avoid creating intermediate list - just count
++        count = 0
++        for seq in self.seqs_dict.values():
++            if not seq.is_finished():
++                count += 1
++        return count
+ 
+     def num_finished_seqs(self) -> int:
+-        return len(self.get_finished_seqs())
++        # Avoid creating intermediate list - just count
++        count = 0
++        for seq in self.seqs_dict.values():
++            if seq.is_finished():
++                count += 1
++        return count
+ 
+     def find(self, seq_id: int) -> Sequence:
+         if seq_id not in self.seqs_dict:
+@@ -561,11 +604,16 @@ class SequenceGroup:
+         del self.seqs_dict[seq_id]
+ 
+     def is_finished(self) -> bool:
+-        return all(seq.is_finished() for seq in self.get_seqs())
++        # Optimized: iterate dict values directly, short-circuit on first unfinished
++        for seq in self.seqs_dict.values():
++            if not seq.is_finished():
++                return False
++        return True
+ 
+     def is_prefill(self) -> bool:
+         # Every sequence should be in the same stage.
+-        return self.get_seqs()[0].is_prefill()
++        # Optimized: get first value directly without creating a list
++        return next(iter(self.seqs_dict.values())).is_prefill()
+ 
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
+@@ -857,7 +905,9 @@ class HiddenStates:
+         seq_ids = get_all_seq_ids(seq_group_metadata_list)
+         if seq_ids != self.seq_ids:
+             # Batch contents changed - prune removed sequences.
+-            index = [self.seq_ids.index(seq_id) for seq_id in seq_ids]
++            # Optimized: use list comprehension with single pass
++            seq_ids_index_map = {seq_id: i for i, seq_id in enumerate(self.seq_ids)}
++            index = [seq_ids_index_map[seq_id] for seq_id in seq_ids]
+             self.hidden_states = self.hidden_states[index]
+             self.seq_ids = seq_ids
+ 

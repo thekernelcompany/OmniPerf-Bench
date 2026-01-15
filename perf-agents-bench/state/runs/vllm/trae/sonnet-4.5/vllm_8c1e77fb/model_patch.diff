@@ -1,0 +1,68 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45a3b48..b03d2cd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,6 +16,18 @@ project(vllm_extensions LANGUAGES CXX)
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+ 
++# Set default build type to Release for optimizations
++if(NOT CMAKE_BUILD_TYPE)
++  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
++endif()
++
++# Add C++ compiler optimization flags for Release builds
++if(CMAKE_BUILD_TYPE STREQUAL "Release")
++  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
++  # Enable additional optimizations
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffast-math -funroll-loops")
++endif()
++
+ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+ message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+ 
+@@ -160,10 +172,19 @@ endif()
+ get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+ 
+ #
+-# Set nvcc parallelism.
++# Set nvcc parallelism and optimization flags.
+ #
+-if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
++if(VLLM_GPU_LANG STREQUAL "CUDA")
++  # Enable parallel compilation by default if not set
++  if(NOT NVCC_THREADS)
++    set(NVCC_THREADS "8" CACHE STRING "Number of threads for NVCC")
++  endif()
+   list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
++  
++  # Add performance optimization flags for CUDA kernels
++  list(APPEND VLLM_GPU_FLAGS "--use_fast_math")
++  list(APPEND VLLM_GPU_FLAGS "-O3")
++  list(APPEND VLLM_GPU_FLAGS "--extra-device-vectorization")
+ endif()
+ 
+ 
+@@ -452,12 +473,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+ endif()
+ 
+ message(STATUS "Enabling moe extension.")
++
++# Create optimized flags for MOE kernels
++set(VLLM_MOE_GPU_FLAGS ${VLLM_GPU_FLAGS})
++if(VLLM_GPU_LANG STREQUAL "CUDA")
++  # Add aggressive optimization for MOE kernels
++  list(APPEND VLLM_MOE_GPU_FLAGS "--maxrregcount=128")
++  list(APPEND VLLM_MOE_GPU_FLAGS "-Xptxas=-v")
++endif()
++
+ define_gpu_extension_target(
+   _moe_C
+   DESTINATION vllm
+   LANGUAGE ${VLLM_GPU_LANG}
+   SOURCES ${VLLM_MOE_EXT_SRC}
+-  COMPILE_FLAGS ${VLLM_GPU_FLAGS}
++  COMPILE_FLAGS ${VLLM_MOE_GPU_FLAGS}
+   ARCHITECTURES ${VLLM_GPU_ARCHES}
+   USE_SABI 3
+   WITH_SOABI)

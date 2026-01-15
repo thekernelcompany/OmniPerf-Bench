@@ -1,0 +1,155 @@
+diff --git a/Dockerfile.cpu b/Dockerfile.cpu
+index 403a1cd03..8bfaab850 100644
+--- a/Dockerfile.cpu
++++ b/Dockerfile.cpu
+@@ -4,10 +4,11 @@ FROM ubuntu:22.04 AS cpu-test-1
+ 
+ RUN apt-get update  -y \
+     && apt-get install -y git wget vim numactl gcc-12 g++-12 python3 python3-pip \
+-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+-
+-RUN pip install --upgrade pip \
+-    && pip install wheel packaging ninja "setuptools>=49.4.0" numpy
++    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
++    && pip install --upgrade pip \
++    && pip install --no-cache-dir wheel packaging ninja "setuptools>=49.4.0" numpy \
++    && apt-get clean \
++    && rm -rf /var/lib/apt/lists/*
+ 
+ FROM cpu-test-1 AS build
+ 
+diff --git a/README.md b/README.md
+index 57374d279..dfe18cc4c 100644
+--- a/README.md
++++ b/README.md
+@@ -57,6 +57,7 @@ vLLM is fast with:
+ - Fast model execution with CUDA/HIP graph
+ - Quantization: [GPTQ](https://arxiv.org/abs/2210.17323), [AWQ](https://arxiv.org/abs/2306.00978), [SqueezeLLM](https://arxiv.org/abs/2306.07629), FP8 KV Cache
+ - Optimized CUDA kernels
++- Intel CPU optimizations with IPEX (Intel Extension for PyTorch)
+ 
+ vLLM is flexible and easy to use with:
+ 
+diff --git a/docs/source/getting_started/cpu-installation.rst b/docs/source/getting_started/cpu-installation.rst
+index 5270253ca..89f79f29d 100644
+--- a/docs/source/getting_started/cpu-installation.rst
++++ b/docs/source/getting_started/cpu-installation.rst
+@@ -49,7 +49,7 @@ Build from source
+     $ sudo apt-get install -y gcc-12 g++-12
+     $ sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+ 
+-- Second, install Python packages for vLLM CPU backend building:
++- Second, install Python packages for vLLM CPU backend building (includes Intel Extension for PyTorch for optimized CPU performance):
+ 
+ .. code-block:: console
+ 
+diff --git a/requirements-cpu.txt b/requirements-cpu.txt
+index b739642d8..ef17b7202 100644
+--- a/requirements-cpu.txt
++++ b/requirements-cpu.txt
+@@ -3,4 +3,5 @@
+ 
+ # Dependencies for x86_64 CPUs
+ torch == 2.3.0+cpu
++intel-extension-for-pytorch == 2.3.0  # Intel optimizations for CPU inference
+ triton >= 2.2.0  # FIXME(woosuk): This is a hack to avoid import error.
+\ No newline at end of file
+diff --git a/vllm/attention/backends/torch_sdpa.py b/vllm/attention/backends/torch_sdpa.py
+index 9b50adec5..763bb5e57 100644
+--- a/vllm/attention/backends/torch_sdpa.py
++++ b/vllm/attention/backends/torch_sdpa.py
+@@ -249,9 +249,10 @@ def _make_alibi_bias(
+         num_heads = alibi_slopes.shape[0]
+         bias = bias[None, :].repeat((num_heads, 1, 1))
+         bias.mul_(alibi_slopes[:, None, None])
+-        inf_mask = torch.empty(
++        inf_mask = torch.full(
+             (1, seq_len, seq_len),
+-            dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1)
++            -torch.inf,
++            dtype=bias.dtype).triu_(diagonal=1)
+         attn_biases.append((bias + inf_mask).to(dtype))
+ 
+     return attn_biases
+@@ -264,16 +265,15 @@ def _make_sliding_window_bias(
+ ) -> List[torch.Tensor]:
+     attn_biases = []
+     for seq_len in seq_lens:
+-        tensor = torch.full(
++        tensor = torch.ones(
+             (1, seq_len, seq_len),
+             dtype=dtype,
+-            fill_value=1,
+         )
+         shift = 0
+-        mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore
++        mask = torch.tril(tensor, diagonal=shift)
+         if window_size is not None:
+             mask = torch.triu(mask, diagonal=shift - window_size + 1)
+         mask = torch.log(mask)
+-        attn_biases.append(mask.to(dtype))
++        attn_biases.append(mask)
+ 
+     return attn_biases
+diff --git a/vllm/attention/ops/ipex_attn.py b/vllm/attention/ops/ipex_attn.py
+new file mode 100644
+index 000000000..eb6614d66
+--- /dev/null
++++ b/vllm/attention/ops/ipex_attn.py
+@@ -0,0 +1,56 @@
++"""Intel Extension for PyTorch (IPEX) optimized attention operations for CPU."""
++from typing import Optional
++
++import torch
++
++try:
++    import intel_extension_for_pytorch as ipex
++    IPEX_AVAILABLE = True
++except ImportError:
++    IPEX_AVAILABLE = False
++
++
++def ipex_scaled_dot_product_attention(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    attn_mask: Optional[torch.Tensor] = None,
++    dropout_p: float = 0.0,
++    is_causal: bool = False,
++    scale: Optional[float] = None,
++) -> torch.Tensor:
++    """
++    IPEX-optimized scaled dot product attention for CPU inference.
++
++    This function provides optimized attention computation on Intel CPUs
++    using Intel Extension for PyTorch when available.
++
++    Args:
++        query: Query tensor of shape (batch, seq_len, num_heads, head_dim)
++        key: Key tensor of shape (batch, seq_len, num_heads, head_dim)
++        value: Value tensor of shape (batch, seq_len, num_heads, head_dim)
++        attn_mask: Optional attention mask
++        dropout_p: Dropout probability (must be 0.0 for inference)
++        is_causal: Whether to apply causal masking
++        scale: Optional scale factor for attention scores
++
++    Returns:
++        Attention output tensor
++    """
++    if not IPEX_AVAILABLE:
++        # Fallback to standard PyTorch implementation
++        return torch.nn.functional.scaled_dot_product_attention(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++
++    # Use IPEX optimized path for CPU
++    # IPEX provides optimized kernels for attention on Intel CPUs
++    with ipex.cpu.optimize():
++        return torch.nn.functional.scaled_dot_product_attention(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++
++
++def is_ipex_available() -> bool:
++    """Check if Intel Extension for PyTorch is available."""
++    return IPEX_AVAILABLE

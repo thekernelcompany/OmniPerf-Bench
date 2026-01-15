@@ -1,0 +1,113 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 1dea711..8fd8caf 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -140,6 +140,27 @@ def apply_top_k_top_p(
+     """
+     if k is None and p is None:
+         return logits
++
++    # Fast path for top-k only when k is uniform across the batch.
++    if k is not None and p is None:
++        # Treat k >= vocab_size as no-op.
++        vocab_size = logits.size(1)
++        k_long = k.to(torch.long)
++        if (k_long >= vocab_size).all():
++            return logits
++        # If k is a scalar or all rows share the same k, use torch.topk.
++        if k_long.numel() == 1 or (k_long.ndim == 1 and torch.all(k_long == k_long[0])):
++            kk = int(k_long.reshape(-1)[0].item())
++            if kk <= 0:
++                # All masked out.
++                logits.fill_(-float("inf"))
++                return logits
++            topk_values, topk_indices = torch.topk(logits, kk, dim=-1)
++            mask = torch.ones_like(logits, dtype=torch.bool)
++            mask.scatter_(-1, topk_indices, False)
++            logits.masked_fill_(mask, -float('inf'))
++            return logits
++
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     if k is not None:
+@@ -159,8 +180,8 @@ def apply_top_k_top_p(
+         top_p_mask[:, -1] = False
+         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+-    # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
++    # Re-sort the probabilities back to the original order (in-place in logits).
++    logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+     return logits
+ 
+ 
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 397a049..45c0519 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -153,25 +153,30 @@ class Sampler(nn.Module):
+         """
+         assert token_ids.dtype == torch.int64
+         # Find the topK values.
+-        topk_logprobs, topk_indices = torch.topk(logprobs,
+-                                                 num_logprobs,
+-                                                 dim=-1)
++        topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+ 
+-        # Get with the logprob of the prompt or sampled token.
++        # Get the logprob of the prompt or sampled token.
+         token_ids = token_ids.unsqueeze(-1)
+         token_logprobs = logprobs.gather(-1, token_ids)
+ 
+         # Compute the ranks of the actual token.
+         token_ranks = (logprobs >= token_logprobs).sum(-1)
+ 
+-        # Concatenate together with the topk.
+-        indices = torch.cat((token_ids, topk_indices), dim=1)
+-        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+-
+-        # Use int32 to reduce the tensor size.
+-        indices = indices.to(torch.int32)
+-
+-        return LogprobsTensors(indices, logprobs, token_ranks)
++        # Preallocate output tensors to avoid concatenation overhead.
++        num_rows = logprobs.size(0)
++        out_indices = torch.empty((num_rows, num_logprobs + 1),
++                                  dtype=torch.int32,
++                                  device=logprobs.device)
++        out_logprobs = torch.empty((num_rows, num_logprobs + 1),
++                                   dtype=logprobs.dtype,
++                                   device=logprobs.device)
++        # Fill first column with selected token, remaining with top-k.
++        out_indices[:, :1] = token_ids
++        out_indices[:, 1:] = topk_indices.to(torch.int32)
++        out_logprobs[:, :1] = token_logprobs
++        out_logprobs[:, 1:] = topk_logprobs
++
++        return LogprobsTensors(out_indices, out_logprobs, token_ranks)
+ 
+     def apply_penalties(
+         self,
+@@ -203,17 +208,11 @@ class Sampler(nn.Module):
+         Filters logits using adaptive probability thresholding.
+         """
+         # Convert logits to probability distribution
+-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
+-        # Reshape min_p for broadcasting
+-        adjusted_min_p = min_p.unsqueeze(1) * max_probabilities
+-        # Identify valid tokens using threshold comparison
+-        valid_token_mask = probability_values >= adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[~valid_token_mask] = -float('inf')
++        probabilities = torch.nn.functional.softmax(logits, dim=-1)
++        # Compute per-row threshold
++        threshold = min_p.unsqueeze(1) * probabilities.amax(dim=-1, keepdim=True)
++        # Mask tokens below threshold in-place
++        logits.masked_fill_(probabilities < threshold, -float('inf'))
+         return logits
+ 
+     def apply_logits_bias(

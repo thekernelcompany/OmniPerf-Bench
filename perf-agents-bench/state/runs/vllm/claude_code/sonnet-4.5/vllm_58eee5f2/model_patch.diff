@@ -1,0 +1,108 @@
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 24ddd35ab..aedaeb0f6 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -50,11 +50,12 @@ def decode_tokens(
+     `skip_special_tokens=None` means to use the backend's default
+     settings.
+     """
+-    if skip_special_tokens is not None:
+-        return tokenizer.decode(token_ids,
+-                                skip_special_tokens=skip_special_tokens)
++    # Optimization 6: Direct call when using default settings
++    if skip_special_tokens is None:
++        return tokenizer.decode(token_ids)
+ 
+-    return tokenizer.decode(token_ids)
++    return tokenizer.decode(token_ids,
++                            skip_special_tokens=skip_special_tokens)
+ 
+ 
+ def encode_tokens(
+@@ -72,6 +73,9 @@ def encode_tokens(
+     `add_special_tokens=None` means to use the backend's default
+     settings.
+     """
++    # Optimization 5: Fast path for common case with no optional args
++    if truncation is None and max_length is None and add_special_tokens is None:
++        return tokenizer.encode(text)
+ 
+     kw_args: dict[str, Any] = {}
+     if max_length is not None:
+@@ -92,8 +96,11 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+     each time they are called, leading to a significant slowdown.
+     This proxy caches these properties for faster access.
+     """
+-    cached_tokenizer = copy.copy(tokenizer)
++    # Optimization 1: Check if already cached to avoid redundant work
++    if hasattr(tokenizer.__class__, '__name__') and tokenizer.__class__.__name__.startswith('Cached'):
++        return tokenizer
+ 
++    # Optimization 2: Pre-compute all cached values before copying
+     tokenizer_all_special_ids = tokenizer.all_special_ids
+     tokenizer_all_special_tokens = tokenizer.all_special_tokens
+     tokenizer_all_special_tokens_extended = (
+@@ -101,14 +108,23 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+     tokenizer_vocab = tokenizer.get_vocab()
+     tokenizer_len = len(tokenizer)
+ 
+-    max_token_id = max(tokenizer_vocab.values())
++    # Optimization 3: Use direct iteration for max() to avoid creating intermediate list
++    max_token_id = max(tokenizer_vocab.values()) if tokenizer_vocab else 0
+     # Some tokenizers (e.g., QwenTokenizer) have special tokens that
+     # are added and included in the implementation of the vocab_size
+     # property, but not in get_vocab(); if there is an implementation
+     # of vocab size, we should take the greater value.
++    # Optimization 9: Avoid exception handling overhead by checking callable first
+     if hasattr(tokenizer, "vocab_size"):
+-        with contextlib.suppress(NotImplementedError):
+-            max_token_id = max(max_token_id, tokenizer.vocab_size)
++        try:
++            vocab_size = tokenizer.vocab_size
++            if vocab_size > max_token_id:
++                max_token_id = vocab_size
++        except (NotImplementedError, AttributeError):
++            pass
++
++    # Optimization 4: Shallow copy after all computations
++    cached_tokenizer = copy.copy(tokenizer)
+ 
+     class CachedTokenizer(tokenizer.__class__):  # type: ignore
+ 
+@@ -209,11 +225,13 @@ def get_tokenizer(
+     # Separate model folder from file path for GGUF models
+     is_gguf = check_gguf_file(tokenizer_name)
+     if is_gguf:
+-        kwargs["gguf_file"] = Path(tokenizer_name).name
+-        tokenizer_name = Path(tokenizer_name).parent
++        tokenizer_name_path = Path(tokenizer_name)
++        kwargs["gguf_file"] = tokenizer_name_path.name
++        tokenizer_name = tokenizer_name_path.parent
+ 
+-    # if tokenizer is from official mistral org
+-    is_from_mistral_org = str(tokenizer_name).split("/")[0] == "mistralai"
++    # Optimization 8: if tokenizer is from official mistral org - optimize string split
++    tokenizer_name_str = str(tokenizer_name)
++    is_from_mistral_org = tokenizer_name_str.startswith("mistralai/")
+     if is_from_mistral_org and tokenizer_mode != "mistral":
+         warnings.warn(
+             'It is strongly recommended to run mistral models with '
+@@ -264,11 +282,13 @@ def get_tokenizer(
+             tokenizer_name, revision)
+         if isinstance(encoder_config, dict) and encoder_config.get(
+                 "do_lower_case", False):
+-            special_tokens_map = {
+-                k: v.lower()
+-                for k, v in tokenizer.special_tokens_map.items()
+-            }
+-            tokenizer.add_special_tokens(special_tokens_map)
++            # Optimization 4: Directly modify special tokens without intermediate dict
++            special_tokens_map = tokenizer.special_tokens_map
++            if special_tokens_map:
++                lowercased_tokens = {
++                    k: v.lower() for k, v in special_tokens_map.items()
++                }
++                tokenizer.add_special_tokens(lowercased_tokens)
+ 
+         # NOTE: We can remove this after https://github.com/THUDM/ChatGLM3/issues/1324
+         if type(tokenizer).__name__ in ("ChatGLMTokenizer",

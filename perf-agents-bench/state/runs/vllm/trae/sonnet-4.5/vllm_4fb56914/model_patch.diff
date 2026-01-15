@@ -1,0 +1,204 @@
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index d073dd6..094aef1 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -22,8 +22,11 @@ __global__ void rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Cache the base offset to reduce redundant calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input[base_offset + idx];
+     variance += x * x;
+   }
+ 
+@@ -36,10 +39,14 @@ __global__ void rms_norm_kernel(
+   }
+   __syncthreads();
+ 
++  // Load s_variance into register to avoid repeated shared memory access
++  const float inv_rms = s_variance;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    const int offset = base_offset + idx;
++    float x = (float)input[offset];
++    // Use __ldg for read-only weight access to utilize read-only cache
++    out[offset] = ((scalar_t)(x * inv_rms)) * __ldg(&weight[idx]);
+   }
+ }
+ 
+@@ -110,12 +117,16 @@ fused_add_rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Cache the base offset to reduce redundant calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    const int offset = base_offset + idx;
++    scalar_t z = input[offset];
++    z += residual[offset];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual[offset] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -127,10 +138,14 @@ fused_add_rms_norm_kernel(
+   }
+   __syncthreads();
+ 
++  // Load s_variance into register to avoid repeated shared memory access
++  const float inv_rms = s_variance;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    input[blockIdx.x * hidden_size + idx] =
+-        ((scalar_t)(x * s_variance)) * weight[idx];
++    const int offset = base_offset + idx;
++    float x = (float)residual[offset];
++    // Use __ldg for read-only weight access to utilize read-only cache
++    input[offset] = ((scalar_t)(x * inv_rms)) * __ldg(&weight[idx]);
+   }
+ }
+ 
+diff --git a/csrc/layernorm_quant_kernels.cu b/csrc/layernorm_quant_kernels.cu
+index d595b9e..a0b95e9 100644
+--- a/csrc/layernorm_quant_kernels.cu
++++ b/csrc/layernorm_quant_kernels.cu
+@@ -31,8 +31,11 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Cache the base offset to reduce redundant calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float)input[blockIdx.x * hidden_size + idx];
++    const float x = (float)input[base_offset + idx];
+     variance += x * x;
+   }
+ 
+@@ -45,14 +48,17 @@ __global__ void rms_norm_static_fp8_quant_kernel(
+   }
+   __syncthreads();
+ 
+-  // invert scale to avoid division
+-  float const scale_inv = 1.0f / *scale;
++  // Load shared memory values into registers to avoid repeated access
++  const float inv_rms = s_variance;
++  // invert scale to avoid division - use __ldg for read-only access
++  float const scale_inv = 1.0f / __ldg(scale);
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)input[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    const int offset = base_offset + idx;
++    float x = (float)input[offset];
++    // Use __ldg for read-only weight access to utilize read-only cache
++    float const out_norm = ((scalar_t)(x * inv_rms)) * __ldg(&weight[idx]);
++    out[offset] = scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
+   }
+ }
+ 
+@@ -134,12 +140,16 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Cache the base offset to reduce redundant calculations
++  const int base_offset = blockIdx.x * hidden_size;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    scalar_t z = input[blockIdx.x * hidden_size + idx];
+-    z += residual[blockIdx.x * hidden_size + idx];
++    const int offset = base_offset + idx;
++    scalar_t z = input[offset];
++    z += residual[offset];
+     float x = (float)z;
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = z;
++    residual[offset] = z;
+   }
+ 
+   using BlockReduce = cub::BlockReduce<float, 1024>;
+@@ -151,14 +161,17 @@ fused_add_rms_norm_static_fp8_quant_kernel(
+   }
+   __syncthreads();
+ 
+-  // invert scale to avoid division
+-  float const scale_inv = 1.0f / *scale;
++  // Load shared memory values into registers to avoid repeated access
++  const float inv_rms = s_variance;
++  // invert scale to avoid division - use __ldg for read-only access
++  float const scale_inv = 1.0f / __ldg(scale);
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float)residual[blockIdx.x * hidden_size + idx];
+-    float const out_norm = ((scalar_t)(x * s_variance)) * weight[idx];
+-    out[blockIdx.x * hidden_size + idx] =
+-        scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
++    const int offset = base_offset + idx;
++    float x = (float)residual[offset];
++    // Use __ldg for read-only weight access to utilize read-only cache
++    float const out_norm = ((scalar_t)(x * inv_rms)) * __ldg(&weight[idx]);
++    out[offset] = scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv);
+   }
+ }
+ 
+diff --git a/csrc/quantization/fp8/common.cu b/csrc/quantization/fp8/common.cu
+index f3f9f66..06a9491 100644
+--- a/csrc/quantization/fp8/common.cu
++++ b/csrc/quantization/fp8/common.cu
+@@ -19,8 +19,8 @@ __global__ void scaled_fp8_quant_kernel(fp8_type* __restrict__ out,
+   int tid = blockDim.x * blockIdx.x + threadIdx.x;
+ 
+   // Invert the scale so that we can use multiplications to avoid expensive
+-  // division.
+-  const float inverted_scale = 1.0f / (*scale);
++  // division. Use __ldg for read-only access to utilize read-only cache.
++  const float inverted_scale = 1.0f / __ldg(scale);
+   scaled_fp8_conversion_vec<scalar_t, true>(
+       out, input, inverted_scale, num_elems, tid, blockDim.x * gridDim.x);
+ }
+@@ -58,8 +58,9 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel(
+       BlockReduce(reduceStorage).Reduce(absmax_val, cub::Max{}, blockDim.x);
+   __shared__ float token_scale;
+   if (tid == 0) {
++    // Use __ldg for read-only scale_ub access if present
+     if (scale_ub) {
+-      token_scale = fminf(block_absmax_val_maybe, *scale_ub);
++      token_scale = fminf(block_absmax_val_maybe, __ldg(scale_ub));
+     } else {
+       token_scale = block_absmax_val_maybe;
+     }
+@@ -70,14 +71,17 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel(
+   }
+   __syncthreads();
+ 
++  // Load token_scale into register to avoid repeated shared memory access
++  const float local_token_scale = token_scale;
++  
+   // Note that we don't use inverted scales so we can match FBGemm impl.
+   if (can_vectorize) {
+     scaled_fp8_conversion_vec<scalar_t, false>(
+-        token_output, token_input, token_scale, hidden_size, tid, blockDim.x);
++        token_output, token_input, local_token_scale, hidden_size, tid, blockDim.x);
+   } else {
+     for (int i = tid; i < hidden_size; i += blockDim.x) {
+       token_output[i] = scaled_fp8_conversion<false, fp8_type>(
+-          static_cast<float>(token_input[i]), token_scale);
++          static_cast<float>(token_input[i]), local_token_scale);
+     }
+   }
+ }

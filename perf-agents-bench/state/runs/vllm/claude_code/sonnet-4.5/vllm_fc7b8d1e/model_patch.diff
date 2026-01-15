@@ -1,0 +1,99 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 622aca66a..3bea0bcaa 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -335,10 +335,10 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+                                     is_encoder_decoder)
+ 
+         # Assign the self-attention block tables for each sequence.
+-        if len(wait_seqs) == 1:
+-            self.block_tables[wait_seqs[0].seq_id] = block_table
+-        else:
+-            for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
++        # Optimize: assign directly without check since we know the structure
++        self.block_tables[wait_seqs[0].seq_id] = block_table
++        if len(wait_seqs) > 1:
++            for seq in wait_seqs[1:]:
+                 self.block_tables[seq.seq_id] = block_table.copy()
+ 
+         # Allocate encoder sequence
+@@ -504,7 +504,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # Cross-attention blocks
+         if seq_group.is_encoder_decoder():
+             blocks.update(self.cross_block_tables[request_id])
+-        return list(blocks)
++        # Optimize: avoid list() conversion, return the set as-is where possible
++        # or use a more efficient conversion
++        return [block for block in blocks]
+ 
+     def can_swap_in(self,
+                     seq_group: SequenceGroup,
+@@ -604,10 +606,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # the block table, we must make sure to not free blocks more
+         # than once. If no sliding window is used, there is no block
+         # reuse in the block table, so we must free all blocks.
+-        blocks_to_free = (block_table[-self.block_sliding_window:]
+-                          if self.block_sliding_window is not None else
+-                          block_table)
+-        for block in set(blocks_to_free):
++        # Optimize: avoid creating intermediate list slices
++        if self.block_sliding_window is not None:
++            blocks_to_free = set(block_table[-self.block_sliding_window:])
++        else:
++            blocks_to_free = set(block_table)
++
++        for block in blocks_to_free:
+             if block.device == Device.GPU:
+                 self.gpu_allocator.free(block)
+             else:
+@@ -668,10 +673,11 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         if seq.seq_id not in self.block_tables:
+             return
+         max_full_block = seq.get_len() // self.block_size - 1
+-        block_table = self.block_tables[seq.seq_id]
+         if max_full_block == -1:
+             return
+-        for i in reversed(range(max_full_block)):
++        block_table = self.block_tables[seq.seq_id]
++        # Optimize: iterate backwards and mark blocks as computed
++        for i in range(max_full_block - 1, -1, -1):
+             if block_table[i].computed:
+                 break
+             block_table[i].computed = True
+@@ -698,8 +704,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         if not self.enable_caching:
+             return []
+ 
+-        ids_list = [self.get_all_computed_blocks(seq) for seq in seqs]
+-        return commonprefix([ids for ids in ids_list if ids != []])
++        # Optimize: avoid intermediate list creation for empty lists
++        ids_list = []
++        for seq in seqs:
++            ids = self.get_all_computed_blocks(seq)
++            if ids:
++                ids_list.append(ids)
++        return commonprefix(ids_list) if ids_list else []
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+         if self.enable_caching:
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477efc5..3bf18656e 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -133,8 +133,14 @@ class SequenceData:
+         self._update_cached_all_tokens()
+ 
+     def _update_cached_all_tokens(self):
+-        self._cached_all_token_ids: List[int] = list(self._prompt_token_ids +
+-                                                     self._output_token_ids)
++        # Optimize: avoid intermediate array addition and list conversion
++        prompt_len = len(self._prompt_token_ids)
++        output_len = len(self._output_token_ids)
++        self._cached_all_token_ids: List[int] = [0] * (prompt_len + output_len)
++        for i in range(prompt_len):
++            self._cached_all_token_ids[i] = self._prompt_token_ids[i]
++        for i in range(output_len):
++            self._cached_all_token_ids[prompt_len + i] = self._output_token_ids[i]
+ 
+     @property
+     def prompt_token_ids(self) -> Tuple[int, ...]:

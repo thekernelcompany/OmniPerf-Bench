@@ -1,0 +1,72 @@
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index 5b19e3f35..688c1a519 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -47,7 +47,7 @@ class Mixer2RMSNormGated(CustomOp):
+         self.n_groups = full_hidden_size // self.group_size
+ 
+         self.variance_epsilon = eps
+-        self.weight = nn.Parameter(torch.ones(self.per_rank_hidden_size))
++        self.weight = nn.Parameter(torch.empty(self.per_rank_hidden_size))
+         set_weight_attrs(self.weight,
+                          {"weight_loader": sharded_weight_loader(0)})
+         assert self.full_hidden_size % self.tp_size== 0,\
+@@ -356,8 +356,8 @@ class MambaMixer2(CustomOp):
+                 divide(num_heads, self.tp_size),
+                 dtype=torch.float32,
+             ))
+-        self.D = nn.Parameter(torch.ones(num_heads // self.tp_size))
+-        self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
++        self.D = nn.Parameter(torch.empty(num_heads // self.tp_size))
++        self.dt_bias = nn.Parameter(torch.empty(num_heads // self.tp_size))
+ 
+         set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
+         a_weight_loader = composed_weight_loader(
+@@ -470,13 +470,10 @@ class MambaMixer2(CustomOp):
+             if has_initial_states is not None and torch.any(
+                     has_initial_states):
+ 
+-                # vectorized ssm_state zero init
+-                batched_zero_init_func = torch.vmap(
+-                    lambda idx: mamba_cache_params.ssm_state[idx].zero_())
+-                batched_zero_init_func(
+-                    mamba_cache_params.
+-                    state_indices_tensor[~has_initial_states].unsqueeze(
+-                        dim=-1), )
++                # vectorized ssm_state zero init - optimized with direct indexing
++                zero_indices = mamba_cache_params.state_indices_tensor[~has_initial_states]
++                if zero_indices.numel() > 0:
++                    mamba_cache_params.ssm_state[zero_indices] = 0
+                 initial_states = mamba_cache_params.ssm_state[
+                     mamba_cache_params.state_indices_tensor]
+ 
+@@ -500,17 +497,9 @@ class MambaMixer2(CustomOp):
+                 dt_limit=(0.0, float("inf")),
+             )
+ 
+-            # vectorized ssm state update using vmap
+-            # the 1d state_indices_tensor needs to be unsqueezed to avoid vmap
+-            # limitation which doesn't allow use of `item()`
+-            # Note: the lambda capture can happen where ssm_state is initialized
+-            #       instead of here
+-            batched_copy = torch.vmap(
+-                lambda idx, source_state: mamba_cache_params.ssm_state[
+-                    idx].copy_(source_state))
+-            batched_copy(
+-                mamba_cache_params.state_indices_tensor.unsqueeze(dim=-1),
+-                varlen_state)
++            # vectorized ssm state update - optimized with direct indexing
++            mamba_cache_params.ssm_state[
++                mamba_cache_params.state_indices_tensor] = varlen_state
+ 
+             # - reshape
+             hidden_states = scan_output.view(seq_len, -1)
+@@ -518,7 +507,7 @@ class MambaMixer2(CustomOp):
+ 
+             n_groups = self.n_groups // self.tp_size
+             A = self.A[:, None, ...][:, :, None].expand(
+-                -1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
++                -1, self.head_dim, self.ssm_state_size)
+             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+             D = self.D[:, None, ...].expand(-1, self.head_dim)

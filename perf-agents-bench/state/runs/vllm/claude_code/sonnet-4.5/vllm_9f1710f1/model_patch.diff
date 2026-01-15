@@ -1,0 +1,135 @@
+diff --git a/vllm/attention/backends/mla/common.py b/vllm/attention/backends/mla/common.py
+index 8184b0732..2fa278b7d 100644
+--- a/vllm/attention/backends/mla/common.py
++++ b/vllm/attention/backends/mla/common.py
+@@ -342,13 +342,17 @@ class MLACommonState(AttentionState, Generic[T]):
+                                               PAD_SLOT_ID,
+                                               dtype=torch.long,
+                                               device=self.runner.device)
+-        self._graph_seq_lens = torch.ones(max_batch_size,
+-                                          dtype=torch.int32,
+-                                          device=self.runner.device)
++        # Optimization: use empty instead of ones for better performance
++        # This tensor will be overwritten before use in graph execution
++        self._graph_seq_lens = torch.empty(max_batch_size,
++                                           dtype=torch.int32,
++                                           device=self.runner.device)
+         self._graph_block_tables = torch.from_numpy(
+             self.runner.graph_block_tables).to(device=self.runner.device)
+ 
+-        self._positions = torch.zeros((max_batch_size, ),
++        # Optimization: use empty instead of zeros for better performance
++        # This tensor will be overwritten before use in graph execution
++        self._positions = torch.empty((max_batch_size, ),
+                                       dtype=torch.long,
+                                       device=self.runner.device)
+ 
+@@ -961,10 +965,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[T], Generic[T]):
+             chunk_seq_lens = (chunk_ends - context_chunk_starts).clamp(min=0)
+             _context_chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                 torch.int32)
+-            zero = torch.zeros(num_chunks, dtype=torch.int32, device=device)\
+-                .unsqueeze(-1)
++            # Optimization: use pad instead of zeros + cat for better performance
+             context_chunk_cu_seq_lens = \
+-                torch.cat([zero, _context_chunk_cu_seq_lens], dim=1)
++                torch.nn.functional.pad(_context_chunk_cu_seq_lens, (1, 0), value=0)
+             context_chunk_max_seq_lens = \
+                 chunk_seq_lens.max(dim=1).values.tolist()
+             context_chunk_seq_tot = chunk_seq_lens.sum(dim=1).tolist()
+@@ -1287,6 +1290,11 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+         assert prefill_metadata.context_lens_tensor is not None
+ 
+         output = None
++        output_lse = None
++        # Optimization: pre-allocate temporary buffers outside loop to avoid
++        # repeated allocations in the merge path
++        output_tmp = None
++        output_lse_tmp = None
+         iters = len(prefill_metadata.context_chunk_seq_tot)
+ 
+         # Fetch from attn_metadata directly, since it late bound by
+@@ -1373,8 +1381,10 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                # Optimization: reuse pre-allocated buffers for merge operations
++                if output_tmp is None:
++                    output_tmp = torch.empty_like(output)
++                    output_lse_tmp = torch.empty_like(output_lse)
+                 merge_attn_states(
+                     output=output_tmp,
+                     output_lse=output_lse_tmp,
+@@ -1383,8 +1393,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                # Swap buffers to avoid extra copy
++                output, output_tmp = output_tmp, output
++                output_lse, output_lse_tmp = output_lse_tmp, output_lse
+ 
+         return output, output_lse
+ 
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index c98262eea..0a0f75c21 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -532,14 +532,12 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
++                # Optimization: use pad instead of zeros + cat for better performance
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=torch.nn.functional.pad(
++                        _chunk_cu_seq_lens, (1, 0), value=0),
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -858,6 +856,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         assert prefill_metadata.chunked_context is not None
+ 
+         output = None
++        output_lse = None
++        # Optimization: pre-allocate temporary buffers outside loop to avoid
++        # repeated allocations in the merge path
++        output_tmp = None
++        output_lse_tmp = None
+         iters = len(prefill_metadata.chunked_context.seq_tot)
+         workspace = prefill_metadata.chunked_context.workspace
+ 
+@@ -909,8 +912,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                # Optimization: reuse pre-allocated buffers for merge operations
++                if output_tmp is None:
++                    output_tmp = torch.empty_like(output)
++                    output_lse_tmp = torch.empty_like(output_lse)
+                 merge_attn_states(
+                     output=output_tmp,
+                     output_lse=output_lse_tmp,
+@@ -919,8 +924,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                # Swap buffers to avoid extra copy
++                output, output_tmp = output_tmp, output
++                output_lse, output_lse_tmp = output_lse_tmp, output_lse
+ 
+         return output, output_lse
+ 

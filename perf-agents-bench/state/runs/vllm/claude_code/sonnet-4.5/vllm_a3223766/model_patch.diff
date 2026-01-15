@@ -1,0 +1,61 @@
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 3a4c25964..d11daa288 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -229,7 +229,7 @@ class MinPLogitsProcessor(LogitsProcessor):
+         super().__init__()
+         self.min_p_count: int = 0
+ 
+-        self.min_p_cpu_tensor = torch.zeros((max_num_reqs, ),
++        self.min_p_cpu_tensor = torch.empty((max_num_reqs, ),
+                                             dtype=torch.float32,
+                                             device="cpu",
+                                             pin_memory=pin_memory)
+@@ -301,16 +301,13 @@ class MinPLogitsProcessor(LogitsProcessor):
+ 
+         # Convert logits to probability distribution
+         probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
++        # Calculate maximum probabilities per sequence and adjust min_p
+         max_probabilities = torch.amax(probability_values,
+                                        dim=-1,
+                                        keepdim=True)
+-        # Adjust min_p
+-        adjusted_min_p = max_probabilities.mul_(self.min_p)
+-        # Identify valid tokens using threshold comparison
+-        invalid_token_mask = probability_values < adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[invalid_token_mask] = -float('inf')
++        max_probabilities.mul_(self.min_p)
++        # Identify and mask invalid tokens using in-place operation
++        logits.masked_fill_(probability_values < max_probabilities, -float('inf'))
+         return logits
+ 
+ 
+@@ -322,7 +319,7 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+         self.device = device
+         self.pin_memory = pin_memory
+ 
+-        self.bias_tensor: torch.Tensor = torch.tensor(())
++        self.bias_tensor: torch.Tensor = torch.empty(0, dtype=torch.float32, device=device)
+         self.logits_slice = (self._device_tensor([], torch.int32),
+                              self._device_tensor([], torch.int32))
+ 
+@@ -381,6 +378,8 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+                                  self._device_tensor(tok_ids, torch.int32))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
++        if not data:
++            return torch.empty(0, dtype=dtype, device=self.device)
+         return (torch.tensor(data,
+                              device="cpu",
+                              dtype=dtype,
+@@ -480,6 +479,8 @@ class MinTokensLogitsProcessor(LogitsProcessor):
+                                  self._device_tensor(tok_ids, torch.int32))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
++        if not data:
++            return torch.empty(0, dtype=dtype, device=self.device)
+         return (torch.tensor(data,
+                              device="cpu",
+                              dtype=dtype,

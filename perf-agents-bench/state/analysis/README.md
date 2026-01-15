@@ -1,6 +1,45 @@
 # Soft Metrics Analysis Output
 
-This directory contains the output of the **Soft Metrics Analyzer** - a system for extracting qualitative and quantitative metrics from agent benchmark runs using LLM-as-a-Judge.
+LLM-as-a-Judge evaluation results for agent benchmark runs.
+
+## Directory Structure
+
+```
+state/analysis/
+├── aggregate_report.json              # Cross-run statistics
+├── vllm/
+│   ├── claude_code/sonnet-4.5/        # 96 analyses
+│   ├── codex/gpt-5/                   # 99 analyses
+│   └── trae/
+│       ├── gpt-5/                     # 70 analyses
+│       └── sonnet-4.5/                # 91 analyses
+└── sglang/
+    └── claude_code/sonnet-4.5/        # 80 analyses
+```
+
+## Naming Convention
+
+All items use standardized commit-based naming:
+
+| Repository | Format | Example |
+|------------|--------|---------|
+| vLLM | `vllm_<commit>` | `vllm_015069b0` |
+| SGLang | `sglang_<commit>` | `sglang_021f76e4` |
+
+The 8-character commit hash uniquely identifies each optimization task.
+
+## Per-Item Files
+
+Each `{repo}_{commit}/` directory contains:
+
+| File | Description |
+|------|-------------|
+| `metrics_summary.json` | Quick-reference scores (0-10) |
+| `analysis.json` | Complete Pydantic-validated analysis |
+| `patch_similarity.json` | Agent vs human patch comparison |
+| `llm_prompt.txt` | Exact prompt sent to LLM judge |
+| `llm_response.json` | Full LLM response |
+| `llm_analysis.json` | Parsed structured scores |
 
 ## Quick Start
 
@@ -15,41 +54,13 @@ python -m bench.cli analyze \
 
 # Analyze a single run
 python -m bench.cli analyze \
-  --run-dir ./state/runs/vllm/claude_code/default/2025-12-16_12-59-57/vllm_core-0000 \
+  --run-dir ./state/runs/vllm/claude_code/sonnet-4.5/vllm_015069b0 \
   --data-dir ../data
-
-# Skip LLM analysis (quantitative metrics only)
-python -m bench.cli analyze --state-root ./state --data-dir ../data --skip-llm
 ```
 
-## Important: `--data-dir` Option
+## Data Directory
 
-The `--data-dir` option specifies the path to the benchmark datasets directory (usually `data/` at the repo root). This is **required** for accurate patch comparison against human reference patches.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--data-dir` / `-D` | Auto-discovery | Path to `data/` directory containing `final/vllm_final_dataset.jsonl` etc. |
-
-**If not specified**, the analyzer will try to auto-discover the `data/` folder by traversing parent directories. For reliable results, always specify `--data-dir ../data` when running from `perf-agents-bench/`.
-
-## Directory Structure
-
-```
-state/analysis/
-├── aggregate_report.json                    # Cross-run statistics
-└── {repo}/
-    └── {agent}/
-        └── {model}/
-            └── {timestamp}/
-                └── {item_id}/
-                    ├── analysis.json           # Complete Pydantic-validated analysis
-                    ├── metrics_summary.json    # Quick-reference compact summary
-                    ├── patch_similarity.json   # Agent vs human patch comparison
-                    ├── trajectory_metrics.json # Per-step token/timing metrics
-                    ├── llm_prompt.txt          # Exact prompt sent to LLM
-                    ├── llm_response.json       # Full LLM response
-                    └── llm_analysis.json       # Parsed structured JSON from LLM
-```
+The `--data-dir` option points to the benchmark datasets (usually `../data` from perf-agents-bench). Required for patch comparison against human reference solutions.
 
 ## Key Output Files
 

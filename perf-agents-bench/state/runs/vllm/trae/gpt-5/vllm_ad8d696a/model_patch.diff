@@ -1,0 +1,54 @@
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index a55d79b..61b8f26 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -286,6 +286,10 @@ class Scheduler:
+         # Latency of the last prompt step
+         self.last_prompt_latency = 0.0
+ 
++
++        # Cache common policies to avoid repeated factory lookups
++        self._fcfs_policy = PolicyFactory.get_policy(policy_name="fcfs")
++
+     @property
+     def lora_enabled(self) -> bool:
+         return bool(self.lora_config)
+@@ -343,8 +347,7 @@ class Scheduler:
+                         self.free_seq(seq)
+ 
+     def has_unfinished_seqs(self) -> bool:
+-        return len(self.waiting) != 0 or len(self.running) != 0 or len(
+-            self.swapped) != 0
++        return bool(self.waiting) or bool(self.running) or bool(self.swapped)
+ 
+     def get_num_unfinished_seq_groups(self) -> int:
+         return len(self.waiting) + len(self.running) + len(self.swapped)
+@@ -717,8 +720,8 @@ class Scheduler:
+             remaining_waiting, prefills = self._schedule_prefills(
+                 self.waiting, budget, curr_loras, enable_chunking=False)
+ 
+-        fcfs_policy = PolicyFactory.get_policy(policy_name="fcfs")
+         # Don't schedule decodes if prefills are scheduled.
++        fcfs_policy = self._fcfs_policy
+         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
+         # only contains decode requests, not chunked prefills.
+         if len(prefills.seq_groups) == 0:
+@@ -801,7 +804,7 @@ class Scheduler:
+             self.swapped, SchedulerSwappedInOutputs.create_empty())
+ 
+         # Decoding should be always scheduled first by fcfs.
+-        fcfs_policy = PolicyFactory.get_policy(policy_name="fcfs")
++        fcfs_policy = self._fcfs_policy
+         remaining_running, running_scheduled = self._schedule_running(
+             self.running,
+             budget,
+@@ -897,8 +900,7 @@ class Scheduler:
+ 
+         # Create input data structures.
+         seq_group_metadata_list: List[SequenceGroupMetadata] = []
+-        for i, scheduled_seq_group in enumerate(
+-                scheduler_outputs.scheduled_seq_groups):
++        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+             seq_group = scheduled_seq_group.seq_group
+             token_chunk_size = scheduled_seq_group.token_chunk_size
+             seq_group.maybe_set_first_scheduled_time(now)

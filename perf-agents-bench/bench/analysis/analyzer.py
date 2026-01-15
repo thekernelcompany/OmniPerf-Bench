@@ -118,6 +118,7 @@ class SoftMetricsAnalyzer:
         repo_filter: Optional[str] = None,
         agent_filter: Optional[str] = None,
         model_filter: Optional[str] = None,
+        timestamp_filter: Optional[str] = None,
     ) -> List[Path]:
         """Discover all run directories matching filters.
 
@@ -126,6 +127,7 @@ class SoftMetricsAnalyzer:
             repo_filter: Filter by repo name (vllm, sglang)
             agent_filter: Filter by agent type (trae, codex, openhands)
             model_filter: Filter by model name (claude-sonnet-45, gpt-5)
+            timestamp_filter: Filter by timestamp (e.g., 2025-12-22_21-40-38)
 
         Returns:
             List of item directories containing journal.json
@@ -158,6 +160,8 @@ class SoftMetricsAnalyzer:
 
                     for timestamp_dir in model_dir.iterdir():
                         if not timestamp_dir.is_dir():
+                            continue
+                        if timestamp_filter and timestamp_dir.name != timestamp_filter:
                             continue
 
                         for item_dir in timestamp_dir.iterdir():

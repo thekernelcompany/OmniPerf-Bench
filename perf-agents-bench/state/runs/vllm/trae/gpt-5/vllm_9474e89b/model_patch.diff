@@ -1,0 +1,139 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..946aae7 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -197,7 +197,8 @@ class BlockSpaceManager:
+         for logical_idx in range(num_prompt_blocks):
+             if (self.block_sliding_window is not None
+                     and logical_idx >= self.block_sliding_window):
+-                block = block_table[logical_idx % self.block_sliding_window]
++                idx = logical_idx % self.block_sliding_window
++                block = block_table[idx]
+             else:
+                 block = self.gpu_allocator.allocate(
+                     seq.hash_of_block(logical_idx),
+@@ -296,7 +297,8 @@ class BlockSpaceManager:
+             # If the last block is now complete, promote it to a full block so
+             # that it can be shared
+             new_block = self._maybe_promote_last_block(seq, last_block)
+-            block_table[-1] = new_block
++            if new_block is not last_block:
++                block_table[-1] = new_block
+             return None
+         else:
+             # The last block is shared with other sequences.
+@@ -325,10 +327,12 @@ class BlockSpaceManager:
+         # NOTE: Here, we assume that the physical blocks are only shared by
+         # the sequences in the same group.
+         blocks: Set[PhysicalTokenBlock] = set()
++        blocks_update = blocks.update
++        tables = self.block_tables
+         for seq in seq_group.get_seqs():
+             if seq.is_finished():
+                 continue
+-            blocks.update(self.block_tables[seq.seq_id])
++            blocks_update(tables[seq.seq_id])
+         return list(blocks)
+ 
+     def can_swap_in(self, seq_group: SequenceGroup) -> bool:
+@@ -406,11 +410,13 @@ class BlockSpaceManager:
+         blocks_to_free = (block_table[-self.block_sliding_window:]
+                           if self.block_sliding_window is not None else
+                           block_table)
++        gpu_free = self.gpu_allocator.free
++        cpu_free = self.cpu_allocator.free
+         for block in set(blocks_to_free):
+             if block.device == Device.GPU:
+-                self.gpu_allocator.free(block)
++                gpu_free(block)
+             else:
+-                self.cpu_allocator.free(block)
++                cpu_free(block)
+ 
+     def free(self, seq: Sequence) -> None:
+         if seq.seq_id not in self.block_tables:
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..6da56a1 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -64,44 +64,29 @@ class LRUEvictor(Evictor):
+     def __contains__(self, block_hash: int) -> bool:
+         return block_hash in self.free_table
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        items = self.free_table
++        if len(items) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
+-        evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
+-                evicted_block = block
+-                break
+-
+-        assert evicted_block is not None
+-
+-        del self.free_table[evicted_block.block_hash]
+-
+-        evicted_block.computed = False
+-        return evicted_block
++        # Single pass selection: pick the block with the smallest last_accessed;
++        # break ties by choosing the one with the largest num_hashed_tokens.
++        chosen: Optional[PhysicalTokenBlock] = None
++        chosen_ts = 0.0
++        chosen_hashed = -1
++        for block in items.values():
++            ts = block.last_accessed
++            nh = block.num_hashed_tokens
++            if (chosen is None or ts < chosen_ts or
++                    (ts == chosen_ts and nh > chosen_hashed)):
++                chosen = block
++                chosen_ts = ts
++                chosen_hashed = nh
++
++        assert chosen is not None
++        del items[chosen.block_hash]
++        chosen.computed = False
++        return chosen
+ 
+     def add(self, block: PhysicalTokenBlock):
+         self.free_table[block.block_hash] = block
+@@ -129,11 +114,12 @@ class RandomEvictor(Evictor):
+         return block_hash in self.free_table
+ 
+     def evict(self) -> PhysicalTokenBlock:
+-        if len(self.free_table) == 0:
++        items = self.free_table
++        if len(items) == 0:
+             raise ValueError("No usable cache memory left")
+-        evicted_block = next(iter(self.free_table.values()))
++        block_hash, evicted_block = next(iter(items.items()))
+         evicted_block.computed = False
+-        del self.free_table[evicted_block.block_hash]
++        del items[block_hash]
+         return evicted_block
+ 
+     def add(self, block: PhysicalTokenBlock):

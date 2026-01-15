@@ -1,0 +1,138 @@
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index eb190adfb..52e73d5b5 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -145,6 +145,8 @@ class CopyOnWriteTracker:
+                 block indices to destination block indices for the
+                 current copy-on-write operations.
+         """
++        if not self._copy_on_writes:
++            return []
+         cows = self._copy_on_writes
+         self._copy_on_writes = []
+         return cows
+@@ -244,7 +246,7 @@ class BlockList:
+         self._blocks = blocks
+ 
+         # Cache block ids for fast query
+-        self._block_ids = []
++        self._block_ids.clear()
+         for block in self._blocks:
+             self._add_block_id(block.block_id)
+ 
+@@ -273,8 +275,8 @@ class BlockList:
+         self._update_block_id(block_index, new_block.block_id)
+ 
+     def reset(self):
+-        self._blocks = []
+-        self._block_ids = []
++        self._blocks.clear()
++        self._block_ids.clear()
+ 
+     def list(self) -> List[Block]:
+         return self._blocks
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index a87e814cf..eba8c5eb2 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -178,6 +178,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             prev_block: Optional[Block],
+             block_token_ids: List[List[int]],
+             device: Optional[Device] = None) -> List[Block]:
++        if not block_token_ids:
++            return []
+         blocks = []
+         for token_ids in block_token_ids:
+             prev_block = self.allocate_immutable_block(prev_block=prev_block,
+@@ -366,18 +368,21 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         forked_blocks: List[Block] = []
+         prev_block = None
++        refcounter = self._refcounter
++        block_pool = self._block_pool
++        block_size = self._block_size
+         for block in source_blocks:
+             block_id = block.block_id
+             assert block_id is not None
+ 
+-            refcount = self._refcounter.incr(block_id)
++            refcount = refcounter.incr(block_id)
+             assert refcount != 1, "can't fork free'd block_id = {}".format(
+                 block_id)
+ 
+-            forked_block = self._block_pool.init_block(
++            forked_block = block_pool.init_block(
+                 prev_block=prev_block,
+                 token_ids=block.token_ids,
+-                block_size=self._block_size,
++                block_size=block_size,
+                 physical_block_id=block_id)
+ 
+             forked_blocks.append(forked_block)
+@@ -505,20 +510,26 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
+-
++        if not block_ids:
++            return
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
+-            elif block_id in self.evictor:
+-                self.evictor.update(block_id, now)
++            if block_tracker[block_id].active:
++                block_tracker[block_id].last_accessed = now
++            elif block_id in evictor:
++                evictor.update(block_id, now)
+             else:
+                 raise ValueError(
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         # Mark all touched blocks as computed.
++        if not self._touched_blocks:
++            return
++        block_tracker = self._block_tracker
+         for block_id in self._touched_blocks:
+-            self._block_tracker[block_id].computed = True
++            block_tracker[block_id].computed = True
+         self._touched_blocks.clear()
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 666723313..4a6543b62 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -550,6 +550,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+             dest_allocator: BlockAllocatorBase,
+             mapping: Dict[PhysicalTokenBlock,
+                           PhysicalTokenBlock]) -> BlockTable:
++        if not block_table:
++            return BlockTable()
+         new_block_table: BlockTable = BlockTable()
+ 
+         for from_block in block_table:
+@@ -678,8 +680,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+             # Update the last accessed time of all the blocks accessed
+             # in this step.
+             block_table = self.block_tables[seq.seq_id]
+-            for block in block_table:
+-                block.last_accessed = access_time
++            if block_table:
++                for block in block_table:
++                    block.last_accessed = access_time
+ 
+     def compute_full_blocks_in_seq(self, seq: Sequence):
+         if seq.seq_id not in self.block_tables:
+@@ -697,6 +700,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         if seq.seq_id not in self.block_tables:
+             return []
+         block_table = self.block_tables[seq.seq_id]
++        if len(block_table) <= 1:
++            return []
+         # NOTE We exclude the last block to avoid the case where the entire
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.

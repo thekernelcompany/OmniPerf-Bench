@@ -1,0 +1,101 @@
+diff --git a/vllm/model_executor/models/nemotron_h.py b/vllm/model_executor/models/nemotron_h.py
+index 2ef8d3115..72a521b51 100644
+--- a/vllm/model_executor/models/nemotron_h.py
++++ b/vllm/model_executor/models/nemotron_h.py
+@@ -354,17 +354,17 @@ class NemotronHModel(nn.Module):
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
++            residual = None
+ 
+-        residual = None
+-        num_non_mamba_layers = 0
++        # Pre-compute mamba layer indices to avoid isinstance checks in loop
++        mamba_layer_idx = 0
+         for i in range(len(self.layers)):
+             layer = self.layers[i]
+             layer_mamba_cache_params = None
+             if isinstance(layer, NemotronHMambaDecoderLayer):
+                 layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
+-                    i - num_non_mamba_layers)
+-            else:
+-                num_non_mamba_layers += 1
++                    mamba_layer_idx)
++                mamba_layer_idx += 1
+ 
+             hidden_states, residual = layer(
+                 positions=positions,
+@@ -399,18 +399,18 @@ class NemotronHModel(nn.Module):
+             if "A_log" in name:
+                 name = name.replace("A_log", "A")
+                 loaded_weight = loaded_weight.to(torch.float32)
+-
+-            if "D" in name:
++            # Combine dtype conversions for efficiency
++            elif any(key in name for key in ["D", "dt_bias"]):
+                 loaded_weight = loaded_weight.to(torch.float32)
+ 
+-            if "dt_bias" in name:
+-                loaded_weight = loaded_weight.to(torch.float32)
++            # load attn params - optimize to avoid double iteration
++            weight_name = None
++            for proj in ["q_proj", "k_proj", "v_proj"]:
++                if proj in name:
++                    weight_name = proj
++                    break
+ 
+-            # load attn params
+-            if any(proj in name for proj in ["q_proj", "k_proj", "v_proj"]):
+-                weight_name = next(proj
+-                                   for proj in ["q_proj", "k_proj", "v_proj"]
+-                                   if proj in name)
++            if weight_name:
+                 name = name.replace(weight_name, "qkv_proj")
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+@@ -515,33 +515,34 @@ class NemotronHForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
+     def _get_mamba_cache_shape(
+             self) -> tuple[tuple[int, int], tuple[int, int]]:
+         world_size = get_tensor_model_parallel_world_size()
+-        hidden_size = self.config.hidden_size
+-
+-        conv_state_shape, temporal_state_shape = None, None
++        config = self.config
++        hidden_size = config.hidden_size
++        ssm_state_size = config.ssm_state_size
++        n_groups_base = config.n_groups
+ 
+-        intermediate_size = self.config.expand * hidden_size
++        intermediate_size = config.expand * hidden_size
+ 
+         # if n_groups is not divisible by world_size, need to extend the shards
+         # to ensure all groups needed by a head is sharded along with it
+         n_groups = (
+-            self.config.n_groups +
+-            extra_groups_for_head_shards(self.config.n_groups, world_size))
++            n_groups_base +
++            extra_groups_for_head_shards(n_groups_base, world_size))
+ 
+         # - heads and n_groups are TP-ed
+         conv_dim = (intermediate_size +
+-                    2 * n_groups * self.config.ssm_state_size)
++                    2 * n_groups * ssm_state_size)
+         conv_state_shape = (
+             divide(conv_dim, world_size),
+-            self.config.conv_kernel - 1,
++            config.conv_kernel - 1,
+         )
+ 
+         # These are not TP-ed as they depend on A, dt_bias, D
+         # - they are typically small
+         #   e.g., (h_heads, d_head, d_state) = (128, 64, 128)
+         temporal_state_shape = (
+-            divide(self.config.mamba_num_heads, world_size),
+-            self.config.mamba_head_dim,
+-            self.config.ssm_state_size,
++            divide(config.mamba_num_heads, world_size),
++            config.mamba_head_dim,
++            ssm_state_size,
+         )
+         return conv_state_shape, temporal_state_shape
+ 

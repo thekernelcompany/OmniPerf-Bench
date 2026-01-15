@@ -1,58 +1,174 @@
-# perf-agents-bench (uv + venv)
+# perf-agents-bench
 
-Minimal, local-first workflow to plan commit pairs, run OpenHands headless to generate agent branches, and summarize results.
+Agent benchmarking harness for evaluating AI coding agents on performance optimization tasks.
 
-## Requirements
-- Python 3.12+ (OpenHands requires 3.12)
-- uv (for OpenHands): `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- Docker (Stage B later)
+## Quick Links
 
-## One-time setup
+| Document | Description |
+|----------|-------------|
+| [SOFT_METRICS_ANALYSIS.md](SOFT_METRICS_ANALYSIS.md) | **Full benchmark results and methodology** |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture and design |
+| [SUCCESS_FAILURE_ANALYSIS.md](SUCCESS_FAILURE_ANALYSIS.md) | Detailed failure analysis |
+
+## Benchmark Results Summary
+
+| Agent | Model | Runs | Avg Score | Success |
+|-------|-------|------|-----------|---------|
+| Claude Code | Sonnet 4.5 | 192 | 7.64 | 98% |
+| Codex | GPT-5 | 99 | 7.05 | 99% |
+| TRAE | GPT-5 | 70 | 7.57 | 70% |
+| TRAE | Sonnet 4.5 | 91 | 8.12 | 51% |
+
+*See [SOFT_METRICS_ANALYSIS.md](SOFT_METRICS_ANALYSIS.md) for full details.*
+
+---
+
+## Setup
+
+### Requirements
+- Python 3.12+
+- Docker (for evaluation)
+- OpenRouter API key (for soft metrics analysis)
+
+### Installation
+
 ```bash
-# Copy and fill env
-cp perf-agents-bench/.env.example perf-agents-bench/.env
-# Edit perf-agents-bench/.env with your creds (LLM_MODEL, LLM_API_KEY, optional GITHUB_TOKEN)
-
-# Create local venv and install CLI deps (once)
 cd perf-agents-bench
-# Create venv with uv (explicit Python 3.12) and install deps into it
-uv venv --python 3.12 .venv
-uv pip install -r requirements.txt -p .venv/bin/python
-cd -
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Set API key for analysis
+export OPENROUTER_API_KEY="sk-or-v1-..."
 ```
 
-## Run on vLLM (Stage A only)
-```bash
-# 1) Plan (edit tasks/vllm.yaml if you want different targets/constraints)
-echo "f092153fbe349a9a1742940e3703bfcff6aa0a6d parent=1" > perf-agents-bench/.work/vllm_commits.txt
-cd perf-agents-bench
-.venv/bin/python -m bench.cli plan \
-  tasks/vllm.yaml \
-  --commits .work/vllm_commits.txt \
-  --out ./state/plan.json
+---
 
-# 2) Prepare (headless; loads .env automatically)
-.venv/bin/python -m bench.cli prepare \
-  tasks/vllm.yaml \
-  --from-plan ./state/plan.json \
-  --bench-cfg bench.yaml \
-  --max-workers 1 --resume
+## Directory Structure
 
-# 3) Report
-LATEST=$(ls -t state/runs | head -n1)
-.venv/bin/python -m bench.cli report state/runs/$LATEST
-cd -
+```
+perf-agents-bench/
+├── bench/                    # CLI and analysis code
+│   ├── cli.py               # Main entry point
+│   ├── analysis/            # Soft metrics analyzer
+│   └── pipeline.py          # Agent execution pipeline
+│
+├── state/
+│   ├── runs/                # Raw agent run data
+│   │   └── vllm/{agent}/{model}/{timestamp}/{item}/
+│   │       ├── trajectory.json
+│   │       ├── model_patch.diff
+│   │       └── run_summary.json
+│   │
+│   └── analysis/            # Soft metrics results
+│       └── vllm/{agent}/{model}/{timestamp}/{item}/
+│           └── metrics_summary.json
+│
+├── tasks/                   # Task configurations
+│   └── vllm.yaml
+│
+└── *.md                     # Documentation
 ```
 
-## How it works
-- Plan writes `state/plan.json` with (human, pre) pairs
-- Prepare uses uvx to run OpenHands headless: `python -m openhands.core.main -d <worktree> -f task.txt`
-- Journals/logs in `perf-agents-bench/state/runs/<run_id>/<item_id>/`
+---
 
-## Headless notes
-- Docs: headless and CLI references: https://docs.all-hands.dev/usage/how-to/headless-mode, https://docs.all-hands.dev/usage/how-to/cli-mode
-- Iterations configurable in `perf-agents-bench/bench.yaml` under `agents.openhands.args.iterations`.
+## CLI Commands
+
+### Run Soft Metrics Analysis
+
+```bash
+# Analyze all runs for an agent/model
+python -m bench.cli analyze \
+    --state-root ./state \
+    --data-dir ../data \
+    --repo vllm \
+    --agent trae \
+    --model gpt-5
+
+# Analyze single run
+python -m bench.cli analyze \
+    --run-dir state/runs/vllm/trae/gpt-5/2025-12-26_15-06-42/vllm_gpt5_rerun_0d243f2a \
+    --data-dir ../data
+```
+
+### Generate Reports
+
+```bash
+# View aggregate report
+cat state/analysis/aggregate_report.json | jq '.summary'
+
+# Generate run report
+python -m bench.cli report state/runs/<run_id>
+```
+
+### Plan and Execute (OpenHands)
+
+```bash
+# 1. Plan commits
+python -m bench.cli plan tasks/vllm.yaml \
+    --commits .work/vllm_commits.txt \
+    --out ./state/plan.json
+
+# 2. Execute
+python -m bench.cli prepare tasks/vllm.yaml \
+    --from-plan ./state/plan.json \
+    --bench-cfg bench.yaml \
+    --max-workers 1
+```
+
+---
+
+## Data Sources
+
+### Canonical Datasets
+
+| Dataset | Location | Runs |
+|---------|----------|------|
+| Claude Code | `state/runs/vllm/claude_code/sonnet-4.5/` | 192 |
+| Codex GPT-5 | `state/runs/vllm/codex/gpt-5/` | 99 |
+| TRAE GPT-5 | `state/runs/vllm/trae/gpt-5/` | 70 |
+| TRAE Sonnet 4.5 | `state/runs/vllm/trae/sonnet-4.5/` | 91 |
+
+**Note:** Legacy/experimental runs are in `_misc/`. See [SOFT_METRICS_ANALYSIS.md](SOFT_METRICS_ANALYSIS.md#trae-gpt-5-dataset-merge) for details.
+
+### HuggingFace
+
+```python
+from datasets import load_dataset
+
+# TRAE GPT-5 trajectories
+ds = load_dataset("Inferencebench/trae-gpt5-trajectories")
+```
+
+---
 
 ## Troubleshooting
-- Doctor: `cd perf-agents-bench && .venv/bin/python -m bench.cli doctor --bench-cfg bench.yaml`
-- Logs: `perf-agents-bench/state/runs/<run_id>/<item_id>/openhands_stderr.txt`
+
+### API Key Issues
+```bash
+# Check key is set
+echo $OPENROUTER_API_KEY | head -c 20
+
+# Key should NOT have quotes
+export OPENROUTER_API_KEY=sk-or-v1-abc123...  # correct
+export OPENROUTER_API_KEY="sk-or-v1-abc123..."  # wrong
+```
+
+### Analysis Failures
+```bash
+# Re-run analysis for specific item
+python -m bench.cli analyze --run-dir <path> --data-dir ../data
+
+# Check for zero scores with patches (analysis bug)
+find state/analysis -name "metrics_summary.json" -exec sh -c \
+  'score=$(jq -r ".scores.overall" "$1"); lines=$(jq -r ".patch.lines_added" "$1"); \
+   if [ "$score" = "0" ] && [ "$lines" != "0" ]; then echo "$1"; fi' _ {} \;
+```
+
+---
+
+## License
+
+See repository root for license information.

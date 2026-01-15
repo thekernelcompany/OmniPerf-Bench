@@ -1,0 +1,73 @@
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 13746ce..0cc2783 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -51,12 +51,13 @@ class SequenceStatus(enum.Enum):
+ 
+     @staticmethod
+     def is_finished(status: "SequenceStatus") -> bool:
+-        return status in [
++        # Optimize: Use tuple for O(1) lookup instead of creating list each time
++        return status in (
+             SequenceStatus.FINISHED_STOPPED,
+             SequenceStatus.FINISHED_LENGTH_CAPPED,
+             SequenceStatus.FINISHED_ABORTED,
+             SequenceStatus.FINISHED_IGNORED,
+-        ]
++        )
+ 
+     @staticmethod
+     def get_finished_reason(status: "SequenceStatus") -> Union[str, None]:
+@@ -525,8 +526,9 @@ class SequenceGroup:
+                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
+ 
+     def get_num_uncomputed_tokens(self) -> int:
++        # Optimize: Iterate directly over dict values instead of creating a list
+         num_uncomputed_tokens = 0
+-        for seq in self.get_seqs():
++        for seq in self.seqs_dict.values():
+             if not seq.is_finished():
+                 num_uncomputed_tokens += seq.data.get_num_uncomputed_tokens()
+         return num_uncomputed_tokens
+@@ -540,10 +542,12 @@ class SequenceGroup:
+         return len(self.get_seqs(status))
+ 
+     def num_unfinished_seqs(self) -> int:
+-        return len(self.get_unfinished_seqs())
++        # Optimize: Count directly instead of creating a list
++        return sum(1 for seq in self.seqs_dict.values() if not seq.is_finished())
+ 
+     def num_finished_seqs(self) -> int:
+-        return len(self.get_finished_seqs())
++        # Optimize: Count directly instead of creating a list
++        return sum(1 for seq in self.seqs_dict.values() if seq.is_finished())
+ 
+     def find(self, seq_id: int) -> Sequence:
+         if seq_id not in self.seqs_dict:
+@@ -561,11 +565,13 @@ class SequenceGroup:
+         del self.seqs_dict[seq_id]
+ 
+     def is_finished(self) -> bool:
+-        return all(seq.is_finished() for seq in self.get_seqs())
++        # Optimize: Iterate directly over dict values instead of creating a list
++        return all(seq.is_finished() for seq in self.seqs_dict.values())
+ 
+     def is_prefill(self) -> bool:
+         # Every sequence should be in the same stage.
+-        return self.get_seqs()[0].is_prefill()
++        # Optimize: Get first value directly without creating a list
++        return next(iter(self.seqs_dict.values())).is_prefill()
+ 
+     def __repr__(self) -> str:
+         return (f"SequenceGroup(request_id={self.request_id}, "
+@@ -857,7 +863,9 @@ class HiddenStates:
+         seq_ids = get_all_seq_ids(seq_group_metadata_list)
+         if seq_ids != self.seq_ids:
+             # Batch contents changed - prune removed sequences.
+-            index = [self.seq_ids.index(seq_id) for seq_id in seq_ids]
++            # Optimize: Use dict lookup instead of list.index() for O(n) instead of O(n²)
++            seq_id_to_index = {seq_id: idx for idx, seq_id in enumerate(self.seq_ids)}
++            index = [seq_id_to_index[seq_id] for seq_id in seq_ids]
+             self.hidden_states = self.hidden_states[index]
+             self.seq_ids = seq_ids
+ 

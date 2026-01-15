@@ -1,0 +1,97 @@
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index b4e0101a0..0913d7a0f 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -155,7 +155,8 @@ def create_and_prepopulate_kv_cache(
+         perm = torch.arange(
+             1, blocks_end)  # Sequential order starting from block 1
+ 
+-    inv_perm = torch.zeros(blocks_end, dtype=torch.long, device=device)
++    inv_perm = torch.empty(blocks_end, dtype=torch.long, device=device)
++    inv_perm[0] = 0
+     inv_perm[1:] = torch.argsort(
+         perm) + 1  # Add 1 to account for starting from block 1
+     kv_cache[:, 1:blocks_end, ...] = kv_cache[:, perm, ...]
+diff --git a/tests/v1/attention/utils.py b/tests/v1/attention/utils.py
+index 30cfbdda5..b3779ec24 100644
+--- a/tests/v1/attention/utils.py
++++ b/tests/v1/attention/utils.py
+@@ -43,12 +43,13 @@ def create_common_attn_metadata(
+         max_block_idx: int = 1000) -> CommonAttentionMetadata:
+     """Create CommonAttentionMetadata from a BatchSpec and ModelParams."""
+     # Create query start locations
++    query_lens_tensor = torch.tensor(batch_spec.query_lens,
++                                     dtype=torch.int32,
++                                     device=device)
+     query_start_loc = torch.zeros(batch_spec.batch_size + 1,
+                                   dtype=torch.int32,
+                                   device=device)
+-    query_start_loc[1:] = torch.tensor(batch_spec.query_lens,
+-                                       dtype=torch.int32,
+-                                       device=device).cumsum(0)
++    query_start_loc[1:] = query_lens_tensor.cumsum(0)
+     query_start_loc_cpu = query_start_loc.cpu()
+     num_tokens = batch_spec.compute_num_tokens()
+ 
+@@ -59,11 +60,7 @@ def create_common_attn_metadata(
+     seq_lens_cpu = seq_lens.cpu()
+ 
+     # Create computed tokens (context length for each sequence)
+-    context_lens = [
+-        batch_spec.seq_lens[i] - batch_spec.query_lens[i]
+-        for i in range(batch_spec.batch_size)
+-    ]
+-    num_computed_tokens_cpu = torch.tensor(context_lens, dtype=torch.int32)
++    num_computed_tokens_cpu = seq_lens_cpu - query_lens_tensor.cpu()
+ 
+     # Create block table (random for testing)
+     max_blocks = max(batch_spec.seq_lens) // block_size + 1
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 953ef26c8..002f34f6f 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -396,17 +396,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+             # Grab the blocks of the shared prefix from the first request.
+             assert common_prefix_len % page_size == 0
+             num_common_kv_blocks = common_prefix_len // page_size
+-            shared_qo_indptr = torch.tensor([0, num_actual_tokens],
+-                                            dtype=torch.int32,
+-                                            device=device)
+-            shared_kv_page_indptr = torch.tensor([0, num_common_kv_blocks],
+-                                                 dtype=torch.int32,
+-                                                 device=device)
++            shared_qo_indptr = torch.empty(2, dtype=torch.int32, device=device)
++            shared_qo_indptr[0] = 0
++            shared_qo_indptr[1] = num_actual_tokens
++            shared_kv_page_indptr = torch.empty(2, dtype=torch.int32, device=device)
++            shared_kv_page_indptr[0] = 0
++            shared_kv_page_indptr[1] = num_common_kv_blocks
+             shared_kv_page_indices = block_table_tensor[
+                 0, :num_common_kv_blocks]
+-            shared_kv_last_page_len = torch.tensor([page_size],
+-                                                   dtype=torch.int32,
+-                                                   device=device)
++            shared_kv_last_page_len = torch.empty(1, dtype=torch.int32, device=device)
++            shared_kv_last_page_len[0] = page_size
+             # Remove the blocks of the shared prefix from all requests.
+             block_table_tensor = block_table_tensor[:, num_common_kv_blocks:]
+             block_table_bounds -= num_common_kv_blocks
+@@ -423,7 +422,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         paged_kv_indices = block_table_tensor[mask]
+ 
+         paged_kv_indptr = torch.cat([
+-            torch.zeros(1,
++            torch.tensor([0],
+                         dtype=block_table_bounds.dtype,
+                         device=block_table_bounds.device),
+             block_table_bounds.cumsum(dim=0, dtype=torch.int32)
+@@ -652,7 +651,8 @@ class FlashInferImpl(AttentionImpl):
+                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
+                 if num_decode_tokens > 0:
+                     # decode_query may be non-contiguous
+-                    decode_query = decode_query.contiguous()
++                    if not decode_query.is_contiguous():
++                        decode_query = decode_query.contiguous()
+                     block_tables_decode = attn_metadata.block_table_tensor[:
+                                                                            num_decode_tokens]
+                     seq_lens_decode = attn_metadata.seq_lens[:

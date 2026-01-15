@@ -1,0 +1,165 @@
+diff --git a/vllm/config.py b/vllm/config.py
+index 6bfe94b..8f9889e 100644
+--- a/vllm/config.py
++++ b/vllm/config.py
+@@ -5014,6 +5014,9 @@ def get_current_model_prefix() -> str:
+     return _current_prefix
+ 
+ 
++# Precompiled pattern to speed up repeated checks for printed object reprs
++_OBJECT_PRINT_RE = re.compile(r"at 0x[a-fA-F0-9]{2,16}>")
++
+ def contains_object_print(text):
+     """
+     Check if the text looks like a printed Python object, e.g.
+@@ -5027,9 +5030,7 @@ def contains_object_print(text):
+     Returns:
+         result (bool): `True` if a match is found, `False` otherwise.
+     """
+-    pattern = r'at 0x[a-fA-F0-9]{2,16}>'
+-    match = re.search(pattern, text)
+-    return match is not None
++    return _OBJECT_PRINT_RE.search(text) is not None
+ 
+ 
+ def assert_hashable(text):
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 0eff741..5c5c746 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -6,6 +6,17 @@ import os
+ import sys
+ import tempfile
+ from typing import TYPE_CHECKING, Any, Callable, Optional
++from urllib.parse import urlparse
++
++# Precompute defaults to avoid repeated getenv/expanduser work at runtime
++_DEFAULT_CACHE_ROOT = os.getenv(
++    "XDG_CACHE_HOME",
++    os.path.join(os.path.expanduser("~"), ".cache"),
++)
++_DEFAULT_CONFIG_ROOT = os.getenv(
++    "XDG_CONFIG_HOME",
++    os.path.join(os.path.expanduser("~"), ".config"),
++)
+ 
+ if TYPE_CHECKING:
+     VLLM_HOST_IP: str = ""
+@@ -146,17 +157,11 @@ if TYPE_CHECKING:
+ 
+ 
+ def get_default_cache_root():
+-    return os.getenv(
+-        "XDG_CACHE_HOME",
+-        os.path.join(os.path.expanduser("~"), ".cache"),
+-    )
++    return _DEFAULT_CACHE_ROOT
+ 
+ 
+ def get_default_config_root():
+-    return os.getenv(
+-        "XDG_CONFIG_HOME",
+-        os.path.join(os.path.expanduser("~"), ".config"),
+-    )
++    return _DEFAULT_CONFIG_ROOT
+ 
+ 
+ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
+@@ -182,7 +187,6 @@ def get_vllm_port() -> Optional[int]:
+     try:
+         return int(port)
+     except ValueError as err:
+-        from urllib.parse import urlparse
+         parsed = urlparse(port)
+         if parsed.scheme:
+             raise ValueError(
+@@ -994,17 +998,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
+ }
+ 
+ # --8<-- [end:env-vars-definition]
++# Simple cache to avoid repeated lambda evaluations for env values
++_ENV_CACHE: dict[str, Any] = {}
++_ENV_KEYS: Optional[tuple[str, ...]] = None
+ 
+ 
+ def __getattr__(name: str):
+-    # lazy evaluation of environment variables
++    # lazy evaluation of environment variables with caching
+     if name in environment_variables:
+-        return environment_variables[name]()
++        try:
++            return _ENV_CACHE[name]
++        except KeyError:
++            value = environment_variables[name]()
++            _ENV_CACHE[name] = value
++            return value
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+ def __dir__():
+-    return list(environment_variables.keys())
++    global _ENV_KEYS
++    if _ENV_KEYS is None:
++        _ENV_KEYS = tuple(environment_variables.keys())
++    return list(_ENV_KEYS)
++
++
++def _invalidate_env_cache(name: Optional[str] = None) -> None:
++    if name is None:
++        _ENV_CACHE.clear()
++    else:
++        _ENV_CACHE.pop(name, None)
++
++# Static list of env vars that influence computation graphs; avoid
++# re-allocating this list on every compute_hash() call.
++_ENV_VARS_TO_HASH: tuple[str, ...] = (
++    "VLLM_PP_LAYER_PARTITION",
++    "VLLM_MLA_DISABLE",
++    "VLLM_USE_TRITON_FLASH_ATTN",
++    "VLLM_USE_TRITON_AWQ",
++    "VLLM_DP_RANK",
++    "VLLM_DP_SIZE",
++    "VLLM_USE_STANDALONE_COMPILE",
++    "VLLM_FUSED_MOE_CHUNK_SIZE",
++)
+ 
+ 
+ def is_set(name: str):
+@@ -1021,6 +1056,7 @@ def set_vllm_use_v1(use_v1: bool):
+             "explicitly by the user. Please raise this as a Github "
+             "Issue and explicitly set VLLM_USE_V1=0 or 1.")
+     os.environ["VLLM_USE_V1"] = "1" if use_v1 else "0"
++    _invalidate_env_cache("VLLM_USE_V1")
+ 
+ 
+ def compute_hash() -> str:
+@@ -1037,26 +1073,14 @@ def compute_hash() -> str:
+ 
+     # summarize environment variables
+     def factorize(name: str):
+-        if __getattr__(name):
+-            factors.append(__getattr__(name))
+-        else:
+-            factors.append("None")
++        val = __getattr__(name)
++        factors.append(val if val else "None")
+ 
+     # The values of envs may affects the computation graph.
+     # TODO(DefTruth): hash all environment variables?
+     # for key in environment_variables:
+     #     factorize(key)
+-    environment_variables_to_hash = [
+-        "VLLM_PP_LAYER_PARTITION",
+-        "VLLM_MLA_DISABLE",
+-        "VLLM_USE_TRITON_FLASH_ATTN",
+-        "VLLM_USE_TRITON_AWQ",
+-        "VLLM_DP_RANK",
+-        "VLLM_DP_SIZE",
+-        "VLLM_USE_STANDALONE_COMPILE",
+-        "VLLM_FUSED_MOE_CHUNK_SIZE",
+-    ]
+-    for key in environment_variables_to_hash:
++    for key in _ENV_VARS_TO_HASH:
+         if key in environment_variables:
+             factorize(key)
+ 

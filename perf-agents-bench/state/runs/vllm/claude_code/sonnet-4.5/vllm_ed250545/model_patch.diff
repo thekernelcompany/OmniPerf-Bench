@@ -1,0 +1,141 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index cbb6bb268..81d7444f1 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -72,7 +72,7 @@ class BlockPool:
+     def get_cached_block(
+             self, block_hash: BlockHash,
+             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
+-        """Get the cached block by the block hash for each group in 
++        """Get the cached block by the block hash for each group in
+         `kv_cache_group_ids`, or None if cache miss for any group.
+         If there are duplicated blocks, we return the first block in the cache.
+ 
+@@ -83,14 +83,15 @@ class BlockPool:
+         Returns:
+             The cached blocks if exists, or None.
+         """
+-        cached_blocks = []
+-        for group_id in kv_cache_group_ids:
++        # Pre-allocate list with exact size to avoid dynamic resizing
++        num_groups = len(kv_cache_group_ids)
++        cached_blocks = [None] * num_groups
++        for i, group_id in enumerate(kv_cache_group_ids):
+             cached_blocks_one_group = self.cached_block_hash_to_block.get(
+                 BlockHashWithGroupId(block_hash, group_id))
+             if not cached_blocks_one_group:
+                 return None
+-            first_block = next(iter(cached_blocks_one_group.values()))
+-            cached_blocks.append(first_block)
++            cached_blocks[i] = next(iter(cached_blocks_one_group.values()))
+         return cached_blocks
+ 
+     def cache_full_blocks(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 457d95cc7..2305953a3 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -214,11 +214,18 @@ class FreeKVCacheBlockQueue:
+         self.num_free_blocks = len(blocks)
+ 
+         # Initialize doubly links of consecutive blocks
+-        for i in range(self.num_free_blocks):
+-            if i > 0:
++        # Optimized to reduce loop overhead by handling edge cases separately
++        if self.num_free_blocks > 0:
++            # First block: no prev, has next
++            if self.num_free_blocks > 1:
++                blocks[0].next_free_block = blocks[1]
++            # Middle blocks: have both prev and next
++            for i in range(1, self.num_free_blocks - 1):
+                 blocks[i].prev_free_block = blocks[i - 1]
+-            if i < self.num_free_blocks - 1:
+                 blocks[i].next_free_block = blocks[i + 1]
++            # Last block: has prev, no next (only if there are 2+ blocks)
++            if self.num_free_blocks > 1:
++                blocks[-1].prev_free_block = blocks[-2]
+ 
+         # Create a fake head and a tail block for the doubly linked list to
+         # reduce branching in the code
+@@ -454,11 +461,25 @@ def generate_block_hash_extra_keys(
+     mm_extra_keys: list[Any]
+     mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
+         request, start_token_idx, end_token_idx, start_mm_idx)
+-    lora_extra_keys: list[int] = _gen_lora_extra_hash_keys(request)
+-    cache_salt_keys: list[str] = [request.cache_salt] if (
+-        start_token_idx == 0 and request.cache_salt) else []
+ 
+-    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys + cache_salt_keys
++    # Build extra_keys list incrementally to avoid multiple list allocations
++    has_lora = request.lora_request is not None
++    has_cache_salt = start_token_idx == 0 and request.cache_salt
++
++    if not has_lora and not has_cache_salt:
++        # Fast path: only mm_extra_keys
++        if not mm_extra_keys:
++            return None, new_start_mm_idx
++        return tuple(mm_extra_keys), new_start_mm_idx
++
++    # Slower path: need to combine multiple key sources
++    # Avoid list concatenation by building result directly
++    extra_keys: list[Any] = []
++    if has_lora:
++        extra_keys.append(request.lora_request.lora_int_id)
++    extra_keys.extend(mm_extra_keys)
++    if has_cache_salt:
++        extra_keys.append(request.cache_salt)
+ 
+     if not extra_keys:
+         return None, new_start_mm_idx
+@@ -510,20 +531,27 @@ def hash_request_tokens(hash_function: Any, block_size: int,
+         The list of computed hash values.
+     """
+     token_ids = request.all_token_ids
++    num_tokens = len(token_ids)
++
++    # Calculate number of full blocks upfront
++    num_full_blocks = num_tokens // block_size
+ 
+     req_need_extra_keys = need_extra_keys(request)
+     req_extra_keys = None
+     curr_mm_idx = 0
+ 
+-    ret = []
++    # Pre-allocate list with exact size to avoid dynamic resizing
++    ret = [None] * num_full_blocks
+     parent_block_hash_value = None
+-    for start in range(0, len(token_ids), block_size):
++    block_idx = 0
++    for start in range(0, num_tokens, block_size):
+         end = start + block_size
+-        block_token_ids = token_ids[start:end]
+-        # Do not hash the block if it is not full.
+-        if len(block_token_ids) < block_size:
++        # Early exit when we reach incomplete block
++        if end > num_tokens:
+             break
+ 
++        block_token_ids = token_ids[start:end]
++
+         if req_need_extra_keys:
+             # MM and LoRA requests need extra keys for block-hash computation.
+             req_extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+@@ -531,8 +559,9 @@ def hash_request_tokens(hash_function: Any, block_size: int,
+ 
+         block_hash = hash_block_tokens(hash_function, parent_block_hash_value,
+                                        block_token_ids, req_extra_keys)
+-        ret.append(block_hash)
++        ret[block_idx] = block_hash
+         parent_block_hash_value = block_hash.hash_value
++        block_idx += 1
+     return ret
+ 
+ 
+@@ -873,6 +902,7 @@ def _get_kv_cache_config_uniform_page_size(
+     # Group all layers by type_id.
+     # E.g., 2 full attention layers and 3 sliding window attention layers,
+     # -> (full.0, full.1), (sw.0, sw.1, sw.2).
++    # Pre-compute to avoid repeated attribute access in tight loop
+     same_type_layers: dict[str, list[str]] = defaultdict(list)
+     for layer_name, layer_spec in kv_cache_spec.items():
+         same_type_layers[layer_spec.type_id].append(layer_name)

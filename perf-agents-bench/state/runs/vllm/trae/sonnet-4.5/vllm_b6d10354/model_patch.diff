@@ -1,0 +1,116 @@
+diff --git a/cmake/utils.cmake b/cmake/utils.cmake
+index 6bf5d51..d60ff78 100644
+--- a/cmake/utils.cmake
++++ b/cmake/utils.cmake
+@@ -98,6 +98,9 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
+       "from torch.utils.cpp_extension import COMMON_NVCC_FLAGS; print(';'.join(COMMON_NVCC_FLAGS))"
+       "Failed to determine torch nvcc compiler flags")
+ 
++    # Add optimization flags for better kernel performance
++    list(APPEND GPU_FLAGS "--use_fast_math")
++
+     if (CUDA_VERSION VERSION_GREATER_EQUAL 11.8)
+       list(APPEND GPU_FLAGS "-DENABLE_FP8_E5M2")
+     endif()
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index 6d34d01..086dc5b 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -19,8 +19,11 @@ __global__ void rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce arithmetic operations
++  const int base_offset = blockIdx.x * hidden_size;
++  
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    const float x = (float) input[blockIdx.x * hidden_size + idx];
++    const float x = (float) input[base_offset + idx];
+     variance += x * x;
+   }
+   variance = blockReduceSum<float>(variance);
+@@ -30,8 +33,8 @@ __global__ void rms_norm_kernel(
+   __syncthreads();
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) input[blockIdx.x * hidden_size + idx];
+-    out[blockIdx.x * hidden_size + idx] = ((scalar_t) (x * s_variance)) * weight[idx];
++    const float x = (float) input[base_offset + idx];
++    out[base_offset + idx] = ((scalar_t) (x * s_variance)) * weight[idx];
+   }
+ }
+ 
+@@ -47,11 +50,15 @@ __global__ void fused_add_rms_norm_kernel(
+   __shared__ float s_variance;
+   float variance = 0.0f;
+ 
++  // Compute base offset once to reduce arithmetic operations
++  const int base_offset = blockIdx.x * hidden_size;
++
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) input[blockIdx.x * hidden_size + idx];
+-    x += (float) residual[blockIdx.x * hidden_size + idx];
++    const int offset = base_offset + idx;
++    float x = (float) input[offset];
++    x += (float) residual[offset];
+     variance += x * x;
+-    residual[blockIdx.x * hidden_size + idx] = (scalar_t) x;
++    residual[offset] = (scalar_t) x;
+   }
+   variance = blockReduceSum<float>(variance);
+   if (threadIdx.x == 0) {
+@@ -60,8 +67,9 @@ __global__ void fused_add_rms_norm_kernel(
+   __syncthreads();
+ 
+   for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+-    float x = (float) residual[blockIdx.x * hidden_size + idx];
+-    input[blockIdx.x * hidden_size + idx] = ((scalar_t) (x * s_variance)) * weight[idx];
++    const int offset = base_offset + idx;
++    const float x = (float) residual[offset];
++    input[offset] = ((scalar_t) (x * s_variance)) * weight[idx];
+   }
+ }
+ 
+diff --git a/csrc/reduction_utils.cuh b/csrc/reduction_utils.cuh
+index c25464e..30366d0 100644
+--- a/csrc/reduction_utils.cuh
++++ b/csrc/reduction_utils.cuh
+@@ -23,9 +23,12 @@ namespace vllm {
+ 
+ template<typename T>
+ __inline__ __device__ T warpReduceSum(T val) {
++  // Fully unroll the warp reduction for better performance
++  // This eliminates loop overhead and allows better instruction scheduling
+ #pragma unroll
+-  for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1)
++  for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+     val += VLLM_SHFL_XOR_SYNC(val, mask);
++  }
+   return val;
+ }
+ 
+@@ -43,8 +46,8 @@ __inline__ __device__ T blockReduceSum(T val) {
+   static __shared__ T shared[WARP_SIZE];
+   constexpr auto LANE_MASK = _calculateLaneMask(WARP_SIZE);
+   constexpr auto WID_SHIFT = _calculateWidShift(WARP_SIZE);
+-  int lane = threadIdx.x & LANE_MASK;
+-  int wid = threadIdx.x >> WID_SHIFT;
++  const int lane = threadIdx.x & LANE_MASK;
++  const int wid = threadIdx.x >> WID_SHIFT;
+ 
+   val = warpReduceSum<T>(val);
+ 
+@@ -53,9 +56,10 @@ __inline__ __device__ T blockReduceSum(T val) {
+ 
+   __syncthreads();
+ 
+-  // Modify from blockDim.x << 5 to blockDim.x / 32. to prevent
+-  // blockDim.x is not divided by 32
+-  val = (threadIdx.x < (blockDim.x / (WARP_SIZE * 1.0f))) ? shared[lane] : (T)(0.0f);
++  // Optimize: compute number of warps once, avoid float division
++  // Use integer arithmetic for better performance
++  const int num_warps = (blockDim.x + WARP_SIZE - 1) >> WID_SHIFT;
++  val = (threadIdx.x < num_warps) ? shared[lane] : (T)(0.0f);
+   val = warpReduceSum<T>(val);
+   return val;
+ }

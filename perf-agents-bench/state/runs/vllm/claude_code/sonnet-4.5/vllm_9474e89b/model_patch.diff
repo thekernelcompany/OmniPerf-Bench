@@ -1,0 +1,147 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a565..df771d22f 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -66,19 +66,24 @@ class BlockAllocator:
+ 
+         if block_hash is None:
+             block_hash = next(self.default_hash_ctr)
++
++        # Check cached_blocks first (most common case)
++        block = self.cached_blocks.get(block_hash)
++        if block is not None:
++            block.ref_count += 1
++            return block
++
++        # Check evictor next
+         if block_hash in self.evictor:
+-            assert block_hash not in self.cached_blocks
+             block = self.evictor.remove(block_hash)
+             assert block.ref_count == 0
+             self.cached_blocks[block_hash] = block
+             block.ref_count += 1
+-            assert block.block_hash == block_hash
+             return block
+-        if block_hash not in self.cached_blocks:
+-            self.cached_blocks[block_hash] = self.allocate_block(
+-                block_hash, num_hashed_tokens)
+-        block = self.cached_blocks[block_hash]
+-        assert block.block_hash == block_hash
++
++        # Allocate new block
++        block = self.allocate_block(block_hash, num_hashed_tokens)
++        self.cached_blocks[block_hash] = block
+         block.ref_count += 1
+         return block
+ 
+@@ -315,21 +320,26 @@ class BlockSpaceManager:
+         # When using a sliding window, blocks will be eventually reused.
+         # In this case the block tables will contain repeated blocks.
+         # When forking, we must make sure that each block's `ref_count`
+-        # is only incremented by one, so we deduplicate them by wrapping
+-        # them in a set.
+-        for block in set(src_block_table):
+-            block.ref_count += 1
++        # is only incremented by one, so we deduplicate them using a dict
++        # for O(1) lookups instead of creating a set.
++        seen_blocks = {}
++        for block in src_block_table:
++            if block.block_number not in seen_blocks:
++                seen_blocks[block.block_number] = block
++                block.ref_count += 1
+ 
+     def _get_physical_blocks(
+             self, seq_group: SequenceGroup) -> List[PhysicalTokenBlock]:
+         # NOTE: Here, we assume that the physical blocks are only shared by
+         # the sequences in the same group.
+-        blocks: Set[PhysicalTokenBlock] = set()
++        # Use dict for O(1) deduplication instead of set
++        blocks_dict: Dict[int, PhysicalTokenBlock] = {}
+         for seq in seq_group.get_seqs():
+             if seq.is_finished():
+                 continue
+-            blocks.update(self.block_tables[seq.seq_id])
+-        return list(blocks)
++            for block in self.block_tables[seq.seq_id]:
++                blocks_dict[block.block_number] = block
++        return list(blocks_dict.values())
+ 
+     def can_swap_in(self, seq_group: SequenceGroup) -> bool:
+         blocks = self._get_physical_blocks(seq_group)
+@@ -406,11 +416,15 @@ class BlockSpaceManager:
+         blocks_to_free = (block_table[-self.block_sliding_window:]
+                           if self.block_sliding_window is not None else
+                           block_table)
+-        for block in set(blocks_to_free):
+-            if block.device == Device.GPU:
+-                self.gpu_allocator.free(block)
+-            else:
+-                self.cpu_allocator.free(block)
++        # Use dict for deduplication to avoid set creation
++        seen_blocks: Dict[int, PhysicalTokenBlock] = {}
++        for block in blocks_to_free:
++            if block.block_number not in seen_blocks:
++                seen_blocks[block.block_number] = block
++                if block.device == Device.GPU:
++                    self.gpu_allocator.free(block)
++                else:
++                    self.cpu_allocator.free(block)
+ 
+     def free(self, seq: Sequence) -> None:
+         if seq.seq_id not in self.block_tables:
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a97..5aaa1a0c4 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -64,37 +64,27 @@ class LRUEvictor(Evictor):
+     def __contains__(self, block_hash: int) -> bool:
+         return block_hash in self.free_table
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
++        # Single pass optimization: find the block with lowest timestamp
++        # and highest num_hashed_tokens in one iteration
++        evicted_block: Optional[PhysicalTokenBlock] = None
++        lowest_timestamp = float('inf')
++        highest_num_hashed_tokens = -1
++
++        for block in self.free_table.values():
++            # Prioritize by timestamp first (lower is better)
+             if block.last_accessed < lowest_timestamp:
+                 lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+                 highest_num_hashed_tokens = block.num_hashed_tokens
+-
+-        evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
+                 evicted_block = block
+-                break
++            # If timestamps equal, prioritize by num_hashed_tokens (higher is better)
++            elif block.last_accessed == lowest_timestamp:
++                if block.num_hashed_tokens > highest_num_hashed_tokens:
++                    highest_num_hashed_tokens = block.num_hashed_tokens
++                    evicted_block = block
+ 
+         assert evicted_block is not None
+ 

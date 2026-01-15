@@ -1,0 +1,81 @@
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index ed7e06cab..27d0597ab 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -59,6 +59,7 @@ class BlockMetaData:
+     Here we use physical block id as the dict key, as there maybe several
+     blocks with the same content hash, but their physical id is unique.
+     """
++    __slots__ = ('content_hash', 'num_hashed_tokens', 'last_accessed')
+ 
+     def __init__(self, content_hash: int, num_hashed_tokens: int,
+                  last_accessed: float):
+@@ -82,26 +83,37 @@ class LRUEvictor(Evictor):
+         return block_id in self.free_table
+ 
+     def evict(self) -> Tuple[int, int]:
+-        if len(self.free_table) == 0:
++        if not self.free_table:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block, evicted_block_id = None, None
+         # The blocks with the lowest timestamps should be placed consecutively
+         # at the start of OrderedDict. Loop through all these blocks to
+         # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block is None:
+-                evicted_block, evicted_block_id = block, _id
+-                continue
+-            if evicted_block.last_accessed < block.last_accessed:
++        free_table_iter = iter(self.free_table.items())
++        evicted_block_id, evicted_block = next(free_table_iter)
++        min_last_accessed = evicted_block.last_accessed
++        max_hashed_tokens = evicted_block.num_hashed_tokens
++
++        for _id, block in free_table_iter:
++            block_last_accessed = block.last_accessed
++            if block_last_accessed < min_last_accessed:
++                # Found a block with earlier access time
++                min_last_accessed = block_last_accessed
++                max_hashed_tokens = block.num_hashed_tokens
++                evicted_block_id = _id
++                evicted_block = block
++            elif block_last_accessed == min_last_accessed:
++                # Same access time, check for more hashed tokens
++                block_num_hashed = block.num_hashed_tokens
++                if block_num_hashed > max_hashed_tokens:
++                    max_hashed_tokens = block_num_hashed
++                    evicted_block_id = _id
++                    evicted_block = block
++            else:
++                # Access time is later, stop searching
+                 break
+-            if evicted_block.num_hashed_tokens < block.num_hashed_tokens:
+-                evicted_block, evicted_block_id = block, _id
+ 
+-        assert evicted_block is not None
+-        assert evicted_block_id is not None
+         self.free_table.pop(evicted_block_id)
+-
+         return evicted_block_id, evicted_block.content_hash
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+@@ -111,13 +123,15 @@ class LRUEvictor(Evictor):
+                                                   last_accessed)
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        block = self.free_table[block_id]
++        block.last_accessed = last_accessed
+ 
+     def remove(self, block_id: int):
+-        if block_id not in self.free_table:
++        try:
++            self.free_table.pop(block_id)
++        except KeyError:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
+ 
+     @property
+     def num_blocks(self) -> int:
