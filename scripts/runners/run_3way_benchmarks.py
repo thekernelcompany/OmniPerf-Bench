@@ -53,27 +53,54 @@ def get_hf_token() -> str:
     return ""
 
 
-def load_perf_data() -> Dict[str, dict]:
-    """Load perf_command, model, gpu_config from full_results.jsonl."""
-    perf_data = {}
-    if not PERF_DATA_FILE.exists():
-        print(f"WARNING: Perf data file not found: {PERF_DATA_FILE}")
-        return perf_data
+BENCHMARK_MODE_MAPPING_FILE = Path("/root/OmniPerf-Bench/data/mappings/benchmark_mode_mapping.json")
 
-    with open(PERF_DATA_FILE) as f:
-        for line in f:
-            try:
-                data = json.loads(line.strip())
-                commit = data.get('commit_hash', '')[:8]
-                if commit and data.get('perf_command'):
-                    perf_data[commit] = {
-                        'perf_command': data['perf_command'],
-                        'model': data.get('model', 'unknown'),
-                        'gpu_config': data.get('gpu_config', 'H100:1'),
-                        'commit_hash_full': data.get('commit_hash', '')
-                    }
-            except json.JSONDecodeError:
-                continue
+
+def load_benchmark_mode_mapping() -> Dict[str, dict]:
+    """Load benchmark mode mapping from HuggingFace dataset export."""
+    if BENCHMARK_MODE_MAPPING_FILE.exists():
+        with open(BENCHMARK_MODE_MAPPING_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def load_perf_data() -> Dict[str, dict]:
+    """Load perf_command, model, gpu_config, benchmark_mode from various sources."""
+    perf_data = {}
+
+    # First load benchmark mode mapping (from HuggingFace dataset)
+    mode_mapping = load_benchmark_mode_mapping()
+    for commit, data in mode_mapping.items():
+        perf_data[commit] = {
+            'perf_command': data.get('perf_command', ''),
+            'model': data.get('model', 'unknown'),
+            'gpu_config': 'H100:1',
+            'commit_hash_full': data.get('commit_full', ''),
+            'benchmark_mode': data.get('benchmark_mode'),  # serving, standalone, prefix_caching, or null
+            'parent_commit': data.get('parent_commit', ''),
+        }
+
+    # Then overlay from full_results.jsonl (for any additional data)
+    if PERF_DATA_FILE.exists():
+        with open(PERF_DATA_FILE) as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    commit = data.get('commit_hash', '')[:8]
+                    if commit and data.get('perf_command'):
+                        if commit not in perf_data:
+                            perf_data[commit] = {}
+                        perf_data[commit].update({
+                            'perf_command': data['perf_command'],
+                            'model': data.get('model', perf_data.get(commit, {}).get('model', 'unknown')),
+                            'gpu_config': data.get('gpu_config', 'H100:1'),
+                            'commit_hash_full': data.get('commit_hash', ''),
+                        })
+                        # Preserve benchmark_mode from HuggingFace if not in jsonl
+                        if 'benchmark_mode' not in perf_data[commit]:
+                            perf_data[commit]['benchmark_mode'] = None
+                except json.JSONDecodeError:
+                    continue
     return perf_data
 
 
@@ -161,6 +188,44 @@ def load_agent_patches() -> Dict[str, Path]:
     return patches
 
 
+def get_benchmark_type(perf_command: str) -> str:
+    """Determine benchmark type from perf_command."""
+    if not perf_command:
+        return 'serving'
+    if 'benchmark_latency' in perf_command or 'bench latency' in perf_command:
+        return 'latency'
+    if 'benchmark_throughput' in perf_command or 'bench throughput' in perf_command:
+        return 'throughput'
+    if 'benchmark_prefix_caching' in perf_command:
+        return 'prefix_caching'
+    # Default to serving (benchmark_serving.py or bench serve)
+    return 'serving'
+
+
+def needs_server(perf_command: str) -> bool:
+    """Determine if benchmark needs a running vLLM server or runs offline.
+
+    - benchmark_serving.py / vllm bench serve: needs server
+    - benchmark_throughput.py / vllm bench throughput: runs offline
+    - benchmark_latency.py / vllm bench latency: runs offline
+    - benchmark_prefix_caching.py: runs offline
+    """
+    if not perf_command:
+        return True  # Default to server-based
+    perf_lower = perf_command.lower()
+
+    # Offline benchmarks
+    if 'benchmark_throughput' in perf_lower or 'bench throughput' in perf_lower:
+        return False
+    if 'benchmark_latency' in perf_lower or 'bench latency' in perf_lower:
+        return False
+    if 'benchmark_prefix_caching' in perf_lower:
+        return False
+
+    # Server-based benchmarks
+    return True
+
+
 def parse_serving_metrics(output: str) -> Dict[str, float]:
     """Parse metrics from benchmark_serving.py output."""
     metrics = {}
@@ -187,6 +252,195 @@ def parse_serving_metrics(output: str) -> Dict[str, float]:
     return metrics
 
 
+def parse_latency_metrics(output: str) -> Dict[str, float]:
+    """Parse metrics from benchmark_latency.py output."""
+    metrics = {}
+    patterns = {
+        'latency_avg_ms': r'(?:Avg latency|avg_latency):\s*([\d.]+)\s*(?:ms|seconds)?',
+        'latency_p50_ms': r'(?:P50 latency|median_latency):\s*([\d.]+)\s*(?:ms|seconds)?',
+        'latency_p99_ms': r'(?:P99 latency|p99_latency):\s*([\d.]+)\s*(?:ms|seconds)?',
+        'throughput_tok_s': r'(?:Throughput|throughput):\s*([\d.]+)\s*(?:tokens?/s|tok/s)',
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            val = float(match.group(1))
+            # Convert seconds to ms if needed
+            if 'latency' in key and 'seconds' in output[max(0, match.start()-20):match.end()+20].lower():
+                val *= 1000
+            metrics[key] = val
+
+    return metrics
+
+
+def parse_throughput_metrics(output: str) -> Dict[str, float]:
+    """Parse metrics from benchmark_throughput.py output."""
+    metrics = {}
+    patterns = {
+        'throughput_tok_s': r'(?:Throughput|throughput):\s*([\d.]+)\s*(?:tokens?/s|tok/s)',
+        'elapsed_time_s': r'(?:Elapsed time|elapsed_time):\s*([\d.]+)\s*(?:s|seconds)?',
+        'total_tokens': r'(?:Total tokens|total_tokens):\s*([\d.]+)',
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            metrics[key] = float(match.group(1))
+
+    return metrics
+
+
+def parse_metrics_by_type(output: str, benchmark_type: str) -> Dict[str, float]:
+    """Parse metrics based on benchmark type."""
+    if benchmark_type == 'latency':
+        return parse_latency_metrics(output)
+    elif benchmark_type == 'throughput':
+        return parse_throughput_metrics(output)
+    elif benchmark_type == 'standalone':
+        # Standalone can be either latency or throughput - try both
+        metrics = parse_throughput_metrics(output)
+        metrics.update(parse_latency_metrics(output))
+        return metrics
+    else:
+        return parse_serving_metrics(output)
+
+
+def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int = 900, benchmark_mode: str = 'standalone') -> dict:
+    """Run standalone benchmark (throughput/latency) without a server."""
+    start_time = time.time()
+
+    human_commit = commit_info['human_commit_full']
+    human_short = commit_info['human_commit_short']
+    model = commit_info.get('model', '')
+    perf_command = commit_info.get('perf_command', '')
+
+    docker_image = f"{HUMAN_IMAGE_PREFIX}:{human_commit}"
+
+    # Build the benchmark command - run perf_command directly
+    docker_cmd = f'''
+    set -e
+    MODEL="{model}"
+
+    export PYTHONPATH=/workspace:$PYTHONPATH
+
+    # Find Python with vLLM
+    VLLM_PYTHON=""
+    for py in /opt/venv/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
+        if [ -x "$(which $py 2>/dev/null || echo '')" ] || [ -x "$py" ]; then
+            if $py -c "import vllm" 2>/dev/null; then
+                VLLM_PYTHON="$py"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$VLLM_PYTHON" ]; then
+        echo "ERROR: Could not find Python with vLLM"
+        exit 1
+    fi
+
+    echo "Using Python: $VLLM_PYTHON"
+    echo "Running benchmark mode: {benchmark_mode}"
+    echo "Original perf command: {perf_command}"
+
+    # Human images have vLLM at /workspace with benchmark scripts
+    PERF_CMD="{perf_command}"
+
+    # Handle vllm bench throughput -> use workspace benchmark script
+    if echo "$PERF_CMD" | grep -q "vllm bench throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench throughput//')
+        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Converted vllm bench throughput to script: $PERF_CMD"
+    # Handle vllm bench latency -> use workspace benchmark script
+    elif echo "$PERF_CMD" | grep -q "vllm bench latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench latency//')
+        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_latency.py $ARGS"
+        echo "Converted vllm bench latency to script: $PERF_CMD"
+    # Handle python benchmarks/benchmark_latency.py -> use workspace script
+    elif echo "$PERF_CMD" | grep -q "benchmark_latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_latency\.py\s*||')
+        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_latency.py $ARGS"
+        echo "Using workspace benchmark_latency.py: $PERF_CMD"
+    # Handle python benchmarks/benchmark_throughput.py -> use workspace script
+    elif echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_throughput\.py\s*||')
+        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Using workspace benchmark_throughput.py: $PERF_CMD"
+    # Handle other python commands
+    elif echo "$PERF_CMD" | grep -q "^python"; then
+        PERF_CMD=$(echo "$PERF_CMD" | sed "s|^python3\\? |$VLLM_PYTHON |")
+        echo "Using Python command: $PERF_CMD"
+    fi
+
+    echo "Final command: $PERF_CMD"
+
+    # Run from workspace directory (human images have vLLM in /workspace)
+    cd /workspace 2>/dev/null || cd /tmp
+
+    # Run the benchmark with proper PYTHONPATH
+    echo "=== Running HUMAN {benchmark_mode} benchmark ==="
+    PYTHONPATH=/workspace:$PYTHONPATH $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
+
+    echo "BENCHMARK_DONE"
+    cat /tmp/benchmark_output.txt
+    '''
+
+    print(f"  Running human {benchmark_mode} benchmark with image: {docker_image}")
+
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm', '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', '/ephemeral/huggingface:/root/.cache/huggingface',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                docker_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        metrics = parse_metrics_by_type(output, benchmark_mode)
+
+        if not metrics:
+            return {
+                'status': 'error',
+                'error': f'No {benchmark_mode} metrics in output',
+                'duration_s': duration,
+                'benchmark_mode': benchmark_mode,
+                'raw_output': output[-10000:]
+            }
+
+        return {
+            'status': 'success',
+            'metrics': metrics,
+            'duration_s': duration,
+            'benchmark_mode': benchmark_mode,
+            'raw_output': output[-10000:]
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            'status': 'timeout',
+            'error': f'Benchmark exceeded {timeout}s timeout',
+            'duration_s': timeout,
+            'benchmark_mode': benchmark_mode,
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e),
+            'duration_s': time.time() - start_time,
+            'benchmark_mode': benchmark_mode,
+        }
+
+
 def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) -> dict:
     """Run benchmark using human's optimized Docker image."""
     start_time = time.time()
@@ -195,6 +449,18 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     human_short = commit_info['human_commit_short']
     model = commit_info.get('model', '')
     perf_command = commit_info.get('perf_command', '')
+    benchmark_type = get_benchmark_type(perf_command)
+
+    # Route based on perf_command type - offline vs server-based
+    if not needs_server(perf_command):
+        # Throughput, latency, prefix_caching benchmarks run offline
+        return run_human_benchmark_offline(commit_info, hf_token, timeout, benchmark_type)
+
+    # Fall through to serving benchmark (needs server)
+
+    # Handle None perf_command
+    if not perf_command:
+        perf_command = f'python benchmarks/benchmark_serving.py --model {model}'
 
     # Adjust perf_command for sonnet dataset (works with old vLLM, generates synthetic data)
     perf_command = re.sub(r'--dataset-name\s+sharegpt', '--dataset-name sonnet', perf_command)
@@ -381,17 +647,7 @@ PATCH
         apt-get update -qq && apt-get install -y -qq git 2>/dev/null || yum install -y git -q 2>/dev/null || true
     fi
 
-    # Clone vLLM repo at specific commit for benchmark scripts
-    cd /opt
-    rm -rf vllm_bench 2>/dev/null || true
-    echo "Cloning vLLM repo for benchmark scripts..."
-    git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>&1 || ( echo "GIT_CLONE_FAILED" && exit 1 )
-    cd vllm_bench
-    git fetch --depth 1 origin $COMMIT 2>/dev/null || git fetch origin $COMMIT 2>/dev/null || true
-    git checkout $COMMIT 2>/dev/null || git checkout -f HEAD
-
-    # Fix benchmark_serving.py compatibility with transformers 4.44.2
-    sed -i 's/tokenizer.chat_template or tokenizer.default_chat_template/getattr(tokenizer, "chat_template", None) or getattr(tokenizer, "default_chat_template", True)/g' benchmarks/benchmark_serving.py 2>/dev/null || true
+    # No need to clone vLLM - we use /workspace/benchmarks/ which has the full scripts
 
     # Start server using the Python that has vLLM
     echo "=== Starting vLLM server for HUMAN benchmark ==="
@@ -420,71 +676,27 @@ PATCH
 
     echo "=== Running HUMAN benchmark ==="
 
-    # Use direct HTTP benchmark for reliability across all vLLM versions
-    echo "Using direct HTTP benchmark..."
-    $VLLM_PYTHON << BENCHMARK_SCRIPT
-import asyncio
-import aiohttp
-import time
-import json
-import random
-import string
+    # Use workspace vLLM's benchmark_serving.py for proper TTFT/TPOT/ITL metrics
+    # (Human images have vLLM in /workspace with full benchmark scripts)
+    cd /workspace
 
-async def send_request(session, url, payload):
-    start = time.perf_counter()
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            result = await resp.json()
-            end = time.perf_counter()
-            output_tokens = len(result.get('choices', [dict()])[0].get('text', '').split())
-            return end - start, output_tokens, None
-    except Exception as e:
-        return None, 0, str(e)
+    echo "Running benchmark_serving.py for serving metrics..."
+    PYTHONPATH=/workspace:$PYTHONPATH $VLLM_PYTHON /workspace/benchmarks/benchmark_serving.py \
+        --model $MODEL \
+        --backend vllm \
+        --port 8000 \
+        --dataset-name sonnet \
+        --dataset-path /workspace/benchmarks/sonnet.txt \
+        --sonnet-input-len 256 \
+        --sonnet-output-len 64 \
+        --num-prompts 100 \
+        --request-rate inf \
+        2>&1 | tee /tmp/benchmark_output.txt
 
-async def benchmark():
-    url = "http://localhost:8000/v1/completions"
-    model = "$MODEL"
-    num_prompts = 100
-    max_tokens = 64
-
-    # Generate random prompts
-    prompts = []
-    for _ in range(num_prompts):
-        prompt = ' '.join(random.choices(['the', 'a', 'is', 'of', 'and', 'to', 'in', 'for', 'on', 'with'], k=200))
-        prompts.append(prompt)
-
-    async with aiohttp.ClientSession() as session:
-        start_time = time.perf_counter()
-        tasks = []
-        for prompt in prompts:
-            payload = dict(
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=0.0
-            )
-            tasks.append(send_request(session, url, payload))
-
-        results = await asyncio.gather(*tasks)
-        end_time = time.perf_counter()
-
-    total_time = end_time - start_time
-    successful = sum(1 for r in results if r[0] is not None)
-    total_output_tokens = sum(r[1] for r in results if r[0] is not None)
-    total_input_tokens = num_prompts * 200  # approx
-
-    print("============ Serving Benchmark Result ============")
-    print("Successful requests:                     " + str(successful))
-    print("Benchmark duration (s):                  " + str(round(total_time, 2)))
-    print("Total input tokens:                      " + str(total_input_tokens))
-    print("Total generated tokens:                  " + str(total_output_tokens))
-    print("Request throughput (req/s):              " + str(round(successful/total_time, 2)))
-    print("Output token throughput (tok/s):         " + str(round(total_output_tokens/total_time, 2)))
-    print("==================================================")
-
-if __name__ == "__main__":
-    asyncio.run(benchmark())
-BENCHMARK_SCRIPT
+    # Show TTFT/TPOT/ITL metrics
+    echo "============ Serving Benchmark Result ============"
+    cat /tmp/benchmark_output.txt | grep -E "(TTFT|TPOT|ITL|throughput|Throughput|Mean|Median|P99)" || true
+    echo "=================================================="
 
     kill $SERVER_PID 2>/dev/null || true
     echo "BENCHMARK_DONE"
@@ -559,14 +771,219 @@ BENCHMARK_SCRIPT
         }
 
 
+def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: str, timeout: int = 900, benchmark_type: str = 'throughput') -> dict:
+    """Run offline benchmark (throughput/latency) by applying agent patch to baseline vLLM."""
+    start_time = time.time()
+
+    human_short = commit_info['human_commit_short']
+    parent_commit = commit_info.get('parent_commit')
+    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
+    perf_command = commit_info.get('perf_command', '')
+
+    # Skip if parent_commit is missing
+    if not parent_commit:
+        return {
+            'status': 'error',
+            'error': 'Missing parent_commit - cannot determine baseline image',
+            'duration_s': time.time() - start_time,
+            'benchmark_type': benchmark_type
+        }
+
+    # Use baseline image (has vLLM at parent commit)
+    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+
+    docker_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+    MODEL="{model}"
+
+    echo "=== Applying agent patch to baseline vLLM ==="
+
+    # Baseline images have vLLM installed in /opt/vllm_baseline
+    cd /opt/vllm_baseline
+
+    # Compatibility fixes (same as server-based benchmark)
+    VLLM_USES_MLLAMA=$(find /opt/vllm_baseline -name "*mllama*" 2>/dev/null | head -1)
+
+    if [ -n "$VLLM_USES_MLLAMA" ]; then
+        if ! python3 -c "from transformers.models.mllama import configuration_mllama" 2>/dev/null; then
+            pip install 'transformers>=4.45.0' -q 2>/dev/null || true
+        fi
+    else
+        if ! python3 -c "from transformers.generation.logits_process import LogitsWarper" 2>/dev/null; then
+            pip install 'transformers==4.44.2' -q 2>/dev/null || true
+        fi
+    fi
+
+    pip install 'numpy<2' -q 2>/dev/null || true
+
+    # Verify vLLM exists
+    if [ ! -d "vllm" ]; then
+        echo "ERROR: vLLM not found at /opt/vllm_baseline"
+        exit 1
+    fi
+
+    # Apply agent patch
+    echo "Applying patch..."
+    if patch -p1 --dry-run < /agent_patch.diff 2>&1; then
+        patch -p1 < /agent_patch.diff 2>&1
+        echo "AGENT_PATCH_APPLIED"
+    else
+        echo "Patch dry-run failed, trying with --force..."
+        patch -p1 --force < /agent_patch.diff 2>&1 || true
+        echo "AGENT_PATCH_APPLIED_FALLBACK"
+    fi
+
+    # Apply rope_scaling fix for Llama-3.1 models
+    find /opt/vllm_baseline/vllm -name "*.py" -exec grep -l 'rope_scaling\\["type"\\]' {{}} \\; 2>/dev/null | while read f; do
+        sed -i 's/rope_scaling\\["type"\\]/rope_scaling.get("type", rope_scaling.get("rope_type"))/g' "$f"
+    done
+
+    # Find Python with vLLM
+    export PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH
+    VLLM_PYTHON=""
+    for py in /opt/venv/bin/python3 /opt/venv/bin/python /usr/local/bin/python3 /usr/bin/python3 $(which python3 2>/dev/null); do
+        if [ -x "$py" ] && PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $py -c "import vllm" 2>/dev/null; then
+            VLLM_PYTHON="$py"
+            echo "Found vLLM at: $VLLM_PYTHON"
+            break
+        fi
+    done
+
+    if [ -z "$VLLM_PYTHON" ]; then
+        VLLM_PYTHON="python3"
+    fi
+
+    echo "=== Running AGENT {benchmark_type} benchmark (offline) ==="
+    echo "Original perf command: {perf_command}"
+
+    # Baseline images have OLD vLLM - use benchmark scripts from /opt/vllm_baseline
+    # NOT the new CLI (which doesn't exist in old versions)
+    PERF_CMD="{perf_command}"
+
+    # Convert vllm bench commands to use the OLD benchmark scripts
+    if echo "$PERF_CMD" | grep -q "vllm bench throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench throughput//')
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Converted vllm bench throughput to script: $PERF_CMD"
+    elif echo "$PERF_CMD" | grep -q "vllm bench latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench latency//')
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_latency.py $ARGS"
+        echo "Converted vllm bench latency to script: $PERF_CMD"
+    # Handle python benchmarks/benchmark_latency.py -> use script from baseline
+    elif echo "$PERF_CMD" | grep -q "benchmark_latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_latency\.py\s*||')
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_latency.py $ARGS"
+        echo "Using baseline benchmark_latency.py: $PERF_CMD"
+    # Handle python benchmarks/benchmark_throughput.py -> use script from baseline
+    elif echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_throughput\.py\s*||')
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Using baseline benchmark_throughput.py: $PERF_CMD"
+    # Handle other python commands
+    elif echo "$PERF_CMD" | grep -q "^python"; then
+        PERF_CMD=$(echo "$PERF_CMD" | sed "s|^python3\\? |$VLLM_PYTHON |")
+        echo "Using Python command: $PERF_CMD"
+    fi
+
+    echo "Final command: $PERF_CMD"
+
+    # Run from baseline vLLM directory
+    cd /opt/vllm_baseline
+
+    # Run the benchmark with proper PYTHONPATH
+    PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
+
+    echo "BENCHMARK_DONE"
+    cat /tmp/benchmark_output.txt
+    '''
+
+    print(f"  Running agent {benchmark_type} benchmark (offline) with baseline image: {baseline_image}")
+    print(f"  Applying patch: {agent_patch}")
+
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm', '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-e', 'VLLM_USE_V1=0',
+                '-v', '/ephemeral/huggingface_cache:/root/.cache/huggingface',
+                '-v', f'{agent_patch}:/agent_patch.diff:ro',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                baseline_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        metrics = parse_metrics_by_type(output, benchmark_type)
+
+        if not metrics:
+            return {
+                'status': 'error',
+                'error': f'No {benchmark_type} metrics in agent output',
+                'duration_s': duration,
+                'benchmark_type': benchmark_type,
+                'raw_output': output[-10000:]
+            }
+
+        return {
+            'status': 'success',
+            'metrics': metrics,
+            'duration_s': duration,
+            'benchmark_type': benchmark_type,
+            'raw_output': output[-5000:]
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            'status': 'timeout',
+            'error': f'Agent benchmark timed out after {timeout}s',
+            'duration_s': timeout,
+            'benchmark_type': benchmark_type
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e),
+            'duration_s': time.time() - start_time,
+            'benchmark_type': benchmark_type
+        }
+
+
 def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, timeout: int = 900) -> dict:
     """Run benchmark by applying agent patch to baseline vLLM."""
     start_time = time.time()
 
     human_short = commit_info['human_commit_short']
-    parent_commit = commit_info['parent_commit']
-    model = commit_info.get('model', '')
+    parent_commit = commit_info.get('parent_commit')
+    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
     perf_command = commit_info.get('perf_command', '')
+    benchmark_type = get_benchmark_type(perf_command)
+
+    # Skip if parent_commit is missing
+    if not parent_commit:
+        return {
+            'status': 'error',
+            'error': 'Missing parent_commit - cannot determine baseline image',
+            'duration_s': time.time() - start_time
+        }
+
+    # Route based on perf_command type - offline vs server-based
+    if not needs_server(perf_command):
+        # Throughput, latency, prefix_caching benchmarks run offline
+        return run_agent_benchmark_offline(commit_info, agent_patch, hf_token, timeout, benchmark_type)
+
+    # Fall through to serving benchmark (needs server)
+
+    # Handle None perf_command
+    if not perf_command:
+        perf_command = f'python benchmarks/benchmark_serving.py --model {model}'
 
     # Adjust perf_command for compatibility
     perf_command = re.sub(r'--dataset-name\s+sharegpt', '--dataset-name random', perf_command)
@@ -745,17 +1162,7 @@ PATCH
         apt-get update -qq && apt-get install -y -qq git 2>/dev/null || yum install -y git -q 2>/dev/null || true
     fi
 
-    # Clone vLLM repo for benchmark scripts
-    cd /opt
-    rm -rf vllm_bench 2>/dev/null || true
-    echo "Cloning vLLM repo for benchmark scripts..."
-    if ! git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_bench 2>&1; then
-        echo "Git clone failed, trying without depth..."
-        git clone https://github.com/vllm-project/vllm.git vllm_bench 2>&1 || ( echo "GIT_CLONE_FAILED" && exit 1 )
-    fi
-    cd vllm_bench
-    git fetch --depth 1 origin $PARENT_COMMIT 2>/dev/null || git fetch origin $PARENT_COMMIT 2>/dev/null || true
-    git checkout $PARENT_COMMIT 2>/dev/null || git checkout -f HEAD
+    # No need to clone vLLM - we use /opt/vllm_baseline/benchmarks/ which has the full scripts
 
     # Start server using the Python that has vLLM (with PYTHONPATH for baseline)
     echo "=== Starting vLLM server for AGENT benchmark ==="
@@ -783,73 +1190,28 @@ PATCH
     fi
 
     echo "=== Running AGENT benchmark ==="
-    cd /opt/vllm_bench/benchmarks
 
-    # Use direct HTTP benchmark for reliability across vLLM versions
-    echo "Using direct HTTP benchmark..."
-    $VLLM_PYTHON << BENCHMARK_SCRIPT
-import asyncio
-import aiohttp
-import time
-import json
-import random
-import string
+    # Use baseline vLLM's benchmark_serving.py for proper TTFT/TPOT/ITL metrics
+    # (Latest vLLM has deprecated stubs, baseline has the full implementation)
+    cd /opt/vllm_baseline
 
-async def send_request(session, url, payload):
-    start = time.perf_counter()
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            result = await resp.json()
-            end = time.perf_counter()
-            output_tokens = len(result.get('choices', [dict()])[0].get('text', '').split())
-            return end - start, output_tokens, None
-    except Exception as e:
-        return None, 0, str(e)
+    echo "Running benchmark_serving.py for serving metrics..."
+    PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py \
+        --model $MODEL \
+        --backend vllm \
+        --port 8000 \
+        --dataset-name sonnet \
+        --dataset-path /opt/vllm_baseline/benchmarks/sonnet.txt \
+        --sonnet-input-len 256 \
+        --sonnet-output-len 64 \
+        --num-prompts 100 \
+        --request-rate inf \
+        2>&1 | tee /tmp/benchmark_output.txt
 
-async def benchmark():
-    url = "http://localhost:8000/v1/completions"
-    model = "$MODEL"
-    num_prompts = 100
-    max_tokens = 64
-
-    # Generate random prompts
-    prompts = []
-    for _ in range(num_prompts):
-        prompt = ' '.join(random.choices(['the', 'a', 'is', 'of', 'and', 'to', 'in', 'for', 'on', 'with'], k=200))
-        prompts.append(prompt)
-
-    async with aiohttp.ClientSession() as session:
-        start_time = time.perf_counter()
-        tasks = []
-        for prompt in prompts:
-            payload = dict(
-                model=model,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=0.0
-            )
-            tasks.append(send_request(session, url, payload))
-
-        results = await asyncio.gather(*tasks)
-        end_time = time.perf_counter()
-
-    total_time = end_time - start_time
-    successful = sum(1 for r in results if r[0] is not None)
-    total_output_tokens = sum(r[1] for r in results if r[0] is not None)
-    total_input_tokens = num_prompts * 200  # approx
-
-    print("============ Serving Benchmark Result ============")
-    print("Successful requests:                     " + str(successful))
-    print("Benchmark duration (s):                  " + str(round(total_time, 2)))
-    print("Total input tokens:                      " + str(total_input_tokens))
-    print("Total generated tokens:                  " + str(total_output_tokens))
-    print("Request throughput (req/s):              " + str(round(successful/total_time, 2)))
-    print("Output token throughput (tok/s):         " + str(round(total_output_tokens/total_time, 2)))
-    print("==================================================")
-
-if __name__ == "__main__":
-    asyncio.run(benchmark())
-BENCHMARK_SCRIPT
+    # Show TTFT/TPOT/ITL metrics
+    echo "============ Serving Benchmark Result ============"
+    cat /tmp/benchmark_output.txt | grep -E "(TTFT|TPOT|ITL|throughput|Throughput|Mean|Median|P99)" || true
+    echo "=================================================="
 
     kill $SERVER_PID 2>/dev/null || true
     echo "BENCHMARK_DONE"
@@ -1024,7 +1386,8 @@ def main():
             print(f"\n{commit}:")
             print(f"  Model: {info.get('model', 'N/A')}")
             print(f"  Human image: {HUMAN_IMAGE_PREFIX}:{info.get('human_commit_full', 'N/A')}")
-            print(f"  Baseline image: {BASELINE_IMAGE_PREFIX}:baseline-{info.get('parent_commit', 'N/A')[:12]}")
+            parent = info.get('parent_commit') or 'N/A'
+            print(f"  Baseline image: {BASELINE_IMAGE_PREFIX}:baseline-{parent[:12]}")
             print(f"  Agent patch: {'YES' if has_patch else 'NO'}")
         return
 

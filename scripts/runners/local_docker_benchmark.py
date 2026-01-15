@@ -34,12 +34,41 @@ OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
 BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
 BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping.json")
 
-# Agent patches configuration
+# Agent patches configuration (legacy - single agent)
 AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 
-# Baseline image caching - once built, save and reuse
-BASELINE_IMAGE_PREFIX = "vllm-baseline-built"  # Local cache prefix
+# Multi-agent configuration - paths to agent patch directories
+AGENT_CONFIGS = {
+    "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
+    "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
+    "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",
+    "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
+}
+
+# Output directories per agent type
+AGENT_OUTPUT_DIRS = {
+    "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
+    "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
+    "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
+    "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+}
+
+
+def get_output_dirs(agent_type: str = "claude_code") -> Dict[str, Path]:
+    """Get output directories for a specific agent type."""
+    base_dir = AGENT_OUTPUT_DIRS.get(agent_type, RESULTS_DIR)
+    return {
+        'results': base_dir,
+        'baseline': base_dir / "baseline_benchmark_results",
+        'agent': base_dir / "agent_benchmark_results",
+        'docker': base_dir / "docker_benchmark_results",
+    }
+
+
+# Pre-built baseline images on Docker Hub (preferred - no compilation needed)
+BASELINE_IMAGE_HUB = "shikhar481/vllm_fixed_human_images"  # Docker Hub images
+BASELINE_IMAGE_PREFIX = "vllm-baseline-built"  # Local cache prefix (fallback)
 
 # Commits that need fixed images (from previous analysis)
 FIXED_IMAGE_COMMITS = {
@@ -74,17 +103,43 @@ class BenchmarkResult:
 
 
 def check_baseline_image_exists(parent_commit: str) -> bool:
-    """Check if a pre-built baseline image exists locally."""
-    image_tag = f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
+    """Check if a pre-built baseline image exists (Docker Hub or local)."""
+    # First check Docker Hub image (preferred - no compilation)
+    hub_image = f"{BASELINE_IMAGE_HUB}:baseline-{parent_commit[:12]}"
+    try:
+        result = subprocess.run(
+            ['docker', 'manifest', 'inspect', hub_image],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return True
+    except:
+        pass
+
+    # Fall back to local cache
+    local_image = f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
     result = subprocess.run(
-        ['docker', 'images', '-q', image_tag],
+        ['docker', 'images', '-q', local_image],
         capture_output=True, text=True, timeout=10
     )
     return bool(result.stdout.strip())
 
 
 def get_baseline_image(parent_commit: str) -> str:
-    """Get the baseline image tag."""
+    """Get the baseline image tag (Docker Hub preferred, local fallback)."""
+    # First check Docker Hub image
+    hub_image = f"{BASELINE_IMAGE_HUB}:baseline-{parent_commit[:12]}"
+    try:
+        result = subprocess.run(
+            ['docker', 'manifest', 'inspect', hub_image],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return hub_image
+    except:
+        pass
+
+    # Fall back to local cache
     return f"{BASELINE_IMAGE_PREFIX}:{parent_commit[:12]}"
 
 
@@ -144,25 +199,63 @@ def load_baseline_mapping(mapping_file: Path = None) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
-def load_agent_patch_mapping() -> Dict[str, Path]:
-    """Map human commits to their agent patch paths."""
+def load_agent_patch_mapping(agent_type: str = "claude_code") -> Dict[str, Path]:
+    """Map human commits to their agent patch paths.
+
+    Supports multiple agent types with different directory structures:
+    - claude_code: vllm_core-*/journal.json + model_patch.diff
+    - codex_gpt5, trae_gpt5, trae_sonnet45: */run_summary.json + model_patch.diff
+
+    Uses os.walk to traverse all subdirectories and find patches.
+    """
     mapping = {}
-    if not AGENT_PATCHES_DIR.exists():
-        print(f"WARNING: Agent patches directory not found: {AGENT_PATCHES_DIR}")
+
+    # Get agent directory from config
+    agent_subdir = AGENT_CONFIGS.get(agent_type)
+    if not agent_subdir:
+        print(f"WARNING: Unknown agent type: {agent_type}")
         return mapping
 
-    for patch_dir in AGENT_PATCHES_DIR.glob("vllm_core-*"):
-        journal_file = patch_dir / "journal.json"
-        if journal_file.exists():
+    agent_dir = Path("/root/OmniPerf-Bench") / agent_subdir
+    if not agent_dir.exists():
+        print(f"WARNING: Agent patches directory not found: {agent_dir}")
+        return mapping
+
+    # Walk through all directories to find patches
+    # Handles both journal.json (claude_code) and run_summary.json (other agents)
+    for root, dirs, files in os.walk(agent_dir):
+        patch_file = Path(root) / "model_patch.diff"
+
+        # Skip if no patch file or empty patch
+        if not patch_file.exists() or patch_file.stat().st_size == 0:
+            continue
+
+        # Try run_summary.json first (used by codex, trae)
+        summary_file = Path(root) / "run_summary.json"
+        journal_file = Path(root) / "journal.json"
+
+        human_commit = None
+
+        if summary_file.exists():
+            try:
+                with open(summary_file) as f:
+                    summary = json.load(f)
+                human_commit = summary.get('commits', {}).get('human', '')[:8]
+            except Exception as e:
+                pass
+
+        # Fallback to journal.json (used by claude_code)
+        if not human_commit and journal_file.exists():
             try:
                 with open(journal_file) as f:
                     journal = json.load(f)
-                human_commit = journal["commits"]["human"][:8]
-                patch_file = patch_dir / "model_patch.diff"
-                if patch_file.exists() and patch_file.stat().st_size > 0:
-                    mapping[human_commit] = patch_file
+                human_commit = journal.get("commits", {}).get("human", "")[:8]
             except Exception as e:
-                print(f"WARNING: Failed to load {journal_file}: {e}")
+                pass
+
+        if human_commit and human_commit not in mapping:
+            mapping[human_commit] = patch_file
+
     return mapping
 
 
@@ -1405,10 +1498,419 @@ PATCH
         )
 
 
-def save_agent_result(result: BenchmarkResult, human_commit: str, mapping_entry: dict):
+def run_combined_baseline_agent_throughput(human_commit: str, parent_commit: str, model: str,
+                                           perf_command: str, agent_patch_path: Path,
+                                           hf_token: str, timeout: int = 10800) -> tuple:
+    """Run baseline throughput benchmark, then apply agent patch and run again.
+
+    Returns tuple of (baseline_result, agent_result).
+    Throughput benchmarks don't need a server - they run directly.
+    """
+    start_time = time.time()
+    human_short = human_commit[:8]
+
+    # Check if we have a pre-built baseline image
+    use_cached = check_baseline_image_exists(parent_commit)
+    if use_cached:
+        docker_image = get_baseline_image(parent_commit)
+        print(f"  Using cached baseline image: {docker_image}")
+    else:
+        docker_image = get_docker_image(human_short, human_commit)
+        print(f"  No cached baseline - will build from source")
+
+    # Extract benchmark args
+    bench_args = re.sub(r'python\s+benchmarks/benchmark_throughput\.py\s*', '', perf_command)
+    bench_args = re.sub(r'vllm\s+bench\s+throughput\s*', '', bench_args)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)
+
+    # Build steps - only needed if not using cached image
+    build_steps = f'''
+    echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-12-4 git
+
+    echo "=== Cloning vLLM at parent commit $PARENT_COMMIT ==="
+    cd /opt
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        echo "Git clone attempt $attempt failed, retrying..."
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
+    cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
+    git checkout $PARENT_COMMIT
+
+    pip install uv -q
+    uv pip uninstall vllm --system || true
+    uv pip install setuptools wheel packaging ninja cmake --system
+
+    export TORCH_CUDA_ARCH_LIST="9.0"
+    export MAX_JOBS=32
+    export NVCC_THREADS=2
+    pip install -e . --no-build-isolation 2>&1
+
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    pip install pyairports --no-cache-dir 2>&1 || true
+    python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+    echo "BUILD_SUCCESS"
+    pip install aiohttp pandas datasets -q
+    '''
+
+    cached_setup = '''
+    echo "=== Using cached baseline image (skipping build) ==="
+    pip install aiohttp pandas datasets -q
+    '''
+
+    docker_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+
+    {cached_setup if use_cached else build_steps}
+
+    # ============ BASELINE BENCHMARK ============
+    echo "=== Running BASELINE throughput benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_throughput.py {bench_args} 2>&1 | tee /tmp/baseline_output.txt
+    echo "BASELINE_BENCHMARK_DONE"
+
+    # ============ AGENT BENCHMARK ============
+    echo "=== Applying agent patch ==="
+    cd /opt/vllm_baseline
+    if git apply --check /agent_patch.diff 2>/dev/null; then
+        git apply /agent_patch.diff
+        echo "AGENT_PATCH_APPLIED"
+    else
+        echo "AGENT_PATCH_FAILED"
+        cat /tmp/baseline_output.txt
+        exit 0
+    fi
+
+    echo "=== Running AGENT throughput benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_throughput.py {bench_args} 2>&1 | tee /tmp/agent_output.txt
+    echo "AGENT_BENCHMARK_DONE"
+
+    echo "=== BASELINE OUTPUT ==="
+    cat /tmp/baseline_output.txt
+    echo "=== AGENT OUTPUT ==="
+    cat /tmp/agent_output.txt
+    '''
+
+    container_name = f"baseline-build-{parent_commit[:12]}"
+
+    try:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        result = subprocess.run(
+            [
+                'docker', 'run',
+                '--name', container_name,
+                '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', '/root/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{agent_patch_path}:/agent_patch.diff:ro',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                docker_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        # Parse outputs
+        baseline_output = ""
+        agent_output = ""
+        if "=== BASELINE OUTPUT ===" in output and "=== AGENT OUTPUT ===" in output:
+            parts = output.split("=== BASELINE OUTPUT ===")
+            if len(parts) > 1:
+                baseline_agent = parts[1].split("=== AGENT OUTPUT ===")
+                baseline_output = baseline_agent[0] if len(baseline_agent) > 0 else ""
+                agent_output = baseline_agent[1] if len(baseline_agent) > 1 else ""
+
+        # Parse throughput metrics
+        def parse_throughput(text):
+            throughput_match = re.search(r'Throughput:\s+([\d.]+)\s+requests/s', text)
+            tok_match = re.search(r'([\d.]+)\s+tokens/s', text)
+            return {
+                'throughput_req_s': float(throughput_match.group(1)) if throughput_match else None,
+                'throughput_tok_s': float(tok_match.group(1)) if tok_match else None,
+            }
+
+        baseline_metrics = parse_throughput(baseline_output or output)
+        agent_metrics = parse_throughput(agent_output) if "AGENT_BENCHMARK_DONE" in output else {}
+
+        baseline_status = 'success' if baseline_metrics.get('throughput_req_s') or baseline_metrics.get('throughput_tok_s') else 'error'
+        baseline_result = BenchmarkResult(
+            commit_hash=parent_commit, status=baseline_status, benchmark_type='throughput',
+            model=model, duration_s=duration,
+            error=None if baseline_status == 'success' else 'No throughput metrics',
+            raw_output=baseline_output[-10000:] if baseline_output else output[-10000:],
+            **baseline_metrics
+        )
+
+        agent_result = None
+        if "AGENT_PATCH_APPLIED" in output:
+            agent_status = 'success' if agent_metrics.get('throughput_req_s') or agent_metrics.get('throughput_tok_s') else 'error'
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status=agent_status, benchmark_type='throughput',
+                model=model, duration_s=duration,
+                error=None if agent_status == 'success' else 'No throughput metrics',
+                raw_output=agent_output[-10000:] if agent_output else "",
+                **agent_metrics
+            )
+        elif "AGENT_PATCH_FAILED" in output:
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status='error', benchmark_type='throughput',
+                model=model, duration_s=duration, error='Agent patch failed to apply'
+            )
+
+        return (baseline_result, agent_result)
+
+    except subprocess.TimeoutExpired:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(commit_hash=parent_commit, status='timeout', benchmark_type='throughput',
+                          model=model, duration_s=timeout, error=f'Timed out after {timeout}s'),
+            None
+        )
+    except Exception as e:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(commit_hash=parent_commit, status='error', benchmark_type='throughput',
+                          model=model, duration_s=time.time() - start_time, error=str(e)),
+            None
+        )
+
+
+def run_combined_baseline_agent_latency(human_commit: str, parent_commit: str, model: str,
+                                        perf_command: str, agent_patch_path: Path,
+                                        hf_token: str, timeout: int = 10800) -> tuple:
+    """Run baseline latency benchmark, then apply agent patch and run again.
+
+    Returns tuple of (baseline_result, agent_result).
+    Latency benchmarks don't need a server - they run directly.
+    """
+    start_time = time.time()
+    human_short = human_commit[:8]
+
+    use_cached = check_baseline_image_exists(parent_commit)
+    if use_cached:
+        docker_image = get_baseline_image(parent_commit)
+        print(f"  Using cached baseline image: {docker_image}")
+    else:
+        docker_image = get_docker_image(human_short, human_commit)
+        print(f"  No cached baseline - will build from source")
+
+    # Extract benchmark args
+    bench_args = re.sub(r'python\s+benchmarks/benchmark_latency\.py\s*', '', perf_command)
+    bench_args = re.sub(r'vllm\s+bench\s+latency\s*', '', bench_args)
+    bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)
+    # Remove environment variable prefixes if present
+    bench_args = re.sub(r'VLLM_\w+=\S+\s*', '', bench_args)
+
+    build_steps = f'''
+    echo "=== BASELINE BUILD: Installing CUDA toolkit ==="
+    apt-get update -qq
+    apt-get install -y -qq cuda-toolkit-12-4 git
+
+    cd /opt
+    for attempt in 1 2 3; do
+        if git clone --depth 1 https://github.com/vllm-project/vllm.git vllm_baseline 2>&1; then
+            break
+        fi
+        rm -rf vllm_baseline 2>/dev/null
+        sleep 5
+    done
+    cd vllm_baseline
+    git fetch --depth 1 origin $PARENT_COMMIT
+    git checkout $PARENT_COMMIT
+
+    pip install uv -q
+    uv pip uninstall vllm --system || true
+    uv pip install setuptools wheel packaging ninja cmake --system
+
+    export TORCH_CUDA_ARCH_LIST="9.0"
+    export MAX_JOBS=32
+    export NVCC_THREADS=2
+    pip install -e . --no-build-isolation 2>&1
+
+    for ovis_file in /opt/vllm_baseline/vllm/transformers_utils/configs/ovis.py /opt/vllm_baseline/vllm/transformers_utils/configs/ovis2.py; do
+        if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+            sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+        fi
+    done
+
+    pip install pyairports --no-cache-dir 2>&1 || true
+    python3 -c "import vllm; print(f'vLLM version: {{vllm.__version__}}')"
+    echo "BUILD_SUCCESS"
+    pip install aiohttp pandas datasets -q
+    '''
+
+    cached_setup = '''
+    echo "=== Using cached baseline image (skipping build) ==="
+    pip install aiohttp pandas datasets -q
+    '''
+
+    docker_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+
+    {cached_setup if use_cached else build_steps}
+
+    # ============ BASELINE BENCHMARK ============
+    echo "=== Running BASELINE latency benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_latency.py {bench_args} 2>&1 | tee /tmp/baseline_output.txt
+    echo "BASELINE_BENCHMARK_DONE"
+
+    # ============ AGENT BENCHMARK ============
+    echo "=== Applying agent patch ==="
+    cd /opt/vllm_baseline
+    if git apply --check /agent_patch.diff 2>/dev/null; then
+        git apply /agent_patch.diff
+        echo "AGENT_PATCH_APPLIED"
+    else
+        echo "AGENT_PATCH_FAILED"
+        cat /tmp/baseline_output.txt
+        exit 0
+    fi
+
+    echo "=== Running AGENT latency benchmark ==="
+    cd /opt/vllm_baseline/benchmarks
+    python3 benchmark_latency.py {bench_args} 2>&1 | tee /tmp/agent_output.txt
+    echo "AGENT_BENCHMARK_DONE"
+
+    echo "=== BASELINE OUTPUT ==="
+    cat /tmp/baseline_output.txt
+    echo "=== AGENT OUTPUT ==="
+    cat /tmp/agent_output.txt
+    '''
+
+    container_name = f"baseline-build-{parent_commit[:12]}"
+
+    try:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        result = subprocess.run(
+            [
+                'docker', 'run',
+                '--name', container_name,
+                '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', '/root/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{agent_patch_path}:/agent_patch.diff:ro',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                docker_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+
+        # Parse outputs
+        baseline_output = ""
+        agent_output = ""
+        if "=== BASELINE OUTPUT ===" in output and "=== AGENT OUTPUT ===" in output:
+            parts = output.split("=== BASELINE OUTPUT ===")
+            if len(parts) > 1:
+                baseline_agent = parts[1].split("=== AGENT OUTPUT ===")
+                baseline_output = baseline_agent[0] if len(baseline_agent) > 0 else ""
+                agent_output = baseline_agent[1] if len(baseline_agent) > 1 else ""
+
+        # Parse latency metrics
+        def parse_latency(text):
+            avg_match = re.search(r'Avg latency:\s+([\d.]+)', text)
+            p50_match = re.search(r'P50 latency:\s+([\d.]+)', text)
+            p99_match = re.search(r'P99 latency:\s+([\d.]+)', text)
+            # Also try alternate format from some benchmark versions
+            if not avg_match:
+                avg_match = re.search(r'avg:\s+([\d.]+)', text, re.IGNORECASE)
+            return {
+                'latency_avg': float(avg_match.group(1)) if avg_match else None,
+                'latency_p50': float(p50_match.group(1)) if p50_match else None,
+                'latency_p99': float(p99_match.group(1)) if p99_match else None,
+            }
+
+        baseline_metrics = parse_latency(baseline_output or output)
+        agent_metrics = parse_latency(agent_output) if "AGENT_BENCHMARK_DONE" in output else {}
+
+        baseline_status = 'success' if baseline_metrics.get('latency_avg') else 'error'
+        baseline_result = BenchmarkResult(
+            commit_hash=parent_commit, status=baseline_status, benchmark_type='latency',
+            model=model, duration_s=duration,
+            error=None if baseline_status == 'success' else 'No latency metrics',
+            raw_output=baseline_output[-10000:] if baseline_output else output[-10000:],
+        )
+        # Store latency metrics in ttft fields (reusing existing structure)
+        if baseline_metrics.get('latency_avg'):
+            baseline_result.ttft_mean = baseline_metrics['latency_avg']
+        if baseline_metrics.get('latency_p99'):
+            baseline_result.ttft_p99 = baseline_metrics['latency_p99']
+
+        agent_result = None
+        if "AGENT_PATCH_APPLIED" in output:
+            agent_status = 'success' if agent_metrics.get('latency_avg') else 'error'
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status=agent_status, benchmark_type='latency',
+                model=model, duration_s=duration,
+                error=None if agent_status == 'success' else 'No latency metrics',
+                raw_output=agent_output[-10000:] if agent_output else "",
+            )
+            if agent_metrics.get('latency_avg'):
+                agent_result.ttft_mean = agent_metrics['latency_avg']
+            if agent_metrics.get('latency_p99'):
+                agent_result.ttft_p99 = agent_metrics['latency_p99']
+        elif "AGENT_PATCH_FAILED" in output:
+            agent_result = BenchmarkResult(
+                commit_hash=f"{human_short}_agent", status='error', benchmark_type='latency',
+                model=model, duration_s=duration, error='Agent patch failed to apply'
+            )
+
+        return (baseline_result, agent_result)
+
+    except subprocess.TimeoutExpired:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(commit_hash=parent_commit, status='timeout', benchmark_type='latency',
+                          model=model, duration_s=timeout, error=f'Timed out after {timeout}s'),
+            None
+        )
+    except Exception as e:
+        subprocess.run(['docker', 'rm', '-f', container_name], capture_output=True, timeout=30)
+        return (
+            BenchmarkResult(commit_hash=parent_commit, status='error', benchmark_type='latency',
+                          model=model, duration_s=time.time() - start_time, error=str(e)),
+            None
+        )
+
+
+def save_agent_result(result: BenchmarkResult, human_commit: str, mapping_entry: dict,
+                      output_dir: Path = None):
     """Save agent benchmark result."""
-    AGENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    result_file = AGENT_OUTPUT_DIR / f"{human_commit}_agent_result.json"
+    if output_dir is None:
+        output_dir = AGENT_OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_file = output_dir / f"{human_commit}_agent_result.json"
 
     result_data = {
         'human_commit': human_commit,
@@ -1439,6 +1941,13 @@ def save_agent_result(result: BenchmarkResult, human_commit: str, mapping_entry:
 
 def run_baseline_benchmarks(args):
     """Run baseline benchmarks for commits in baseline_benchmark_mapping.json."""
+    # Get agent type and output directories
+    agent_type = getattr(args, 'agent_type', 'claude_code')
+    output_dirs = get_output_dirs(agent_type)
+
+    print(f"=== Agent Type: {agent_type} ===")
+    print(f"Output directory: {output_dirs['results']}")
+
     print("Loading baseline mapping...")
     mapping_file = Path(args.mapping) if args.mapping else None
     mapping = load_baseline_mapping(mapping_file)
@@ -1447,9 +1956,9 @@ def run_baseline_benchmarks(args):
 
     print(f"Found {len(mapping)} commits in baseline mapping")
 
-    # Load agent patch mapping
-    print("Loading agent patch mapping...")
-    agent_patches = load_agent_patch_mapping()
+    # Load agent patch mapping for the specified agent type
+    print(f"Loading agent patch mapping for {agent_type}...")
+    agent_patches = load_agent_patch_mapping(agent_type)
     print(f"Found {len(agent_patches)} agent patches")
 
     # Filter by commit if specified
@@ -1501,7 +2010,8 @@ def run_baseline_benchmarks(args):
         print(f"  Type: {btype}")
 
         # Check if already run
-        result_file = BASELINE_OUTPUT_DIR / f"{m['human_commit_short']}_baseline_result.json"
+        baseline_output_dir = output_dirs['baseline']
+        result_file = baseline_output_dir / f"{m['human_commit_short']}_baseline_result.json"
         if result_file.exists():
             print(f"  SKIP: Already have baseline result")
             continue
@@ -1511,7 +2021,7 @@ def run_baseline_benchmarks(args):
         agent_patch = agent_patches.get(human_short)
 
         # Pre-build clean baseline image if needed (before any benchmarks or patches)
-        if btype == 'serving' and agent_patch:
+        if agent_patch:
             if not check_baseline_image_exists(parent_commit):
                 print(f"  Pre-building clean baseline image...")
                 if not build_baseline_image_only(human_commit, parent_commit):
@@ -1526,6 +2036,18 @@ def run_baseline_benchmarks(args):
             result, agent_result = run_combined_baseline_agent_serving(
                 human_commit, parent_commit, model, perf_command, agent_patch, hf_token
             )
+        elif btype == 'throughput' and agent_patch:
+            # Use combined function for throughput benchmarks with agent patches
+            print(f"  Running combined baseline + agent throughput benchmark")
+            result, agent_result = run_combined_baseline_agent_throughput(
+                human_commit, parent_commit, model, perf_command, agent_patch, hf_token
+            )
+        elif btype == 'latency' and agent_patch:
+            # Use combined function for latency benchmarks with agent patches
+            print(f"  Running combined baseline + agent latency benchmark")
+            result, agent_result = run_combined_baseline_agent_latency(
+                human_commit, parent_commit, model, perf_command, agent_patch, hf_token
+            )
         elif btype == 'serving':
             result = run_baseline_serving_benchmark(human_commit, parent_commit, model, perf_command, hf_token)
         elif btype == 'throughput':
@@ -1537,7 +2059,7 @@ def run_baseline_benchmarks(args):
             continue
 
         # Save with human commit prefix for easy mapping
-        BASELINE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        baseline_output_dir.mkdir(parents=True, exist_ok=True)
         result_data = {
             'human_commit': m['human_commit_short'],
             'human_commit_full': human_commit,
@@ -1578,7 +2100,7 @@ def run_baseline_benchmarks(args):
 
         # Save agent result if available
         if agent_result:
-            save_agent_result(agent_result, human_short, m)
+            save_agent_result(agent_result, human_short, m, output_dirs['agent'])
             if agent_result.status == 'success':
                 print(f"  AGENT SUCCESS")
                 if agent_result.throughput_tok_s:
@@ -1613,6 +2135,10 @@ def main():
                         help='Run baseline benchmarks (build vLLM from source at parent commit)')
     parser.add_argument('--mapping', type=str, default=None,
                         help='Path to baseline mapping JSON file (default: baseline_benchmark_mapping.json)')
+    parser.add_argument('--agent-type', type=str,
+                        choices=list(AGENT_CONFIGS.keys()),
+                        default='claude_code',
+                        help='Agent type to benchmark (default: claude_code)')
     args = parser.parse_args()
 
     # If baseline mode, run baseline benchmarks instead
