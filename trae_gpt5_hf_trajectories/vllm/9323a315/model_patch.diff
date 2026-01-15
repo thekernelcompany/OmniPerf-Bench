@@ -1,0 +1,174 @@
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 4a1a5fb..7782249 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -16,11 +16,13 @@ import os
+ import sys
+ from typing import List
+ 
+-import requests
++
+ from sphinx.ext import autodoc
+ 
+ logger = logging.getLogger(__name__)
+-sys.path.append(os.path.abspath("../.."))
++base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
++if base_path not in sys.path:
++    sys.path.append(base_path)
+ 
+ # -- Project information -----------------------------------------------------
+ 
+@@ -106,6 +108,7 @@ def get_repo_base_and_branch(pr_number):
+     if _cached_base and _cached_branch:
+         return _cached_base, _cached_branch
+ 
++    import requests
+     url = f"https://api.github.com/repos/vllm-project/vllm/pulls/{pr_number}"
+     response = requests.get(url)
+     if response.status_code == 200:
+@@ -185,8 +188,9 @@ autodoc_mock_imports = [
+     "decord",
+ ]
+ 
++_modules = sys.modules
+ for mock_target in autodoc_mock_imports:
+-    if mock_target in sys.modules:
++    if mock_target in _modules:
+         logger.info(
+             "Potentially problematic mock target (%s) found; "
+             "autodoc_mock_imports cannot mock modules that have already "
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 0000000..e69de29
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 4aa0eeb..76e1e81 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -28,9 +28,9 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
+-ALLOWED_DETAILED_TRACE_MODULES = ["model", "worker", "all"]
++ALLOWED_DETAILED_TRACE_MODULES = ("model", "worker", "all")
+ 
+-DEVICE_OPTIONS = [
++DEVICE_OPTIONS = (
+     "auto",
+     "cuda",
+     "neuron",
+@@ -39,8 +39,9 @@ DEVICE_OPTIONS = [
+     "tpu",
+     "xpu",
+     "hpu",
+-]
++)
+ 
++TASK_CHOICES = get_args(TaskOption)
+ 
+ def nullable_str(val: str):
+     if not val or val == "None":
+@@ -63,16 +64,18 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
+ 
+     out_dict: Dict[str, int] = {}
+     for item in val.split(","):
+-        kv_parts = [part.lower().strip() for part in item.split("=")]
+-        if len(kv_parts) != 2:
++        # Split once; avoid unnecessary lower() on numeric values
++        if "=" not in item:
+             raise argparse.ArgumentTypeError(
+                 "Each item should be in the form KEY=VALUE")
+-        key, value = kv_parts
++        key_part, value_part = item.split("=", 1)
++        key = key_part.lower().strip()
++        value_str = value_part.strip()
+ 
+         try:
+-            parsed_value = int(value)
++            parsed_value = int(value_str)
+         except ValueError as exc:
+-            msg = f"Failed to parse value of item {key}={value}"
++            msg = f"Failed to parse value of item {key}={value_str}"
+             raise argparse.ArgumentTypeError(msg) from exc
+ 
+         if key in out_dict and out_dict[key] != parsed_value:
+@@ -233,7 +236,7 @@ class EngineArgs:
+         parser.add_argument(
+             '--task',
+             default=EngineArgs.task,
+-            choices=get_args(TaskOption),
++            choices=TASK_CHOICES,
+             help='The task to use the model for. Each vLLM instance only '
+             'supports one task, even if the same model can be used for '
+             'multiple tasks. When the model only supports one task, "auto" '
+diff --git a/vllm/model_executor/guided_decoding/__init__.py b/vllm/model_executor/guided_decoding/__init__.py
+index d7b6742..a9889d1 100644
+--- a/vllm/model_executor/guided_decoding/__init__.py
++++ b/vllm/model_executor/guided_decoding/__init__.py
+@@ -4,21 +4,29 @@ from vllm.logits_process import LogitsProcessor
+ from vllm.sampling_params import GuidedDecodingParams
+ 
+ 
++_LMFE_LOCAL_FN = None
++_OUTLINES_GETTER = None
++_OUTLINES_LOCAL_GETTER = None
++
+ async def get_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+     # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
+-        # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+-        from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+-            get_outlines_guided_decoding_logits_processor)
+-        return await get_outlines_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++    if guided_params.grammar or guided_params.backend == 'outlines':
++        global _OUTLINES_GETTER
++        if _OUTLINES_GETTER is None:
++            from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
++                get_outlines_guided_decoding_logits_processor as _fn)
++            _OUTLINES_GETTER = _fn
++        return await _OUTLINES_GETTER(guided_params, tokenizer)
+     if guided_params.backend == 'lm-format-enforcer':
++        global _LMFE_LOCAL_FN
++        if _LMFE_LOCAL_FN is not None:
++            return _LMFE_LOCAL_FN(guided_params, tokenizer)
+         from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+             get_local_lm_format_enforcer_guided_decoding_logits_processor)
+-        return get_local_lm_format_enforcer_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++        _LMFE_LOCAL_FN = get_local_lm_format_enforcer_guided_decoding_logits_processor
++        return _LMFE_LOCAL_FN(guided_params, tokenizer)
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "
+@@ -29,17 +37,22 @@ def get_local_guided_decoding_logits_processor(
+         guided_params: GuidedDecodingParams,
+         tokenizer) -> Optional[LogitsProcessor]:
+     # CFG grammar not supported by LMFE, so we use outlines instead
+-    if guided_params.backend == 'outlines' or guided_params.grammar:
+-        # NOTE: lazy import outlines to avoid https://github.com/vllm-project/vllm/issues/4193
+-        from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
+-            get_local_outlines_guided_decoding_logits_processor)
+-        return get_local_outlines_guided_decoding_logits_processor(
++    if guided_params.grammar or guided_params.backend == 'outlines':
++        global _OUTLINES_LOCAL_GETTER
++        if _OUTLINES_LOCAL_GETTER is None:
++            from vllm.model_executor.guided_decoding.outlines_decoding import (  # noqa
++                get_local_outlines_guided_decoding_logits_processor as _fn)
++            _OUTLINES_LOCAL_GETTER = _fn
++        return _OUTLINES_LOCAL_GETTER(
+             guided_params, tokenizer)
+     if guided_params.backend == 'lm-format-enforcer':
++        global _LMFE_LOCAL_FN
++        if _LMFE_LOCAL_FN is not None:
++            return _LMFE_LOCAL_FN(guided_params, tokenizer)
+         from vllm.model_executor.guided_decoding.lm_format_enforcer_decoding import (  # noqa
+             get_local_lm_format_enforcer_guided_decoding_logits_processor)
+-        return get_local_lm_format_enforcer_guided_decoding_logits_processor(
+-            guided_params, tokenizer)
++        _LMFE_LOCAL_FN = get_local_lm_format_enforcer_guided_decoding_logits_processor
++        return _LMFE_LOCAL_FN(guided_params, tokenizer)
+ 
+     raise ValueError(
+         f"Unknown guided decoding backend '{guided_params.backend}'. "

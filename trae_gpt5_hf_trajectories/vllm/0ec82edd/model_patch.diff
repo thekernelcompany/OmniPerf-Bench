@@ -1,0 +1,63 @@
+diff --git a/benchmarks/kernels/benchmark_moe_align_block_size.py b/benchmarks/kernels/benchmark_moe_align_block_size.py
+index 5170ac0..968026d 100644
+--- a/benchmarks/kernels/benchmark_moe_align_block_size.py
++++ b/benchmarks/kernels/benchmark_moe_align_block_size.py
+@@ -13,12 +13,7 @@ from vllm.triton_utils import triton
+ 
+ 
+ def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
+-    return torch.stack(
+-        [
+-            torch.randperm(num_experts, dtype=torch.int32, device="cuda")[:topk]
+-            for _ in range(num_tokens)
+-        ]
+-    )
++    return torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+ 
+ 
+ def check_correctness(num_tokens, num_experts=256, block_size=256, topk=8):
+diff --git a/csrc/moe/moe_align_sum_kernels.cu b/csrc/moe/moe_align_sum_kernels.cu
+index 462dbd1..63c31ea 100644
+--- a/csrc/moe/moe_align_sum_kernels.cu
++++ b/csrc/moe/moe_align_sum_kernels.cu
+@@ -185,7 +185,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+         auto options_int =
+             torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
+         torch::Tensor cumsum_buffer =
+-            torch::zeros({num_experts + 1}, options_int);
++            torch::empty({num_experts + 1}, options_int);
+         bool small_batch_expert_mode =
+             (topk_ids.numel() < 1024) && (num_experts <= 64);
+ 
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 0000000..e69de29
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 3aae183..ff8048f 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -107,9 +107,10 @@ def moe_align_block_size_triton(
+     tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    cumsum[0] = 0
+     tokens_per_thread = cdiv(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -202,10 +203,10 @@ def moe_align_block_size(
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+     if pad_sorted_ids:
+         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+-    sorted_ids = torch.empty((max_num_tokens_padded, ),
++    sorted_ids = torch.full((max_num_tokens_padded, ),
++                             topk_ids.numel(),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.

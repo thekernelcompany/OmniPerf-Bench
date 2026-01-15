@@ -1,0 +1,150 @@
+diff --git a/vllm/attention/backends/mla/common.py b/vllm/attention/backends/mla/common.py
+index 8184b07..15f682e 100644
+--- a/vllm/attention/backends/mla/common.py
++++ b/vllm/attention/backends/mla/common.py
+@@ -961,10 +961,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[T], Generic[T]):
+             chunk_seq_lens = (chunk_ends - context_chunk_starts).clamp(min=0)
+             _context_chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                 torch.int32)
+-            zero = torch.zeros(num_chunks, dtype=torch.int32, device=device)\
+-                .unsqueeze(-1)
+-            context_chunk_cu_seq_lens = \
+-                torch.cat([zero, _context_chunk_cu_seq_lens], dim=1)
++            context_chunk_cu_seq_lens = torch.empty((num_chunks, self.num_prefills + 1), dtype=torch.int32, device=device)
++            context_chunk_cu_seq_lens[:, 0] = 0
++            context_chunk_cu_seq_lens[:, 1:] = _context_chunk_cu_seq_lens
+             context_chunk_max_seq_lens = \
+                 chunk_seq_lens.max(dim=1).values.tolist()
+             context_chunk_seq_tot = chunk_seq_lens.sum(dim=1).tolist()
+@@ -1295,6 +1294,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+         assert attn_metadata.context_chunk_workspace is not None
+         workspace = attn_metadata.context_chunk_workspace
+ 
++
++        tmp_output = None
++        tmp_output_lse = None
+         for i in range(iters):
+             toks = prefill_metadata.context_chunk_seq_tot[i]
+ 
+@@ -1322,9 +1324,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+ 
+             # For MLA the v head dim is smaller than qk head dim so we pad
+             # out v with 0s to match the qk head dim
+-            v_padded = torch.nn.functional.pad(v,
+-                                               [0, q.shape[-1] - v.shape[-1]],
+-                                               value=0)
++            pad = q.shape[-1] - v.shape[-1]
++            v_padded = v if pad == 0 else torch.nn.functional.pad(v, [0, pad], value=0)
+ 
+             if is_hip and envs.VLLM_USE_TRITON_FLASH_ATTN:
+                 attn_output, attn_softmax_lse = self.triton_fa_func(
+@@ -1373,18 +1374,20 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                if tmp_output is None:
++                    tmp_output = torch.empty_like(output)
++                    tmp_output_lse = torch.empty_like(output_lse)
+                 merge_attn_states(
+-                    output=output_tmp,
+-                    output_lse=output_lse_tmp,
++                    output=tmp_output,
++                    output_lse=tmp_output_lse,
+                     prefix_output=output,
+                     prefix_lse=output_lse,
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                output, tmp_output = tmp_output, output
++                output_lse, tmp_output_lse = tmp_output_lse, output_lse
++
+ 
+         return output, output_lse
+ 
+@@ -1412,8 +1415,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
+ 
+         # For MLA the v head dim is smaller than qk head dim so we pad out
+         # v with 0s to match the qk head dim
+-        v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
+-                                           value=0)
++        pad = q.shape[-1] - v.shape[-1]
++        v_padded = v if pad == 0 else torch.nn.functional.pad(v, [0, pad], value=0)
++
+ 
+         if is_hip and envs.VLLM_USE_TRITON_FLASH_ATTN:
+             output = self.triton_fa_func(
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index c98262e..4636a8b 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -532,14 +532,13 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
++                cu_seq_lens = torch.empty((num_chunks, self._num_prefills + 1), dtype=torch.int32, device=device)
++                cu_seq_lens[:, 0] = 0
++                cu_seq_lens[:, 1:] = _chunk_cu_seq_lens
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=cu_seq_lens,
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -861,6 +860,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         iters = len(prefill_metadata.chunked_context.seq_tot)
+         workspace = prefill_metadata.chunked_context.workspace
+ 
++
++        tmp_output = None
++        tmp_output_lse = None
+         for i in range(iters):
+             toks = prefill_metadata.chunked_context.seq_tot[i]
+ 
+@@ -888,9 +890,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+ 
+             # For MLA the v head dim is smaller than qk head dim so we pad
+             # out v with 0s to match the qk head dim
+-            v_padded = torch.nn.functional.pad(v,
+-                                               [0, q.shape[-1] - v.shape[-1]],
+-                                               value=0)
++            pad = q.shape[-1] - v.shape[-1]
++            v_padded = v if pad == 0 else torch.nn.functional.pad(v, [0, pad], value=0)
+ 
+             attn_output, attn_softmax_lse = self.flash_attn_varlen_func(
+                 q=q,
+@@ -909,18 +910,19 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                 output = attn_output
+                 output_lse = attn_softmax_lse
+             else:
+-                output_tmp = torch.empty_like(output)
+-                output_lse_tmp = torch.empty_like(output_lse)
++                if tmp_output is None:
++                    tmp_output = torch.empty_like(output)
++                    tmp_output_lse = torch.empty_like(output_lse)
+                 merge_attn_states(
+-                    output=output_tmp,
+-                    output_lse=output_lse_tmp,
++                    output=tmp_output,
++                    output_lse=tmp_output_lse,
+                     prefix_output=output,
+                     prefix_lse=output_lse,
+                     suffix_output=attn_output,
+                     suffix_lse=attn_softmax_lse,
+                 )
+-                output = output_tmp
+-                output_lse = output_lse_tmp
++                output, tmp_output = tmp_output, output
++                output_lse, tmp_output_lse = tmp_output_lse, output_lse
+ 
+         return output, output_lse
+ 

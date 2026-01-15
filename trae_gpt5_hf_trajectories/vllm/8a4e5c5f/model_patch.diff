@@ -1,0 +1,254 @@
+diff --git a/docs/design/v1/p2p_nccl_connector.md b/docs/design/v1/p2p_nccl_connector.md
+index b1df93c..89cd13f 100644
+--- a/docs/design/v1/p2p_nccl_connector.md
++++ b/docs/design/v1/p2p_nccl_connector.md
+@@ -2,6 +2,14 @@ An implementation of xPyD with dynamic scaling based on point-to-point communica
+ 
+ # Detailed Design
+ 
++
++## Performance considerations
++- Precompile regex patterns used for request_id parsing to avoid repeated compilation.
++- Specify tensor dtypes explicitly (e.g., torch.long) to avoid dtype inference overhead during tensor creation.
++- Reuse long-lived aiohttp ClientSession for proxy forwarding instead of creating per-request sessions.
++- Minimize environment variable lookups by binding os.environ to a local reference in hot paths.
++- Reduce string allocations by using str.partition instead of str.split when extracting prefixes.
++
+ ## Overall Process
+ As shown in Figure 1, the overall process of this **PD disaggregation** solution is described through a request flow:  
+ 
+diff --git a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+index 4e82424..8a0bd43 100644
+--- a/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
++++ b/examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_proxy_p2p_nccl_xpyd.py
+@@ -28,13 +28,9 @@ def _listen_for_register(poller, router_socket):
+             #        "zmq_address": "ip:port"}
+             data = msgpack.loads(message)
+             if data["type"] == "P":
+-                global prefill_instances
+-                global prefill_cv
+                 with prefill_cv:
+                     prefill_instances[data["http_address"]] = data["zmq_address"]
+             elif data["type"] == "D":
+-                global decode_instances
+-                global decode_cv
+                 with decode_cv:
+                     decode_instances[data["http_address"]] = data["zmq_address"]
+             else:
+@@ -68,6 +64,15 @@ def start_service_discovery(hostname, port):
+ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+ 
+ app = Quart(__name__)
++_AIOHTTP_SESSION: aiohttp.ClientSession | None = None
++
++
++async def _get_session() -> aiohttp.ClientSession:
++    global _AIOHTTP_SESSION
++    if _AIOHTTP_SESSION is None or _AIOHTTP_SESSION.closed:
++        _AIOHTTP_SESSION = aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT)
++    return _AIOHTTP_SESSION
++
+ 
+ 
+ def random_uuid() -> str:
+@@ -75,19 +80,19 @@ def random_uuid() -> str:
+ 
+ 
+ async def forward_request(url, data, request_id):
+-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+-        headers = {
+-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+-            "X-Request-Id": request_id,
+-        }
+-        async with session.post(url=url, json=data, headers=headers) as response:
+-            if response.status == 200:
+-                if True:
+-                    async for chunk_bytes in response.content.iter_chunked(1024):
+-                        yield chunk_bytes
+-                else:
+-                    content = await response.read()
+-                    yield content
++    session = await _get_session()
++    headers = {
++        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
++        "X-Request-Id": request_id,
++    }
++    async with session.post(url=url, json=data, headers=headers) as response:
++        if response.status == 200:
++            if True:
++                async for chunk_bytes in response.content.iter_chunked(1024):
++                    yield chunk_bytes
++            else:
++                content = await response.read()
++                yield content
+ 
+ 
+ @app.route("/v1/completions", methods=["POST"])
+@@ -100,14 +105,10 @@ async def handle_request():
+         prefill_request["max_tokens"] = 1
+ 
+         global count
+-        global prefill_instances
+-        global prefill_cv
+         with prefill_cv:
+             prefill_list = list(prefill_instances.items())
+             prefill_addr, prefill_zmq_addr = prefill_list[count % len(prefill_list)]
+ 
+-        global decode_instances
+-        global decode_cv
+         with decode_cv:
+             decode_list = list(decode_instances.items())
+             decode_addr, decode_zmq_addr = decode_list[count % len(decode_list)]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+index 52f589a..99f7c85 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py
+@@ -26,6 +26,10 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# Precompile regex patterns to avoid recompilation on each parse
++_PREFILL_RE = re.compile(r"___prefill_addr_(.*):(\d+)___")
++_DECODE_RE = re.compile(r"___decode_addr_(.*):(\d+)")
++
+ 
+ @dataclass
+ class ReqMeta:
+@@ -40,10 +44,10 @@ class ReqMeta:
+     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int],
+                   block_size: int) -> "ReqMeta":
+         valid_num_tokens = len(token_ids)
+-        token_ids_tensor = torch.tensor(token_ids)
+-        block_ids_tensor = torch.tensor(block_ids)
++        token_ids_tensor = torch.tensor(token_ids, dtype=torch.long)
++        block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+         num_blocks = block_ids_tensor.shape[0]
+-        block_offsets = torch.arange(0, block_size)
++        block_offsets = torch.arange(0, block_size, dtype=torch.long)
+         slot_mapping = block_offsets.reshape((1, block_size)) + \
+                 block_ids_tensor.reshape((num_blocks, 1)) * block_size
+         slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
+@@ -456,13 +460,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
+     @staticmethod
+     def parse_request_id(request_id: str, is_prefill=True) -> tuple[str, int]:
+         # Regular expression to match the string hostname and integer port
+-        if is_prefill:
+-            pattern = r"___decode_addr_(.*):(\d+)"
+-        else:
+-            pattern = r"___prefill_addr_(.*):(\d+)___"
++        pattern = _DECODE_RE if is_prefill else _PREFILL_RE
+ 
+-        # Use re.search to find the pattern in the request_id
+-        match = re.search(pattern, request_id)
++        # Use pre-compiled regex to find the pattern in the request_id
++        match = pattern.search(request_id)
+         if match:
+             # Extract the ranks
+             ip = match.group(1)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+index 6c9ccb2..7adca43 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_engine.py
+@@ -41,22 +41,23 @@ def set_p2p_nccl_context(num_channels: str):
+         'NCCL_ALGO',  # RING,TREE
+     ]
+ 
++    env = os.environ
+     for var in env_vars:
+-        original_values[var] = os.environ.get(var)
++        original_values[var] = env.get(var)
+ 
+     logger.info("set_p2p_nccl_context, original_values: %s", original_values)
+ 
+     try:
+-        os.environ['NCCL_MAX_NCHANNELS'] = num_channels
+-        os.environ['NCCL_MIN_NCHANNELS'] = num_channels
+-        os.environ['NCCL_CUMEM_ENABLE'] = '1'
++        env['NCCL_MAX_NCHANNELS'] = num_channels
++        env['NCCL_MIN_NCHANNELS'] = num_channels
++        env['NCCL_CUMEM_ENABLE'] = '1'
+         yield
+     finally:
+         for var in env_vars:
+             if original_values[var] is not None:
+-                os.environ[var] = original_values[var]
++                env[var] = original_values[var]
+             else:
+-                os.environ.pop(var, None)
++                env.pop(var, None)
+ 
+ 
+ class P2pNcclEngine:
+@@ -295,6 +296,7 @@ class P2pNcclEngine:
+             socks = dict(self.poller.poll())
+             if self.router_socket in socks:
+                 remote_address, message = self.router_socket.recv_multipart()
++                raddr = remote_address.decode()
+                 data = msgpack.loads(message)
+                 if data["cmd"] == "NEW":
+                     unique_id = self.nccl.unique_id_from_bytes(
+@@ -304,10 +306,10 @@ class P2pNcclEngine:
+                         with set_p2p_nccl_context(self.nccl_num_channels):
+                             comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                                 2, unique_id, rank)
+-                        self.comms[remote_address.decode()] = (comm, rank)
++                        self.comms[raddr] = (comm, rank)
+                         logger.info(
+                             "🤝ncclCommInitRank Success, %s👈%s, MyRank:%s",
+-                            self.zmq_address, remote_address.decode(), rank)
++                            self.zmq_address, raddr, rank)
+                 elif data["cmd"] == "PUT":
+                     tensor_id = data["tensor_id"]
+                     try:
+@@ -318,7 +320,7 @@ class P2pNcclEngine:
+                                                  device=self.device)
+                         self.router_socket.send_multipart(
+                             [remote_address, b"0"])
+-                        comm, rank = self.comms[remote_address.decode()]
++                        comm, rank = self.comms[raddr]
+                         self._recv(comm, tensor, rank ^ 1, self.recv_stream)
+                         tensor_size = tensor.element_size() * tensor.numel()
+                         if (self.buffer_size + tensor_size
+@@ -329,7 +331,7 @@ class P2pNcclEngine:
+                             logger.warning(
+                                 "🔴[PUT]Recv Tensor, Out Of Threshold, "
+                                 "%s👈%s, data:%s, addr:%d", self.zmq_address,
+-                                remote_address.decode(), data, addr)
++                                raddr, data, addr)
+                         else:
+                             self.buffer_size += tensor_size
+ 
+@@ -340,7 +342,7 @@ class P2pNcclEngine:
+                         logger.warning(
+                             "🔴[PUT]Recv Tensor, Out Of Memory, %s👈%s, "
+                             "data:%s", self.zmq_address,
+-                            remote_address.decode(), data)
++                            raddr, data)
+ 
+                     with self.recv_store_cv:
+                         self.recv_store[tensor_id] = tensor
+@@ -368,7 +370,7 @@ class P2pNcclEngine:
+                         [remote_address, msgpack.dumps(data)])
+ 
+                     if data["ret"] == 0:
+-                        comm, rank = self.comms[remote_address.decode()]
++                        comm, rank = self.comms[raddr]
+                         self._send(comm, tensor.to(self.device), rank ^ 1,
+                                    self.send_stream)
+                 else:
+@@ -377,13 +379,13 @@ class P2pNcclEngine:
+                         remote_address, data)
+ 
+     def _have_sent_tensor_id(self, tensor_id: str):
+-        request_id = tensor_id.split('#')[0]
++        request_id = tensor_id.partition('#')[0]
+         if request_id not in self.send_request_id_to_tensor_ids:
+             self.send_request_id_to_tensor_ids[request_id] = set()
+         self.send_request_id_to_tensor_ids[request_id].add(tensor_id)
+ 
+     def _have_received_tensor_id(self, tensor_id: str):
+-        request_id = tensor_id.split('#')[0]
++        request_id = tensor_id.partition('#')[0]
+         if request_id not in self.recv_request_id_to_tensor_ids:
+             self.recv_request_id_to_tensor_ids[request_id] = set()
+         self.recv_request_id_to_tensor_ids[request_id].add(tensor_id)

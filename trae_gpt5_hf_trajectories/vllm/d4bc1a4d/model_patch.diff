@@ -1,0 +1,122 @@
+diff --git a/cacheflow/models/attention.py b/cacheflow/models/attention.py
+new file mode 100644
+index 000000000..34f8fc0e6
+--- /dev/null
++++ b/cacheflow/models/attention.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++from typing import Optional
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++
++class OPTCacheFlowAttention(nn.Module):
++    """
++    Efficient causal self-attention using PyTorch scaled_dot_product_attention.
++    Avoids explicit attention mask construction and redundant tensor initialization.
++    """
++
++    def __init__(self, embed_dim: int, num_heads: int) -> None:
++        super().__init__()
++        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
++        self.embed_dim = embed_dim
++        self.num_heads = num_heads
++        self.head_dim = embed_dim // num_heads
++
++    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
++        # Shapes: (B, T, C)
++        B, T, _ = q.shape
++        # Reshape to (B, nH, T, H)
++        q = q.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
++        k = k.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
++        v = v.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
++
++        # Use SDPA with causal flag to leverage optimized kernels (flash/mem-efficient when available)
++        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
++        # (B, nH, T, H) -> (B, T, C)
++        out = attn.transpose(1, 2).reshape(B, T, self.embed_dim)
++        return out
+diff --git a/cacheflow/models/opt.py b/cacheflow/models/opt.py
+index 3a340317a..5dae3d7c9 100644
+--- a/cacheflow/models/opt.py
++++ b/cacheflow/models/opt.py
+@@ -3,6 +3,7 @@ import torch
+ from torch import nn
+ from transformers import OPTConfig
+ from transformers import PreTrainedModel
++from .attention import OPTCacheFlowAttention
+ 
+ 
+ class OPTLearnedPositionalEmbedding(nn.Embedding):
+@@ -35,13 +36,13 @@ class OPTAttention(nn.Module):
+         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
++        self.attn = OPTCacheFlowAttention(embed_dim, num_heads)
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        q = self.q_proj(hidden_states) * self.scaling
++        q = self.q_proj(hidden_states)
+         k = self.k_proj(hidden_states)
+         v = self.v_proj(hidden_states)
+-        # TODO
+-        attn_output = None
++        attn_output = self.attn(q, k, v)
+         output = self.out_proj(attn_output)
+         return output
+ 
+@@ -54,17 +55,17 @@ class OPTDecoderLayer(nn.Module):
+         self.self_attn = OPTAttention(
+             embed_dim=self.embed_dim,
+             num_heads=config.num_attention_heads,
+-            bias=config.enable_bias,
++            bias=getattr(config, "enable_bias", True),
+         )
+         self.do_layer_norm_before = config.do_layer_norm_before
+-        assert config.activation_function == 'relu'
+-        self.activation_fn = nn.ReLU()
++        assert getattr(config, 'activation_function', 'relu') == 'relu'
++        self.activation_fn = nn.ReLU(inplace=True)
+ 
+         self.self_attn_layer_norm = nn.LayerNorm(
+-            self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
+-        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+-        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+-        self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
++            self.embed_dim, elementwise_affine=getattr(config, 'layer_norm_elementwise_affine', True))
++        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=getattr(config, 'enable_bias', True))
++        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=getattr(config, 'enable_bias', True))
++        self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=getattr(config, 'layer_norm_elementwise_affine', True))
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Self Attention
+@@ -129,9 +130,9 @@ class OPTDecoder(OPTPreTrainedModel):
+         # Note that the only purpose of `config._remove_final_layer_norm` is to keep backward compatibility
+         # with checkpoints that have been fine-tuned before transformers v4.20.1
+         # see https://github.com/facebookresearch/metaseq/pull/164
+-        if config.do_layer_norm_before and not config._remove_final_layer_norm:
++        if config.do_layer_norm_before and not getattr(config, '_remove_final_layer_norm', False):
+             self.final_layer_norm = nn.LayerNorm(
+-                config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
++                config.hidden_size, elementwise_affine=getattr(config, 'layer_norm_elementwise_affine', True)
+             )
+         else:
+             self.final_layer_norm = None
+@@ -148,7 +149,6 @@ class OPTDecoder(OPTPreTrainedModel):
+     ) -> torch.Tensor:
+         inputs_embeds = self.embed_tokens(input_ids)
+         pos_embeds = self.embed_positions(positions)
+-        pos_embeds = None
+         if self.project_in is not None:
+             inputs_embeds = self.project_in(inputs_embeds)
+         hidden_states = inputs_embeds + pos_embeds
+@@ -198,5 +198,5 @@ class OPTForCausalLM(OPTPreTrainedModel):
+         positions: torch.LongTensor,
+     ) -> torch.Tensor:
+         hidden_states = self.model.decoder(input_ids, positions)
+-        logits = self.lm_head(hidden_states).contiguous()
++        logits = self.lm_head(hidden_states)
+         return logits

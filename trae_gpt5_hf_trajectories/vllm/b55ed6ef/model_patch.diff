@@ -1,0 +1,104 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e791453..9ee989e 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -59,7 +59,7 @@ class InputBatch:
+         # Find a way to reduce the CPU memory usage.
+         # This buffer is not directly transferred to the GPU, so it does not
+         # need to be pinned.
+-        self.token_ids_cpu_tensor = torch.zeros(
++        self.token_ids_cpu_tensor = torch.empty(
+             (max_num_reqs, max_model_len),
+             device="cpu",
+             dtype=torch.int32,
+@@ -70,12 +70,12 @@ class InputBatch:
+         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+-        self.block_table = torch.zeros(
++        self.block_table = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device=self.device,
+             dtype=torch.int32,
+         )
+-        self.block_table_cpu_tensor = torch.zeros(
++        self.block_table_cpu_tensor = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device="cpu",
+             dtype=torch.int32,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54..56d9443 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -143,31 +143,42 @@ class GPUModelRunner:
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
+-                                            dtype=torch.int32,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
++                                            dtype=torch.int64,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.seq_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device="cpu",
+                                              pin_memory=self.pin_memory)
+         self.seq_start_loc_np = self.seq_start_loc_cpu.numpy()
++        # Preallocate device buffers to avoid per-step allocations.
++        self.query_start_loc_device = torch.empty(self.max_num_reqs + 1,
++                                                  dtype=torch.int32,
++                                                  device=self.device)
++        self.seq_start_loc_device = torch.empty(self.max_num_reqs + 1,
++                                                dtype=torch.int32,
++                                                device=self.device)
++        self.slot_mapping_device = torch.empty(self.max_num_tokens,
++                                               dtype=torch.int64,
++                                               device=self.device)
++
+ 
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+         # Remove stopped requests from the cached states.
+@@ -356,12 +367,16 @@ class GPUModelRunner:
+             self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
+         self.positions[:total_num_scheduled_tokens].copy_(
+             self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
+-        query_start_loc = self.query_start_loc_cpu[:num_reqs + 1].to(
+-            self.device, non_blocking=True)
+-        seq_start_loc = self.seq_start_loc_cpu[:num_reqs + 1].to(
+-            self.device, non_blocking=True)
+-        slot_mapping = self.slot_mapping_cpu[:total_num_scheduled_tokens].to(
+-            self.device, non_blocking=True).long()
++        self.query_start_loc_device[:num_reqs + 1].copy_(
++            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
++        query_start_loc = self.query_start_loc_device[:num_reqs + 1]
++        self.seq_start_loc_device[:num_reqs + 1].copy_(
++            self.seq_start_loc_cpu[:num_reqs + 1], non_blocking=True)
++        seq_start_loc = self.seq_start_loc_device[:num_reqs + 1]
++        self.slot_mapping_device[:total_num_scheduled_tokens].copy_(
++            self.slot_mapping_cpu[:total_num_scheduled_tokens],
++            non_blocking=True)
++        slot_mapping = self.slot_mapping_device[:total_num_scheduled_tokens]
+ 
+         # Prepare for cascade attention if needed.
+         common_prefix_len = (scheduler_output.num_common_prefix_blocks *

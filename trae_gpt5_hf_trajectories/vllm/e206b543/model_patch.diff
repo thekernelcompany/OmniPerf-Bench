@@ -1,0 +1,75 @@
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index 329b03a57..f9d300529 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -3,7 +3,6 @@
+ # noqa: UP007
+ from __future__ import annotations
+ 
+-import copy
+ import json
+ import re
+ from dataclasses import dataclass, field
+@@ -117,11 +116,11 @@ class GrammarCompilerCache:
+     This cache reduces the overhead of creating new compiler instances when
+     using the same tokenizer configuration.
+     """
+-    _cache: dict[str, xgr.GrammarCompiler] = {}
++    _cache: dict[int, xgr.GrammarCompiler] = {}
+ 
+     @classmethod
+     def get_compiler(cls, config: GrammarConfig) -> xgr.GrammarCompiler:
+-        cache_key = str(config.tokenizer_hash)
++        cache_key = config.tokenizer_hash
+ 
+         if cache_key not in cls._cache:
+             assert config.tokenizer_data is not None
+@@ -319,7 +318,7 @@ class XGrammarLogitsProcessor:
+             for i, matcher in enumerate(self.matchers):
+                 if not matcher.is_terminated():
+                     sampled_token = input_ids[-1]
+-                    assert self.matchers[i].accept_token(sampled_token)
++                    assert matcher.accept_token(sampled_token)
+ 
+         for i, matcher in enumerate(self.matchers):
+             if not matcher.is_terminated():
+@@ -334,8 +333,12 @@ class XGrammarLogitsProcessor:
+         dtype = scores.dtype
+         if device_type != "cuda":
+             # xgrammar on cpu only supports float32 scores
+-            # see: https://github.com/mlc-ai/xgrammar/blob/c1b64920cad24f44f235778c1c00bb52d57da01a/python/xgrammar/kernels/apply_token_bitmask_inplace_cpu.py#L22
+-            scores = scores.to("cpu").float().unsqueeze(0)
++            # If already on CPU with float32, avoid redundant copies.
++            if device_type == "cpu" and dtype == torch.float32:
++                scores = scores.unsqueeze(0)
++            else:
++                # see: https://github.com/mlc-ai/xgrammar/blob/c1b64920cad24f44f235778c1c00bb52d57da01a/python/xgrammar/kernels/apply_token_bitmask_inplace_cpu.py#L22
++                scores = scores.to("cpu").float().unsqueeze(0)
+ 
+         # Note: In this method, if the tensors have different dimensions
+         # on CPU device fails, but on GPU it runs without error. Hence the
+@@ -343,10 +346,21 @@ class XGrammarLogitsProcessor:
+         xgr.apply_token_bitmask_inplace(
+             scores, self.token_bitmask.to(scores.device, non_blocking=True))
+         if device_type != "cuda":
+-            scores = scores.to(dtype).to(device_type).squeeze()
++            if device_type == "cpu" and dtype == torch.float32:
++                scores = scores.squeeze()
++            else:
++                scores = scores.to(dtype).to(device_type).squeeze()
+ 
+         return scores
+ 
+     def clone(self) -> XGrammarLogitsProcessor:
+-        """Deepcopy due to per-sequence state in the matchers"""
+-        return copy.deepcopy(self)
++        """Create a new instance with shared compiled grammar but separate state."""
++        new_processor = XGrammarLogitsProcessor(self.config)
++        # Share the compiled grammar context (immutable after compilation)
++        new_processor.ctx = self.ctx
++        # Preserve batch size; lazily reinitialize matchers/bitmask on first call
++        new_processor.batch_size = self.batch_size
++        new_processor.matchers = []
++        new_processor.token_bitmask = None  # type: ignore[assignment]
++        new_processor.prefilled = False
++        return new_processor

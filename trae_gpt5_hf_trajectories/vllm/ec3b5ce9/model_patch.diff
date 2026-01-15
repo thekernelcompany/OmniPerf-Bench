@@ -1,0 +1,66 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 6dafdac96..3a43a77b5 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -81,20 +81,21 @@ def _convert_tokens_to_string_with_added_encoders(
+     # even when the loop body is very simple.
+     sub_texts = []
+     current_sub_text = []
++    cts = tokenizer.convert_tokens_to_string
++    added_vocab = tokenizer.get_added_vocab()
++    all_special_tokens = set(tokenizer.all_special_tokens) if skip_special_tokens else None
+     for token in output_tokens:
+-        if skip_special_tokens and token in tokenizer.all_special_tokens:
++        if skip_special_tokens and token in all_special_tokens:  # type: ignore[arg-type]
+             continue
+-        if token in tokenizer.added_tokens_encoder:
++        if token in added_vocab:
+             if current_sub_text:
+-                sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-                sub_texts.append(sub_text)
++                sub_texts.append(cts(current_sub_text))
+                 current_sub_text = []
+             sub_texts.append(token)
+         else:
+             current_sub_text.append(token)
+     if current_sub_text:
+-        sub_text = tokenizer.convert_tokens_to_string(current_sub_text)
+-        sub_texts.append(sub_text)
++        sub_texts.append(cts(current_sub_text))
+     return " ".join(sub_texts)
+ 
+ 
+@@ -129,16 +130,23 @@ def detokenize_incrementally(
+     # The prefix text is necessary only to defeat cleanup algorithms in
+     # the decode which decide to add a space or not depending on the
+     # surrounding ids.
+-    if not getattr(tokenizer, "added_tokens_encoder", {}):
+-        prefix_text = tokenizer.convert_tokens_to_string(
+-            output_tokens[prefix_offset:read_offset])
++    if tokenizer.is_fast or not tokenizer.get_added_vocab():
++        prefix_slice = output_tokens[prefix_offset:read_offset]
++        if prefix_slice:
++            prefix_text = tokenizer.convert_tokens_to_string(prefix_slice)
++        else:
++            prefix_text = ""
+         new_text = tokenizer.convert_tokens_to_string(
+             output_tokens[prefix_offset:])
+     else:
+-        prefix_text = _convert_tokens_to_string_with_added_encoders(
+-            tokenizer,
+-            output_tokens[prefix_offset:read_offset],
+-            skip_special_tokens=skip_special_tokens)
++        prefix_slice = output_tokens[prefix_offset:read_offset]
++        if prefix_slice:
++            prefix_text = _convert_tokens_to_string_with_added_encoders(
++                tokenizer,
++                prefix_slice,
++                skip_special_tokens=skip_special_tokens)
++        else:
++            prefix_text = ""
+         new_text = _convert_tokens_to_string_with_added_encoders(
+             tokenizer,
+             output_tokens[prefix_offset:],

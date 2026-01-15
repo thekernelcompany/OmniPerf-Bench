@@ -1,0 +1,203 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23..5df6633 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -43,6 +43,29 @@ class BlockTracker:
+         self.reset()
+ 
+ 
++
++
++def _fast_common_prefix(lists: List[List[int]]) -> List[int]:
++    """Efficient common prefix computation specialized for List[int]."""
++    if not lists:
++        return []
++    non_empty = [lst for lst in lists if lst]
++    if not non_empty:
++        return []
++    min_len = min(len(lst) for lst in non_empty)
++    if min_len == 0:
++        return []
++    prefix: List[int] = []
++    # Compare element-wise until a mismatch.
++    first = non_empty[0]
++    for i in range(min_len):
++        v = first[i]
++        if all(lst[i] == v for lst in non_empty[1:]):
++            prefix.append(v)
++        else:
++            break
++    return prefix
++
+ class PrefixCachingBlockAllocator(BlockAllocator):
+     """A block allocator that implements prefix caching.
+ 
+@@ -86,6 +109,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self._block_pool = BlockPool(self._block_size, self._create_block,
+                                      self, num_blocks * extra_factor)
+ 
++
++
+         # An allocator for blocks that do not have prefix hashes.
+         self._hashless_allocator = NaiveBlockAllocator(
+             create_block=self._create_block,  # type: ignore
+@@ -100,6 +125,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self.evictor: Evictor = make_evictor(eviction_policy)
+ 
+         # We share the refcounter between allocators. This allows us to promote
++
+         # blocks originally allocated in the hashless allocator to immutable
+         # blocks.
+         self._refcounter = self._hashless_allocator.refcounter
+@@ -108,12 +134,33 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             refcounter=self._refcounter.as_readonly())
+ 
+     # Implements Block.Factory.
++
++    def _maybe_get_cached_block_id_fast(self, prev_block: Optional[Block],
++                                        token_ids: List[int]) -> Optional[Tuple[int, int]]:
++        # Fast path: compute the content hash without creating a temporary block object.
++        if len(token_ids) != self._block_size:
++            return None
++        is_first_block = prev_block is None
++        prev_hash: Optional[int]
++        if is_first_block:
++            prev_hash = None
++        else:
++            prev_hash = getattr(prev_block, "content_hash", None)  # type: ignore[attr-defined]
++            if prev_hash is None:
++                return None
++        h = PrefixCachingBlock.hash_block_tokens(is_first_block, prev_hash, token_ids)
++        cached_id = self._cached_blocks.get(h)
++        if cached_id is None:
++            return None
++        return (h, cached_id)
++
+     def _create_block(
+         self,
+         prev_block: Optional[Block],
+         token_ids: List[int],
+         block_size: int,
+         allocator: BlockAllocator,
++
+         block_id: Optional[int] = None,
+         computed: bool = False,
+     ) -> Block:
+@@ -146,15 +193,37 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        # First, try to create a block that points to cached data
++        # Initialize lightweight cache counters lazily
++        if not hasattr(self, "_cache_queries"):
++            self._cache_queries = 0  # type: ignore[attr-defined]
++            self._cache_hits = 0     # type: ignore[attr-defined]
++
++        # Fast path: compute content hash and look up cache before creating temp block
++        fast = self._maybe_get_cached_block_id_fast(prev_block, token_ids)
++        if fast is not None:
++            content_hash, cached_block_id = fast
++            self._cache_queries += 1  # type: ignore[attr-defined]
++            self._cache_hits += 1     # type: ignore[attr-defined]
++            block = self._block_pool.init_block(prev_block=prev_block,
++                                                token_ids=token_ids,
++                                                block_size=self._block_size,
++                                                physical_block_id=cached_block_id)
++            # Avoid recomputing hash later
++            block._cached_content_hash = content_hash  # type: ignore[attr-defined]
++            self._incr_refcount_cached_block(block)
++            return block
++
++        # Slow path: create a temporary block to compute content hash and try cache
+         block = self._block_pool.init_block(prev_block=prev_block,
+                                             token_ids=token_ids,
+                                             block_size=self._block_size,
+                                             physical_block_id=None)
+         assert block.content_hash is not None
+ 
++        self._cache_queries += 1  # type: ignore[attr-defined]
+         cached_block_id = self._cached_blocks.get(block.content_hash, None)
+         if cached_block_id is not None:
++            self._cache_hits += 1  # type: ignore[attr-defined]
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block)
+             return block
+@@ -319,6 +388,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         allocator free(..) with keep_block_object=True is called to only free
+         the block id (since the block object may be reused by the caller)
+         """
++
+         block_id = block.block_id
+         assert block_id is not None, "Freeing unallocated block is undefined"
+ 
+@@ -393,12 +463,17 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         Args:
+             absolute_id (int): The absolute block id for the block 
+-                in whole allocator.
++
+ 
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        mapping = getattr(self, "_abs_to_phys", None)
++        if mapping is None:
++            _sorted_ids = sorted(self.all_block_ids)
++            mapping = {bid: i for i, bid in enumerate(_sorted_ids)}
++            setattr(self, "_abs_to_phys", mapping)
++        return mapping[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -410,6 +485,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             return True
+         return False
+ 
++
++    def get_prefix_cache_hit_rate(self) -> float:
++        q = getattr(self, "_cache_queries", 0)
++        h = getattr(self, "_cache_hits", 0)
++        return (h / q) if q else 0.0
++
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+         block. This means that its content can be referenced by future blocks
+@@ -501,6 +582,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
++        if not block_ids:
++            return
+         raise NotImplementedError("Marking as computed is incremental")
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+@@ -552,7 +635,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # runner.
+ 
+         # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
++        return _fast_common_prefix([
+             ids for ids in computed_seq_block_ids  # type: ignore
+             if ids != []
+         ])
+@@ -827,8 +910,17 @@ class PrefixCachingBlock(Block):
+         Returns:
+         - int: The computed hash value for the block.
+         """
+-        assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        # Faster and allocation-free rolling hash (64-bit FNV-1a variant).
++        FNV_OFFSET = 1469598103934665603
++        FNV_PRIME = 1099511628211
++        h = FNV_OFFSET ^ (1 if is_first_block else 0)
++        if prev_block_hash is not None:
++            h ^= (prev_block_hash & 0xFFFFFFFFFFFFFFFF)
++            h = (h * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
++        for t in cur_block_token_ids:
++            h ^= (t & 0xFFFFFFFFFFFFFFFF)
++            h = (h * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
++        return int(h)
+ 
+ 
+ class ComputedBlocksTracker:

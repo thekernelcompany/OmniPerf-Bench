@@ -1,0 +1,77 @@
+diff --git a/csrc/quantization/fp8/common.cu b/csrc/quantization/fp8/common.cu
+index 0725a22..e07b9fb 100644
+--- a/csrc/quantization/fp8/common.cu
++++ b/csrc/quantization/fp8/common.cu
+@@ -91,8 +91,7 @@ void static_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
+   int const block_size = 256;
+   int const num_tokens = input.numel() / input.size(-1);
+   int const num_elems = input.numel();
+-  dim3 const grid(num_tokens);
+-  int const blocks = (num_elems + block_size - 1) / block_size;
++  dim3 const grid(blocks);
+   dim3 const block(block_size);
+   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+diff --git a/model_patch.diff b/model_patch.diff
+index 454c849..e69de29 100644
+--- a/model_patch.diff
++++ b/model_patch.diff
+@@ -1,58 +0,0 @@
+-diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+-index d073dd6..c55c601 100644
+---- a/csrc/layernorm_kernels.cu
+-+++ b/csrc/layernorm_kernels.cu
+-@@ -148,7 +148,8 @@ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
+-   int num_tokens = input.numel() / hidden_size;
+- 
+-   dim3 grid(num_tokens);
+--  dim3 block(std::min(hidden_size, 1024));
+-+  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+-+  dim3 block(std::min(hidden_size, max_block_size));
+-   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+-   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&] {
+-diff --git a/csrc/layernorm_quant_kernels.cu b/csrc/layernorm_quant_kernels.cu
+-index d595b9e..6b5167b 100644
+---- a/csrc/layernorm_quant_kernels.cu
+-+++ b/csrc/layernorm_quant_kernels.cu
+-@@ -173,7 +173,8 @@ void rms_norm_static_fp8_quant(torch::Tensor& out,     // [..., hidden_size]
+-   int num_tokens = input.numel() / hidden_size;
+- 
+-   dim3 grid(num_tokens);
+--  dim3 block(std::min(hidden_size, 1024));
+-+  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
+-+  dim3 block(std::min(hidden_size, max_block_size));
+-   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+-   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-   VLLM_DISPATCH_FLOATING_TYPES(
+-diff --git a/csrc/quantization/fp8/common.cu b/csrc/quantization/fp8/common.cu
+-index f3f9f66..0725a22 100644
+---- a/csrc/quantization/fp8/common.cu
+-+++ b/csrc/quantization/fp8/common.cu
+-@@ -92,6 +92,7 @@ void static_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
+-   int const num_tokens = input.numel() / input.size(-1);
+-   int const num_elems = input.numel();
+-   dim3 const grid(num_tokens);
+-+  int const blocks = (num_elems + block_size - 1) / block_size;
+-   dim3 const block(block_size);
+-   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+-   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+-index 5106b99..ba4b11c 100644
+---- a/vllm/model_executor/models/deepseek_v2.py
+-+++ b/vllm/model_executor/models/deepseek_v2.py
+-@@ -822,11 +822,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
+-             device: torch.device) -> IntermediateTensors:
+-         return IntermediateTensors({
+-             "hidden_states":
+--            torch.zeros((batch_size, self.config.hidden_size),
+-+            torch.empty((batch_size, self.config.hidden_size),
+-                         dtype=dtype,
+-                         device=device),
+-             "residual":
+--            torch.zeros((batch_size, self.config.hidden_size),
+-+            torch.empty((batch_size, self.config.hidden_size),
+-                         dtype=dtype,
+-                         device=device),
+-         })

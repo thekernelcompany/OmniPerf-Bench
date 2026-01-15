@@ -1,0 +1,98 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5e7ed06..2845ea4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -203,6 +203,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3,-dlcm=ca>" "$<$<COMPILE_LANGUAGE:CUDA>:-O3>"
+   )
+ endif()
++# Apply similar optimizations for HIP builds
++if(VLLM_GPU_LANG STREQUAL "HIP")
++  list(APPEND VLLM_GPU_FLAGS "-O3")
++  list(APPEND VLLM_GPU_FLAGS "-DNDEBUG")
++endif()
++
++# Generate compile_commands.json to aid tooling without affecting build outputs
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
++
++# Additional per-source tuning for topk_softmax kernels (CUDA)
++if(VLLM_GPU_LANG STREQUAL "CUDA")
++  set_property(
++    SOURCE csrc/moe/topk_softmax_kernels.cu
++    APPEND PROPERTY
++    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3,-dlcm=ca>" "$<$<COMPILE_LANGUAGE:CUDA>:-O3>"
++  )
++endif()
++
+ 
+ 
+ #
+diff --git a/model_patch.diff b/model_patch.diff
+index 8149cb2..e69de29 100644
+--- a/model_patch.diff
++++ b/model_patch.diff
+@@ -1,64 +0,0 @@
+-diff --git a/CMakeLists.txt b/CMakeLists.txt
+-index 45a3b48..5e7ed06 100644
+---- a/CMakeLists.txt
+-+++ b/CMakeLists.txt
+-@@ -20,6 +20,27 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+- message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+- 
+- include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+-+# Default to Release build for optimized performance if not specified
+-+if(NOT CMAKE_BUILD_TYPE)
+-+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+-+  message(STATUS "Defaulting CMAKE_BUILD_TYPE to Release")
+-+endif()
+-+
+-+# Enable high optimization and NDEBUG for C++ release builds
+-+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+-+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -DNDEBUG -g" CACHE STRING "" FORCE)
+-+
+-+# Enable LTO/IPO when supported to improve host-side performance
+-+include(CheckIPOSupported)
+-+check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_error)
+-+if(_ipo_supported)
+-+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+-+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+-+  message(STATUS "IPO/LTO enabled for Release/RelWithDebInfo")
+-+else()
+-+  message(STATUS "IPO/LTO not supported: ${_ipo_error}")
+-+endif()
+-+
+- 
+- # Suppress potential warnings about unused manually-specified variables
+- set(ignoreMe "${VLLM_PYTHON_PATH}")
+-@@ -158,6 +179,31 @@ endif()
+- # The final set of arches is stored in `VLLM_GPU_FLAGS`.
+- #
+- get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
+-+# Additional CUDA optimization flags and per-file tuning
+-+if(VLLM_GPU_LANG STREQUAL "CUDA")
+-+  # Default NVCC parallel threads to the number of logical cores if not specified
+-+  if(NOT NVCC_THREADS)
+-+    include(ProcessorCount)
+-+    ProcessorCount(_nvcc_cores)
+-+    if(_nvcc_cores GREATER 0)
+-+      set(NVCC_THREADS ${_nvcc_cores})
+-+      message(STATUS "Setting NVCC_THREADS to ${NVCC_THREADS}")
+-+    endif()
+-+  endif()
+-+
+-+  # General optimization and cache preference for device code
+-+  list(APPEND VLLM_GPU_FLAGS "-O3")
+-+  list(APPEND VLLM_GPU_FLAGS "-DNDEBUG")
+-+  list(APPEND VLLM_GPU_FLAGS "-Xptxas=-O3,-dlcm=ca")
+-+
+-+  # Per-source tuning for MoE align/sum kernels
+-+  set_property(
+-+    SOURCE csrc/moe/moe_align_sum_kernels.cu
+-+    APPEND PROPERTY
+-+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O3,-dlcm=ca>" "$<$<COMPILE_LANGUAGE:CUDA>:-O3>"
+-+  )
+-+endif()
+-+
+- 
+- #
+- # Set nvcc parallelism.

@@ -1,0 +1,75 @@
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 3a4c259..50d3add 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -229,7 +229,7 @@ class MinPLogitsProcessor(LogitsProcessor):
+         super().__init__()
+         self.min_p_count: int = 0
+ 
+-        self.min_p_cpu_tensor = torch.zeros((max_num_reqs, ),
++        self.min_p_cpu_tensor = torch.empty((max_num_reqs, ),
+                                             dtype=torch.float32,
+                                             device="cpu",
+                                             pin_memory=pin_memory)
+@@ -246,6 +246,8 @@ class MinPLogitsProcessor(LogitsProcessor):
+             self.min_p_device = self.min_p_cpu_tensor
+         # Current slice of the device tensor
+         self.min_p: torch.Tensor = self.min_p_device[:0]
++        # Cached log(min_p) per request to avoid recomputing every apply
++        self.log_min_p: torch.Tensor = self.min_p_device[:0]
+ 
+     def is_argmax_invariant(self) -> bool:
+         """Min-p never impacts greedy sampling"""
+@@ -294,23 +296,22 @@ class MinPLogitsProcessor(LogitsProcessor):
+                 self.min_p.copy_(self.min_p_cpu_tensor[:size],
+                                  non_blocking=True)
+             self.min_p.unsqueeze_(1)
++            # Precompute log(min_p) once when updated
++            self.log_min_p = torch.log(self.min_p)
++        elif not self.min_p_count:
++            # No active min_p: keep cached tensors empty
++            self.log_min_p = self.min_p_device[:0]
+ 
+     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+         if not self.min_p_count:
+             return logits
+ 
+-        # Convert logits to probability distribution
+-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
+-        # Adjust min_p
+-        adjusted_min_p = max_probabilities.mul_(self.min_p)
+-        # Identify valid tokens using threshold comparison
+-        invalid_token_mask = probability_values < adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[invalid_token_mask] = -float('inf')
++        # Use logits-space threshold to avoid softmax:
++        # keep tokens where z_i - z_max >= log(min_p)
++        max_logits = torch.amax(logits, dim=-1, keepdim=True)
++        log_min_p = self.log_min_p if self.log_min_p.numel() else torch.log(self.min_p)
++        threshold = max_logits + log_min_p
++        logits.masked_fill_(logits < threshold, float('-inf'))
+         return logits
+ 
+ 
+@@ -381,6 +382,8 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+                                  self._device_tensor(tok_ids, torch.int32))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
++        if self.device.type == "cpu":
++            return torch.tensor(data, device="cpu", dtype=dtype)
+         return (torch.tensor(data,
+                              device="cpu",
+                              dtype=dtype,
+@@ -480,6 +483,8 @@ class MinTokensLogitsProcessor(LogitsProcessor):
+                                  self._device_tensor(tok_ids, torch.int32))
+ 
+     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
++        if self.device.type == "cpu":
++            return torch.tensor(data, device="cpu", dtype=dtype)
+         return (torch.tensor(data,
+                              device="cpu",
+                              dtype=dtype,

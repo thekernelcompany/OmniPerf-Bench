@@ -1,0 +1,65 @@
+diff --git a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+index 7016ff3..9cce02e 100644
+--- a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
++++ b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+@@ -33,6 +33,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
+         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
+ 
++
++        # Cache frequently used configs/objects to reduce per-call overhead.
++        self._dispatch_config: Optional[deep_ep.Config] = None
++        self._combine_config: Optional[deep_ep.Config] = None
++        self._contiguous_reducer = TopKWeightAndReduceContiguous()
++
+     def num_dispatchers(self) -> int:
+         return self.num_dispatchers_
+ 
+@@ -49,12 +55,16 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+     def _get_dispatch_config(self) -> Optional[deep_ep.Config]:
+         if self.dp_size not in self.available_rank_configs:
+             return None
+-        return deep_ep.Buffer.get_dispatch_config(self.dp_size)
++        if self._dispatch_config is None:
++            self._dispatch_config = deep_ep.Buffer.get_dispatch_config(self.dp_size)
++        return self._dispatch_config
+ 
+     def _get_combine_config(self) -> Optional[deep_ep.Config]:
+         if self.dp_size not in self.available_rank_configs:
+             return None
+-        return deep_ep.Buffer.get_combine_config(self.dp_size)
++        if self._combine_config is None:
++            self._combine_config = deep_ep.Buffer.get_combine_config(self.dp_size)
++        return self._combine_config
+ 
+     def _do_dispatch(self, tokens: torch.Tensor,
+                      token_scales: Optional[torch.Tensor],
+@@ -112,10 +122,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # DeepEP's topk_ids output refers to the local experts directly. Offset
+         # the topk_ids to move it back to the global experts space so it aligns
+         # with existing vLLM interfaces.
+-        expert_topk_ids = torch.where(
+-            expert_topk_ids == -1,
+-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
+-            expert_topk_ids + self.rank_expert_offset)
++        if expert_topk_ids.numel() != 0:
++            invalid_mask = expert_topk_ids.eq(-1)
++            if self.rank_expert_offset != 0:
++                expert_topk_ids.add_(self.rank_expert_offset)
++            fill_val = num_experts - 1 if self.rank_expert_offset == 0 else 0
++            expert_topk_ids.masked_fill_(invalid_mask, fill_val)
+ 
+         # Makes a GPU-CPU copy.
+         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
+@@ -196,9 +208,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # tokens from the all2all reach this EP rank.
+         if fused_expert_output.numel() != 0:
+             if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
+-                weight_and_reduce_impl = TopKWeightAndReduceContiguous()
++                weight_and_reduce_impl = self._contiguous_reducer
+             fused_expert_output = weight_and_reduce_impl.apply(
+-                output=None,
++                output=output,
+                 fused_expert_output=fused_expert_output,
+                 topk_weights=topk_weights,
+                 topk_ids=topk_ids,

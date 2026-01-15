@@ -1,0 +1,71 @@
+diff --git a/vllm/model_executor/layers/rotary_embedding.py b/vllm/model_executor/layers/rotary_embedding.py
+index 48cdebee9..a26257b04 100644
+--- a/vllm/model_executor/layers/rotary_embedding.py
++++ b/vllm/model_executor/layers/rotary_embedding.py
+@@ -161,12 +161,8 @@ class RotaryEmbedding(CustomOp):
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         from vllm import _custom_ops as ops
+ 
+-        # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
+-        # is expensive, so avoid calling it if possible
+-        if self.cos_sin_cache.device != query.device or \
+-            self.cos_sin_cache.dtype != query.dtype:
+-            self.cos_sin_cache = self.cos_sin_cache.to(query.device,
+-                                                       dtype=query.dtype)
++        self.cos_sin_cache = self.cos_sin_cache.to(query.device,
++                                                   dtype=query.dtype)
+ 
+         # ops.rotary_embedding()/batched_rotary_embedding()
+         # are in-place operations that update the query and key tensors.
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index f3fff585b..e43aba2c0 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -199,6 +199,8 @@ from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
+ 
+ import torch
+ from compressed_tensors.quantization import QuantizationStrategy
++import torch.nn.functional as F
++
+ 
+ from vllm import _custom_ops as ops
+ from vllm import envs
+@@ -223,7 +225,6 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     scaled_quantize)
+ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+-from vllm.platforms import current_platform
+ from vllm.utils import cdiv, round_down
+ 
+ try:
+@@ -532,14 +533,10 @@ class MLACommonMetadataBuilder(Generic[M]):
+                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+                 _chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
+                     torch.int32)
+-                zero = torch.zeros(num_chunks,
+-                                   dtype=torch.int32,
+-                                   device=device).unsqueeze(-1)
+ 
+                 chunked_context_metadata = \
+                     MLACommonPrefillMetadata.ChunkedContextMetadata(
+-                    cu_seq_lens=torch.cat(
+-                        [zero, _chunk_cu_seq_lens], dim=1),
++                    cu_seq_lens=F.pad(_chunk_cu_seq_lens, (1, 0, 0, 0), mode='constant', value=0),
+                     starts=chunk_starts,
+                     seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+                     max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+@@ -628,14 +625,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+ 
+         self.rotary_emb = rotary_emb
+ 
+-        if current_platform.is_cuda():
+-            # Hack for V1 for now to avoid torch library overhead (since we are
+-            # already inside an attention custom op), pull out the forward
+-            # method from the rotary embedding and call it directly (and avoid
+-            # calling forward_native, when we can call forward_cuda)
+-            # TODO(lucas): we should probably find a cleaner way to do this
+-            self.rotary_emb = rotary_emb.forward_cuda
+-
+         self.q_proj = q_proj
+         self.kv_b_proj = kv_b_proj
+         self.o_proj = o_proj

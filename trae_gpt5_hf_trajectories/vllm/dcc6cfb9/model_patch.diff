@@ -1,0 +1,63 @@
+diff --git a/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
+index 628aa5c7b..3e916414f 100644
+--- a/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/batched_deep_gemm_moe.py
+@@ -55,6 +55,7 @@ def _silu_mul_fp8_quant_deep_gemm(
+ 
+     # Meta ---------------------------------------------------------------
+     BLOCK: tl.constexpr,
++    NUM_STAGES: tl.constexpr,
+ ):
+     G = H // GROUP_SIZE
+ 
+@@ -71,24 +72,19 @@ def _silu_mul_fp8_quant_deep_gemm(
+ 
+     cols = tl.arange(0, BLOCK)
+     cols = cols.to(tl.int64)
+-    mask_h = cols < BLOCK
++    offset_i_h = cols * stride_i_h
++    offset_yq_h = cols * stride_yq_h
+ 
+-    t = tl.zeros([], tl.int64)
+-    while t < n_tokens:
++    for t in tl.range(0, n_tokens, num_stages=NUM_STAGES):
+         base_i_offset = (e * stride_i_e + t * stride_i_t +
+                          g * GROUP_SIZE * stride_i_h)
+         base_yq_offset = (e * stride_yq_e + t * stride_yq_t +
+                           g * GROUP_SIZE * stride_yq_h)
+         base_ys_offset = e * stride_ys_e + t * stride_ys_t + g * stride_ys_g
+ 
+-        mask = mask_h
+-        x = tl.load(input_ptr + base_i_offset + cols * stride_i_h,
+-                    mask=mask,
+-                    other=0.0).to(tl.float32)
++        x = tl.load(input_ptr + base_i_offset + offset_i_h).to(tl.float32)
+         y2 = tl.load(input_ptr + base_i_offset + H * stride_i_h +
+-                     cols * stride_i_h,
+-                     mask=mask,
+-                     other=0.0).to(tl.float32)
++                     offset_i_h).to(tl.float32)
+ 
+         x = x * (1.0 / (1.0 + tl.exp(-x)))
+         y = x * y2
+@@ -99,11 +95,9 @@ def _silu_mul_fp8_quant_deep_gemm(
+             tl.log2(scale_raw))) if use_ue8m0 else scale_raw
+         y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+ 
+-        tl.store(y_q_ptr + base_yq_offset + cols * stride_yq_h, y_q, mask=mask)
++        tl.store(y_q_ptr + base_yq_offset + offset_yq_h, y_q)
+         tl.store(y_s_ptr + base_ys_offset, y_s)
+ 
+-        t += 1
+-
+ 
+ def silu_mul_fp8_quant_deep_gemm(
+     y: torch.Tensor,  # (E, T, 2*H) float32
+@@ -180,6 +174,7 @@ def silu_mul_fp8_quant_deep_gemm(
+         fp8_max,
+         is_blackwell_deep_gemm_used(),
+         BLOCK=group_size,
++        NUM_STAGES=2,
+         num_warps=4,
+     )
+ 

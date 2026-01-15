@@ -26,7 +26,7 @@ PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/ex
 AGENT_CONFIGS = {
     "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
     "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
-    "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",
+    "trae_gpt5": "trae_gpt5_hf_trajectories/vllm",  # HuggingFace trajectories
     "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
 }
 
@@ -817,6 +817,12 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
 
     pip install 'numpy<2' -q 2>/dev/null || true
 
+    # Fix broken transformers installations (check for common import issues)
+    if ! python3 -c "from transformers.utils import logging" 2>/dev/null; then
+        echo "Fixing broken transformers installation (utils module missing)..."
+        pip install --force-reinstall 'transformers>=4.44.0,<5' -q 2>/dev/null || true
+    fi
+
     # Verify vLLM exists
     if [ ! -d "vllm" ]; then
         echo "ERROR: vLLM not found at /opt/vllm_baseline"
@@ -884,6 +890,14 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
     elif echo "$PERF_CMD" | grep -q "^python"; then
         PERF_CMD=$(echo "$PERF_CMD" | sed "s|^python3\\? |$VLLM_PYTHON |")
         echo "Using Python command: $PERF_CMD"
+    fi
+
+    # Add default input/output lengths for throughput benchmarks if missing
+    if echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        if ! echo "$PERF_CMD" | grep -q "\\-\\-input-len"; then
+            PERF_CMD="$PERF_CMD --input-len 512 --output-len 128"
+            echo "Added default input/output lengths for throughput benchmark"
+        fi
     fi
 
     echo "Final command: $PERF_CMD"
@@ -1036,6 +1050,12 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
 
     # Always ensure numpy<2 for outlines compatibility
     pip install 'numpy<2' -q 2>/dev/null || true
+
+    # Fix broken transformers installations (check for common import issues)
+    if ! python3 -c "from transformers.utils import logging" 2>/dev/null; then
+        echo "Fixing broken transformers installation (utils module missing)..."
+        pip install --force-reinstall 'transformers>=4.44.0,<5' -q 2>/dev/null || true
+    fi
 
     # Verify vLLM exists
     if [ ! -d "vllm" ]; then
@@ -1200,10 +1220,9 @@ PATCH
         --model $MODEL \
         --backend vllm \
         --port 8000 \
-        --dataset-name sonnet \
-        --dataset-path /opt/vllm_baseline/benchmarks/sonnet.txt \
-        --sonnet-input-len 256 \
-        --sonnet-output-len 64 \
+        --dataset-name random \
+        --random-input-len 256 \
+        --random-output-len 64 \
         --num-prompts 100 \
         --request-rate inf \
         2>&1 | tee /tmp/benchmark_output.txt
