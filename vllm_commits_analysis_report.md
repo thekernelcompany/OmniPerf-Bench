@@ -182,7 +182,7 @@ We executed the 4 fixable commits with corrected benchmark commands. Results upl
 |--------|---------|--------|----------|-------|-------|------------|------------|
 | 3476ed08 | vllm_core-0017 | All 3 succeeded | 169.20 ms | 175.44 ms | 184.16 ms | -3.69% | -8.85% |
 | 6ce01f30 | vllm_core-0030 | All 3 succeeded | 9.18 req/s | 9.21 req/s | 9.20 req/s | +0.33% | +0.22% |
-| 99abb8b6 | vllm_core-0051 | Human failed | 2177.47 ms | **N/A** | 2231.11 ms | N/A | -2.46% |
+| 99abb8b6 | vllm_core-0051 | All 3 succeeded | 2174.04 ms | 2179.97 ms | 2186.58 ms | -0.27% | -0.58% |
 | fa63e710 | vllm_core-0091 | Not run | N/A | N/A | N/A | N/A | N/A |
 
 ### Detailed Results
@@ -220,20 +220,13 @@ We executed the 4 fixable commits with corrected benchmark commands. Results upl
 
 | Variant | Status | Latency (ms) | Throughput (tok/s) |
 |---------|--------|--------------|-------------------|
-| Baseline | Success | 2177.47 | 2639.30 |
-| Human | **FAILED** | N/A | N/A |
-| Agent | Success | 2231.11 | 2635.0 |
+| Baseline | Success | 2174.04 | 2635.10 |
+| Human | Success | 2179.97 | 2634.0 |
+| Agent | Success | 2186.58 | 2635.6 |
 
-**Human Benchmark Failure — Root Cause:**
+**Analysis:** All variants show similar performance. Human shows -0.27% latency regression, Agent shows -0.58% regression. The Triton kernel optimization has minimal measurable impact in this benchmark configuration.
 
-The human Docker image has a dependency conflict:
-
-```
-vllm 0.0.0+local requires transformers>=4.48.2
-ModuleNotFoundError: No module named 'transformers.models.mllama'
-```
-
-The vLLM in this image requires `transformers>=4.48.2` (which has `mllama` model support), but our compatibility fix downgrades to `transformers==4.44.2` to fix `LogitsWarper` imports. These requirements are mutually exclusive.
+**Note:** The original human Docker image was missing the `vllm.benchmarks` module. It was rebuilt as `shikhar481/vllm_fixed_human_images:human-99abb8b650c66664cdc84d815b7f306f33bd9881` with vLLM installed from source to include benchmarks.
 
 #### fa63e710 — Reduce scheduling overhead (NOT RUN)
 
@@ -241,58 +234,11 @@ The vLLM in this image requires `transformers>=4.48.2` (which has `mllama` model
 
 ---
 
-### Docker Image Fix Required for 99abb8b6
+### Docker Image Fix for 99abb8b6 (RESOLVED)
 
-#### Problem
+The original human image (`ayushnangia16/nvidia-vllm-docker:99abb8b6...`) was missing the `vllm.benchmarks` module because it was built with `pip install vllm` instead of from source.
 
-The human image (`ayushnangia16/nvidia-vllm-docker:99abb8b6...`) has:
-1. vLLM requiring `transformers>=4.48.2` (has `mllama` model support)
-2. But benchmark scripts need `transformers==4.44.2` (for `LogitsWarper` compatibility)
-
-#### Solution Options
-
-**Option 1: Fix the Docker Image**
-
-Rebuild the image to include benchmark scripts compatible with its vLLM version:
-
-```dockerfile
-# Ensure benchmark scripts are included and compatible
-COPY benchmarks/ /workspace/benchmarks/
-# Don't rely on external benchmark script cloning
-```
-
-**Option 2: Fix the Benchmark Runner Script**
-
-Update `rerun_4_fixable_commits.py` to detect when vLLM requires newer transformers:
-
-```python
-def needs_transformers_downgrade(python_path: str) -> bool:
-    """Check if vLLM needs transformers downgrade or has mllama dependency."""
-    # If vLLM has mllama, it needs transformers>=4.48.2
-    check_cmd = f"{python_path} -c \"import vllm.transformers_utils.configs.mllama\" 2>/dev/null"
-    result = subprocess.run(check_cmd, shell=True)
-    if result.returncode == 0:
-        # Has mllama - DON'T downgrade transformers
-        return False
-
-    # Check if LogitsWarper import fails
-    check_cmd = f"{python_path} -c \"from transformers.generation.logits_process import LogitsWarper\""
-    result = subprocess.run(check_cmd, shell=True)
-    return result.returncode != 0
-```
-
-**Option 3: Use Native Benchmark Scripts**
-
-For images with newer vLLM, use the benchmark scripts bundled with that vLLM installation:
-
-```python
-# Check if /workspace/benchmarks exists in container
-if os.path.exists("/workspace/benchmarks/benchmark_latency.py"):
-    benchmarks_dir = "/workspace/benchmarks"
-else:
-    # Fall back to cloning compatible version
-    clone_benchmark_scripts()
-```
+**Resolution:** Rebuilt the image as `shikhar481/vllm_fixed_human_images:human-99abb8b650c66664cdc84d815b7f306f33bd9881` with vLLM installed from source to include the benchmarks module.
 
 ---
 
@@ -309,6 +255,4 @@ else:
 ### Next Steps
 
 1. **Build missing baseline image** for fa63e710 (parent: 2a0309a646b1)
-2. **Fix human image** for 99abb8b6 using one of the solutions above
-3. **Re-run failed benchmarks** once images are fixed
-4. **Consider statistical significance tests** for small improvements (<1%)
+2. **Consider statistical significance tests** for small improvements (<1%)
