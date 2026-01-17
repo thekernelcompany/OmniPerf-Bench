@@ -14,9 +14,9 @@
 
 ### Update 2026-01-17
 
-Added benchmark results for:
-- **021f76e4**: Complete 3-way benchmark (Baseline + Human + Agent)
-- **6fc17596**: Partial benchmark (Human only - baseline failed)
+Benchmark results for:
+- **021f76e4**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +15-20% improvement**
+- **6fc17596**: Complete benchmark (Baseline + Human) - **Micro-optimization (<1% macro impact)**
 
 ---
 
@@ -219,32 +219,41 @@ Re-ran with clean GPU resources. All three phases completed successfully.
 
 ---
 
-### Commit 6fc17596 - FA3 Pad Optimization (Partial)
+### Commit 6fc17596 - FA3 Pad Optimization (Complete)
 
 **PR:** [sgl-project/sglang#5945](https://github.com/sgl-project/sglang/pull/5945)
 **Subject:** Optimize FA3 pad operation (71% faster - 35us -> 10us)
 **Docker Repo:** ayushnangia16/nvidia-sglang-docker
 
 #### Status
-- **Baseline:** FAILED (container killed with exit code 137)
+- **Baseline:** SUCCESS
 - **Human:** SUCCESS
 - **Agent:** N/A (no agent patch available)
 
-#### Human Results (No baseline comparison available)
+#### Baseline vs Human Comparison
 
-| Metric | Human Result |
-|--------|--------------|
-| TTFT Mean (ms) | 63.99 |
-| TTFT Median (ms) | 40.63 |
-| TTFT P99 (ms) | 457.52 |
-| ITL Mean (ms) | 13.76 |
-| ITL Median (ms) | 12.13 |
-| ITL P99 (ms) | 41.55 |
-| Throughput (req/s) | 5.90 |
-| E2E Latency Mean (ms) | 2913.52 |
-| E2E Latency Median (ms) | 1842.62 |
+| Metric | Baseline | Human | Improvement |
+|--------|----------|-------|-------------|
+| TTFT Mean (ms) | 62.68 | 62.45 | **+0.37%** |
+| TTFT Median (ms) | 41.15 | 41.29 | -0.34% |
+| TTFT P99 (ms) | 425.72 | 423.90 | +0.43% |
+| ITL Mean (ms) | 13.72 | 13.71 | **+0.07%** |
+| ITL Median (ms) | 12.10 | 12.12 | -0.17% |
+| ITL P99 (ms) | 42.84 | 42.74 | +0.23% |
+| E2E Latency Mean (ms) | 2904.94 | 2902.56 | +0.08% |
+| E2E Latency Median (ms) | 1816.55 | 1828.42 | -0.65% |
+| Throughput (req/s) | 5.90 | 5.90 | **0.0%** |
 
-**Note:** Baseline image (`ad506a4e`) from `ayushnangia16/nvidia-sglang-docker` consistently fails to start (exit 137 - OOM/killed). Cannot calculate improvement metrics.
+#### Key Finding
+
+The **claimed 71% improvement (35us -> 10us)** refers to a **micro-operation** (the pad operation within FA3). At the macro level of a full serving benchmark:
+- The improvement is **< 1%** and within measurement noise
+- A 25us savings per operation is negligible compared to:
+  - Overall E2E latency (~2900ms)
+  - ITL (~13ms)
+  - TTFT (~62ms)
+
+This demonstrates the difference between **micro-benchmarks** (specific operation timing) and **macro-benchmarks** (end-to-end performance). While the PR's optimization is real and validated by the 71% micro-benchmark improvement, it doesn't significantly impact overall serving performance.
 
 ---
 
