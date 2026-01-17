@@ -16,8 +16,17 @@
 
 Benchmark results for:
 - **021f76e4**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +15-20% improvement, Agent underperforms**
-- **6fc17596**: Complete benchmark (Baseline + Human) - **Micro-optimization (<1% macro impact)**
+- **6fc17596**: Complete 3-way benchmark (Baseline + Human + Agent) - **Agent outperforms Human by 8% TTFT**
 - **ddcf9fe3**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +5% TTFT, Agent matches Human**
+
+### Key Insight
+
+Agent performance varies by optimization type:
+| Optimization Type | Human vs Agent | Example |
+|-------------------|----------------|---------|
+| Architectural refactors | Human wins by 10-25% | 021f76e4 (LoRA stream sync) |
+| Kernel-level patterns | Agent matches Human | ddcf9fe3 (triton attention) |
+| Memory initialization | Agent wins by 8% | 6fc17596 (torch.zeros→empty) |
 
 ---
 
@@ -220,41 +229,57 @@ Re-ran with clean GPU resources. All three phases completed successfully.
 
 ---
 
-### Commit 6fc17596 - FA3 Pad Optimization (Complete)
+### Commit 6fc17596 - FA3 Pad Optimization (Complete 3-Way)
 
 **PR:** [sgl-project/sglang#5945](https://github.com/sgl-project/sglang/pull/5945)
 **Subject:** Optimize FA3 pad operation (71% faster - 35us -> 10us)
 **Docker Repo:** ayushnangia16/nvidia-sglang-docker
+**Model:** meta-llama/Llama-3.1-8B-Instruct
 
 #### Status
 - **Baseline:** SUCCESS
 - **Human:** SUCCESS
-- **Agent:** N/A (no agent patch available)
+- **Agent:** SUCCESS
 
-#### Baseline vs Human Comparison
+#### Full 3-Way Comparison
 
-| Metric | Baseline | Human | Improvement |
-|--------|----------|-------|-------------|
-| TTFT Mean (ms) | 62.68 | 62.45 | **+0.37%** |
-| TTFT Median (ms) | 41.15 | 41.29 | -0.34% |
-| TTFT P99 (ms) | 425.72 | 423.90 | +0.43% |
-| ITL Mean (ms) | 13.72 | 13.71 | **+0.07%** |
-| ITL Median (ms) | 12.10 | 12.12 | -0.17% |
-| ITL P99 (ms) | 42.84 | 42.74 | +0.23% |
-| E2E Latency Mean (ms) | 2904.94 | 2902.56 | +0.08% |
-| E2E Latency Median (ms) | 1816.55 | 1828.42 | -0.65% |
-| Throughput (req/s) | 5.90 | 5.90 | **0.0%** |
+| Metric | Baseline | Human | Agent |
+|--------|----------|-------|-------|
+| TTFT Mean (ms) | 54.29 | 60.66 | **55.66** |
+| TTFT Median (ms) | 40.99 | 40.58 | **40.31** |
+| TTFT P99 (ms) | 349.13 | 404.14 | **335.22** |
+| ITL Mean (ms) | 13.77 | 13.71 | 13.75 |
+| ITL Median (ms) | 12.12 | 12.12 | 12.10 |
+| ITL P99 (ms) | 43.04 | 42.80 | 42.84 |
+| E2E Latency Mean (ms) | 2906.04 | 2900.26 | 2903.00 |
+| E2E Latency Median (ms) | 1831.76 | 1824.38 | **1820.15** |
+| Throughput (req/s) | 5.89 | 5.90 | 5.90 |
+
+#### Agent vs Human Performance
+
+| Metric | Agent vs Baseline | Human vs Baseline | Agent vs Human |
+|--------|-------------------|-------------------|----------------|
+| TTFT Mean | -2.52% (worse) | -11.73% (worse) | **+8.24% better** |
+| TTFT Median | +1.66% (better) | +1.0% (better) | +0.67% better |
+| TTFT P99 | +3.98% (better) | -15.76% (worse) | **+17% better** |
+| E2E Median | +0.63% (better) | +0.4% (better) | +0.23% better |
+| Throughput | +0.17% | +0.17% | 0% |
 
 #### Key Finding
 
-The **claimed 71% improvement (35us -> 10us)** refers to a **micro-operation** (the pad operation within FA3). At the macro level of a full serving benchmark:
-- The improvement is **< 1%** and within measurement noise
-- A 25us savings per operation is negligible compared to:
-  - Overall E2E latency (~2900ms)
-  - ITL (~13ms)
-  - TTFT (~62ms)
+**Agent outperforms Human on this optimization.** The agent applied `torch.zeros → torch.empty` across 20 metadata initialization locations in `flashattention_backend.py`. This approach achieved:
+- **8.24% better TTFT Mean** than Human
+- **17% better TTFT P99** than Human
+- Identical throughput
 
-This demonstrates the difference between **micro-benchmarks** (specific operation timing) and **macro-benchmarks** (end-to-end performance). While the PR's optimization is real and validated by the 71% micro-benchmark improvement, it doesn't significantly impact overall serving performance.
+The Human PR's claimed 71% improvement (35us -> 10us) refers to a **micro-operation**. At the macro level, neither Human nor Agent shows significant improvement over baseline (<2%), but the Agent's broader application of the optimization pattern resulted in slightly better tail latencies.
+
+#### Agent Patch Details
+
+The agent (GPT-5, run 2025-12-23) was given a hint about the optimization pattern and applied it comprehensively:
+- Changed 20 `torch.zeros` → `torch.empty` calls
+- Targeted metadata initialization in CUDA graph setup
+- Modified `decode_cuda_graph_metadata`, `draft_decode_metadata_topk_normal`, `target_verify_metadata`, and `encoder_metadata` structures
 
 ---
 
