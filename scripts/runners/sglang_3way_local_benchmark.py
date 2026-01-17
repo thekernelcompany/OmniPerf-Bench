@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SGLang True 3-Way Local Docker Benchmark Runner
+SGLang True 3-Way Local Docker Benchmark Runner (vLLM-Compatible Output)
 
 Runs actual 3-way benchmarks (baseline vs human vs agent) for SGLang commits
 using SEPARATE Docker images for baseline and human commits.
@@ -12,6 +12,8 @@ Docker Repository: shikhar481/sglang-images
 - Baseline: shikhar481/sglang-images:{parent_commit_hash}
 - Human: shikhar481/sglang-images:{human_commit_hash}
 - Agent: Baseline image + agent patch overlay
+
+Output Format: vLLM-compatible schema (76 columns) for HuggingFace upload.
 
 Requirements:
 - Docker with NVIDIA GPU support (nvidia-container-toolkit)
@@ -30,6 +32,9 @@ Usage:
 
     # Skip agent phase (just baseline vs human)
     python sglang_3way_local_benchmark.py --no-agent
+
+    # Specify agent info for output metadata
+    python sglang_3way_local_benchmark.py --agent-name codex --agent-model gpt-5
 """
 
 import os
@@ -55,7 +60,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-DOCKER_REPO = "shikhar481/sglang-images"
+DEFAULT_DOCKER_REPO = "shikhar481/sglang-images"
+ALT_DOCKER_REPOS = {
+    "ayushnangia16": "ayushnangia16/nvidia-sglang-docker",
+    "shikhar481": "shikhar481/sglang-images",
+}
 RESULTS_DIR = Path("omniperf_results_3way_sglang_docker")
 CANDIDATES_FILE = Path("/tmp/sglang_3way_candidates.json")
 
@@ -63,6 +72,47 @@ CANDIDATES_FILE = Path("/tmp/sglang_3way_candidates.json")
 SERVER_PORT = 30000
 SERVER_TIMEOUT = 600  # seconds to wait for server to start
 BENCHMARK_TIMEOUT = 900  # seconds for benchmark to complete
+
+
+def detect_benchmark_mode(perf_command: str) -> str:
+    """
+    Detect benchmark mode from perf_command.
+
+    Returns: 'serving' or 'throughput'
+    """
+    if "bench_serving" in perf_command.lower():
+        return "serving"
+    elif "bench_throughput" in perf_command.lower():
+        return "throughput"
+    # Default to serving for backward compatibility
+    return "serving"
+
+
+def get_gpu_config() -> str:
+    """Get GPU configuration string."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            gpus = [g.strip() for g in result.stdout.strip().split('\n') if g.strip()]
+            if gpus:
+                # Get primary GPU name and count
+                gpu_name = gpus[0]
+                # Simplify name (e.g., "NVIDIA H100 80GB HBM3" -> "H100")
+                if "H100" in gpu_name:
+                    return f"H100:{len(gpus)}"
+                elif "A100" in gpu_name:
+                    return f"A100:{len(gpus)}"
+                elif "V100" in gpu_name:
+                    return f"V100:{len(gpus)}"
+                return f"{gpu_name}:{len(gpus)}"
+    except Exception:
+        pass
+    return "GPU:1"
 
 
 def check_docker_gpu():
@@ -118,19 +168,29 @@ def load_candidates() -> List[Dict]:
 
 
 def parse_benchmark_output(output: str) -> Dict[str, float]:
-    """Parse benchmark output to extract metrics."""
+    """
+    Parse benchmark output to extract metrics.
+
+    Returns metrics with SGLang-native names.
+    """
     metrics = {}
 
+    # Patterns match SGLang output format: "Metric (unit):   value"
     patterns = {
-        "request_throughput": r"Request throughput.*?(\d+\.?\d*)\s*req/s",
-        "output_token_throughput": r"Output token throughput.*?(\d+\.?\d*)\s*tok/s",
-        "total_token_throughput": r"Total token throughput.*?(\d+\.?\d*)\s*tok/s",
-        "mean_ttft_ms": r"Mean TTFT.*?(\d+\.?\d*)\s*ms",
-        "median_ttft_ms": r"Median TTFT.*?(\d+\.?\d*)\s*ms",
-        "mean_tpot_ms": r"Mean TPOT.*?(\d+\.?\d*)\s*ms",
-        "median_tpot_ms": r"Median TPOT.*?(\d+\.?\d*)\s*ms",
-        "mean_itl_ms": r"Mean ITL.*?(\d+\.?\d*)\s*ms",
-        "median_itl_ms": r"Median ITL.*?(\d+\.?\d*)\s*ms",
+        "request_throughput": r"Request throughput \(req/s\):\s*(\d+\.?\d*)",
+        "output_token_throughput": r"Output token throughput \(tok/s\):\s*(\d+\.?\d*)",
+        "total_token_throughput": r"Total token throughput \(tok/s\):\s*(\d+\.?\d*)",
+        "mean_ttft_ms": r"Mean TTFT \(ms\):\s*(\d+\.?\d*)",
+        "median_ttft_ms": r"Median TTFT \(ms\):\s*(\d+\.?\d*)",
+        "p99_ttft_ms": r"P99 TTFT \(ms\):\s*(\d+\.?\d*)",
+        "mean_tpot_ms": r"Mean TPOT \(ms\):\s*(\d+\.?\d*)",
+        "median_tpot_ms": r"Median TPOT \(ms\):\s*(\d+\.?\d*)",
+        "p99_tpot_ms": r"P99 TPOT \(ms\):\s*(\d+\.?\d*)",
+        "mean_itl_ms": r"Mean ITL \(ms\):\s*(\d+\.?\d*)",
+        "median_itl_ms": r"Median ITL \(ms\):\s*(\d+\.?\d*)",
+        "p99_itl_ms": r"P99 ITL \(ms\):\s*(\d+\.?\d*)",
+        "mean_e2e_latency_ms": r"Mean E2E Latency \(ms\):\s*(\d+\.?\d*)",
+        "median_e2e_latency_ms": r"Median E2E Latency \(ms\):\s*(\d+\.?\d*)",
     }
 
     for key, pattern in patterns.items():
@@ -144,6 +204,123 @@ def parse_benchmark_output(output: str) -> Dict[str, float]:
     return metrics
 
 
+def convert_to_vllm_metrics(metrics: Dict[str, float], prefix: str) -> Dict[str, Any]:
+    """
+    Convert SGLang metrics to vLLM naming convention.
+
+    Args:
+        metrics: SGLang metrics dict
+        prefix: 'baseline_', 'human_', or 'agent_'
+
+    Returns dict with vLLM-compatible metric names.
+    """
+    result = {}
+
+    # TTFT (Time To First Token)
+    if "mean_ttft_ms" in metrics:
+        result[f"{prefix}ttft_mean"] = metrics["mean_ttft_ms"]
+    if "median_ttft_ms" in metrics:
+        result[f"{prefix}ttft_median"] = metrics["median_ttft_ms"]
+    if "p99_ttft_ms" in metrics:
+        result[f"{prefix}ttft_p99"] = metrics["p99_ttft_ms"]
+
+    # TPOT (Time Per Output Token)
+    if "mean_tpot_ms" in metrics:
+        result[f"{prefix}tpot_mean"] = metrics["mean_tpot_ms"]
+    if "median_tpot_ms" in metrics:
+        result[f"{prefix}tpot_median"] = metrics["median_tpot_ms"]
+    if "p99_tpot_ms" in metrics:
+        result[f"{prefix}tpot_p99"] = metrics["p99_tpot_ms"]
+
+    # ITL (Inter-Token Latency)
+    if "mean_itl_ms" in metrics:
+        result[f"{prefix}itl_mean"] = metrics["mean_itl_ms"]
+    if "median_itl_ms" in metrics:
+        result[f"{prefix}itl_median"] = metrics["median_itl_ms"]
+    if "p99_itl_ms" in metrics:
+        result[f"{prefix}itl_p99"] = metrics["p99_itl_ms"]
+
+    # Throughput
+    if "request_throughput" in metrics:
+        result[f"{prefix}throughput"] = metrics["request_throughput"]
+
+    # Latency
+    if "mean_e2e_latency_ms" in metrics:
+        result[f"{prefix}latency_avg"] = metrics["mean_e2e_latency_ms"]
+    if "median_e2e_latency_ms" in metrics:
+        result[f"{prefix}latency_median"] = metrics["median_e2e_latency_ms"]
+
+    return result
+
+
+def calculate_improvements(
+    baseline_metrics: Dict[str, float],
+    target_metrics: Dict[str, float],
+    prefix: str = ""
+) -> Dict[str, Optional[float]]:
+    """
+    Calculate improvement percentages.
+
+    For latency metrics (ttft, tpot, itl, latency): lower is better
+    For throughput metrics: higher is better
+
+    Returns dict with {prefix}improvement_{metric} keys.
+    """
+    improvements = {}
+
+    latency_keys = ["ttft_mean", "ttft_median", "ttft_p99",
+                    "tpot_mean", "tpot_median", "tpot_p99",
+                    "itl_mean", "itl_median", "itl_p99",
+                    "latency_avg", "latency_median"]
+
+    throughput_keys = ["throughput"]
+
+    def calc_improvement(base_val, new_val, higher_is_better=False):
+        """Calculate % improvement. Positive = better."""
+        if not base_val or base_val == 0:
+            return None
+        if higher_is_better:
+            # Higher is better (throughput)
+            return round(((new_val - base_val) / base_val) * 100, 2)
+        else:
+            # Lower is better (latency)
+            return round(((base_val - new_val) / base_val) * 100, 2)
+
+    # Calculate improvements for latency metrics
+    for key in latency_keys:
+        base_key = f"baseline_{key}"
+        target_key_lookup = [f"human_{key}", f"agent_{key}"]
+
+        if base_key in baseline_metrics:
+            for tk in target_key_lookup:
+                if tk in target_metrics:
+                    improvement = calc_improvement(
+                        baseline_metrics[base_key],
+                        target_metrics[tk],
+                        higher_is_better=False
+                    )
+                    improvements[f"{prefix}improvement_{key}"] = improvement
+                    break
+
+    # Calculate improvements for throughput metrics
+    for key in throughput_keys:
+        base_key = f"baseline_{key}"
+        target_key_lookup = [f"human_{key}", f"agent_{key}"]
+
+        if base_key in baseline_metrics:
+            for tk in target_key_lookup:
+                if tk in target_metrics:
+                    improvement = calc_improvement(
+                        baseline_metrics[base_key],
+                        target_metrics[tk],
+                        higher_is_better=True
+                    )
+                    improvements[f"{prefix}improvement_{key}"] = improvement
+                    break
+
+    return improvements
+
+
 def run_benchmark_in_docker(
     image: str,
     model: str,
@@ -151,6 +328,7 @@ def run_benchmark_in_docker(
     phase: str,
     agent_patch: str = None,
     hf_token: str = None,
+    lora_server_args: str = "",
 ) -> Dict[str, Any]:
     """
     Run a single benchmark phase inside Docker container.
@@ -176,9 +354,11 @@ def run_benchmark_in_docker(
 
     try:
         # Build docker run command
+        # Use --entrypoint "" to override potentially corrupted bash in some images
         docker_cmd = [
             "docker", "run",
             "--rm",
+            "--entrypoint", "",
             "--gpus", "all",
             "--name", container_name,
             "--network", "host",  # Use host network for simplicity
@@ -197,9 +377,16 @@ def run_benchmark_in_docker(
 
         docker_cmd.append(image)
 
-        # Create the benchmark script to run inside container
+        # Build server launch command with optional LoRA args
+        server_cmd = f"python3 -m sglang.launch_server --model-path {model} --port {SERVER_PORT} --host 0.0.0.0"
+        if lora_server_args:
+            server_cmd += f" {lora_server_args}"
+            # LoRA requires radix cache to be disabled for compatibility
+            server_cmd += " --disable-radix-cache"
+
+        # Create the benchmark script to run inside container (POSIX sh compatible)
         benchmark_script = f'''
-#!/bin/bash
+#!/bin/sh
 set -e
 
 echo "=== SGLang Benchmark: {phase} ==="
@@ -220,22 +407,20 @@ fi
 
 # Start server in background
 echo "Starting SGLang server..."
-python3 -m sglang.launch_server \\
-    --model-path {model} \\
-    --port {SERVER_PORT} \\
-    --host 0.0.0.0 \\
-    2>&1 | tee /tmp/server.log &
+{server_cmd} 2>&1 | tee /tmp/server.log &
 
 SERVER_PID=$!
 
 # Wait for server to be ready
 echo "Waiting for server..."
-for i in $(seq 1 {SERVER_TIMEOUT // 5}); do
+i=0
+while [ $i -lt {SERVER_TIMEOUT // 5} ]; do
     if curl -s http://127.0.0.1:{SERVER_PORT}/health > /dev/null 2>&1; then
         echo "Server ready!"
         break
     fi
     sleep 5
+    i=$((i + 1))
 done
 
 # Check if server is running
@@ -249,12 +434,16 @@ fi
 # Run benchmark
 echo "Running benchmark..."
 BENCH_CMD="{perf_command}"
-if [[ "$BENCH_CMD" != *"--port"* ]]; then
-    BENCH_CMD="$BENCH_CMD --port {SERVER_PORT}"
-fi
-if [[ "$BENCH_CMD" != *"--host"* ]]; then
-    BENCH_CMD="$BENCH_CMD --host 127.0.0.1"
-fi
+# Add port if not present (POSIX-compatible check)
+case "$BENCH_CMD" in
+    *"--port"*) ;;
+    *) BENCH_CMD="$BENCH_CMD --port {SERVER_PORT}" ;;
+esac
+# Add host if not present
+case "$BENCH_CMD" in
+    *"--host"*) ;;
+    *) BENCH_CMD="$BENCH_CMD --host 127.0.0.1" ;;
+esac
 
 echo "Executing: $BENCH_CMD"
 $BENCH_CMD 2>&1 | tee /tmp/benchmark.log
@@ -275,8 +464,8 @@ cat /tmp/server.log
 exit $BENCH_EXIT
 '''
 
-        # Run docker with bash script
-        full_cmd = docker_cmd + ["bash", "-c", benchmark_script]
+        # Run docker with sh script (use /bin/sh for POSIX compatibility)
+        full_cmd = docker_cmd + ["/bin/sh", "-c", benchmark_script]
 
         logger.info(f"[{phase}] Starting Docker container...")
         logger.debug(f"Command: {' '.join(full_cmd[:10])}...")
@@ -336,16 +525,26 @@ def run_3way_benchmark(
     candidate: Dict,
     hf_token: str = None,
     include_agent: bool = True,
+    agent_name: str = "claude-code",
+    agent_model: str = "sonnet-4.5",
 ) -> Dict[str, Any]:
     """
     Run true 3-way benchmark using local Docker.
 
-    Returns combined results from all three phases.
+    Returns combined results in vLLM-compatible format.
     """
-    human_short = candidate["human"]
-    parent_short = candidate["parent"]
+    # Handle both short and full hashes - use first 8 chars for short version
+    human_tag = candidate["human"]  # Tag for Docker image (could be short or full)
+    parent_tag = candidate["parent"]  # Tag for Docker image
+    human_short = human_tag[:8]  # Always use first 8 chars for short hash
+    parent_short = parent_tag[:8]
     model = candidate["model"]
     perf_command = candidate["perf_command"]
+    lora_server_args = candidate.get("lora_server_args", "")
+
+    # Detect benchmark mode
+    benchmark_mode = detect_benchmark_mode(perf_command)
+    gpu_config = get_gpu_config()
 
     # Read agent patch
     patch_path = candidate.get("patch_path")
@@ -353,30 +552,55 @@ def run_3way_benchmark(
     if patch_path and Path(patch_path).exists():
         agent_patch = Path(patch_path).read_text()
 
+    # Initialize result with vLLM-compatible structure
     result = {
-        "commit": human_short,
-        "human_commit": candidate.get("human_full", human_short),
-        "parent_commit": candidate.get("parent_full", parent_short),
-        "model": model,
+        # Core metadata
+        "commit_hash": candidate.get("human_full", human_short),
+        "commit_short": human_short,
+        "commit_subject": candidate.get("subject", ""),
+        "repo": "sglang",
         "perf_command": perf_command,
-        "subject": candidate.get("subject", ""),
+        "files_changed": candidate.get("files_changed", []),
+        "pr_url": candidate.get("pr_url", ""),
+        "models": [model],
+        "parent_commit": candidate.get("parent_full", parent_short),
+
+        # Agent/benchmark metadata
+        "agent_name": agent_name,
+        "agent_model": agent_model,
+        "benchmark_date": datetime.now().isoformat(),
+        "benchmark_mode": benchmark_mode,
+        "gpu_config": gpu_config,
+        "data_source": "local_docker",
+
+        # Flags per omniperf_v1 schema
+        "has_serving": "bench_serving" in perf_command.lower(),
+        "has_throughput": "bench_throughput" in perf_command.lower(),
+        "has_latency": False,
+
+        # Status
         "status": "error",
         "error": None,
-        "baseline_metrics": {},
-        "human_metrics": {},
-        "agent_metrics": {},
-        "human_improvement": {},
-        "agent_improvement": {},
-        "agent_vs_human": {},
         "duration_s": 0,
-        "benchmark_mode": "3way_local_docker",
     }
 
     start_time = time.time()
 
-    # Docker images
-    baseline_image = f"{DOCKER_REPO}:{parent_short}"
-    human_image = f"{DOCKER_REPO}:{human_short}"
+    # Get Docker repo for this candidate (supports per-candidate repos)
+    docker_repo = candidate.get("docker_repo", DEFAULT_DOCKER_REPO)
+
+    # Docker images - use full hashes if available for ayushnangia16 repo
+    if "ayushnangia16" in docker_repo:
+        # ayushnangia16 images use full commit hashes
+        human_image_tag = candidate.get("human_full", human_tag)
+        parent_image_tag = candidate.get("parent_full", parent_tag)
+    else:
+        # shikhar481 images use short hashes
+        human_image_tag = human_tag
+        parent_image_tag = parent_tag
+
+    baseline_image = f"{docker_repo}:{parent_image_tag}"
+    human_image = f"{docker_repo}:{human_image_tag}"
 
     # Pull images first
     logger.info("Pulling Docker images...")
@@ -402,10 +626,13 @@ def run_3way_benchmark(
         perf_command=perf_command,
         phase="baseline",
         hf_token=hf_token,
+        lora_server_args=lora_server_args,
     )
-    result["baseline_metrics"] = baseline_result["metrics"]
+
+    # Convert baseline metrics to vLLM format
+    baseline_vllm = convert_to_vllm_metrics(baseline_result["metrics"], "baseline_")
+    result.update(baseline_vllm)
     result["baseline_raw"] = baseline_result["raw_output"]
-    result["baseline_server_logs"] = baseline_result.get("server_logs", "")
 
     # Run human phase
     logger.info(f"\n{'='*60}")
@@ -419,10 +646,17 @@ def run_3way_benchmark(
         perf_command=perf_command,
         phase="human",
         hf_token=hf_token,
+        lora_server_args=lora_server_args,
     )
-    result["human_metrics"] = human_result["metrics"]
+
+    # Convert human metrics to vLLM format
+    human_vllm = convert_to_vllm_metrics(human_result["metrics"], "human_")
+    result.update(human_vllm)
     result["human_raw"] = human_result["raw_output"]
-    result["human_server_logs"] = human_result.get("server_logs", "")
+
+    # Calculate human improvements
+    human_improvements = calculate_improvements(baseline_vllm, human_vllm, "human_")
+    result.update(human_improvements)
 
     # Run agent phase (on baseline image with patch)
     if include_agent and agent_patch:
@@ -438,56 +672,47 @@ def run_3way_benchmark(
             phase="agent",
             agent_patch=agent_patch,
             hf_token=hf_token,
+            lora_server_args=lora_server_args,
         )
-        result["agent_metrics"] = agent_result["metrics"]
+
+        # Convert agent metrics to vLLM format
+        agent_vllm = convert_to_vllm_metrics(agent_result["metrics"], "agent_")
+        result.update(agent_vllm)
         result["agent_raw"] = agent_result["raw_output"]
-        result["agent_server_logs"] = agent_result.get("server_logs", "")
 
-    # Calculate improvements
-    baseline = result["baseline_metrics"]
-    human = result["human_metrics"]
-    agent = result["agent_metrics"]
+        # Calculate agent improvements (vs baseline)
+        agent_improvements = calculate_improvements(baseline_vllm, agent_vllm, "agent_")
+        result.update(agent_improvements)
 
-    def calc_improvement(base_val, new_val, is_throughput=True):
-        """Calculate % improvement. Positive = better."""
-        if not base_val or base_val == 0:
-            return None
-        if is_throughput:
-            # Higher is better
-            return round(((new_val - base_val) / base_val) * 100, 2)
-        else:
-            # Lower is better (latency)
-            return round(((base_val - new_val) / base_val) * 100, 2)
-
-    if baseline and human:
-        for key in baseline:
-            if key in human:
-                is_throughput = "throughput" in key.lower()
-                improvement = calc_improvement(baseline[key], human[key], is_throughput)
-                if improvement is not None:
-                    result["human_improvement"][key] = improvement
-
-    if baseline and agent:
-        for key in baseline:
-            if key in agent:
-                is_throughput = "throughput" in key.lower()
-                improvement = calc_improvement(baseline[key], agent[key], is_throughput)
-                if improvement is not None:
-                    result["agent_improvement"][key] = improvement
-
-    if human and agent:
-        for key in human:
-            if key in agent:
-                pct = round(((agent[key] - human[key]) / human[key]) * 100, 2) if human[key] else 0
-                result["agent_vs_human"][key] = pct
+        # Calculate agent vs human comparison
+        if human_vllm and agent_vllm:
+            agent_vs_human = {}
+            for key in ["ttft_mean", "ttft_median", "throughput"]:
+                human_key = f"human_{key}"
+                agent_key = f"agent_{key}"
+                if human_key in human_vllm and agent_key in agent_vllm:
+                    human_val = human_vllm[human_key]
+                    agent_val = agent_vllm[agent_key]
+                    if human_val and human_val != 0:
+                        is_latency = "ttft" in key or "tpot" in key or "itl" in key
+                        if is_latency:
+                            # Lower is better, positive means agent is better
+                            pct = round(((human_val - agent_val) / human_val) * 100, 2)
+                        else:
+                            # Higher is better, positive means agent is better
+                            pct = round(((agent_val - human_val) / human_val) * 100, 2)
+                        agent_vs_human[f"agent_vs_human_{key}"] = pct
+            result.update(agent_vs_human)
+    else:
+        result["agent_raw"] = ""
 
     # Determine overall status
-    if result["baseline_metrics"] and result["human_metrics"]:
+    if baseline_vllm and human_vllm:
         result["status"] = "success"
-    elif result["human_metrics"]:
+    elif human_vllm:
         result["status"] = "partial"
         result["error"] = "Baseline failed"
-    elif result["baseline_metrics"]:
+    elif baseline_vllm:
         result["status"] = "partial"
         result["error"] = "Human failed"
     else:
@@ -501,7 +726,7 @@ def run_3way_benchmark(
 
 def save_result(result: Dict, results_dir: Path):
     """Save benchmark result to JSON file."""
-    commit = result.get("commit", "unknown")
+    commit = result.get("commit_short", result.get("commit", "unknown"))
     commit_dir = results_dir / "sglang" / commit
     commit_dir.mkdir(parents=True, exist_ok=True)
 
@@ -519,6 +744,10 @@ def main():
     parser.add_argument("--skip-existing", action="store_true", help="Skip commits with existing results")
     parser.add_argument("--no-agent", action="store_true", help="Skip agent phase (just baseline vs human)")
     parser.add_argument("--limit", type=int, help="Limit number of benchmarks to run")
+    parser.add_argument("--agent-name", type=str, default="claude-code", help="Agent name for metadata (default: claude-code)")
+    parser.add_argument("--agent-model", type=str, default="sonnet-4.5", help="Agent model for metadata (default: sonnet-4.5)")
+    parser.add_argument("--status", type=str, help="Filter by status (e.g., 'ready', 'completed')")
+    parser.add_argument("--include-all", action="store_true", help="Include all candidates regardless of status")
     args = parser.parse_args()
 
     # Setup
@@ -544,6 +773,16 @@ def main():
             logger.error(f"No candidate matching commit {args.commit}")
             return
 
+    # Filter by status (default: only 'ready' and 'completed')
+    if args.status:
+        candidates = [c for c in candidates if c.get("status") == args.status]
+        logger.info(f"Filtered by status '{args.status}': {len(candidates)} candidates")
+    elif not args.include_all:
+        # Default: only run ready/completed candidates (skip broken ones)
+        runnable_statuses = {"ready", "completed"}
+        candidates = [c for c in candidates if c.get("status") in runnable_statuses]
+        logger.info(f"Filtered to runnable status (ready/completed): {len(candidates)} candidates")
+
     # Check for existing results
     if args.skip_existing:
         existing = set()
@@ -563,17 +802,37 @@ def main():
 
     if args.dry_run:
         print("\n=== DRY RUN - Would run these 3-way benchmarks ===")
-        print(f"Docker repo: {DOCKER_REPO}")
+        print(f"Default Docker repo: {DEFAULT_DOCKER_REPO}")
         print(f"Agent phase: {'ENABLED' if not args.no_agent else 'DISABLED'}")
+        print(f"Agent name: {args.agent_name}")
+        print(f"Agent model: {args.agent_model}")
         print()
         for i, c in enumerate(candidates, 1):
-            bench_type = "server" if "bench_serving" in c["perf_command"].lower() else "direct"
+            bench_mode = detect_benchmark_mode(c["perf_command"])
+            docker_repo = c.get("docker_repo", DEFAULT_DOCKER_REPO)
+            status = c.get("status", "unknown")
+            claimed = c.get("claimed_improvement", "")
+
+            # Determine image tags based on repo
+            if "ayushnangia16" in docker_repo:
+                human_tag = c.get("human_full", c["human"])
+                parent_tag = c.get("parent_full", c["parent"])
+            else:
+                human_tag = c["human"]
+                parent_tag = c["parent"]
+
             print(f"{i}. {c['human']} (parent: {c['parent']})")
-            print(f"   Subject: {c['subject']}")
+            print(f"   Subject: {c['subject'][:60]}...")
             print(f"   Model: {c['model']}")
-            print(f"   Type: {bench_type}")
-            print(f"   Baseline: {DOCKER_REPO}:{c['parent']}")
-            print(f"   Human: {DOCKER_REPO}:{c['human']}")
+            print(f"   Mode: {bench_mode}")
+            print(f"   Docker repo: {docker_repo}")
+            print(f"   Baseline: {docker_repo}:{parent_tag}")
+            print(f"   Human: {docker_repo}:{human_tag}")
+            print(f"   Status: {status}")
+            if claimed:
+                print(f"   Claimed: {claimed}")
+            if c.get('lora_server_args'):
+                print(f"   LoRA args: {c['lora_server_args']}")
             print()
         return
 
@@ -589,7 +848,7 @@ def main():
     for i, candidate in enumerate(candidates, 1):
         logger.info(f"\n{'='*60}")
         logger.info(f"[{i}/{len(candidates)}] Running 3-way benchmark for {candidate['human']}")
-        logger.info(f"Subject: {candidate['subject']}")
+        logger.info(f"Subject: {candidate['subject'][:60]}...")
         logger.info(f"{'='*60}")
 
         try:
@@ -597,6 +856,8 @@ def main():
                 candidate=candidate,
                 hf_token=hf_token,
                 include_agent=not args.no_agent,
+                agent_name=args.agent_name,
+                agent_model=args.agent_model,
             )
 
             save_result(result, RESULTS_DIR)
@@ -604,10 +865,10 @@ def main():
             if result["status"] == "success":
                 success_count += 1
                 logger.info(f"SUCCESS ({result['duration_s']:.1f}s)")
-                if result.get("human_improvement"):
-                    logger.info(f"  Human improvement: {result['human_improvement']}")
-                if result.get("agent_improvement"):
-                    logger.info(f"  Agent improvement: {result['agent_improvement']}")
+                # Print improvements
+                improvements = {k: v for k, v in result.items() if "improvement" in k and v is not None}
+                if improvements:
+                    logger.info(f"  Improvements: {improvements}")
             else:
                 error_count += 1
                 logger.error(f"FAILED: {result.get('error', 'Unknown error')}")
