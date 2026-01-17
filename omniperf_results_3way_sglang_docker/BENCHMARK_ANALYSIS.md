@@ -9,14 +9,15 @@
 ## Executive Summary
 
 - **Total Commits:** 80
-- **Successfully Benchmarked:** 2 (2.5%)
+- **Successfully Benchmarked:** 3 (3.75%)
 - **Primary Blockers:** Missing benchmark commands (57.5%), Multi-GPU requirements (28.8%), Broken Docker images (6.2%)
 
 ### Update 2026-01-17
 
 Benchmark results for:
-- **021f76e4**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +15-20% improvement**
+- **021f76e4**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +15-20% improvement, Agent underperforms**
 - **6fc17596**: Complete benchmark (Baseline + Human) - **Micro-optimization (<1% macro impact)**
+- **ddcf9fe3**: Complete 3-way benchmark (Baseline + Human + Agent) - **Human +5% TTFT, Agent matches Human**
 
 ---
 
@@ -254,6 +255,53 @@ The **claimed 71% improvement (35us -> 10us)** refers to a **micro-operation** (
   - TTFT (~62ms)
 
 This demonstrates the difference between **micro-benchmarks** (specific operation timing) and **macro-benchmarks** (end-to-end performance). While the PR's optimization is real and validated by the 71% micro-benchmark improvement, it doesn't significantly impact overall serving performance.
+
+---
+
+### Commit ddcf9fe3 - Triton Attention Optimization (Complete 3-Way)
+
+**PR:** [sgl-project/sglang#3731](https://github.com/sgl-project/sglang/pull/3731)
+**Subject:** Optimize triton attention custom mask
+**Docker Repo:** ayushnangia16/nvidia-sglang-docker
+**Model:** meta-llama/Llama-2-7b-chat-hf
+
+#### Status
+- **Baseline:** SUCCESS
+- **Human:** SUCCESS
+- **Agent:** SUCCESS
+
+#### Full 3-Way Comparison
+
+| Metric | Baseline | Human | Agent |
+|--------|----------|-------|-------|
+| TTFT Mean (ms) | 65.66 | 62.32 | 62.38 |
+| TTFT Median (ms) | 54.78 | 51.99 | 51.78 |
+| TTFT P99 (ms) | 181.51 | 165.92 | 164.52 |
+| ITL Mean (ms) | 16.67 | 16.64 | 16.71 |
+| ITL Median (ms) | 14.58 | 14.56 | 14.60 |
+| ITL P99 (ms) | 59.28 | 55.94 | 56.02 |
+| E2E Latency Mean (ms) | 4068.33 | 4060.16 | 4074.89 |
+| Throughput (req/s) | 5.83 | 5.83 | 5.83 |
+
+#### Improvements Over Baseline
+
+| Metric | Human | Agent |
+|--------|-------|-------|
+| TTFT Mean | **+5.09%** | **+5.00%** |
+| TTFT Median | **+5.09%** | **+5.48%** |
+| TTFT P99 | **+8.59%** | **+9.36%** |
+| ITL P99 | **+5.63%** | **+5.50%** |
+| Throughput | 0% | 0% |
+
+#### Key Finding
+
+**Agent matches Human performance.** Unlike the LoRA optimization (021f76e4) where the human significantly outperformed the agent, here the AI-generated patch achieved essentially identical results to the human PR.
+
+This suggests that for **kernel-level optimizations** (triton attention masks), the agent can effectively replicate human improvements, whereas for **architectural refactors** (LoRA stream sync elimination), the human approach is superior.
+
+#### Note on Benchmark Command
+
+Original perf_command referenced `benchmark/gsm8k/bench_sglang.py` which didn't exist in the Docker image. Used `bench_serving` instead, which exercises the same triton attention code path.
 
 ---
 
