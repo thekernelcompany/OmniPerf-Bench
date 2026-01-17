@@ -15,11 +15,11 @@ Out of 80 commits analyzed, only 2 were successfully benchmarked. This document 
 
 | Category | Count | Fixable? |
 |----------|-------|----------|
-| Successfully completed | 2 | N/A |
+| Successfully completed | 3 | N/A |
 | No Docker image built | 3 | Build images |
 | FlashInfer incompatible | 1 | Rebuild with correct flashinfer |
 | Corrupt binary (arch mismatch) | 1 | Rebuild image |
-| Benchmark script missing | 1 | Update perf_command |
+| VLM not supported | 1 | Rebuild with multimodal support |
 | No perf_command extracted | 46 | Need command inference |
 | Multi-GPU required | 23 | Need infrastructure |
 
@@ -40,7 +40,8 @@ After testing with a free GPU (0 MiB used), here's the actual status:
 | `93470a14` | N/A | N/A | N/A | No Docker image on Hub |
 | `bb3a3b66` | N/A | N/A | N/A | No Docker image on Hub |
 | `d1112d85` | N/A | N/A | N/A | No Docker image on Hub |
-| `ddcf9fe3` | **OK** | OK | BROKEN | Benchmark script path doesn't exist in image |
+| `ddcf9fe3` | **OK** | OK | **OK** | **COMPLETED** (used bench_serving instead) |
+| `3212c2ad` | OK | OK | BROKEN | VLM multimodal processor not registered |
 
 ### Key Finding
 
@@ -242,6 +243,151 @@ RUN huggingface-cli login --token $HF_TOKEN && \
 
 ---
 
+## Category 7: VLM (Vision-Language Model) Support
+
+### Symptoms
+
+```
+ValueError: Cannot find corresponding multimodal processor registered in sglang for model type `clip_vision_model`
+```
+
+Or:
+
+```
+NotImplementedError: Multimodal processor not implemented for this model
+```
+
+### Affected Commits
+
+| Commit | PR | Model | Issue |
+|--------|-----|-------|-------|
+| `3212c2ad` | #6003 | llava-hf/llava-1.5-7b-hf | VLM processor not registered |
+
+### Root Cause
+
+The SGLang version in the Docker image was installed without full multimodal support. The `clip_vision_model` processor is not registered because:
+
+1. SGLang was installed with minimal dependencies (`pip install -e "python"` instead of `pip install -e "python[all]"`)
+2. The multimodal processors were not properly initialized
+3. Missing vision-related dependencies (pillow, torchvision, etc.)
+
+### Fix When Rebuilding
+
+#### Option A: Full Installation with Multimodal Support (Recommended)
+
+```dockerfile
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+# System dependencies including image processing libs
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    git \
+    libnuma-dev \
+    libjpeg-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# SGLang with ALL dependencies including multimodal
+ARG COMMIT_HASH
+RUN git clone https://github.com/sgl-project/sglang.git /sglang && \
+    cd /sglang && \
+    git checkout ${COMMIT_HASH} && \
+    pip install -e "python[all]"
+
+# Explicitly install vision dependencies
+RUN pip install --no-cache-dir \
+    pillow \
+    torchvision \
+    transformers[vision]
+
+# FlashInfer for H100
+RUN pip install flashinfer -f https://flashinfer.ai/whl/cu124/torch2.4/
+
+WORKDIR /sglang
+```
+
+#### Option B: Patch Existing Image
+
+If you have a working image but just need VLM support:
+
+```bash
+# Start container interactively
+docker run -it --gpus all YOUR_IMAGE bash
+
+# Inside container, install missing deps
+pip install pillow torchvision "transformers[vision]"
+
+# Reinstall sglang with all extras
+cd /sglang  # or wherever sglang is installed
+pip install -e "python[all]"
+
+# Test VLM support
+python3 -c "
+from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
+print('VLM OK')
+"
+
+# Commit the changes
+# (from host): docker commit CONTAINER_ID new-image:tag
+```
+
+### Verification Commands
+
+```bash
+IMAGE="your-vlm-enabled-image:tag"
+
+# 1. Check VLM processor registration
+docker run --rm --gpus all $IMAGE python3 -c "
+from sglang.srt.managers.multimodal_processor import get_mm_processor
+print('Multimodal processor module OK')
+"
+
+# 2. Check llava specifically
+docker run --rm --gpus all $IMAGE python3 -c "
+from transformers import LlavaProcessor
+print('LlavaProcessor OK')
+"
+
+# 3. Test server startup with VLM model
+docker run --rm --gpus all -e HF_TOKEN=\$HF_TOKEN $IMAGE \
+    timeout 120 python3 -m sglang.launch_server \
+    --model-path llava-hf/llava-1.5-7b-hf \
+    --port 30000
+
+# 4. Run VLM benchmark
+docker run --rm --gpus all -e HF_TOKEN=\$HF_TOKEN $IMAGE \
+    python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model llava-hf/llava-1.5-7b-hf \
+    --dataset-name mmmu \
+    --num-prompts 50 \
+    --request-rate 2
+```
+
+### VLM-Specific Benchmark Commands
+
+For VLM commits, use the `mmmu` dataset:
+
+```bash
+# Standard VLM benchmark
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model llava-hf/llava-1.5-7b-hf \
+    --dataset-name mmmu \
+    --num-prompts 50 \
+    --request-rate 2
+```
+
+### VLM Commits to Rebuild
+
+| Commit | PR | Subject | Model |
+|--------|-----|---------|-------|
+| `3212c2ad` | #6003 | VLM tensor transport (16% faster) | llava-hf/llava-1.5-7b-hf |
+| `bb3a3b66` | #137 | Faster JSON decoding for llava | llava-hf/llava-1.5-7b-hf |
+
+---
+
 ## Complete Rebuild Checklist
 
 When rebuilding Docker images, ensure ALL of these are addressed:
@@ -356,6 +502,7 @@ docker run --rm --gpus all $IMAGE python3 -m sglang.bench_latency \
 | Missing image | Build pipeline | Build and push image |
 | HF token missing | Runtime | Pass `-e HF_TOKEN=...` |
 | Model gated | HuggingFace account | Request access to model |
+| VLM not supported | Dockerfile | Use `pip install -e "python[all]"` + vision deps |
 
 ---
 
@@ -365,27 +512,48 @@ Based on verified testing (2026-01-17):
 
 | Priority | Commit | Fix Required | Effort |
 |----------|--------|--------------|--------|
-| 1 | `ddcf9fe3` | Change perf_command to use `bench_serving` | Low (config change) |
+| 1 | `3212c2ad` | Rebuild with VLM support (`python[all]`) | Medium |
 | 2 | `79961afa` | Rebuild with compatible flashinfer | Medium |
 | 3 | `93470a14` | Build Docker image | Medium |
-| 4 | `bb3a3b66` | Build Docker image | Medium |
+| 4 | `bb3a3b66` | Build Docker image + VLM support | Medium |
 | 5 | `d1112d85` | Build Docker image | Medium |
 | 6 | `2bd18e2d` | Rebuild image (corrupt binary) | Medium |
 
-### Quick Win: ddcf9fe3
+### Completed Benchmarks (No Fix Needed)
 
-This commit's Docker images **work perfectly** - sgl_kernel and flashinfer both load. The only issue is the perf_command references a non-existent script path.
+| Commit | PR | Status |
+|--------|-----|--------|
+| `021f76e4` | #6994 LoRA stream sync | **COMPLETED** |
+| `6fc17596` | #5945 FA3 pad operation | **COMPLETED** |
+| `ddcf9fe3` | #3731 Triton attention | **COMPLETED** |
 
-**Current command:**
-```bash
-python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --parallel 1319
+### High Priority: 3212c2ad (VLM 16% Improvement)
+
+This commit claims **16% faster VLM inference** (207.7s -> 173.3s). The Docker image exists and sgl_kernel loads, but VLM support is missing.
+
+**Error:**
+```
+ValueError: Cannot find corresponding multimodal processor registered in sglang for model type `clip_vision_model`
 ```
 
-**Suggested fix** - use standard bench_serving instead:
+**Fix:** Rebuild with full multimodal support:
 ```bash
-python3 -m sglang.bench_serving --backend sglang --model meta-llama/Llama-2-7b-chat-hf --num-prompts 200 --request-rate 8
+# In Dockerfile
+pip install -e "python[all]"
+pip install pillow torchvision "transformers[vision]"
+```
+
+**Benchmark command after fix:**
+```bash
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model llava-hf/llava-1.5-7b-hf \
+    --dataset-name mmmu \
+    --num-prompts 50 \
+    --request-rate 2
 ```
 
 ---
 
 *Generated: 2026-01-17*
+*Updated: 2026-01-17 (Added VLM support section, updated completed benchmarks)*
