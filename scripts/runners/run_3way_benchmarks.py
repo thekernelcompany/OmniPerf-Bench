@@ -26,7 +26,7 @@ PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/ex
 AGENT_CONFIGS = {
     "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
     "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
-    "trae_gpt5": "trae_gpt5_hf_trajectories/vllm",  # HuggingFace trajectories
+    "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",  # Local trajectories
     "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
 }
 
