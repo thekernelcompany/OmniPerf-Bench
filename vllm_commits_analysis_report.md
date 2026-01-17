@@ -183,7 +183,7 @@ We executed the 4 fixable commits with corrected benchmark commands. Results upl
 | 3476ed08 | vllm_core-0017 | All 3 succeeded | 169.20 ms | 175.44 ms | 184.16 ms | -3.69% | -8.85% |
 | 6ce01f30 | vllm_core-0030 | All 3 succeeded | 9.18 req/s | 9.21 req/s | 9.20 req/s | +0.33% | +0.22% |
 | 99abb8b6 | vllm_core-0051 | All 3 succeeded | 2174.04 ms | 2179.97 ms | 2186.58 ms | -0.27% | -0.58% |
-| fa63e710 | vllm_core-0091 | Not run | N/A | N/A | N/A | N/A | N/A |
+| fa63e710 | vllm_core-0091 | All 3 succeeded | 3203.06 ms | 3202.98 ms | 3201.86 ms | +0.00% | +0.04% |
 
 ### Detailed Results
 
@@ -228,9 +228,18 @@ We executed the 4 fixable commits with corrected benchmark commands. Results upl
 
 **Note:** The original human Docker image was missing the `vllm.benchmarks` module. It was rebuilt as `shikhar481/vllm_fixed_human_images:human-99abb8b650c66664cdc84d815b7f306f33bd9881` with vLLM installed from source to include benchmarks.
 
-#### fa63e710 — Reduce scheduling overhead (NOT RUN)
+#### fa63e710 — Reduce scheduling overhead after cuda sync
 
-**Reason:** Baseline Docker image `shikhar481/vllm_fixed_human_images:baseline-2a0309a646b1` does not exist.
+**Benchmark:** Latency (100 iterations)
+**Model:** meta-llama/Meta-Llama-3-8B
+
+| Variant | Latency (ms) | Throughput (tok/s) |
+|---------|--------------|-------------------|
+| Baseline | 3203.06 | 12,797.0 |
+| Human | 3202.98 | 12,775.4 |
+| Agent | 3201.86 | 12,773.1 |
+
+**Analysis:** All variants show essentially identical performance (within 0.04%). The scheduling overhead optimization has negligible measurable impact, confirming the original assessment that the effect size was within noise.
 
 ---
 
@@ -252,7 +261,13 @@ The original human image (`ayushnangia16/nvidia-vllm-docker:99abb8b6...`) was mi
 
 ---
 
-### Next Steps
+### Conclusion
 
-1. **Build missing baseline image** for fa63e710 (parent: 2a0309a646b1)
-2. **Consider statistical significance tests** for small improvements (<1%)
+All 4 fixable commits have been successfully benchmarked with corrected commands. Results show:
+
+- **3476ed08**: Both human and agent show regressions (-3.69% and -8.85%)
+- **6ce01f30**: Marginal improvements within noise (+0.33% and +0.22%)
+- **99abb8b6**: Slight regressions (-0.27% and -0.58%)
+- **fa63e710**: No measurable difference (+0.00% and +0.04%)
+
+The benchmarks confirm that most of these "performance optimizations" have minimal real-world impact when measured properly.
