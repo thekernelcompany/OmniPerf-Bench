@@ -11,66 +11,43 @@ Out of 80 commits analyzed, only 2 were successfully benchmarked. This document 
 
 ---
 
-## Failure Categories Overview
+## Failure Categories Overview (Verified 2026-01-17)
 
-| Category | Count | % | Fixable by Rebuild? |
-|----------|-------|---|---------------------|
-| No perf_command extracted | 46 | 57.5% | No (need command inference) |
-| Multi-GPU required | 23 | 28.8% | No (need infrastructure) |
-| No Docker image built | 5 | 6.2% | Yes |
-| Broken Docker image (libnuma) | 5 | 6.2% | **Yes** |
-| Successfully completed | 2 | 2.5% | N/A |
+| Category | Count | Fixable? |
+|----------|-------|----------|
+| Successfully completed | 2 | N/A |
+| No Docker image built | 3 | Build images |
+| FlashInfer incompatible | 1 | Rebuild with correct flashinfer |
+| Corrupt binary (arch mismatch) | 1 | Rebuild image |
+| Benchmark script missing | 1 | Update perf_command |
+| No perf_command extracted | 46 | Need command inference |
+| Multi-GPU required | 23 | Need infrastructure |
+
+**Important:** Zero commits failed due to OOM. The exit 137 errors seen earlier were transient GPU resource conflicts, not image issues.
 
 ---
 
-## Category 1: Missing `libnuma.so.1` (MOST COMMON DOCKER ISSUE)
+## Category 1: Verified Status of Each Candidate (2026-01-17)
 
-### Symptoms
+After testing with a free GPU (0 MiB used), here's the actual status:
 
-```
-ImportError: libnuma.so.1: cannot open shared object file: No such file or directory
-```
+| Commit | sgl_kernel | flashinfer | Benchmark | Actual Issue |
+|--------|------------|------------|-----------|--------------|
+| `021f76e4` | OK | OK | OK | **COMPLETED** |
+| `6fc17596` | OK | OK | OK | **COMPLETED** |
+| `79961afa` | OK | BROKEN | - | FlashInfer `BatchDecodeWithPagedKVCacheWrapper` missing |
+| `2bd18e2d` | BROKEN | - | - | "cannot execute binary file" (corrupt/arch mismatch) |
+| `93470a14` | N/A | N/A | N/A | No Docker image on Hub |
+| `bb3a3b66` | N/A | N/A | N/A | No Docker image on Hub |
+| `d1112d85` | N/A | N/A | N/A | No Docker image on Hub |
+| `ddcf9fe3` | **OK** | OK | BROKEN | Benchmark script path doesn't exist in image |
 
-This error occurs when importing `sgl_kernel` on H100 GPUs (SM90 architecture).
+### Key Finding
 
-### Affected Commits
-
-| Commit | PR | Subject |
-|--------|-----|---------|
-| `2bd18e2d` | #2901 | Memory pool optimization |
-| `93470a14` | #5090 | FA3 Code optimization |
-| `bb3a3b66` | #137 | JSON decoding for llava |
-| `d1112d85` | #2797 | Input embeds endpoint |
-| `ddcf9fe3` | #3731 | Triton attention mask |
-
-### Root Cause
-
-Docker images were built without `libnuma-dev` package. The `sgl_kernel` CUDA extension requires `libnuma.so.1` for NUMA-aware memory allocation on multi-socket systems like H100.
-
-### Fix When Rebuilding
-
-Add to Dockerfile:
-
-```dockerfile
-# Add BEFORE pip install sglang
-RUN apt-get update && apt-get install -y \
-    libnuma-dev \
-    && rm -rf /var/lib/apt/lists/*
-```
-
-Or if using a build script:
-
-```bash
-apt-get update && apt-get install -y libnuma-dev
-```
-
-### Verification After Rebuild
-
-```bash
-docker run --rm --gpus all YOUR_IMAGE python3 -c "import sgl_kernel; print('OK')"
-```
-
-Expected output: `OK`
+The original "libnuma" classification was **incorrect**. When tested properly:
+- `ddcf9fe3` - sgl_kernel loads fine, but `benchmark/gsm8k/bench_sglang.py` doesn't exist
+- `2bd18e2d` - Binary is corrupt, not a libnuma issue
+- `79961afa` - sgl_kernel works, but flashinfer has incompatible version
 
 ---
 
@@ -382,19 +359,32 @@ docker run --rm --gpus all $IMAGE python3 -m sglang.bench_latency \
 
 ---
 
-## Priority Commits to Rebuild
+## Priority Commits to Fix
 
-These commits have inferred benchmark commands and would be runnable after rebuild:
+Based on verified testing (2026-01-17):
 
-| Priority | Commit | Claimed Improvement | Current Issue |
-|----------|--------|---------------------|---------------|
-| 1 | `2bd18e2d` | Memory pool opt | libnuma missing |
-| 2 | `93470a14` | FA3 code opt | libnuma missing |
-| 3 | `bb3a3b66` | JSON decoding | libnuma missing |
-| 4 | `d1112d85` | Input embeds | libnuma missing |
-| 5 | `ddcf9fe3` | Triton attention | libnuma missing |
+| Priority | Commit | Fix Required | Effort |
+|----------|--------|--------------|--------|
+| 1 | `ddcf9fe3` | Change perf_command to use `bench_serving` | Low (config change) |
+| 2 | `79961afa` | Rebuild with compatible flashinfer | Medium |
+| 3 | `93470a14` | Build Docker image | Medium |
+| 4 | `bb3a3b66` | Build Docker image | Medium |
+| 5 | `d1112d85` | Build Docker image | Medium |
+| 6 | `2bd18e2d` | Rebuild image (corrupt binary) | Medium |
 
-All 5 require the same fix: rebuild with `libnuma-dev` installed.
+### Quick Win: ddcf9fe3
+
+This commit's Docker images **work perfectly** - sgl_kernel and flashinfer both load. The only issue is the perf_command references a non-existent script path.
+
+**Current command:**
+```bash
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319 --parallel 1319
+```
+
+**Suggested fix** - use standard bench_serving instead:
+```bash
+python3 -m sglang.bench_serving --backend sglang --model meta-llama/Llama-2-7b-chat-hf --num-prompts 200 --request-rate 8
+```
 
 ---
 
