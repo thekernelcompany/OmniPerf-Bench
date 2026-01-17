@@ -5,7 +5,7 @@
 This analysis examines Claude Code (sonnet-4.5) performance on 44 vLLM optimization tasks, comparing agent-generated patches against human expert patches using both hard metrics (actual benchmark performance) and soft metrics (qualitative code analysis).
 
 **Key Findings:**
-- **47.7%** of tasks performed equal or better than human (9 beats + 12 similar)
+- **50.0%** of tasks performed equal or better than human (9 beats + 13 similar)
 - **50.0%** either failed or performed worse (11 worse + 11 agent failures)
 - **86%** of agent patches targeted the same or related bottleneck as human
 - **72%** targeted the exact same files as human
@@ -25,10 +25,11 @@ This analysis examines Claude Code (sonnet-4.5) performance on 44 vLLM optimizat
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| H+A+B (full data) | 22 | Can compare Agent vs Human vs Baseline |
+| H+A+B (full data) | 23 | Can compare Agent vs Human vs Baseline |
 | H+A (no baseline) | 10 | Can only compare Agent vs Human |
 | Agent failures | 11 | Human patch exists, agent patch failed to run |
-| Human failure | 1 | Human patch failed, agent succeeded (99abb8b6) |
+
+**Note:** Commit 99abb8b6 was previously categorized as a human failure but now has valid benchmark data for both human and agent patches (in "similar" category at -0.30%).
 
 **Excluded:** 9 commits with wrong benchmark command (ed250545, 8a4e5c5f, f26c4aee, 6d0734c5, 61b8cea3, cf2f084d, 80aa7e91, ca7a2d5f, 8bc68e19)
 
@@ -41,18 +42,17 @@ This analysis examines Claude Code (sonnet-4.5) performance on 44 vLLM optimizat
 | Category | Count | Percentage |
 |----------|-------|------------|
 | Agent beats Human (>2%) | 9 | 20.5% |
-| Similar (±2%) | 12 | 27.3% |
+| Similar (±2%) | 13 | 29.5% |
 | Agent worse (<-2%) | 11 | 25.0% |
 | Agent failed (no A data) | 11 | 25.0% |
-| Human failed (B+A only) | 1 | 2.3% |
 
-### Breakdown: 32 Commits with Both H+A Data
+### Breakdown: 33 Commits with Both H+A Data
 
 | Category | Count | Percentage |
 |----------|-------|------------|
-| Beats (>2%) | 9 | 28.1% |
-| Similar (±2%) | 12 | 37.5% |
-| Worse (<-2%) | 11 | 34.4% |
+| Beats (>2%) | 9 | 27.3% |
+| Similar (±2%) | 13 | 39.4% |
+| Worse (<-2%) | 11 | 33.3% |
 
 ### Top Performers (Agent Beats Human)
 
@@ -224,9 +224,9 @@ Commits where agent patch failed to produce runnable benchmarks:
 |-----------------|---|-------|---------|-------|---------|
 | likely_similar | 4 | 0 | 2 | 2 | 0% |
 | likely_partial | 20 | 6 | 7 | 7 | 30% |
-| likely_ineffective | 8 | 3 | 3 | 2 | **37.5%** |
+| likely_ineffective | 9 | 3 | 4 | 2 | **33.3%** |
 
-**Counter-intuitive finding:** "likely_ineffective" has a HIGHER beats rate (37.5%) than "likely_similar" (0%).
+**Counter-intuitive finding:** "likely_ineffective" has a HIGHER beats rate (33.3%) than "likely_similar" (0%).
 
 ### 3.2 Case Studies: Why Predictions Miss
 
@@ -249,8 +249,8 @@ Commits where agent patch failed to produce runnable benchmarks:
 
 | Bottleneck | n | Beats | Similar | Worse | Beats % |
 |------------|---|-------|---------|-------|---------|
-| same_target | 12 | 3 | 4 | 5 | 25% |
-| related_target | 17 | 6 | 6 | 5 | **35%** |
+| same_target | 13 | 3 | 5 | 5 | 23.1% |
+| related_target | 17 | 6 | 6 | 5 | **35.3%** |
 | different_target | 3 | 0 | 2 | 1 | **0%** |
 
 **Insights:**
@@ -261,8 +261,8 @@ Commits where agent patch failed to produce runnable benchmarks:
 
 | File Overlap | n | Beats | Similar | Worse | Beats % |
 |--------------|---|-------|---------|-------|---------|
-| 100% | 23 | 5 | 9 | 9 | 22% |
-| <100% | 9 | 4 | 3 | 2 | **44%** |
+| 100% | 23 | 5 | 9 | 9 | 21.7% |
+| <100% | 10 | 4 | 4 | 2 | **40%** |
 
 **Counter-intuitive finding:** Lower file overlap correlates with HIGHER beats rate.
 
@@ -272,8 +272,8 @@ Commits where agent patch failed to produce runnable benchmarks:
 
 | Failure Mode | n | Beats | Similar | Worse | Beats % |
 |--------------|---|-------|---------|-------|---------|
-| not_applicable | 9 | 2 | 3 | 4 | 22% |
-| complexity_avoidance | 12 | 2 | 6 | 4 | 17% |
+| not_applicable | 9 | 2 | 3 | 4 | 22.2% |
+| complexity_avoidance | 13 | 2 | 7 | 4 | 15.4% |
 | localization_failure | 10 | 4 | 3 | 3 | **40%** |
 | incomplete_implementation | 1 | 1 | 0 | 0 | 100% |
 
@@ -316,19 +316,20 @@ Commits where agent patch failed to produce runnable benchmarks:
 
 ## Appendix: Commit Lists
 
-### 32 Commits with H+A Data
+### 33 Commits with H+A Data
 ```
 015069b0, 19d98e0c, 22d33bac, 296f927f, 299ebb62, 2deb029d, 30172b49, 310aca88,
 3476ed08, 3a243095, 4c822298, 58eee5f2, 6a417b86, 6ce01f30, 6e36f4fa, 70b808fe,
-7c01f706, 89a84b0b, 9474e89b, 98f47f2a, 9badee53, 9f1710f1, a3223766, b55ed6ef,
-b690e348, bc7c4d20, e206b543, e3580537, fa63e710, fc542144, fc7b8d1e, fe66b347
+7c01f706, 89a84b0b, 9474e89b, 98f47f2a, 99abb8b6, 9badee53, 9f1710f1, a3223766,
+b55ed6ef, b690e348, bc7c4d20, e206b543, e3580537, fa63e710, fc542144, fc7b8d1e,
+fe66b347
 ```
 
-### 22 Commits with H+A+B (Full Data)
+### 23 Commits with H+A+B (Full Data)
 ```
 015069b0, 22d33bac, 296f927f, 299ebb62, 2deb029d, 30172b49, 310aca88, 3476ed08,
-4c822298, 58eee5f2, 6a417b86, 6ce01f30, 70b808fe, 98f47f2a, 9f1710f1, a3223766,
-b55ed6ef, b690e348, bc7c4d20, fa63e710, fc542144, fe66b347
+4c822298, 58eee5f2, 6a417b86, 6ce01f30, 70b808fe, 98f47f2a, 99abb8b6, 9f1710f1,
+a3223766, b55ed6ef, b690e348, bc7c4d20, fa63e710, fc542144, fe66b347
 ```
 
 ### 11 Agent Failures
