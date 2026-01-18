@@ -1,35 +1,79 @@
 # Docker Image Rebuild Guide for SGLang Benchmarks
 
 **Date:** 2026-01-17
-**Last Updated:** 2026-01-18 (ALL IMAGES FIXED - Final sanity check passed)
+**Last Updated:** 2026-01-18 (ALL 30 SINGLE-GPU IMAGES BUILT)
 **Purpose:** Document all failure reasons and provide rebuild instructions
 
 ---
 
 ## Executive Summary
 
-Out of 80 commits analyzed, only 2 were successfully benchmarked initially. On 2026-01-17, 8 images were pushed to `shikhar481/sglang-images`.
+Out of 80 commits analyzed, **30 Docker images** have been built and pushed to `shikhar481/sglang-images`.
 
-### ✅ ALL IMAGES FIXED (2026-01-18 - Final)
+### ✅ ALL SINGLE-GPU IMAGES COMPLETE (2026-01-18 - Final)
 
-**9 images successfully rebuilt with uvloop + sgl-kernel and pushed to `shikhar481/sglang-images`:**
+**30 images successfully built with uvloop + sgl-kernel and pushed to `shikhar481/sglang-images`:**
 
-| Commit | SGLang Ver | uvloop | sgl_kernel | Status |
-|--------|------------|--------|------------|--------|
-| `2bd18e2d` | 0.4.1.post6 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `3212c2ad` | 0.4.9.post4 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `d1112d85` | 0.4.4.post1 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `10189d08` | 0.3.6 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `ddcf9fe3` | 0.4.3.post2 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `79961afa` | 0.4.6.post2 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `93470a14` | 0.4.5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `f4a8987f` | 0.4.6.post5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
-| `c087ddd6` | 0.4.6.post5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+All images verified with sanity checks: uvloop ✅ | sgl_kernel (5 .so) ✅ | torch 2.4.0 ✅ | flashinfer ✅ | zmq ✅
 
-**Skipped (incompatible):**
+#### Phase 1: Initial Rebuilds (9 images)
+
+| Commit | SGLang Ver | Description | Status |
+|--------|------------|-------------|--------|
+| `2bd18e2d` | 0.4.1.post6 | Memory pool | ✅ **PUSHED** |
+| `3212c2ad` | 0.4.9.post4 | 16% VLM faster | ✅ **PUSHED** |
+| `d1112d85` | 0.4.4.post1 | Input embeds | ✅ **PUSHED** |
+| `10189d08` | 0.3.6 | CPU affinity | ✅ **PUSHED** |
+| `ddcf9fe3` | 0.4.3.post2 | Triton attention | ✅ **PUSHED** |
+| `79961afa` | 0.4.6.post2 | 21% FA3 faster | ✅ **PUSHED** |
+| `93470a14` | 0.4.5 | FA3 optimization | ✅ **PUSHED** |
+| `f4a8987f` | 0.4.6.post5 | Parent baseline | ✅ **PUSHED** |
+| `c087ddd6` | 0.4.6.post5 | 10-15% kernel | ✅ **PUSHED** |
+
+#### Phase 2: High-Priority Builds (3 images)
+
+| Commit | SGLang Ver | Claimed Improvement | Status |
+|--------|------------|---------------------|--------|
+| `2a754e57` | 0.1.17 | **2x prefill** | ✅ **PUSHED** |
+| `9216b106` | 0.1.14 | **40% scheduler** | ✅ **PUSHED** |
+| `b1e5a33a` | 0.4.6.post5 | **13% LoRA ITL** | ✅ **PUSHED** |
+
+#### Phase 3: Remaining Single-GPU Builds (18 images)
+
+| Commit | SGLang Ver | PR | Subject | Status |
+|--------|------------|-----|---------|--------|
+| `09deb20d` | 0.1.14 | #420 | Logits memory | ✅ **PUSHED** |
+| `1acca3a2` | 0.4.6.post2 | #5969 | FA3 len() removal | ✅ **PUSHED** |
+| `2854a5ea` | 0.3.1.post3 | #1496 | bench_latency fix | ✅ **PUSHED** |
+| `564a898a` | 0.1.20 | #619 | Mem indices | ✅ **PUSHED** |
+| `62757db6` | 0.2.11 | #1010 | Cache disabled | ✅ **PUSHED** |
+| `6a2941f4` | 0.1.20 | #625 | TP overhead | ✅ **PUSHED** |
+| `6f560c76` | 0.1.9 | #117 | First token latency | ✅ **PUSHED** |
+| `8f8f96a6` | 0.3.4.post1 | #1773 | stop_token_ids | ✅ **PUSHED** |
+| `9183c23e` | 0.4.1.post3 | #2695 | Weights update | ✅ **PUSHED** |
+| `9c064bf7` | 0.3.2 | #1587 | LoRA Step 1 | ✅ **PUSHED** |
+| `9c745d07` | 0.3.5.post2 | #2056 | xgrammar | ✅ **PUSHED** |
+| `ab4a83b2` | 0.3.0 | #1339 | Optimize schedule | ✅ **PUSHED** |
+| `ac971ff6` | 0.1.21 | #658 | stream_interval | ✅ **PUSHED** |
+| `b1709305` | 0.3.3.post1 | #1697 | Radix tree | ✅ **PUSHED** |
+| `b77a02cd` | 0.3.4.post2 | #1752 | Grammar backends | ✅ **PUSHED** |
+| `c98e84c2` | 0.3.2 | #1589 | torch.argmax | ✅ **PUSHED** |
+| `e3ec6bf4` | 0.4.7 | #6814 | FP8 quant | ✅ **PUSHED** |
+| `e5db40dc` | 0.3.3.post1 | #1694 | ORJson | ✅ **PUSHED** |
+
+#### Skipped (1 image)
+
 | Commit | SGLang Ver | Reason |
 |--------|------------|--------|
 | `bb3a3b66` | 0.1.11 | Too old - incompatible with torch 2.4 and sgl-kernel |
+
+#### Remaining (Cannot Build)
+
+| Category | Count | Reason |
+|----------|-------|--------|
+| Multi-GPU Required | 10 | Need multi-GPU infrastructure |
+| Skip/Reverts | 6 | Not benchmarkable |
+| Not in JSONL | 3 | fbcbb263, f06e90c2, e88dd482 |
 
 **All working images have:**
 - ✅ uvloop installed (server can start)
