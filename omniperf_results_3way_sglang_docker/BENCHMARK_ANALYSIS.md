@@ -1,6 +1,6 @@
 # SGLang 3-Way Benchmark Analysis
 
-**Date:** 2026-01-17 (Updated)
+**Date:** 2026-01-17 (Updated 2026-01-18 - FINAL)
 **GPU:** NVIDIA H100 PCIe (80GB)
 **Benchmark Type:** 3-way comparison (Baseline vs Human vs Agent)
 
@@ -10,7 +10,186 @@
 
 - **Total Commits:** 80
 - **Successfully Benchmarked:** 3 (3.75%)
-- **Primary Blockers:** Missing benchmark commands (57.5%), Multi-GPU requirements (28.8%), Broken Docker images (6.2%)
+- **Docker Images Ready:** 30 (all rebuilt with uvloop + sgl-kernel)
+- **Primary Blockers:** Multi-GPU requirements (10 commits), Skip/Reverts (6 commits)
+
+### Update 2026-01-18 (FINAL) - All Single-GPU Docker Images Built
+
+**30 SGLang Docker images now available on `shikhar481/sglang-images`:**
+
+All images verified with: uvloop ✅ | sgl_kernel (5 .so files) ✅ | torch 2.4.0 ✅ | flashinfer ✅ | zmq ✅
+
+#### Tier 1: High-Impact Optimizations (7 images)
+
+| Commit | PR | Claimed Improvement | SGLang Ver | Status |
+|--------|-----|---------------------|------------|--------|
+| `2a754e57` | #579 | **2x prefill** | 0.1.17 | ✅ |
+| `9216b106` | #394 | **40% scheduler** | 0.1.14 | ✅ |
+| `b1e5a33a` | #6960 | **13% LoRA ITL** | 0.4.6.post5 | ✅ |
+| `79961afa` | #6077 | **21% FA3 faster** | 0.4.6.post2 | ✅ |
+| `3212c2ad` | #6003 | **16% VLM faster** | 0.4.9.post4 | ✅ |
+| `c087ddd6` | #6627 | **10-15% kernel** | 0.4.6.post5 | ✅ |
+| `1acca3a2` | #5969 | FA3 len() removal | 0.4.6.post2 | ✅ |
+
+#### Previously Rebuilt Images (5 images)
+
+| Commit | PR | Description | SGLang Ver | Status |
+|--------|-----|-------------|------------|--------|
+| `2bd18e2d` | #2901 | Memory pool | 0.4.1.post6 | ✅ |
+| `d1112d85` | #2797 | Input embeds | 0.4.4.post1 | ✅ |
+| `10189d08` | #2171 | CPU affinity | 0.3.6 | ✅ |
+| `ddcf9fe3` | #3731 | Triton attention | 0.4.3.post2 | ✅ |
+| `93470a14` | #5090 | FA3 optimization | 0.4.5 | ✅ |
+| `f4a8987f` | - | Parent baseline | 0.4.6.post5 | ✅ |
+
+#### Newly Built Images (18 images) - 2026-01-18
+
+| Commit | PR | Subject | SGLang Ver | Status |
+|--------|-----|---------|------------|--------|
+| `09deb20d` | #420 | Logits memory | 0.1.14 | ✅ |
+| `2854a5ea` | #1496 | bench_latency fix | 0.3.1.post3 | ✅ |
+| `564a898a` | #619 | Mem indices | 0.1.20 | ✅ |
+| `62757db6` | #1010 | Cache disabled | 0.2.11 | ✅ |
+| `6a2941f4` | #625 | TP overhead | 0.1.20 | ✅ |
+| `6f560c76` | #117 | First token latency | 0.1.9 | ✅ |
+| `8f8f96a6` | #1773 | stop_token_ids fix | 0.3.4.post1 | ✅ |
+| `9183c23e` | #2695 | Weights update | 0.4.1.post3 | ✅ |
+| `9c064bf7` | #1587 | LoRA Step 1 | 0.3.2 | ✅ |
+| `9c745d07` | #2056 | xgrammar | 0.3.5.post2 | ✅ |
+| `ab4a83b2` | #1339 | Optimize schedule | 0.3.0 | ✅ |
+| `ac971ff6` | #658 | stream_interval | 0.1.21 | ✅ |
+| `b1709305` | #1697 | Radix tree | 0.3.3.post1 | ✅ |
+| `b77a02cd` | #1752 | Grammar backends | 0.3.4.post2 | ✅ |
+| `c98e84c2` | #1589 | torch.argmax | 0.3.2 | ✅ |
+| `e3ec6bf4` | #6814 | FP8 quant | 0.4.7 | ✅ |
+| `e5db40dc` | #1694 | ORJson | 0.3.3.post1 | ✅ |
+
+---
+
+## Benchmark Commands for New Images
+
+### Priority 1: `2a754e57` - 2x Prefill Performance (PR #579)
+
+```bash
+# Pull image
+docker pull shikhar481/sglang-images:2a754e57
+
+# Run benchmark
+docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
+    shikhar481/sglang-images:2a754e57 \
+    python3 -m sglang.bench_latency \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --batch-size 1 \
+    --input-len 8192 \
+    --output-len 1
+```
+
+**What it tests:** Large prefill performance (8K input tokens, minimal output)
+
+---
+
+### Priority 2: `9216b106` - 40% Scheduler Improvement (PR #394)
+
+```bash
+# Pull image
+docker pull shikhar481/sglang-images:9216b106
+
+# Start server
+docker run -d --gpus all -p 30000:30000 -e HF_TOKEN=$HF_TOKEN \
+    --name sglang-9216b106 \
+    shikhar481/sglang-images:9216b106 \
+    python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --port 30000
+
+# Wait for server to be ready, then run benchmark
+docker run --rm --network host \
+    shikhar481/sglang-images:9216b106 \
+    python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --num-prompt 300 \
+    --request-rate 16
+
+# Cleanup
+docker stop sglang-9216b106 && docker rm sglang-9216b106
+```
+
+**What it tests:** High parallelism workload (request-rate 16, LPM scheduler priority)
+
+---
+
+### Priority 3: `b1e5a33a` - 13% LoRA ITL Improvement (PR #6960)
+
+```bash
+# Pull image
+docker pull shikhar481/sglang-images:b1e5a33a
+
+# Start server with LoRA adapter
+docker run -d --gpus all -p 30000:30000 -e HF_TOKEN=$HF_TOKEN \
+    --name sglang-b1e5a33a \
+    shikhar481/sglang-images:b1e5a33a \
+    python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --port 30000 \
+    --lora-paths lora=algoprog/fact-generation-llama-3.1-8b-instruct-lora
+
+# Wait for server to be ready, then run benchmark
+docker run --rm --network host \
+    shikhar481/sglang-images:b1e5a33a \
+    python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --num-prompt 480 \
+    --request-rate 8 \
+    --disable-radix-cache
+
+# Cleanup
+docker stop sglang-b1e5a33a && docker rm sglang-b1e5a33a
+```
+
+**What it tests:** LoRA serving optimization (stream sync elimination)
+
+---
+
+### Other Rebuilt Images - Benchmark Commands
+
+| Commit | Benchmark Command |
+|--------|-------------------|
+| `79961afa` | `bench_latency --batch-size 64 --input-len 2048 --output-len 256` |
+| `3212c2ad` | `bench_serving --model llava-hf/llava-1.5-7b-hf --num-prompt 100 --request-rate 2` |
+| `c087ddd6` | `benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py --hidden-size 1024` |
+| `93470a14` | `bench_latency --batch-size 64 --input-len 2048 --output-len 256` |
+| `2bd18e2d` | `bench_serving --num-prompt 200 --request-rate 8` |
+| `d1112d85` | `bench_latency --batch-size 32 --input-len 512 --output-len 128` |
+| `10189d08` | `bench_serving --num-prompt 200 --request-rate 16` |
+
+### Newly Built Images (2026-01-18) - Benchmark Commands
+
+All commands use `python3 -m sglang.` prefix and `--model meta-llama/Llama-3.1-8B-Instruct` unless specified.
+
+| Commit | PR | Subject | Benchmark Command |
+|--------|-----|---------|-------------------|
+| `09deb20d` | #420 | Logits memory | `bench_serving --num-prompt 300 --request-rate 10` |
+| `1acca3a2` | #5969 | FA3 len() removal | `bench_latency --batch-size 64 --input-len 2048 --output-len 256` |
+| `2854a5ea` | #1496 | bench_latency fix | `bench_latency --batch-size 32 --input-len 512 --output-len 128` |
+| `564a898a` | #619 | Mem indices | `bench_serving --num-prompt 300 --request-rate 10` |
+| `62757db6` | #1010 | Cache disabled | `bench_serving --num-prompt 200 --request-rate 8 --disable-radix-cache` |
+| `6a2941f4` | #625 | TP overhead | `bench_serving --num-prompt 200 --request-rate 10` |
+| `6f560c76` | #117 | First token latency | `bench_serving --num-prompt 100 --request-rate 4 --output-len 256` |
+| `8f8f96a6` | #1773 | stop_token_ids | `bench_latency --batch-size 64 --input-len 512 --output-len 128` |
+| `9183c23e` | #2695 | Weights update | `bench_latency --batch-size 32 --input-len 512 --output-len 128` |
+| `9c064bf7` | #1587 | LoRA Step 1 | `bench_serving --num-prompt 480 --request-rate 8 --disable-radix-cache` (+ LoRA adapter) |
+| `9c745d07` | #2056 | xgrammar | `bench_serving --num-prompt 100 --request-rate 4` (+ `--grammar-backend xgrammar`) |
+| `ab4a83b2` | #1339 | Optimize schedule | `bench_serving --num-prompt 300 --request-rate 16` |
+| `ac971ff6` | #658 | stream_interval | `bench_serving --num-prompt 100 --request-rate 4 --output-len 512` (+ `--stream-interval 1`) |
+| `b1709305` | #1697 | Radix tree | `bench_serving --num-prompt 500 --request-rate 10` |
+| `b77a02cd` | #1752 | Grammar backends | `bench_serving --num-prompt 100 --request-rate 4` (+ `--grammar-backend xgrammar`) |
+| `c98e84c2` | #1589 | torch.argmax | `bench_latency --batch-size 64 --input-len 256 --output-len 256` |
+| `e3ec6bf4` | #6814 | FP8 quant | `bench_latency --batch-size 32 --input-len 1024 --output-len 128` |
+| `e5db40dc` | #1694 | ORJson | `bench_serving --num-prompt 500 --request-rate 30 --output-len 64` |
+
+---
 
 ### Update 2026-01-17
 
