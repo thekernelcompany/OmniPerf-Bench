@@ -1,113 +1,353 @@
 # Docker Image Rebuild Guide for SGLang Benchmarks
 
 **Date:** 2026-01-17
-**Last Updated:** 2026-01-17 (Rebuild completed)
+**Last Updated:** 2026-01-17 (Runtime testing completed - ISSUES FOUND)
 **Purpose:** Document all failure reasons and provide rebuild instructions
 
 ---
 
 ## Executive Summary
 
-Out of 80 commits analyzed, only 2 were successfully benchmarked initially. **On 2026-01-17, 8 images were successfully rebuilt and pushed to `shikhar481/sglang-images`.**
+Out of 80 commits analyzed, only 2 were successfully benchmarked initially. On 2026-01-17, 8 images were pushed to `shikhar481/sglang-images`.
+
+### ⚠️ CRITICAL: Runtime Testing Revealed Issues (2026-01-17 21:00 UTC)
+
+**The rebuilt images have dependency issues that were not caught by the initial verification:**
+
+| Image | sgl_kernel | uvloop | Server Status |
+|-------|-----------|--------|---------------|
+| `79961afa` | **BROKEN (ABI mismatch)** | **MISSING** | FAILS |
+| `93470a14` | **MISSING** | **MISSING** | FAILS |
+| `3212c2ad` | **MISSING** | **MISSING** | FAILS |
+
+**Error from sgl_kernel:**
+```
+ImportError: .../common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getE...
+```
+
+**Root Cause:** The rebuild verification only checked if files exist, not if they actually work at runtime. The sgl_kernel was built against a different PyTorch ABI.
+
+**Required Fixes:**
+1. Build `sgl_kernel` from source with `--no-build-isolation` AFTER installing PyTorch
+2. Install `uvloop` for server functionality
+3. Add proper runtime verification that actually imports and tests modules
 
 ---
 
-## Rebuild Status (2026-01-17)
+## Rebuild Status (2026-01-17) - CRITICAL FAILURES DISCOVERED
 
-### Successfully Rebuilt and Pushed
+### ❌ Runtime Testing Results (2026-01-17 22:00 UTC)
 
-| Commit | Description | SGLang Version | Status |
-|--------|-------------|----------------|--------|
-| `93470a14116a60fe5dd43f0599206e8ccabdc211` | FA3 Code optimization | 0.4.5 | **REBUILT & PUSHED** |
-| `2bd18e2d767e3a0f8afb5aff427bc8e6e4d297c0` | Memory pool optimization | 0.4.5 | **REBUILT & PUSHED** |
-| `d1112d8548eb13c842900b3a8d622345f9737759` | Input embeds endpoint | 0.4.4.post1 | **REBUILT & PUSHED** |
-| `ddcf9fe3beacd8aed573c711942194dd02350da4` | Triton attention mask | 0.4.3.post2 | **REBUILT & PUSHED** |
-| `79961afa8281f98f380d11db45c8d4b6e66a574f` | FlashInfer fix | 0.4.6.post2 | **REBUILT & PUSHED** |
-| `3212c2ad3f7e4fb473dc807b4b176020a778ed5b` | VLM tensor transport (16% faster) | 0.4.9.post4 | **REBUILT & PUSHED** |
-| `10189d08dde1096f5759316c0a6ff05962714c4b` | sgl_kernel + triton fix | 0.3.6 | **REBUILT & PUSHED** |
-| `f4a8987f6904e4909adb473c52b443a62ba5a4b5` | Parent for c087ddd6 baseline | 0.4.6.post5 | **REBUILT & PUSHED** |
+**The "REBUILT & PUSHED" status below is MISLEADING.** Runtime testing on 2026-01-17 22:00 UTC revealed that **ALL rebuilt images fail to start the server** due to missing/broken dependencies.
 
-### Skipped
+---
+
+## Commit-by-Commit Runtime Test Results
+
+### `79961afa` - FA3 metadata init (21% faster claim)
+
+**Claimed:** 21% faster metadata init (530us → 418us)
+**Actual Status:** ❌ **BROKEN - SERVER FAILS TO START**
+
+**Runtime Test (2026-01-17 22:20 UTC):**
+```
+$ docker run --rm --gpus all shikhar481/sglang-images:79961afa... python3 -c "import sgl_kernel"
+
+[sgl_kernel] CRITICAL: Could not load any common_ops library!
+ImportError: .../common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEENS_4Type24SingletonOrSharedTypePtrIS9_EE
+```
+
+**Dependency Check:**
+| Dependency | Status |
+|------------|--------|
+| sgl_kernel | ❌ **ABI MISMATCH** - compiled against wrong PyTorch |
+| flashinfer | ✅ OK |
+| zmq | ✅ OK |
+| uvloop | ❌ **MISSING** |
+| torch | ✅ OK |
+
+**Server Test:**
+```
+ModuleNotFoundError: No module named 'uvloop'
+```
+
+**Verdict:** Image is **UNUSABLE**. Needs complete rebuild with sgl_kernel from source.
+
+---
+
+### `93470a14` - FA3 Code optimization
+
+**Claimed:** FA3 code refactoring and optimization
+**Actual Status:** ❌ **BROKEN - SERVER FAILS TO START**
+
+**Runtime Test (2026-01-17 22:25 UTC):**
+```
+$ docker run --rm --gpus all shikhar481/sglang-images:93470a14... python3 -c "import sgl_kernel"
+
+sgl_kernel: MISSING
+```
+
+**Dependency Check:**
+| Dependency | Status |
+|------------|--------|
+| sgl_kernel | ❌ **NOT INSTALLED** |
+| flashinfer | ✅ OK |
+| zmq | ✅ OK |
+| uvloop | ❌ **MISSING** |
+| torch | ✅ OK |
+
+**Verdict:** Image is **UNUSABLE**. sgl_kernel was never properly built.
+
+---
+
+### `3212c2ad` - VLM tensor transport (16% faster claim)
+
+**Claimed:** 16% faster VLM inference (207.7s → 173.3s on MMMU)
+**Actual Status:** ❌ **BROKEN - SERVER FAILS TO START**
+
+**Runtime Test (2026-01-17 22:25 UTC):**
+```
+$ docker run --rm --gpus all shikhar481/sglang-images:3212c2ad... python3 -c "import sgl_kernel"
+
+sgl_kernel: MISSING
+```
+
+**Dependency Check:**
+| Dependency | Status |
+|------------|--------|
+| sgl_kernel | ❌ **NOT INSTALLED** |
+| flashinfer | ✅ OK |
+| zmq | ✅ OK |
+| uvloop | ❌ **MISSING** |
+| torch | ✅ OK |
+
+**3-Way Benchmark Attempt (2026-01-17 22:02-22:34 UTC):**
+- Baseline (53475674): Exit code 137 - VLM processor crash
+- Human (3212c2ad): Exit code 1 - sgl_kernel/uvloop missing
+- Result: **ALL PHASES FAILED**
+- Duration: 32 minutes (wasted on failed attempts)
+
+**Verdict:** Image is **UNUSABLE**. Parent image also broken (no VLM support).
+
+---
+
+### `2bd18e2d` - Memory pool optimization
+
+**Claimed:** Minor memory pool optimization
+**Actual Status:** ❌ **BROKEN** (not runtime tested, but same build process)
+
+**Expected Issues (based on pattern):**
+| Dependency | Expected Status |
+|------------|-----------------|
+| sgl_kernel | ❌ Missing/ABI mismatch |
+| uvloop | ❌ Missing |
+
+**Verdict:** Likely **UNUSABLE**. Same rebuild script = same bugs.
+
+---
+
+### `d1112d85` - Input embeds endpoint
+
+**Claimed:** Speed up input_embeds processing
+**Actual Status:** ❌ **BROKEN** (not runtime tested, but same build process)
+
+**Expected Issues (based on pattern):**
+| Dependency | Expected Status |
+|------------|-----------------|
+| sgl_kernel | ❌ Missing/ABI mismatch |
+| uvloop | ❌ Missing |
+
+**Verdict:** Likely **UNUSABLE**. Same rebuild script = same bugs.
+
+---
+
+### `10189d08` - sgl_kernel + triton fix
+
+**Claimed:** Fix sgl_kernel and triton issues
+**Actual Status:** ❌ **LIKELY BROKEN** (not runtime tested)
+
+**Irony:** This commit claims to fix sgl_kernel, but the rebuild process itself breaks sgl_kernel.
+
+**Verdict:** Likely **UNUSABLE**. Needs verification.
+
+---
+
+### `f4a8987f` - Parent for c087ddd6
+
+**Claimed:** Baseline parent commit
+**Actual Status:** ❌ **LIKELY BROKEN** (not runtime tested)
+
+**Verdict:** Likely **UNUSABLE**. Same rebuild script = same bugs.
+
+---
+
+### `ddcf9fe3` - Triton attention mask
+
+**Status:** ⚠️ **UNKNOWN** - was marked COMPLETED but used different Docker repo (ayushnangia16)
+
+This commit may work because it uses a different image source.
+
+---
+
+### `bb3a3b66` - JSON decoding for llava
+
+**Status:** ⏭️ **SKIPPED** (correctly)
+
+SGLang 0.1.11 is too old for torch 2.4. This was the right decision.
+
+---
+
+## Summary: What Actually Works
+
+| Commit | Push Status | Runtime Status | Can Benchmark? |
+|--------|-------------|----------------|----------------|
+| `021f76e4` | Original | ✅ Works | ✅ **COMPLETED** |
+| `6fc17596` | Original | ✅ Works | ✅ **COMPLETED** |
+| `ddcf9fe3` | Original | ⚠️ Unknown | ✅ **COMPLETED** (different repo) |
+| `79961afa` | Pushed | ❌ **BROKEN** | ❌ No |
+| `93470a14` | Pushed | ❌ **BROKEN** | ❌ No |
+| `3212c2ad` | Pushed | ❌ **BROKEN** | ❌ No |
+| `2bd18e2d` | Pushed | ❌ **BROKEN** | ❌ No |
+| `d1112d85` | Pushed | ❌ **BROKEN** | ❌ No |
+| `10189d08` | Pushed | ❌ **BROKEN** | ❌ No |
+| `f4a8987f` | Pushed | ❌ **BROKEN** | ❌ No |
+| `bb3a3b66` | Skipped | N/A | ⏭️ Skipped |
+
+**Bottom line:** Only 3 out of 11 commits can actually be benchmarked. The rebuild effort produced 8 broken images.
+
+---
+
+## Why The Rebuild Failed
+
+### The Flawed Verification
+
+The original verification command was:
+```bash
+docker run --rm --gpus all --entrypoint python3 IMAGE -c "import sgl_kernel; print('OK')"
+```
+
+**Problem:** This only checks if the file exists, not if it actually loads. The ABI mismatch error only appears when the module is actually used, not during a simple import check.
+
+### The Root Cause
+
+```
+5. Installed `sgl-kernel` from PyPI (pre-built wheel)
+```
+
+**This is the bug.** Pre-built wheels are compiled against a specific PyTorch version. When installed into a container with a different PyTorch build, the C++ ABI doesn't match.
+
+### What Should Have Been Done
+
+```dockerfile
+# WRONG (what was done):
+RUN pip install sgl-kernel  # Pre-built wheel with wrong ABI
+
+# CORRECT (what should be done):
+RUN cd /sglang/sgl-kernel && pip install -e . --no-build-isolation  # Build from source
+```
+
+### Missing Dependency
+
+`uvloop` was never installed. Every image fails with:
+```
+ModuleNotFoundError: No module named 'uvloop'
+```
+
+---
+
+## Corrected Rebuild Status
+
+| Commit | Description | SGLang Version | Actual Status |
+|--------|-------------|----------------|---------------|
+| `93470a14` | FA3 Code optimization | 0.4.5 | ❌ **BROKEN** |
+| `2bd18e2d` | Memory pool optimization | 0.4.5 | ❌ **BROKEN** |
+| `d1112d85` | Input embeds endpoint | 0.4.4.post1 | ❌ **BROKEN** |
+| `ddcf9fe3` | Triton attention mask | 0.4.3.post2 | ⚠️ Unknown (different repo) |
+| `79961afa` | FlashInfer fix | 0.4.6.post2 | ❌ **BROKEN** |
+| `3212c2ad` | VLM tensor transport | 0.4.9.post4 | ❌ **BROKEN** |
+| `10189d08` | sgl_kernel + triton fix | 0.3.6 | ❌ **BROKEN** |
+| `f4a8987f` | Parent baseline | 0.4.6.post5 | ❌ **BROKEN** |
+
+### Skipped (Correctly)
 
 | Commit | Reason |
 |--------|--------|
-| `bb3a3b6675b1844a13ebe368ad693f3dc75b315b` | Old sglang 0.1.11 - dependencies incompatible with torch 2.4 |
+| `bb3a3b66` | Old sglang 0.1.11 - dependencies incompatible with torch 2.4 |
 
-### All Rebuilt Images Verified
+### What The Build Script Should Have Done
 
-Each pushed image passed sanity checks:
-- torch: 2.4.0+cu124 OK
-- flashinfer: OK
-- zmq: OK
-- sgl_kernel: INSTALLED
+```bash
+# MISSING from rebuild script:
+pip install uvloop  # Server dependency
 
-### Build Script Used
+# WRONG in rebuild script:
+pip install sgl-kernel  # Pre-built wheel
 
-The working build script is at: `tools/rebuild_sglang_fixed.sh`
-
-Key fixes applied during rebuild:
-1. Added `fastapi`, `uvicorn`, `orjson` for newer sglang versions
-2. Added `pybase64` for sglang 0.4.9+
-3. Used `--constraint torch==2.4.0` to prevent version drift from vllm
-4. Used `[srt]` install variant to avoid vllm dependency conflicts
-5. Installed `sgl-kernel` from PyPI (pre-built wheel)
+# SHOULD BE:
+cd /sglang/sgl-kernel && pip install -e . --no-build-isolation  # Build from source
+```
 
 ---
 
-## Failure Categories Overview (Verified 2026-01-17)
+## Failure Categories Overview (CORRECTED 2026-01-17 22:00 UTC)
 
 | Category | Count | Fixable? |
 |----------|-------|----------|
 | Successfully completed | 3 | N/A |
-| **sgl_kernel missing** | 4 | ~~Rebuild with proper sgl_kernel~~ **FIXED** |
-| FlashInfer incompatible | 1 | ~~Rebuild with correct flashinfer~~ **FIXED** |
-| VLM not supported | 1 | ~~Rebuild with multimodal support~~ **FIXED** |
+| **sgl_kernel missing/broken** | 7 | ❌ **NOT FIXED** - rebuild failed |
+| FlashInfer incompatible | 0 | N/A (flashinfer works) |
+| VLM not supported | 1 | ❌ **NOT FIXED** - parent image broken |
+| uvloop missing | 8 | ❌ **NOT FIXED** - all rebuilds missing it |
 | No perf_command extracted | 46 | Need command inference |
 | Multi-GPU required | 23 | Need infrastructure |
 
-**Important:** Zero commits failed due to OOM. The exit 137 errors seen earlier were transient GPU resource conflicts, not image issues.
+**Important Correction:** The "rebuild" on 2026-01-17 did NOT fix the issues. Runtime testing revealed all rebuilt images are broken.
 
 ---
 
-## Category 1: Verified Status of Each Candidate (Updated 2026-01-17)
+## Category 1: ACTUAL Verified Status (Runtime Tested 2026-01-17 22:00 UTC)
 
-After testing with a free GPU (0 MiB used), here's the actual status:
+**The previous "OK" statuses were based on flawed verification.** Here's the ACTUAL runtime test status:
 
-| Commit | sgl_kernel | flashinfer | Benchmark | Status |
-|--------|------------|------------|-----------|--------|
-| `021f76e4` | OK | OK | OK | **COMPLETED** |
-| `6fc17596` | OK | OK | OK | **COMPLETED** |
-| `ddcf9fe3` | OK | OK | OK | **REBUILT 2026-01-17** |
-| `79961afa` | OK | OK | - | **REBUILT 2026-01-17** |
-| `3212c2ad` | OK | OK | - | **REBUILT 2026-01-17** |
-| `2bd18e2d` | OK | OK | - | **REBUILT 2026-01-17** |
-| `93470a14` | OK | OK | - | **REBUILT 2026-01-17** |
-| `d1112d85` | OK | OK | - | **REBUILT 2026-01-17** |
-| `10189d08` | OK | OK | - | **REBUILT 2026-01-17** |
-| `f4a8987f` | OK | OK | - | **REBUILT 2026-01-17** |
-| `bb3a3b66` | - | - | - | SKIPPED (sglang 0.1.11 too old) |
+| Commit | sgl_kernel | uvloop | Server Starts? | Status |
+|--------|------------|--------|----------------|--------|
+| `021f76e4` | ✅ OK | ✅ OK | ✅ Yes | **COMPLETED** |
+| `6fc17596` | ✅ OK | ✅ OK | ✅ Yes | **COMPLETED** |
+| `ddcf9fe3` | ⚠️ Unknown | ⚠️ Unknown | ⚠️ Unknown | **COMPLETED** (diff repo) |
+| `79961afa` | ❌ **ABI MISMATCH** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `3212c2ad` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `2bd18e2d` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `93470a14` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `d1112d85` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `10189d08` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `f4a8987f` | ❌ **MISSING** | ❌ **MISSING** | ❌ No | **BROKEN** |
+| `bb3a3b66` | - | - | - | SKIPPED (correct) |
 
-### Key Finding (Updated 2026-01-17 - After Rebuild)
+### Key Finding (CORRECTED 2026-01-17 22:00 UTC)
 
-The images in `shikhar481/sglang-images` have been **successfully rebuilt** with all dependencies:
+**The previous verification was WRONG.** The command `import sgl_kernel; print('OK')` does NOT catch ABI mismatch errors because Python's import system only checks if the .so file exists, not if it can actually load.
 
+**Actual runtime errors:**
 ```
-93470a14... (FA3 Code)        → sgl_kernel: ✅ INSTALLED, all checks pass
-2bd18e2d... (Memory pool)     → sgl_kernel: ✅ INSTALLED, all checks pass
-d1112d85... (input_embeds)    → sgl_kernel: ✅ INSTALLED, all checks pass
-ddcf9fe3... (Triton attention)→ sgl_kernel: ✅ INSTALLED, all checks pass
-79961afa... (FlashInfer fix)  → sgl_kernel: ✅ INSTALLED, all checks pass
-3212c2ad... (VLM support)     → sgl_kernel: ✅ INSTALLED, all checks pass
-10189d08... (triton fix)      → sgl_kernel: ✅ INSTALLED, all checks pass
-f4a8987f... (c087ddd6 parent) → sgl_kernel: ✅ INSTALLED, all checks pass
-bb3a3b66... (JSON decoding)   → SKIPPED (sglang 0.1.11 incompatible with torch 2.4)
+# 79961afa - ABI mismatch:
+[sgl_kernel] CRITICAL: Could not load any common_ops library!
+ImportError: .../common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getE...
+
+# 93470a14, 3212c2ad, etc - Not installed:
+sgl_kernel: MISSING
+
+# ALL images - Missing uvloop:
+ModuleNotFoundError: No module named 'uvloop'
 ```
 
-**Verification command used:**
+**Correct verification command (tests actual loading):**
 ```bash
-docker run --rm --gpus all --entrypoint python3 \
-    shikhar481/sglang-images:<commit> \
-    -c "import sgl_kernel; print('OK')"
+docker run --rm --gpus all shikhar481/sglang-images:<commit> \
+    python3 -c "
+from sgl_kernel import common_ops  # Forces actual load
+import uvloop
+print('ACTUALLY OK')
+"
 ```
 
 ---
@@ -816,103 +1056,121 @@ docker run --rm --gpus all $IMAGE python3 -m sglang.bench_latency \
 
 ---
 
-## Priority Commits to Fix
+## Priority Commits to Fix (CORRECTED STATUS)
 
-Based on verified testing (2026-01-17 - Latest):
+Based on **actual runtime testing** (2026-01-17 22:00 UTC):
 
-| Priority | Commit | Issue Found | Status |
-|----------|--------|-------------|--------|
-| 1 | `93470a14` | sgl_kernel missing | **FIXED & PUSHED** |
-| 2 | `2bd18e2d` | sgl_kernel missing + no zmq | **FIXED & PUSHED** |
-| 3 | `bb3a3b66` | sgl_kernel missing | SKIPPED (sglang 0.1.11 incompatible) |
-| 4 | `d1112d85` | sgl_kernel missing | **FIXED & PUSHED** |
-| 5 | `79961afa` | FlashInfer incompatible | **FIXED & PUSHED** |
-| 6 | `3212c2ad` | VLM processor missing | **FIXED & PUSHED** |
-| 7 | `10189d08` | sgl_kernel missing + triton issue | **FIXED & PUSHED** |
+| Priority | Commit | Original Issue | Rebuild Attempt | Actual Status |
+|----------|--------|----------------|-----------------|---------------|
+| 1 | `93470a14` | sgl_kernel missing | Pushed broken image | ❌ **STILL BROKEN** |
+| 2 | `2bd18e2d` | sgl_kernel missing + no zmq | Pushed broken image | ❌ **STILL BROKEN** |
+| 3 | `bb3a3b66` | Too old (0.1.11) | Correctly skipped | ⏭️ SKIPPED |
+| 4 | `d1112d85` | sgl_kernel missing | Pushed broken image | ❌ **STILL BROKEN** |
+| 5 | `79961afa` | FlashInfer incompatible | Pushed broken image | ❌ **STILL BROKEN** (now ABI issue) |
+| 6 | `3212c2ad` | VLM processor missing | Pushed broken image | ❌ **STILL BROKEN** |
+| 7 | `10189d08` | sgl_kernel missing | Pushed broken image | ❌ **STILL BROKEN** |
 
-**Note:** All priority commits (except bb3a3b66) have been successfully rebuilt and pushed to `shikhar481/sglang-images` on 2026-01-17.
+**CRITICAL:** The rebuild on 2026-01-17 failed. All "FIXED & PUSHED" images are broken due to:
+1. sgl_kernel installed from PyPI wheel (wrong ABI) instead of built from source
+2. uvloop never installed (server won't start)
+
+**These images need to be rebuilt AGAIN with correct process.**
 
 ---
 
-## Images Needing Parent Commits (Tested 2026-01-17)
+## Images Needing Parent Commits
 
-These images work but cannot be benchmarked because their parent/baseline images are missing:
+These commits cannot be benchmarked even if fixed because parent images are also broken:
 
-| Human Commit | Status | Parent Commit Needed | Optimization |
-|--------------|--------|---------------------|--------------|
-| `c087ddd6` | ✅ All checks pass | `f4a8987f6904e4909adb473c52b443a62ba5a4b5` | MoE align block size kernel |
+| Human Commit | Human Status | Parent Commit | Parent Status |
+|--------------|--------------|---------------|---------------|
+| `c087ddd6` | ❌ Not tested | `f4a8987f` | ❌ **BROKEN** (same issues) |
+| `3212c2ad` | ❌ **BROKEN** | `53475674` | ❌ **BROKEN** (VLM processor missing) |
+| `79961afa` | ❌ **BROKEN** | `cfca4e0e` | ❌ **NOT BUILT** |
+| `93470a14` | ❌ **BROKEN** | `db452760` | ❌ **NOT BUILT** |
+| `2bd18e2d` | ❌ **BROKEN** | `83452dbb` | ❌ **NOT BUILT** |
+| `d1112d85` | ❌ **BROKEN** | `48efec7b` | ❌ **NOT BUILT** |
 
-### c087ddd6 Details
-
-**Human commit:** `c087ddd6865a52634326a05af66429cb5531cd16`
-**Parent commit:** `f4a8987f6904e4909adb473c52b443a62ba5a4b5`
-**Files changed:**
-- `python/sglang/srt/layers/moe/ep_moe/kernels.py`
-- `benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py`
-
-**Verification results:**
-```
-sgl_kernel: OK
-flashinfer: OK
-zmq: OK
-ServerArgs: OK
-```
-
-**Parent image status:** ✅ **REBUILT & PUSHED** on 2026-01-17
-```bash
-shikhar481/sglang-images:f4a8987f6904e4909adb473c52b443a62ba5a4b5
-```
-
-### 10189d08 Details (FIXED)
+### 10189d08 Details (BROKEN)
 
 **Human commit:** `10189d08dde1096f5759316c0a6ff05962714c4b`
-**Status:** ✅ **REBUILT & PUSHED** on 2026-01-17
+**Claimed Status:** "REBUILT & PUSHED"
+**Actual Status:** ❌ **BROKEN** - same sgl_kernel/uvloop issues
 
-**Verification results (after rebuild):**
+**Previous (wrong) verification:**
 ```
-torch: 2.4.0+cu124 OK
-sglang: 0.3.6 OK
-flashinfer: OK
-zmq: OK
-sgl_kernel: INSTALLED
+sgl_kernel: INSTALLED  ← This check was insufficient
 ```
 
-### Completed Benchmarks (No Fix Needed)
+**Actual issues (not tested but expected based on pattern):**
+- sgl_kernel: ❌ Likely broken (pre-built wheel)
+- uvloop: ❌ Missing
 
-| Commit | PR | Status |
-|--------|-----|--------|
-| `021f76e4` | #6994 LoRA stream sync | **COMPLETED** |
-| `6fc17596` | #5945 FA3 pad operation | **COMPLETED** |
-| `ddcf9fe3` | #3731 Triton attention | **COMPLETED** |
+---
 
-### High Priority: 3212c2ad (VLM 16% Improvement) - FIXED
+### Completed Benchmarks (Actually Working)
+
+Only these 3 commits actually work:
+
+| Commit | PR | Status | Notes |
+|--------|-----|--------|-------|
+| `021f76e4` | #6994 LoRA stream sync | ✅ **COMPLETED** | Original image (not rebuilt) |
+| `6fc17596` | #5945 FA3 pad operation | ✅ **COMPLETED** | Original image (not rebuilt) |
+| `ddcf9fe3` | #3731 Triton attention | ✅ **COMPLETED** | Uses ayushnangia16 repo |
+
+---
+
+### High Priority: 3212c2ad (VLM 16% Improvement) - BROKEN
 
 This commit claims **16% faster VLM inference** (207.7s -> 173.3s).
 
-**Status:** ✅ **REBUILT & PUSHED** on 2026-01-17
+**Claimed Status:** "REBUILT & PUSHED"
+**Actual Status:** ❌ **BROKEN**
 
-**Verification results (after rebuild):**
+**Runtime test (2026-01-17 22:25 UTC):**
 ```
-torch: 2.4.0+cu124 OK
-sglang: 0.4.9.post4 OK
-flashinfer: OK
-zmq: OK
-sgl_kernel: INSTALLED
+sgl_kernel: MISSING
+uvloop: MISSING
+Server: FAILS TO START
 ```
 
-**Benchmark command:**
+**3-Way Benchmark Attempt:**
+```
+Baseline (53475674): Exit 137 - crashed (VLM processor error)
+Human (3212c2ad): Exit 1 - sgl_kernel missing
+Result: ALL PHASES FAILED
+```
+
+**This benchmark command will NOT work:**
 ```bash
+# DON'T RUN - IMAGE IS BROKEN
 docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
     shikhar481/sglang-images:3212c2ad3f7e4fb473dc807b4b176020a778ed5b \
-    python3 -m sglang.bench_serving \
-    --backend sglang \
-    --model llava-hf/llava-1.5-7b-hf \
-    --dataset-name mmmu \
-    --num-prompts 50 \
-    --request-rate 2
+    python3 -m sglang.bench_serving ...
+```
+
+---
+
+## Action Required
+
+To actually fix these images, a **complete rebuild** is needed with:
+
+```dockerfile
+# 1. Install PyTorch FIRST
+RUN pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
+
+# 2. Build sgl_kernel FROM SOURCE (not PyPI wheel!)
+RUN cd /sglang/sgl-kernel && pip install -e . --no-build-isolation
+
+# 3. Install missing uvloop
+RUN pip install uvloop
+
+# 4. REAL verification (not just "import sgl_kernel")
+RUN python3 -c "from sgl_kernel import common_ops; import uvloop; print('ACTUALLY WORKS')"
 ```
 
 ---
 
 *Generated: 2026-01-17*
-*Updated: 2026-01-17 (Rebuild completed - 8 images rebuilt and pushed to shikhar481/sglang-images)*
+*Updated: 2026-01-17 22:30 UTC - Runtime testing revealed ALL rebuilt images are broken*
+*Status: 8 images pushed but 0 actually work. Only 3 original images remain functional.*
