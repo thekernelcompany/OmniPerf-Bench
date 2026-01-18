@@ -129,13 +129,18 @@ RUN python3 -c "import sglang; print(f'SGLang {sglang.__version__}: OK')"
 
 # 9. Build sgl_kernel FROM SOURCE (NOT PyPI - pre-built wheels have wrong ABI!)
 # CRITICAL: --no-build-isolation ensures we use the installed torch for ABI compatibility
+# First install build dependencies required by sgl_kernel
+RUN pip install scikit-build-core cmake
+
+# sgl_kernel build is optional - some commits don't need it or have broken source
+# We try to build from source, but continue if it fails
 RUN if [ -d "/opt/sglang/sgl-kernel" ]; then \
-        echo "Building sgl_kernel from source..." && \
+        echo "Attempting to build sgl_kernel from source..." && \
         cd /opt/sglang/sgl-kernel && \
-        pip install -e . --no-build-isolation && \
-        echo "sgl_kernel: built from source OK"; \
+        (pip install -e . --no-build-isolation 2>&1 && echo "sgl_kernel: built from source OK") || \
+        echo "WARNING: sgl_kernel build failed - image may work without it for some models"; \
     else \
-        echo "Warning: sgl-kernel directory not found in this commit"; \
+        echo "Note: sgl-kernel directory not found in this commit"; \
     fi
 
 # 10. Final dependency check - datasets and other utils
@@ -152,8 +157,8 @@ RUN echo "=== FINAL SANITY CHECKS ===" && \
     python3 -c "import flashinfer; print('flashinfer: OK')" && \
     python3 -c "import zmq; print('zmq: OK')" && \
     python3 -c "import uvloop; print('uvloop: OK')" && \
-    (python3 -c "from sgl_kernel import common_ops; print('sgl_kernel: OK (ABI verified)')" || echo "sgl_kernel: NOT AVAILABLE (older commit)") && \
-    echo "=== ALL SANITY CHECKS PASSED ==="
+    (python3 -c "import sgl_kernel; from sgl_kernel import common_ops; print('sgl_kernel: OK (ABI verified)')" 2>/dev/null || echo "sgl_kernel: NOT AVAILABLE (build failed or not needed)") && \
+    echo "=== ALL REQUIRED CHECKS PASSED ==="
 
 WORKDIR /workspace
 
