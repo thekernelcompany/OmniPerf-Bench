@@ -1,12 +1,13 @@
 #!/bin/bash
-# SGLang Docker Image Rebuild Script (Corrected)
+# SGLang Docker Image Rebuild Script (Corrected v2)
 # Based on DOCKER_IMAGE_REBUILD_GUIDE.md
 #
 # Key fixes:
 # 1. Install PyTorch FIRST (determines C++ ABI)
 # 2. Pin ALL dependencies to prevent version drift
-# 3. Build sgl_kernel properly
-# 4. Sanity checks at each step
+# 3. Build sgl_kernel FROM SOURCE (not PyPI!) to ensure ABI compatibility
+# 4. Install uvloop (required for SGLang server)
+# 5. Sanity checks verify actual module loading (catches ABI mismatch)
 
 set -e
 
@@ -107,6 +108,7 @@ RUN pip install \
     pillow \
     fastapi \
     uvicorn \
+    uvloop \
     orjson \
     pybase64
 
@@ -125,8 +127,16 @@ RUN pip install -e "python[srt]" --constraint /tmp/constraints.txt || \
 # Sanity check
 RUN python3 -c "import sglang; print(f'SGLang {sglang.__version__}: OK')"
 
-# 9. Install sgl_kernel from PyPI
-RUN pip install sgl-kernel || echo "Warning: sgl-kernel not available from PyPI"
+# 9. Build sgl_kernel FROM SOURCE (NOT PyPI - pre-built wheels have wrong ABI!)
+# CRITICAL: --no-build-isolation ensures we use the installed torch for ABI compatibility
+RUN if [ -d "/opt/sglang/sgl-kernel" ]; then \
+        echo "Building sgl_kernel from source..." && \
+        cd /opt/sglang/sgl-kernel && \
+        pip install -e . --no-build-isolation && \
+        echo "sgl_kernel: built from source OK"; \
+    else \
+        echo "Warning: sgl-kernel directory not found in this commit"; \
+    fi
 
 # 10. Final dependency check - datasets and other utils
 RUN pip install \
@@ -135,13 +145,14 @@ RUN pip install \
     tqdm \
     pybase64
 
-# 11. FINAL SANITY CHECKS
+# 11. FINAL SANITY CHECKS (must test actual module loading, not just import!)
 RUN echo "=== FINAL SANITY CHECKS ===" && \
     python3 -c "import torch; v=torch.__version__; assert v.startswith('2.4'), f'FAIL: torch={v}'; print(f'torch: {v} OK')" && \
     python3 -c "import sglang; print(f'sglang: {sglang.__version__} OK')" && \
     python3 -c "import flashinfer; print('flashinfer: OK')" && \
     python3 -c "import zmq; print('zmq: OK')" && \
-    (python3 -c "import sgl_kernel; print('sgl_kernel: OK')" || echo "sgl_kernel: NOT INSTALLED (will try at runtime)") && \
+    python3 -c "import uvloop; print('uvloop: OK')" && \
+    (python3 -c "from sgl_kernel import common_ops; print('sgl_kernel: OK (ABI verified)')" || echo "sgl_kernel: NOT AVAILABLE (older commit)") && \
     echo "=== ALL SANITY CHECKS PASSED ==="
 
 WORKDIR /workspace
@@ -242,15 +253,29 @@ except ImportError as e:
     errors.append(f"zmq: {e}")
     print(f"zmq: FAIL - {e}")
 
-# Check sgl_kernel installation
+# Check uvloop (REQUIRED for server)
+try:
+    import uvloop
+    print("uvloop: OK")
+except ImportError as e:
+    errors.append(f"uvloop: {e}")
+    print(f"uvloop: FAIL - {e}")
+
+# Check sgl_kernel - must test actual module loading, not just import!
 print()
-print("=== sgl_kernel check ===")
+print("=== sgl_kernel check (ABI verification) ===")
 spec = importlib.util.find_spec("sgl_kernel")
 if spec is not None:
     print(f"sgl_kernel: INSTALLED at {spec.origin}")
+    # CRITICAL: Test actual module loading to catch ABI mismatch
+    try:
+        from sgl_kernel import common_ops
+        print("sgl_kernel: ABI VERIFIED (common_ops loaded)")
+    except Exception as e:
+        print(f"sgl_kernel: ABI MISMATCH - {e}")
+        errors.append(f"sgl_kernel ABI mismatch: {e}")
 else:
-    print("sgl_kernel: NOT INSTALLED")
-    # Don't treat as error since some commits don't have it
+    print("sgl_kernel: NOT INSTALLED (older commit - OK)")
 
 print()
 print("=" * 50)
