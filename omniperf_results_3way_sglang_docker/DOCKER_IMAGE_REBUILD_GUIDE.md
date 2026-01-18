@@ -167,15 +167,15 @@ Or ABI mismatch errors:
 ImportError: /usr/local/.../sgl_kernel/sm90/common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getE...
 ```
 
-### Affected Commits (Verified 2026-01-17)
+### Affected Commits (Updated 2026-01-17 - FIXED)
 
-| Commit | sgl_kernel Status | Additional Issues |
-|--------|-------------------|-------------------|
-| `2bd18e2d` | ❌ Not installed | Also missing `zmq` |
-| `bb3a3b66` | ❌ Not installed | - |
-| `d1112d85` | ❌ Not installed | - |
-| `93470a14` | ❌ Not installed | - |
-| `ddcf9fe3` (new) | ❌ ABI mismatch | Symbol undefined in common_ops.so |
+| Commit | sgl_kernel Status | Additional Issues | Current Status |
+|--------|-------------------|-------------------|----------------|
+| `2bd18e2d` | ~~❌ Not installed~~ | ~~Also missing `zmq`~~ | **✅ REBUILT** |
+| `bb3a3b66` | ❌ Not installed | - | SKIPPED (sglang 0.1.11 too old) |
+| `d1112d85` | ~~❌ Not installed~~ | - | **✅ REBUILT** |
+| `93470a14` | ~~❌ Not installed~~ | - | **✅ REBUILT** |
+| `ddcf9fe3` | ~~❌ ABI mismatch~~ | ~~Symbol undefined~~ | **✅ REBUILT** |
 
 ### Root Cause
 
@@ -307,7 +307,7 @@ except ImportError as e:
 
 ---
 
-## Category 4: Missing Docker Images
+## Category 4: Missing Docker Images (Historical)
 
 ### Symptoms
 
@@ -347,7 +347,7 @@ docker push ayushnangia16/nvidia-sglang-docker:<short_hash>
 
 ---
 
-## Category 4: FlashInfer Compatibility
+## Category 5: FlashInfer Compatibility (Historical)
 
 ### Symptoms
 
@@ -387,7 +387,7 @@ docker run --rm --gpus all YOUR_IMAGE python3 -c \
 
 ---
 
-## Category 5: Missing Python Dependencies
+## Category 6: Missing Python Dependencies
 
 ### Symptoms
 
@@ -411,7 +411,7 @@ RUN pip install --no-cache-dir \
 
 ---
 
-## Category 6: Model Download Failures
+## Category 7: Model Download Failures
 
 ### Symptoms
 
@@ -456,7 +456,7 @@ RUN huggingface-cli login --token $HF_TOKEN && \
 
 ---
 
-## Category 7: VLM (Vision-Language Model) Support
+## Category 8: VLM (Vision-Language Model) Support (Historical)
 
 ### Symptoms
 
@@ -592,12 +592,12 @@ python3 -m sglang.bench_serving \
     --request-rate 2
 ```
 
-### VLM Commits to Rebuild
+### VLM Commits Status
 
-| Commit | PR | Subject | Model |
-|--------|-----|---------|-------|
-| `3212c2ad` | #6003 | VLM tensor transport (16% faster) | llava-hf/llava-1.5-7b-hf |
-| `bb3a3b66` | #137 | Faster JSON decoding for llava | llava-hf/llava-1.5-7b-hf |
+| Commit | PR | Subject | Model | Status |
+|--------|-----|---------|-------|--------|
+| `3212c2ad` | #6003 | VLM tensor transport (16% faster) | llava-hf/llava-1.5-7b-hf | **✅ REBUILT** |
+| `bb3a3b66` | #137 | Faster JSON decoding for llava | llava-hf/llava-1.5-7b-hf | SKIPPED (sglang 0.1.11) |
 
 ---
 
