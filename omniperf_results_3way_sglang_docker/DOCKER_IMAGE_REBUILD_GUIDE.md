@@ -1,7 +1,7 @@
 # Docker Image Rebuild Guide for SGLang Benchmarks
 
 **Date:** 2026-01-17
-**Last Updated:** 2026-01-17 (Runtime testing completed - ISSUES FOUND)
+**Last Updated:** 2026-01-18 (Build script FIXED - ready for rebuild)
 **Purpose:** Document all failure reasons and provide rebuild instructions
 
 ---
@@ -10,7 +10,20 @@
 
 Out of 80 commits analyzed, only 2 were successfully benchmarked initially. On 2026-01-17, 8 images were pushed to `shikhar481/sglang-images`.
 
-### ⚠️ CRITICAL: Runtime Testing Revealed Issues (2026-01-17 21:00 UTC)
+### ✅ BUILD SCRIPT FIXED (2026-01-18)
+
+The build script `tools/rebuild_sglang_fixed.sh` has been updated to fix the issues discovered in runtime testing:
+
+**Fixes Applied:**
+1. ✅ Build `sgl_kernel` FROM SOURCE (not PyPI wheel) with `--no-build-isolation`
+2. ✅ Install `uvloop` for server functionality
+3. ✅ Proper runtime verification that tests actual module loading (`from sgl_kernel import common_ops`)
+
+**Ready to rebuild:** All 8 broken images can now be rebuilt with the fixed script.
+
+---
+
+### ⚠️ HISTORICAL: Runtime Testing Revealed Issues (2026-01-17 21:00 UTC)
 
 **The rebuilt images have dependency issues that were not caught by the initial verification:**
 
@@ -27,10 +40,10 @@ ImportError: .../common_ops.abi3.so: undefined symbol: _ZN3c108ListType3getE...
 
 **Root Cause:** The rebuild verification only checked if files exist, not if they actually work at runtime. The sgl_kernel was built against a different PyTorch ABI.
 
-**Required Fixes:**
-1. Build `sgl_kernel` from source with `--no-build-isolation` AFTER installing PyTorch
-2. Install `uvloop` for server functionality
-3. Add proper runtime verification that actually imports and tests modules
+**Required Fixes (NOW APPLIED):**
+1. ~~Build `sgl_kernel` from source with `--no-build-isolation` AFTER installing PyTorch~~ ✅ FIXED
+2. ~~Install `uvloop` for server functionality~~ ✅ FIXED
+3. ~~Add proper runtime verification that actually imports and tests modules~~ ✅ FIXED
 
 ---
 
@@ -1153,24 +1166,41 @@ docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
 
 ## Action Required
 
-To actually fix these images, a **complete rebuild** is needed with:
+### ✅ Build Script Now Fixed (2026-01-18)
+
+The build script `tools/rebuild_sglang_fixed.sh` has been updated with all the required fixes:
+
+**To rebuild the broken images:**
+```bash
+# Rebuild all 8 broken images with the fixed script
+./tools/rebuild_sglang_fixed.sh 79961afa...  # FA3 metadata init
+./tools/rebuild_sglang_fixed.sh 93470a14...  # FA3 Code optimization
+./tools/rebuild_sglang_fixed.sh 3212c2ad...  # VLM tensor transport
+./tools/rebuild_sglang_fixed.sh 2bd18e2d...  # Memory pool optimization
+./tools/rebuild_sglang_fixed.sh d1112d85...  # Input embeds endpoint
+./tools/rebuild_sglang_fixed.sh 10189d08...  # sgl_kernel + triton fix
+./tools/rebuild_sglang_fixed.sh f4a8987f...  # Parent for c087ddd6
+./tools/rebuild_sglang_fixed.sh ddcf9fe3...  # Triton attention mask
+```
+
+**Key fixes in the updated script:**
 
 ```dockerfile
-# 1. Install PyTorch FIRST
+# 1. Install PyTorch FIRST (determines C++ ABI)
 RUN pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 
 # 2. Build sgl_kernel FROM SOURCE (not PyPI wheel!)
-RUN cd /sglang/sgl-kernel && pip install -e . --no-build-isolation
+RUN cd /opt/sglang/sgl-kernel && pip install -e . --no-build-isolation
 
-# 3. Install missing uvloop
+# 3. Install uvloop (CRITICAL for server)
 RUN pip install uvloop
 
-# 4. REAL verification (not just "import sgl_kernel")
+# 4. REAL verification (tests actual module loading, catches ABI mismatch)
 RUN python3 -c "from sgl_kernel import common_ops; import uvloop; print('ACTUALLY WORKS')"
 ```
 
 ---
 
 *Generated: 2026-01-17*
-*Updated: 2026-01-17 22:30 UTC - Runtime testing revealed ALL rebuilt images are broken*
-*Status: 8 images pushed but 0 actually work. Only 3 original images remain functional.*
+*Updated: 2026-01-18 - Build script fixed, ready for rebuild*
+*Status: 8 images need rebuild with fixed script. 3 original images remain functional.*
