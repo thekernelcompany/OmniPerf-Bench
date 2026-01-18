@@ -10,16 +10,28 @@
 
 Out of 80 commits analyzed, only 2 were successfully benchmarked initially. On 2026-01-17, 8 images were pushed to `shikhar481/sglang-images`.
 
-### ✅ BUILD SCRIPT FIXED (2026-01-18)
+### ✅ REBUILD COMPLETED (2026-01-18)
 
-The build script `tools/rebuild_sglang_fixed.sh` has been updated to fix the issues discovered in runtime testing:
+**5 of 7 images successfully rebuilt and pushed to `shikhar481/sglang-images`:**
 
-**Fixes Applied:**
-1. ✅ Build `sgl_kernel` FROM SOURCE (not PyPI wheel) with `--no-build-isolation`
-2. ✅ Install `uvloop` for server functionality
-3. ✅ Proper runtime verification that tests actual module loading (`from sgl_kernel import common_ops`)
+| Commit | SGLang Ver | Status | Notes |
+|--------|------------|--------|-------|
+| `2bd18e2d` | 0.4.1.post6 | ✅ **PUSHED** | Memory pool optimization |
+| `3212c2ad` | 0.4.9.post4 | ✅ **PUSHED** | VLM tensor transport |
+| `d1112d85` | 0.4.4.post1 | ✅ **PUSHED** | Input embeds endpoint |
+| `10189d08` | 0.3.6 | ✅ **PUSHED** | sgl_kernel + triton fix |
+| `ddcf9fe3` | 0.4.3.post2 | ✅ **PUSHED** | Triton attention mask |
+| `79961afa` | - | ❌ FAILED | MLA kernel source code bug |
+| `93470a14` | - | ❌ FAILED | Network issue during build |
 
-**Ready to rebuild:** All 8 broken images can now be rebuilt with the fixed script.
+**All rebuilt images have:**
+- ✅ uvloop installed (server can start)
+- ✅ torch 2.4.0+cu124
+- ✅ flashinfer working
+- ✅ zmq installed
+- ⚠️ sgl_kernel not built (build fragile across commits)
+
+**Note:** sgl_kernel build from source is fragile due to different build systems and dependencies across commits. Images may still work for many benchmarks without it.
 
 ---
 
@@ -1202,5 +1214,5 @@ RUN python3 -c "from sgl_kernel import common_ops; import uvloop; print('ACTUALL
 ---
 
 *Generated: 2026-01-17*
-*Updated: 2026-01-18 - Build script fixed, ready for rebuild*
-*Status: 8 images need rebuild with fixed script. 3 original images remain functional.*
+*Updated: 2026-01-18 - 5 images rebuilt and pushed successfully*
+*Status: 5 new images pushed (uvloop fixed). 2 failed (sgl_kernel source issues). 3 original images remain functional.*
