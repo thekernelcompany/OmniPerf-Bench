@@ -1,7 +1,7 @@
 # Docker Image Rebuild Guide for SGLang Benchmarks
 
 **Date:** 2026-01-17
-**Last Updated:** 2026-01-18 (Build script FIXED - ready for rebuild)
+**Last Updated:** 2026-01-18 (ALL IMAGES FIXED - Final sanity check passed)
 **Purpose:** Document all failure reasons and provide rebuild instructions
 
 ---
@@ -10,28 +10,33 @@
 
 Out of 80 commits analyzed, only 2 were successfully benchmarked initially. On 2026-01-17, 8 images were pushed to `shikhar481/sglang-images`.
 
-### ✅ REBUILD COMPLETED (2026-01-18)
+### ✅ ALL IMAGES FIXED (2026-01-18 - Final)
 
-**5 of 7 images successfully rebuilt and pushed to `shikhar481/sglang-images`:**
+**9 images successfully rebuilt with uvloop + sgl-kernel and pushed to `shikhar481/sglang-images`:**
 
-| Commit | SGLang Ver | Status | Notes |
-|--------|------------|--------|-------|
-| `2bd18e2d` | 0.4.1.post6 | ✅ **PUSHED** | Memory pool optimization |
-| `3212c2ad` | 0.4.9.post4 | ✅ **PUSHED** | VLM tensor transport |
-| `d1112d85` | 0.4.4.post1 | ✅ **PUSHED** | Input embeds endpoint |
-| `10189d08` | 0.3.6 | ✅ **PUSHED** | sgl_kernel + triton fix |
-| `ddcf9fe3` | 0.4.3.post2 | ✅ **PUSHED** | Triton attention mask |
-| `79961afa` | - | ❌ FAILED | MLA kernel source code bug |
-| `93470a14` | - | ❌ FAILED | Network issue during build |
+| Commit | SGLang Ver | uvloop | sgl_kernel | Status |
+|--------|------------|--------|------------|--------|
+| `2bd18e2d` | 0.4.1.post6 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `3212c2ad` | 0.4.9.post4 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `d1112d85` | 0.4.4.post1 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `10189d08` | 0.3.6 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `ddcf9fe3` | 0.4.3.post2 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `79961afa` | 0.4.6.post2 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `93470a14` | 0.4.5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `f4a8987f` | 0.4.6.post5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
+| `c087ddd6` | 0.4.6.post5 | ✅ OK | ✅ OK | ✅ **PUSHED** |
 
-**All rebuilt images have:**
+**Skipped (incompatible):**
+| Commit | SGLang Ver | Reason |
+|--------|------------|--------|
+| `bb3a3b66` | 0.1.11 | Too old - incompatible with torch 2.4 and sgl-kernel |
+
+**All working images have:**
 - ✅ uvloop installed (server can start)
+- ✅ sgl-kernel installed from PyPI (5 .so files)
 - ✅ torch 2.4.0+cu124
 - ✅ flashinfer working
 - ✅ zmq installed
-- ⚠️ sgl_kernel not built (build fragile across commits)
-
-**Note:** sgl_kernel build from source is fragile due to different build systems and dependencies across commits. Images may still work for many benchmarks without it.
 
 ---
 
@@ -1214,5 +1219,5 @@ RUN python3 -c "from sgl_kernel import common_ops; import uvloop; print('ACTUALL
 ---
 
 *Generated: 2026-01-17*
-*Updated: 2026-01-18 - 5 images rebuilt and pushed successfully*
-*Status: 5 new images pushed (uvloop fixed). 2 failed (sgl_kernel source issues). 3 original images remain functional.*
+*Updated: 2026-01-18 - ALL 9 images rebuilt with uvloop + sgl-kernel*
+*Status: 9 images working (uvloop + sgl-kernel). 1 skipped (bb3a3b66 - sglang 0.1.11 too old).*
