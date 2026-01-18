@@ -321,10 +321,26 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     docker_cmd = f'''
     set -e
     MODEL="{model}"
+    COMMIT="{human_commit}"
 
-    export PYTHONPATH=/workspace:$PYTHONPATH
+    # FIRST: Apply aimv2 compatibility fix BEFORE trying to import vllm
+    # (import crashes due to this issue)
+    echo "Applying aimv2 compatibility fix (pre-import)..."
+    for VLLM_DIR in /usr/local/lib/python*/dist-packages/vllm /opt/venv/lib/python*/site-packages/vllm /usr/lib/python*/site-packages/vllm; do
+        for ovis_file in "$VLLM_DIR/transformers_utils/configs/ovis.py" "$VLLM_DIR/transformers_utils/configs/ovis2.py"; do
+            if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+                if ! grep -q 'exist_ok=True' "$ovis_file" 2>/dev/null; then
+                    sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+                    echo "Patched aimv2 registration in $ovis_file"
+                fi
+            fi
+        done
+    done
 
-    # Find Python with vLLM
+    # Install transformers if missing (some images lack it)
+    pip install transformers -q 2>/dev/null || true
+
+    # Now find Python with vLLM
     VLLM_PYTHON=""
     for py in /opt/venv/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
         if [ -x "$(which $py 2>/dev/null || echo '')" ] || [ -x "$py" ]; then
@@ -344,29 +360,50 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     echo "Running benchmark mode: {benchmark_mode}"
     echo "Original perf command: {perf_command}"
 
-    # Human images have vLLM at /workspace with benchmark scripts
+    # Download only the benchmark scripts we need (much faster than cloning entire repo)
+    echo "Downloading benchmark scripts..."
+    mkdir -p /opt/vllm_bench/benchmarks
+    cd /opt/vllm_bench/benchmarks
+
+    # Download benchmark scripts from vLLM main branch (they are stable across versions)
+    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py; do
+        if [ ! -f "$script" ]; then
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -o "$script" 2>/dev/null || \
+            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -O "$script" 2>/dev/null || true
+        fi
+    done
+
+    # Also download backend_request_func.py which is needed by benchmark_serving.py
+    if [ ! -f "backend_request_func.py" ]; then
+        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -o "backend_request_func.py" 2>/dev/null || \
+        wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -O "backend_request_func.py" 2>/dev/null || true
+    fi
+
+    echo "Benchmark scripts downloaded"
+    ls -la /opt/vllm_bench/benchmarks/
+
     PERF_CMD="{perf_command}"
 
-    # Handle vllm bench throughput -> use workspace benchmark script
+    # Handle vllm bench throughput -> use cloned benchmark script
     if echo "$PERF_CMD" | grep -q "vllm bench throughput"; then
         ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench throughput//')
-        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_throughput.py $ARGS"
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_throughput.py $ARGS"
         echo "Converted vllm bench throughput to script: $PERF_CMD"
-    # Handle vllm bench latency -> use workspace benchmark script
+    # Handle vllm bench latency -> use cloned benchmark script
     elif echo "$PERF_CMD" | grep -q "vllm bench latency"; then
         ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench latency//')
-        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_latency.py $ARGS"
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_latency.py $ARGS"
         echo "Converted vllm bench latency to script: $PERF_CMD"
-    # Handle python benchmarks/benchmark_latency.py -> use workspace script
+    # Handle python benchmarks/benchmark_latency.py -> use cloned script
     elif echo "$PERF_CMD" | grep -q "benchmark_latency"; then
         ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_latency\.py\s*||')
-        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_latency.py $ARGS"
-        echo "Using workspace benchmark_latency.py: $PERF_CMD"
-    # Handle python benchmarks/benchmark_throughput.py -> use workspace script
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_latency.py $ARGS"
+        echo "Using cloned benchmark_latency.py: $PERF_CMD"
+    # Handle python benchmarks/benchmark_throughput.py -> use cloned script
     elif echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
         ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_throughput\.py\s*||')
-        PERF_CMD="$VLLM_PYTHON /workspace/benchmarks/benchmark_throughput.py $ARGS"
-        echo "Using workspace benchmark_throughput.py: $PERF_CMD"
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Using cloned benchmark_throughput.py: $PERF_CMD"
     # Handle other python commands
     elif echo "$PERF_CMD" | grep -q "^python"; then
         PERF_CMD=$(echo "$PERF_CMD" | sed "s|^python3\\? |$VLLM_PYTHON |")
@@ -375,12 +412,11 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
 
     echo "Final command: $PERF_CMD"
 
-    # Run from workspace directory (human images have vLLM in /workspace)
-    cd /workspace 2>/dev/null || cd /tmp
+    cd /opt/vllm_bench/benchmarks
 
-    # Run the benchmark with proper PYTHONPATH
+    # Run the benchmark (use installed vLLM, not cloned repo)
     echo "=== Running HUMAN {benchmark_mode} benchmark ==="
-    PYTHONPATH=/workspace:$PYTHONPATH $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
+    $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
 
     echo "BENCHMARK_DONE"
     cat /tmp/benchmark_output.txt
@@ -394,7 +430,7 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
                 'docker', 'run', '--rm', '--gpus', 'all',
                 '-e', f'HF_TOKEN={hf_token}',
                 '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
-                '-v', '/ephemeral/huggingface:/root/.cache/huggingface',
+                '-v', '/ephemeral/huggingface_cache:/root/.cache/huggingface',
                 '--shm-size=16g',
                 '--entrypoint', 'bash',
                 docker_image,
@@ -429,6 +465,342 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
         return {
             'status': 'timeout',
             'error': f'Benchmark exceeded {timeout}s timeout',
+            'duration_s': timeout,
+            'benchmark_mode': benchmark_mode,
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e),
+            'duration_s': time.time() - start_time,
+            'benchmark_mode': benchmark_mode,
+        }
+
+
+def run_baseline_benchmark_offline(commit_info: dict, hf_token: str, timeout: int = 900, benchmark_mode: str = 'standalone') -> dict:
+    """Run standalone benchmark on baseline (parent commit) Docker image."""
+    start_time = time.time()
+
+    human_commit = commit_info['human_commit_full']
+    human_short = commit_info['human_commit_short']
+    parent_commit = commit_info.get('parent_commit', '')
+    model = commit_info.get('model', '')
+    perf_command = commit_info.get('perf_command', '')
+
+    if not parent_commit:
+        return {
+            'status': 'error',
+            'error': 'Missing parent_commit - cannot determine baseline image',
+            'duration_s': time.time() - start_time,
+        }
+
+    # Baseline image uses parent commit hash
+    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+
+    # Build the benchmark command - use /opt/vllm_baseline
+    docker_cmd = f'''
+    set -e
+    MODEL="{model}"
+    COMMIT="{parent_commit}"
+
+    # Apply aimv2 compatibility fix
+    echo "Applying aimv2 compatibility fix..."
+    for VLLM_DIR in /opt/vllm_baseline/vllm /usr/local/lib/python*/dist-packages/vllm; do
+        for ovis_file in "$VLLM_DIR/transformers_utils/configs/ovis.py" "$VLLM_DIR/transformers_utils/configs/ovis2.py"; do
+            if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+                if ! grep -q 'exist_ok=True' "$ovis_file" 2>/dev/null; then
+                    sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+                    echo "Patched aimv2 registration in $ovis_file"
+                fi
+            fi
+        done
+    done
+
+    # Install transformers if missing
+    pip install transformers -q 2>/dev/null || true
+
+    # Set PYTHONPATH to use baseline vLLM
+    export PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH
+
+    # Find Python with vLLM
+    VLLM_PYTHON=""
+    for py in /opt/venv/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
+        if [ -x "$(which $py 2>/dev/null || echo '')" ] || [ -x "$py" ]; then
+            if PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $py -c "import vllm" 2>/dev/null; then
+                VLLM_PYTHON="$py"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$VLLM_PYTHON" ]; then
+        echo "ERROR: Could not find Python with vLLM"
+        exit 1
+    fi
+
+    echo "Using Python: $VLLM_PYTHON"
+    echo "Running BASELINE benchmark mode: {benchmark_mode}"
+    echo "Original perf command: {perf_command}"
+
+    PERF_CMD="{perf_command}"
+
+    # Use baseline vLLM's benchmark scripts from /opt/vllm_baseline/benchmarks/
+    if echo "$PERF_CMD" | grep -q "vllm bench throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench throughput//')
+        PERF_CMD="PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Converted to baseline throughput: $PERF_CMD"
+    elif echo "$PERF_CMD" | grep -q "vllm bench latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed 's/vllm bench latency//')
+        PERF_CMD="PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_latency.py $ARGS"
+        echo "Converted to baseline latency: $PERF_CMD"
+    elif echo "$PERF_CMD" | grep -q "benchmark_serving"; then
+        # Serving benchmark - need to start a server first
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_serving\\.py\\s*||')
+        MODEL=$(echo "$ARGS" | grep -oP '(?<=--model\\s)\\S+')
+        echo "Running SERVING benchmark - starting vLLM server first..."
+        echo "Model: $MODEL"
+
+        # Download newer benchmark scripts that support synthetic data generation
+        echo "Downloading v0.6.0 benchmark scripts..."
+        mkdir -p /opt/vllm_bench/benchmarks
+        cd /opt/vllm_bench/benchmarks
+        for script in benchmark_serving.py backend_request_func.py; do
+            if [ ! -f "$script" ]; then
+                curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -o "$script" 2>/dev/null || \\
+                wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -O "$script" 2>/dev/null || true
+            fi
+        done
+        echo "Benchmark scripts downloaded"
+
+        # Create sonnet.txt dataset if missing
+        if [ ! -f /opt/vllm_bench/benchmarks/sonnet.txt ]; then
+            echo "Creating sonnet dataset file..."
+            $VLLM_PYTHON -c "
+lines = ['Shall I compare thee to a summers day? ' * 10] * 500
+with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
+    f.write('\\n'.join(lines))
+"
+            echo "Sonnet dataset created"
+        fi
+
+        # Convert to sonnet dataset and add dataset path
+        ARGS=$(echo "$ARGS" | sed 's/--dataset-name sharegpt/--dataset-name sonnet/')
+        ARGS=$(echo "$ARGS" | sed 's/--dataset-name random/--dataset-name sonnet/')
+        ARGS=$(echo "$ARGS" | sed 's/--dataset [^ ]*//')
+        ARGS=$(echo "$ARGS" | sed 's/--dataset-path [^ ]*//')
+        if ! echo "$ARGS" | grep -q -- "--dataset-name"; then
+            ARGS="$ARGS --dataset-name sonnet"
+        fi
+        if ! echo "$ARGS" | grep -q -- "--sonnet-input-len"; then
+            ARGS="$ARGS --sonnet-input-len 256 --sonnet-output-len 64"
+        fi
+        # Add explicit dataset path for sonnet.txt
+        ARGS="$ARGS --dataset-path /opt/vllm_bench/benchmarks/sonnet.txt"
+        echo "Modified ARGS for sonnet dataset: $ARGS"
+
+        # Filter out server-specific arguments that benchmark_serving.py doesn't accept
+        echo "Filtering server-only arguments from benchmark args..."
+        FILTERED_ARGS=""
+        SKIP_NEXT=0
+        for arg in $ARGS; do
+            if [ $SKIP_NEXT -eq 1 ]; then
+                SKIP_NEXT=0
+                continue
+            fi
+            case "$arg" in
+                --dtype|--guided-decoding-backend|--tensor-parallel-size|--enforce-eager|--gpu-memory-utilization|--max-model-len|--max-concurrency)
+                    SKIP_NEXT=1
+                    echo "Filtering server-only arg: $arg"
+                    ;;
+                *)
+                    FILTERED_ARGS="$FILTERED_ARGS $arg"
+                    ;;
+            esac
+        done
+        ARGS="$FILTERED_ARGS"
+        echo "Filtered ARGS: $ARGS"
+
+        # Fix transformers compatibility for older baseline vLLM (conditional like human benchmark)
+        # Check both LogitsWarper AND transformers.utils (both can cause import failures)
+        if ! $VLLM_PYTHON -c "from transformers.generation.logits_process import LogitsWarper; from transformers.utils import versions" 2>/dev/null; then
+            # Check if this vLLM version uses mllama (check for mllama.py in vllm)
+            VLLM_USES_MLLAMA=$(find /opt/vllm_baseline -name "*mllama*" 2>/dev/null | head -1)
+            if [ -z "$VLLM_USES_MLLAMA" ]; then
+                echo "Fixing transformers compatibility (LogitsWarper or transformers.utils missing, mllama not needed)..."
+                # Force uninstall first to handle corrupted installations, then reinstall
+                $VLLM_PYTHON -m pip uninstall transformers -y --quiet 2>&1 || true
+                # Clean up any corrupted package remnants
+                rm -rf /usr/local/lib/python*/dist-packages/transformers* 2>/dev/null || true
+                rm -rf /usr/local/lib/python*/dist-packages/*ransformers* 2>/dev/null || true
+                # Fresh install
+                $VLLM_PYTHON -m pip install 'transformers==4.44.2' --quiet 2>&1 || echo "Warning: transformers install may have failed"
+            else
+                echo "Skipping transformers downgrade - vLLM uses mllama which needs transformers>=4.45"
+            fi
+        fi
+        echo "Installing numpy<2..."
+        $VLLM_PYTHON -m pip install 'numpy<2' --quiet 2>&1 || true
+        # Fix outlines dependencies that may be missing
+        echo "Installing pyairports pycountry..."
+        $VLLM_PYTHON -m pip install pyairports pycountry 2>&1
+        echo "Done installing dependencies"
+
+        # Start vLLM server in background (use baseline vLLM)
+        PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \\
+            --model "$MODEL" \\
+            --port 8000 \\
+            --disable-log-requests \\
+            > /tmp/server.log 2>&1 &
+        SERVER_PID=$!
+        echo "Started vLLM server with PID $SERVER_PID"
+
+        # Wait for server to be ready
+        MAX_WAIT=300
+        WAITED=0
+        while [ $WAITED -lt $MAX_WAIT ]; do
+            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+                echo "Server is ready after $WAITED seconds"
+                break
+            fi
+            sleep 5
+            WAITED=$((WAITED + 5))
+            echo "Waiting for server... ($WAITED/$MAX_WAIT)"
+        done
+
+        if [ $WAITED -ge $MAX_WAIT ]; then
+            echo "ERROR: Server failed to start within $MAX_WAIT seconds"
+            cat /tmp/server.log
+            kill $SERVER_PID 2>/dev/null || true
+            echo "SERVER_START_FAILED"
+            exit 1
+        fi
+
+        # Run benchmark using downloaded v0.6.0 script (supports synthetic data)
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_serving.py $ARGS --base-url http://localhost:8000"
+        echo "Running serving benchmark: $PERF_CMD"
+        eval $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
+
+        # Stop the server
+        echo "Stopping vLLM server..."
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+
+        echo "BENCHMARK_DONE"
+        cat /tmp/benchmark_output.txt
+        exit 0
+    elif echo "$PERF_CMD" | grep -q "benchmark_latency"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_latency\\.py\\s*||')
+
+        # Filter out speculative decoding args (human's optimization, not baseline)
+        echo "Filtering speculative decoding args from latency benchmark..."
+        FILTERED_ARGS=""
+        SKIP_NEXT=0
+        for arg in $ARGS; do
+            if [ $SKIP_NEXT -eq 1 ]; then
+                SKIP_NEXT=0
+                continue
+            fi
+            case "$arg" in
+                --speculative-model|--num-speculative-tokens|--speculative-draft-token-sampling-method|--ngram-prompt-lookup-max|--spec-decoding-acceptance-method)
+                    SKIP_NEXT=1
+                    echo "Filtering speculative arg: $arg"
+                    ;;
+                *)
+                    FILTERED_ARGS="$FILTERED_ARGS $arg"
+                    ;;
+            esac
+        done
+        ARGS="$FILTERED_ARGS"
+        echo "Filtered latency ARGS: $ARGS"
+
+        PERF_CMD="PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_latency.py $ARGS"
+        echo "Using baseline benchmark_latency.py: $PERF_CMD"
+    elif echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_throughput\\.py\\s*||')
+        PERF_CMD="PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_throughput.py $ARGS"
+        echo "Using baseline benchmark_throughput.py: $PERF_CMD"
+    elif echo "$PERF_CMD" | grep -q "^python"; then
+        PERF_CMD=$(echo "$PERF_CMD" | sed "s|^python3\\? |PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON |")
+        echo "Using Python command: $PERF_CMD"
+    fi
+
+    echo "Final command: $PERF_CMD"
+
+    # Run the benchmark (for non-serving benchmarks)
+    echo "=== Running BASELINE {benchmark_mode} benchmark ==="
+    eval $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
+
+    echo "BENCHMARK_DONE"
+    cat /tmp/benchmark_output.txt
+    '''
+
+    print(f"  Running baseline {benchmark_mode} benchmark with image: {baseline_image}")
+
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm', '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-e', 'VLLM_USE_V1=0',
+                '-v', '/ephemeral/huggingface_cache:/root/.cache/huggingface',
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                baseline_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        # Parse metrics from output
+        metrics = {}
+        benchmark_type = get_benchmark_type(perf_command)
+
+        if benchmark_type == 'latency':
+            latency_match = re.search(r'Avg latency:\s*([\d.]+)\s*seconds', output)
+            if latency_match:
+                metrics['latency_avg_ms'] = float(latency_match.group(1)) * 1000
+        else:
+            throughput_match = re.search(r'Output token throughput \(tok/s\):\s*([\d.]+)', output) or \
+                              re.search(r'Throughput:\s*([\d.]+)\s*requests/s', output) or \
+                              re.search(r'throughput[:\s]*([\d.]+)', output, re.IGNORECASE)
+            if throughput_match:
+                metrics['output_token_throughput_tok_s'] = float(throughput_match.group(1))
+
+            ttft_match = re.search(r'Mean TTFT \(ms\):\s*([\d.]+)', output)
+            tpot_match = re.search(r'Mean TPOT \(ms\):\s*([\d.]+)', output)
+            itl_match = re.search(r'Mean ITL \(ms\):\s*([\d.]+)', output)
+            if ttft_match:
+                metrics['ttft_mean_ms'] = float(ttft_match.group(1))
+            if tpot_match:
+                metrics['tpot_mean_ms'] = float(tpot_match.group(1))
+            if itl_match:
+                metrics['itl_mean_ms'] = float(itl_match.group(1))
+
+        if metrics:
+            return {
+                'status': 'success',
+                'metrics': metrics,
+                'duration_s': duration,
+                'raw_output': output[-5000:],
+                'benchmark_mode': benchmark_mode,
+            }
+        else:
+            return {
+                'status': 'error',
+                'error': f'No {benchmark_type} metrics in output',
+                'duration_s': duration,
+                'raw_output': output[-5000:],
+                'benchmark_mode': benchmark_mode,
+            }
+
+    except subprocess.TimeoutExpired:
+        return {
+            'status': 'error',
+            'error': f'Timeout after {timeout}s',
             'duration_s': timeout,
             'benchmark_mode': benchmark_mode,
         }
@@ -491,9 +863,22 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     COMMIT="{human_commit}"
     MODEL="{model}"
 
-    # CRITICAL: Set PYTHONPATH to include /workspace where vLLM is often installed
-    # in human Docker images (vLLM source is at /workspace/vllm/)
-    export PYTHONPATH=/workspace:$PYTHONPATH
+    # FIRST: Apply aimv2 compatibility fix BEFORE trying to import vllm
+    # (import crashes due to aimv2 config conflict)
+    echo "Applying aimv2 compatibility fix (pre-import)..."
+    for VLLM_DIR in /usr/local/lib/python*/dist-packages/vllm /opt/venv/lib/python*/site-packages/vllm /usr/lib/python*/site-packages/vllm; do
+        for ovis_file in "$VLLM_DIR/transformers_utils/configs/ovis.py" "$VLLM_DIR/transformers_utils/configs/ovis2.py"; do
+            if [ -f "$ovis_file" ] && grep -q 'AutoConfig.register("aimv2"' "$ovis_file" 2>/dev/null; then
+                if ! grep -q 'exist_ok=True' "$ovis_file" 2>/dev/null; then
+                    sed -i 's/AutoConfig.register("aimv2", AIMv2Config)/AutoConfig.register("aimv2", AIMv2Config, exist_ok=True)/' "$ovis_file"
+                    echo "Patched aimv2 registration in $ovis_file"
+                fi
+            fi
+        done
+    done
+
+    # Install transformers if missing (some images lack it)
+    pip install transformers -q 2>/dev/null || true
 
     # Install uv for faster package management
     pip install uv -q 2>/dev/null || true
@@ -641,13 +1026,38 @@ PATCH
     # Install benchmark deps using the same Python
     $VLLM_PYTHON -m pip install aiohttp pandas datasets -q 2>/dev/null || true
 
-    # Install git if not available
-    if ! command -v git &> /dev/null; then
-        echo "Installing git..."
-        apt-get update -qq && apt-get install -y -qq git 2>/dev/null || yum install -y git -q 2>/dev/null || true
+    # Download only the benchmark scripts we need (much faster than cloning entire repo)
+    echo "Downloading benchmark scripts..."
+    mkdir -p /opt/vllm_bench/benchmarks
+    cd /opt/vllm_bench/benchmarks
+
+    # Download benchmark scripts from vLLM main branch (they are stable across versions)
+    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py; do
+        if [ ! -f "$script" ]; then
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -o "$script" 2>/dev/null || \
+            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -O "$script" 2>/dev/null || true
+        fi
+    done
+
+    # Also download backend_request_func.py which is needed by benchmark_serving.py
+    if [ ! -f "backend_request_func.py" ]; then
+        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -o "backend_request_func.py" 2>/dev/null || \
+        wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -O "backend_request_func.py" 2>/dev/null || true
     fi
 
-    # No need to clone vLLM - we use /workspace/benchmarks/ which has the full scripts
+    echo "Benchmark scripts downloaded"
+    ls -la /opt/vllm_bench/benchmarks/
+
+    # Create sonnet.txt dataset if missing
+    if [ ! -f /opt/vllm_bench/benchmarks/sonnet.txt ]; then
+        echo "Creating sonnet dataset..."
+        $VLLM_PYTHON -c "
+import random
+lines = ['Shall I compare thee to a summers day? ' * 10] * 500
+with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
+    f.write('\\n'.join(lines))
+"
+    fi
 
     # Start server using the Python that has vLLM
     echo "=== Starting vLLM server for HUMAN benchmark ==="
@@ -676,17 +1086,16 @@ PATCH
 
     echo "=== Running HUMAN benchmark ==="
 
-    # Use workspace vLLM's benchmark_serving.py for proper TTFT/TPOT/ITL metrics
-    # (Human images have vLLM in /workspace with full benchmark scripts)
-    cd /workspace
+    # Use cloned vLLM's benchmark_serving.py for proper TTFT/TPOT/ITL metrics
+    cd /opt/vllm_bench/benchmarks
 
     echo "Running benchmark_serving.py for serving metrics..."
-    PYTHONPATH=/workspace:$PYTHONPATH $VLLM_PYTHON /workspace/benchmarks/benchmark_serving.py \
+    $VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_serving.py \
         --model $MODEL \
         --backend vllm \
         --port 8000 \
         --dataset-name sonnet \
-        --dataset-path /workspace/benchmarks/sonnet.txt \
+        --dataset-path /opt/vllm_bench/benchmarks/sonnet.txt \
         --sonnet-input-len 256 \
         --sonnet-output-len 64 \
         --num-prompts 100 \
@@ -1345,6 +1754,8 @@ def main():
                         help='Specific commits to run (short hash)')
     parser.add_argument('--human-only', action='store_true',
                         help='Only run human benchmarks')
+    parser.add_argument('--baseline-only', action='store_true',
+                        help='Only run baseline benchmarks')
     parser.add_argument('--agent-only', action='store_true',
                         help='Only run agent benchmarks')
     parser.add_argument('--dry-run', action='store_true',
@@ -1426,7 +1837,7 @@ def main():
         print(f"  Model: {info.get('model', 'N/A')}")
 
         # Run human benchmark
-        if not args.agent_only:
+        if not args.agent_only and not args.baseline_only:
             human_result_file = AGENT_OUTPUT_DIR / f"{commit}_human_result.json"
             if human_result_file.exists():
                 print(f"  SKIP: Human result already exists")
@@ -1442,8 +1853,55 @@ def main():
                 else:
                     print(f"  HUMAN FAILED: {human_result.get('error', 'Unknown error')}")
 
+        # Run baseline benchmark
+        if args.baseline_only or (not args.human_only and not args.agent_only):
+            baseline_result_file = AGENT_OUTPUT_DIR / f"{commit}_baseline_result.json"
+            if baseline_result_file.exists():
+                print(f"  SKIP: Baseline result already exists")
+            else:
+                print(f"\n  --- Running BASELINE benchmark ---")
+                benchmark_mode = info.get('benchmark_mode', 'standalone')
+                if benchmark_mode == 'serving':
+                    # For now, use offline for baseline (serving mode can be added later)
+                    baseline_result = run_baseline_benchmark_offline(info, hf_token, args.timeout, 'standalone')
+                else:
+                    baseline_result = run_baseline_benchmark_offline(info, hf_token, args.timeout, benchmark_mode or 'standalone')
+
+                # Save baseline result
+                baseline_data = {
+                    'human_commit': commit,
+                    'human_commit_full': info.get('human_commit_full', ''),
+                    'parent_commit': info.get('parent_commit', ''),
+                    'model': info.get('model', ''),
+                    'status': baseline_result['status'],
+                    'error': baseline_result.get('error'),
+                    'duration_s': baseline_result.get('duration_s', 0),
+                    'metrics': baseline_result.get('metrics', {}),
+                    'raw_output': baseline_result.get('raw_output', ''),
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                }
+                AGENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                with open(baseline_result_file, 'w') as f:
+                    json.dump(baseline_data, f, indent=2)
+                print(f"  Saved to {baseline_result_file}")
+
+                results.setdefault('baseline', []).append((commit, baseline_result))
+
+                if baseline_result['status'] == 'success':
+                    metrics = baseline_result['metrics']
+                    throughput = metrics.get('output_token_throughput_tok_s')
+                    latency = metrics.get('latency_avg_ms')
+                    if throughput:
+                        print(f"  BASELINE SUCCESS: {throughput} tok/s")
+                    elif latency:
+                        print(f"  BASELINE SUCCESS: {latency} ms latency")
+                    else:
+                        print(f"  BASELINE SUCCESS: {metrics}")
+                else:
+                    print(f"  BASELINE FAILED: {baseline_result.get('error', 'Unknown error')}")
+
         # Run agent benchmark
-        if not args.human_only:
+        if not args.human_only and not args.baseline_only:
             agent_result_file = AGENT_OUTPUT_DIR / f"{commit}_agent_result.json"
             if agent_result_file.exists():
                 print(f"  SKIP: Agent result already exists")
@@ -1466,11 +1924,13 @@ def main():
     print("SUMMARY")
     print('='*70)
 
-    human_success = sum(1 for _, r in results['human'] if r['status'] == 'success')
-    agent_success = sum(1 for _, r in results['agent'] if r['status'] == 'success')
+    human_success = sum(1 for _, r in results.get('human', []) if r['status'] == 'success')
+    baseline_success = sum(1 for _, r in results.get('baseline', []) if r['status'] == 'success')
+    agent_success = sum(1 for _, r in results.get('agent', []) if r['status'] == 'success')
 
-    print(f"Human benchmarks: {human_success}/{len(results['human'])} succeeded")
-    print(f"Agent benchmarks: {agent_success}/{len(results['agent'])} succeeded")
+    print(f"Human benchmarks: {human_success}/{len(results.get('human', []))} succeeded")
+    print(f"Baseline benchmarks: {baseline_success}/{len(results.get('baseline', []))} succeeded")
+    print(f"Agent benchmarks: {agent_success}/{len(results.get('agent', []))} succeeded")
 
 
 if __name__ == '__main__':
