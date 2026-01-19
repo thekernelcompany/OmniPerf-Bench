@@ -1,0 +1,48 @@
+# Dockerfile for SGLang v0.3.2 (c98e84c2)
+# Commit date: 2024-10-06
+# Original deps: vllm==0.5.5
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip python3-dev git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install torch 2.4.0 (compatible with vllm 0.5.5)
+RUN pip3 install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# Install vllm 0.5.5
+RUN pip3 install --no-cache-dir vllm==0.5.5
+
+# Install flashinfer for torch 2.4
+RUN pip3 install --no-cache-dir flashinfer==0.1.6 -i https://flashinfer.ai/whl/cu121/torch2.4/
+
+# Clone and checkout EXACT commit
+RUN git clone https://github.com/sgl-project/sglang.git /sglang
+WORKDIR /sglang
+RUN git checkout c98e84c2
+
+# PATCH: Fix duplicated model implementation assertion
+# The assertion fails because both SGLang and vllm define LlamaForCausalLM
+# Change: Allow duplicate, let SGLang's implementation override vllm's
+RUN sed -i 's/assert (/if not (/g; s/), f"Duplicated model implementation/: logger.debug(f"Overriding model implementation/g' \
+    python/sglang/srt/model_executor/model_runner.py
+
+# Verify patch was applied
+RUN grep -q "Overriding model" python/sglang/srt/model_executor/model_runner.py || (echo "Patch failed" && exit 1)
+
+# Install runtime dependencies
+RUN pip3 install --no-cache-dir aiohttp decord fastapi hf_transfer huggingface_hub interegular \
+    packaging pillow psutil pydantic python-multipart uvicorn uvloop pyzmq "outlines>=0.0.44"
+
+# Set PYTHONPATH and install sglang
+ENV PYTHONPATH="/sglang/python:${PYTHONPATH}"
+WORKDIR /sglang/python
+RUN pip3 install --no-cache-dir .
+
+# Verify installation
+RUN python3 -c "import sglang; print(f'SGLang {sglang.__version__}')"
+
+WORKDIR /sglang
