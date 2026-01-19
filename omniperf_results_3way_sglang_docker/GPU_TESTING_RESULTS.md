@@ -176,36 +176,216 @@ Old SGLang versions use `outlines.fsm.guide` which no longer exists.
 
 ---
 
-## Test Commands Reference
+## Test Commands Reference (For Build Instance)
 
-### Full Import Test
+**CRITICAL: Import tests are NOT sufficient. You MUST run server startup test.**
+
+### Quick Validation Script (Copy-Paste Ready)
+
 ```bash
-docker run --rm --gpus all shikhar481/sglang-images:<COMMIT> python3 -c "
-import sgl_kernel
-import uvloop
-import flashinfer
-import sglang
-from sglang.srt.server_args import ServerArgs
-print('ALL OK')
+#!/bin/bash
+# Usage: ./test_image.sh <image_tag>
+# Example: ./test_image.sh 9216b106-v2
+
+TAG="${1:-latest}"
+IMAGE="shikhar481/sglang-images:$TAG"
+
+echo "============================================"
+echo "Testing: $IMAGE"
+echo "============================================"
+
+# Step 1: Import Test
+echo ""
+echo "[1/3] Import Test..."
+docker run --rm --gpus all $IMAGE python3 -c "
+import sys
+print(f'Python: {sys.version.split()[0]}')
+try:
+    import sglang
+    print(f'sglang: {sglang.__version__}')
+except Exception as e:
+    print(f'sglang: FAIL - {e}')
+    sys.exit(1)
+
+try:
+    import vllm
+    print(f'vllm: {vllm.__version__}')
+except Exception as e:
+    print(f'vllm: FAIL - {e}')
+
+try:
+    import uvloop
+    print('uvloop: OK')
+except Exception as e:
+    print(f'uvloop: FAIL - {e}')
+
+try:
+    import flashinfer
+    print(f'flashinfer: {flashinfer.__version__}')
+except:
+    print('flashinfer: N/A (v0.1.x)')
+
+try:
+    import sgl_kernel
+    print('sgl_kernel: OK')
+except:
+    print('sgl_kernel: N/A (v0.1.x/v0.2.x)')
+
+print('Import test: PASS')
+"
+IMPORT_RESULT=$?
+
+if [ $IMPORT_RESULT -ne 0 ]; then
+    echo "[FAIL] Import test failed"
+    exit 1
+fi
+
+# Step 2: Server Startup Test (THE CRITICAL ONE)
+echo ""
+echo "[2/3] Server Startup Test (this is the real test)..."
+docker run --rm --gpus all $IMAGE timeout 60 python3 -c "
+# This simulates what launch_server does without actually starting the server
+import sys
+try:
+    from sglang.srt.server import launch_server
+    print('Server module import: PASS')
+except Exception as e:
+    print(f'Server module import: FAIL')
+    print(f'Error: {e}')
+    sys.exit(1)
+"
+SERVER_RESULT=$?
+
+if [ $SERVER_RESULT -ne 0 ]; then
+    echo ""
+    echo "[FAIL] Server startup test failed"
+    echo ""
+    echo "Common fixes:"
+    echo "  - 'outlines.fsm' error: pip install 'outlines==0.0.34'"
+    echo "  - '_grouped_size_compiled_for_decode_kernels' error: need older flashinfer"
+    echo "  - 'orjson' error: pip install orjson"
+    exit 1
+fi
+
+# Step 3: Full Server Launch Test (Optional but recommended)
+echo ""
+echo "[3/3] Full Server Launch Test..."
+CONTAINER_ID=$(docker run -d --rm --gpus all -p 30000:30000 $IMAGE \
+    python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --port 30000 --host 0.0.0.0)
+
+echo "Container: $CONTAINER_ID"
+echo "Waiting 45s for server to start..."
+sleep 45
+
+# Check if container is still running
+if docker ps -q --filter "id=$CONTAINER_ID" | grep -q .; then
+    # Try health check
+    if curl -s http://localhost:30000/health 2>/dev/null | grep -q "ok\|healthy"; then
+        echo "Health check: PASS"
+        echo ""
+        echo "============================================"
+        echo "[SUCCESS] $TAG is FULLY FUNCTIONAL"
+        echo "============================================"
+    else
+        echo "Health check: No response (may still be loading model)"
+        echo "Check logs: docker logs $CONTAINER_ID"
+    fi
+else
+    echo "Container exited. Logs:"
+    docker logs $CONTAINER_ID 2>&1 | tail -20
+    echo ""
+    echo "[FAIL] Server crashed during startup"
+fi
+
+# Cleanup
+docker kill $CONTAINER_ID 2>/dev/null
+
+echo ""
+echo "Done testing $TAG"
+```
+
+### Manual Test Commands
+
+**Step 1: Import Test (necessary but NOT sufficient)**
+```bash
+docker run --rm --gpus all shikhar481/sglang-images:<TAG> python3 -c "
+import sglang; print(f'sglang: {sglang.__version__}')
+import vllm; print(f'vllm: {vllm.__version__}')
+import uvloop; print('uvloop: OK')
+try:
+    import flashinfer; print(f'flashinfer: {flashinfer.__version__}')
+except: print('flashinfer: N/A')
+from sglang.srt.server_args import ServerArgs; print('ServerArgs: OK')
 "
 ```
 
-### Server Startup Test
+**Step 2: Server Module Test (THE CRITICAL TEST)**
 ```bash
-docker run -d --rm --gpus all -p 30000:30000 \
-    shikhar481/sglang-images:<COMMIT> \
+docker run --rm --gpus all shikhar481/sglang-images:<TAG> python3 -c "
+from sglang.srt.server import launch_server
+print('Server module: OK')
+"
+```
+
+If this fails, check the error:
+- `No module named 'outlines.fsm'` → Fix: `pip install 'outlines==0.0.34'`
+- `cannot import name '_grouped_size_compiled_for_decode_kernels'` → Fix: Need older flashinfer
+- `No module named 'orjson'` → Fix: `pip install orjson`
+
+**Step 3: Full Server Startup Test**
+```bash
+# Start server in background
+docker run -d --rm --gpus all -p 30000:30000 --name test_server \
+    shikhar481/sglang-images:<TAG> \
     python3 -m sglang.launch_server \
     --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --port 30000 --host 0.0.0.0
+
+# Wait and check logs
+sleep 45
+docker logs test_server 2>&1 | tail -30
+
+# Check if healthy
+curl http://localhost:30000/health
+
+# Cleanup
+docker kill test_server
 ```
 
-### Benchmark Test
+### Error Reference & Fixes
+
+| Error | Affected Versions | Fix |
+|-------|-------------------|-----|
+| `No module named 'outlines.fsm'` | v0.1.x | `pip install 'outlines==0.0.34'` |
+| `cannot import name '_grouped_size_compiled_for_decode_kernels'` | v0.2.x, v0.3.x | Need flashinfer 0.0.x or 0.1.x (not 0.2.x) |
+| `No module named 'orjson'` | v0.3.6+ | `pip install orjson` |
+| `cannot import name '_set_default_torch_dtype'` | v0.1.x | Need vllm 0.2.x or 0.3.x (not 0.4.x+) |
+| `sgl_kernel ABI mismatch` | v0.4.x | Build sgl_kernel from source with GPU |
+| `No module named 'sgl_kernel'` | v0.2.x | Install sgl_kernel |
+| `huggingface-hub version` | v0.3.x | `pip install 'huggingface-hub<1.0'` |
+
+### Batch Test All Images
+
 ```bash
-docker run --rm --network host shikhar481/sglang-images:<COMMIT> \
-    python3 -m sglang.bench_serving \
-    --backend sglang \
-    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --num-prompts 50 --request-rate 4
+#!/bin/bash
+# Test multiple images
+IMAGES=(
+    "9216b106-v2"
+    "2a754e57-v2"
+    "62757db6-v2"
+    "ab4a83b2-v2"
+    "10189d08-v2"
+)
+
+for tag in "${IMAGES[@]}"; do
+    echo "Testing $tag..."
+    docker run --rm --gpus all shikhar481/sglang-images:$tag python3 -c "
+from sglang.srt.server import launch_server
+print('$tag: PASS')
+" 2>&1 | grep -E "(PASS|Error|error|FAIL|cannot import|No module)"
+done
 ```
 
 ---
