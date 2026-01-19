@@ -10,17 +10,19 @@
 
 ## Executive Summary
 
-**Total Testing: 44 image tests across 3 phases. Only 3 images are functional.**
+**Total: 5 working images out of 26 unique commits tested.**
 
-| Phase | Images | Import Test | Server Test | Working |
-|-------|--------|-------------|-------------|---------|
-| Phase 1 (Original) | 8 | 3 pass | 3 pass | **3** |
-| Phase 2 (First Rebuild) | 18 | 0 pass | N/A | **0** |
-| Phase 3 (v2 Rebuild) | 18 | 18 pass | 0 pass | **0** |
+| Phase | Test Type | Result |
+|-------|-----------|--------|
+| Phase 1-3 | Various | 3 original images work |
+| Phase 4 | Server module import (no GPU) | 11 pass |
+| Phase 5 | **Actual server startup (GPU)** | **2 pass** |
 
-**Critical Finding:** Import tests are NOT sufficient. The v2 images pass all import tests but fail at server startup.
+**CRITICAL: Only actual server startup tests are reliable.**
 
-**Only 3 working images:** `021f76e4`, `777688b8`, `c087ddd6` (all recent SGLang versions)
+**Working Images (5 total):**
+- Original: `021f76e4`, `777688b8`, `c087ddd6`
+- v3: `9c745d07-v3` (v0.3.5.post2), `10189d08-v3` (v0.3.6)
 
 ---
 
@@ -718,6 +720,87 @@ v0.1.x images are **unfixable** without source code modifications:
 
 ---
 
-*Updated: 2026-01-19 18:00 UTC*
-*Build Machine: OmniPerf-Bench*
-*Server module import test: No GPU required*
+## Phase 5: GPU Server Startup Validation (2026-01-19)
+
+**CRITICAL FINDING: Server module import tests are STILL NOT SUFFICIENT.**
+
+Phase 4 (build machine) reported 11 working images based on `from sglang.srt.server import launch_server`.
+Phase 5 (GPU machine) tested actual server startup with TinyLlama - **only 2 images work**.
+
+### Test Command Used
+
+```bash
+docker run -d --gpus all -p 30000:30000 shikhar481/sglang-images:<TAG> \
+    python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --port 30000 --host 0.0.0.0
+
+# Wait 60s, then verify
+curl http://localhost:30000/get_model_info
+```
+
+### v3 Images - Actual Server Startup Results
+
+| Tag | Version | Server Module Import | **Actual Server Startup** | Error |
+|-----|---------|---------------------|--------------------------|-------|
+| `62757db6-v3` | v0.2.11 | ✅ PASS | ❌ **FAIL** | `RuntimeError: There is no current event loop in thread 'MainThread'` |
+| `ab4a83b2-v3` | v0.3.0 | ✅ PASS | ❌ **FAIL** | `ImportError: cannot import name 'set_weight_attrs'` |
+| `2854a5ea-v3` | v0.3.1.post3 | ✅ PASS | ❌ **FAIL** | (assumed same pattern) |
+| `9c064bf7-v3` | v0.3.2 | ✅ PASS | ❌ **FAIL** | `AssertionError: Duplicated model implementation for LlamaForCausalLM` |
+| `c98e84c2-v3` | v0.3.2 | ✅ PASS | ❌ **FAIL** | `AssertionError: Duplicated model implementation for LlamaForCausalLM` |
+| `e5db40dc-v3` | v0.3.3.post1 | ✅ PASS | ❌ **FAIL** | (assumed same pattern) |
+| `b1709305-v3` | v0.3.3.post1 | ✅ PASS | ❌ **FAIL** | (assumed same pattern) |
+| `b77a02cd-v3` | v0.3.4.post2 | ✅ PASS | ❌ **FAIL** | (assumed same pattern) |
+| `8f8f96a6-v3` | v0.3.4.post1 | ✅ PASS | ❌ **FAIL** | `AssertionError: Duplicated model implementation for LlamaForCausalLM` |
+| `9c745d07-v3` | v0.3.5.post2 | ✅ PASS | ✅ **WORKING** | Server starts, health check passes |
+| `10189d08-v3` | v0.3.6 | ✅ PASS | ✅ **WORKING** | Server starts, inference works |
+
+### New Errors Discovered
+
+**1. Event Loop Error (v0.2.x)**
+```
+RuntimeError: There is no current event loop in thread 'MainThread'.
+```
+Caused by uvloop incompatibility with SGLang 0.2.x multiprocessing.
+
+**2. Missing set_weight_attrs (v0.3.0)**
+```
+ImportError: cannot import name 'set_weight_attrs' from 'sglang.srt.utils'
+```
+SGLang/vllm version mismatch.
+
+**3. Duplicated Model Implementation (v0.3.2 - v0.3.4)**
+```
+AssertionError: Duplicated model implementation for LlamaForCausalLM
+```
+SGLang model registry conflicts with vllm model registry.
+
+### Conclusion
+
+**Only 2 v3 images actually work:**
+- `9c745d07-v3` (v0.3.5.post2)
+- `10189d08-v3` (v0.3.6)
+
+**The correct test is actual server startup, NOT server module import.**
+
+---
+
+## Final Summary (All Phases)
+
+| Phase | Images | Module Import | **Actual Server** | Notes |
+|-------|--------|---------------|-------------------|-------|
+| Phase 1 (Original) | 8 | 3 | **3** | GPU tested |
+| Phase 2 (First Rebuild) | 18 | 0 | 0 | Broken |
+| Phase 3 (v2 Rebuild) | 18 | 18 | 0 | All fail at server |
+| Phase 4 (v3 Build Machine) | 18 | 11 | - | No GPU |
+| Phase 5 (v3 GPU Validation) | 11 | 11 | **2** | Only v0.3.5+ work |
+
+**TOTAL WORKING IMAGES: 5**
+- Original: `021f76e4`, `777688b8`, `c087ddd6`
+- v3: `9c745d07-v3` (v0.3.5.post2), `10189d08-v3` (v0.3.6)
+
+---
+
+*Updated: 2026-01-19 18:45 UTC*
+*GPU Machine: L40S instance*
+*Test: Actual server startup with TinyLlama-1.1B*
