@@ -372,6 +372,12 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     # Install transformers if missing (some images lack it)
     pip install transformers -q 2>/dev/null || true
 
+    # Fix lm-format-enforcer compatibility with newer transformers (LogitsWarper removed)
+    if ! python3 -c "import vllm" 2>/dev/null; then
+        echo "vLLM import failed - trying lm-format-enforcer upgrade..."
+        pip install --upgrade lm-format-enforcer 2>/dev/null || true
+    fi
+
     # Now find Python with vLLM
     VLLM_PYTHON=""
     for py in /opt/venv/bin/python3 /usr/local/bin/python3 /usr/bin/python3 python3; do
@@ -918,9 +924,9 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     # Check if vLLM imports work first, only apply fixes if needed
     echo "Checking vLLM compatibility..."
 
-    # First try importing vLLM without any changes
-    if python3 -c "import vllm" 2>/dev/null; then
-        echo "vLLM imports OK - no compatibility fixes needed"
+    # First try importing vLLM api_server (not just vllm - api_server imports lm-format-enforcer)
+    if python3 -c "from vllm.entrypoints.openai import api_server" 2>/dev/null; then
+        echo "vLLM api_server imports OK - no compatibility fixes needed"
     else
         echo "vLLM import failed - applying compatibility fixes..."
 
@@ -942,8 +948,17 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
                 pip install 'transformers==4.44.2' -q 2>/dev/null || true
             else
                 echo "Skipping transformers downgrade - vLLM uses mllama which needs transformers>=4.45"
+                # Instead, upgrade lm-format-enforcer to work with newer transformers
+                echo "Upgrading lm-format-enforcer for newer transformers compatibility..."
+                pip install --upgrade lm-format-enforcer 2>/dev/null || true
             fi
         fi
+    fi
+
+    # Final fix: if vLLM api_server still fails to import due to lm-format-enforcer, upgrade it
+    if ! python3 -c "from vllm.entrypoints.openai import api_server" 2>/dev/null; then
+        echo "vLLM api_server still failing - trying lm-format-enforcer upgrade..."
+        pip install --upgrade lm-format-enforcer 2>/dev/null || true
     fi
 
     # Always ensure numpy<2 for outlines compatibility

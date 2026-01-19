@@ -333,6 +333,40 @@ Two commits have incomplete baseline/human data due to infrastructure issues:
 |--------|-------|
 | `ce6bf3a2`, `ccf02fcb` | `benchmark_mode = None` - mode not properly classified |
 
+### Unbenchmarkable Commits (vLLM Version Incompatibility)
+
+**7 commits cannot be benchmarked** due to Docker images containing old vLLM versions that don't support the configured model (`meta-llama/Llama-3.1-8B-Instruct`):
+
+| Commit | PR | vLLM Version | Error |
+|--------|-----|--------------|-------|
+| `3a243095` | #3623 (Mar 2024) | ~0.3.x | `Unknown RoPE scaling type llama3` |
+| `7c01f706` | #5974 (Jun 2024) | ~0.4.x | `Unknown RoPE scaling type llama3` |
+| `80aa7e91` | #4971 (May 2024) | ~0.4.x | `Unknown RoPE scaling type llama3` |
+| `8bc68e19` | #4208 (Apr 2024) | 0.4.2 | `Unknown RoPE scaling type llama3` |
+| `9ed82e70` | #6520 (Jul 2024) | 0.5.2 | `Unknown RoPE scaling type llama3` |
+| `ad8d696a` | #4270 (Apr 2024) | 0.4.1 | `Unknown RoPE scaling type llama3` |
+| `cf2f084d` | #3279 (Mar 2024) | 0.3.3 | `Unknown RoPE scaling type llama3` |
+
+**Root cause:** Llama 3.1 was released July 23, 2024 with a new "llama3" RoPE scaling type. These PRs predate that release. The Docker images were built with vLLM versions that don't support this RoPE type. The original PR authors likely used older models (Llama-2, Mistral-7B, etc.) but the specific models were not documented in the PRs.
+
+**Resolution options:**
+1. Rebuild Docker images with newer vLLM (changes what's being benchmarked)
+2. Use compatible older models (e.g., `meta-llama/Llama-2-7b-hf`)
+3. Mark as unbenchmarkable (current status)
+
+### Special Cases: Non-Standard Benchmarks
+
+Two commits have `benchmark_mode = None` because they don't fit standard benchmark patterns:
+
+| Commit | PR | Issue | Human's Actual Benchmark |
+|--------|-----|-------|-------------------------|
+| `ccf02fcb` | #14848 (Mar 2025) | Mamba2-specific revert | Used `lm_eval` with `ibm-ai-platform/Bamba-9B` (accuracy test, not throughput/latency) |
+| `ce6bf3a2` | #7898 (Aug 2024) | TPU-specific optimization | Used `benchmark_throughput.py` on **TPU** with `google/gemma-2b`. Cannot be benchmarked on GPU. |
+
+These commits are included in the dataset but lack meaningful benchmark comparisons because:
+- `ccf02fcb`: The human tested model accuracy, not inference performance
+- `ce6bf3a2`: The optimization targets TPU-specific overhead (Dynamo guard evaluation), which doesn't apply to GPU
+
 ## Benchmark Design
 
 Each row represents a benchmark run for a specific vLLM commit, comparing three versions:
@@ -446,6 +480,10 @@ print(f"Commits with multiple agents: {len(multi_agent_commits)}")
 
 ## Changelog
 
+- **2026-01-19**: Documented unbenchmarkable commits:
+  - 7 commits with vLLM version incompatibility (RoPE scaling type llama3 not supported)
+  - 2 commits with non-standard benchmarks (ccf02fcb: Mamba2/lm_eval, ce6bf3a2: TPU-specific)
+  - Added human_ttft metrics for 7 serving commits (19d98e0c, 35fad35a, 660470e5, 6e36f4fa, 89a84b0b, e3580537, fc7b8d1e)
 - **2026-01-19**: Fixed 8 Claude Code commits:
   - 7 serving commits corrected from throughput to ttft/tpot/itl metrics (99abb8b6, 22d33bac, 9badee53, e206b543, 89a84b0b, 19d98e0c, 6e36f4fa)
   - 1 prefix_caching commit fixed (2deb029d: benchmark_mode standalone→prefix_caching, throughput=5446.28 tok/s)
