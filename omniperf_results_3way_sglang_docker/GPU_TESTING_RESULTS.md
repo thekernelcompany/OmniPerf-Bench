@@ -10,15 +10,17 @@
 
 ## Executive Summary
 
-**Total Testing: 26 images tested (8 original + 18 rebuilt), only 3 are functional:**
+**Total Testing: 44 image tests across 3 phases. Only 3 images are functional.**
 
-| Phase | Images | Working | Broken |
-|-------|--------|---------|--------|
-| Phase 1 (Original) | 8 | 3 | 5 |
-| Phase 2 (Rebuilt) | 18 | 0 | 18 |
-| **Total** | **26** | **3 (11.5%)** | **23 (88.5%)** |
+| Phase | Images | Import Test | Server Test | Working |
+|-------|--------|-------------|-------------|---------|
+| Phase 1 (Original) | 8 | 3 pass | 3 pass | **3** |
+| Phase 2 (First Rebuild) | 18 | 0 pass | N/A | **0** |
+| Phase 3 (v2 Rebuild) | 18 | 18 pass | 0 pass | **0** |
 
-**The documentation claims 30 images are ready - this is incorrect. Only 3 images work.**
+**Critical Finding:** Import tests are NOT sufficient. The v2 images pass all import tests but fail at server startup.
+
+**Only 3 working images:** `021f76e4`, `777688b8`, `c087ddd6` (all recent SGLang versions)
 
 ---
 
@@ -354,5 +356,123 @@ Only the original 3 images remain functional:
 
 ---
 
-*Updated: 2026-01-19 11:30 UTC*
+---
+
+## Phase 3: v2 Image Testing (2026-01-19)
+
+18 new images with `-v2` suffix were rebuilt with corrected dependency versions as documented in `REBUILD_FROM_SOURCE.md`. This section documents comprehensive GPU testing of these images.
+
+### Import Test Results
+
+All 18 v2 images **PASS basic import tests**:
+
+| Category | Images | Import Test | Versions |
+|----------|--------|-------------|----------|
+| v0.1.x | 7 | **ALL PASS** | SGLang 0.1.9-0.1.21, vllm 0.2.7-0.3.3 |
+| v0.2.x | 1 | **PASS** | SGLang 0.2.11, vllm 0.5.4, flashinfer OK |
+| v0.3.x | 10 | **ALL PASS** | SGLang 0.3.0-0.3.6, vllm 0.5.5, flashinfer OK |
+
+### Server Startup Test Results (CRITICAL)
+
+**ALL 18 v2 images FAIL at server startup despite passing import tests.**
+
+| Category | Server Startup | Error |
+|----------|----------------|-------|
+| v0.1.x (7) | **ALL FAIL** | `ModuleNotFoundError: No module named 'outlines.fsm'` |
+| v0.2.x (1) | **FAIL** | `ImportError: cannot import name '_grouped_size_compiled_for_decode_kernels'` |
+| v0.3.x (10) | **ALL FAIL** | `ImportError: cannot import name '_grouped_size_compiled_for_decode_kernels'` or `ModuleNotFoundError: No module named 'orjson'` |
+
+### Detailed v0.1.x v2 Results
+
+| Commit | SGLang | vllm | Import | Server | Error |
+|--------|--------|------|--------|--------|-------|
+| `9216b106-v2` | 0.1.14 | 0.3.3 | PASS | FAIL | outlines.fsm |
+| `2a754e57-v2` | 0.1.17 | 0.3.3 | PASS | FAIL | outlines.fsm |
+| `09deb20d-v2` | 0.1.14 | 0.3.3 | PASS | FAIL | outlines.fsm |
+| `564a898a-v2` | 0.1.20 | 0.3.3 | PASS | FAIL | outlines.fsm |
+| `6a2941f4-v2` | 0.1.20 | 0.3.3 | PASS | FAIL | outlines.fsm |
+| `6f560c76-v2` | 0.1.9 | 0.2.7 | PASS | FAIL | outlines.fsm |
+| `ac971ff6-v2` | 0.1.21 | 0.3.3 | PASS | FAIL | outlines.fsm |
+
+**Error:**
+```
+ModuleNotFoundError: No module named 'outlines.fsm'
+```
+
+**Root Cause:** SGLang 0.1.x uses `from outlines.fsm.fsm import RegexFSM` but the outlines library API changed - the `fsm` submodule no longer exists.
+
+### Detailed v0.2.x/v0.3.x v2 Results
+
+| Commit | SGLang | flashinfer | Import | Server | Error |
+|--------|--------|------------|--------|--------|-------|
+| `62757db6-v2` | 0.2.11 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `ab4a83b2-v2` | 0.3.0 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `2854a5ea-v2` | 0.3.1.post3 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `9c064bf7-v2` | 0.3.2 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `c98e84c2-v2` | 0.3.2 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `e5db40dc-v2` | 0.3.3.post1 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `b1709305-v2` | 0.3.3.post1 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `b77a02cd-v2` | 0.3.4.post2 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `8f8f96a6-v2` | 0.3.4.post1 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `9c745d07-v2` | 0.3.5.post2 | 0.2.0.post1 | PASS | FAIL | flashinfer API |
+| `10189d08-v2` | 0.3.6 | 0.2.0.post1 | PASS | FAIL | orjson missing |
+
+**Error (v0.2.x/v0.3.x early):**
+```
+from flashinfer.decode import _grouped_size_compiled_for_decode_kernels
+ImportError: cannot import name '_grouped_size_compiled_for_decode_kernels' from 'flashinfer.decode'
+```
+
+**Error (v0.3.6):**
+```
+ModuleNotFoundError: No module named 'orjson'
+```
+
+**Root Cause:**
+- flashinfer 0.2.0.post1 doesn't have `_grouped_size_compiled_for_decode_kernels` internal function that older SGLang versions expect
+- v0.3.6 additionally requires `orjson` which wasn't installed
+
+### Phase 3 Conclusions
+
+**The v2 rebuild fixed vllm/huggingface-hub version issues but introduced new problems:**
+
+1. **v0.1.x** - The `outlines` library API changed; need to pin `outlines<0.1.0` or use a fork
+2. **v0.2.x/v0.3.x** - The flashinfer version (0.2.0.post1) is TOO NEW; SGLang 0.2.x/0.3.x expects older flashinfer with internal `_grouped_size_compiled_for_decode_kernels` function
+3. **v0.3.6** - Missing `orjson` dependency
+
+### Required Fixes for v3 Rebuild
+
+| Version | Current Issue | Required Fix |
+|---------|--------------|--------------|
+| v0.1.x | outlines.fsm missing | Pin `outlines==0.0.34` or older |
+| v0.2.x | flashinfer API mismatch | Pin flashinfer ~0.0.x (pre-0.1.0) |
+| v0.3.x | flashinfer API mismatch | Pin flashinfer ~0.0.x or ~0.1.x |
+| v0.3.6 | orjson missing | Add `pip install orjson` |
+
+### Key Lesson
+
+**Import tests are insufficient.** A proper test must attempt server startup:
+```bash
+docker run --rm --gpus all <image> python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 --port 30000 --host 0.0.0.0
+```
+
+---
+
+## Overall Summary (All Phases)
+
+| Phase | Images | Working | Status |
+|-------|--------|---------|--------|
+| Phase 1 (Original) | 8 | 3 | Tested |
+| Phase 2 (First Rebuild) | 18 | 0 | All broken |
+| Phase 3 (v2 Rebuild) | 18 | 0 | Import OK, Server FAIL |
+| **Total Unique** | **26** | **3 (11.5%)** | |
+
+**Only the original 3 images work: `021f76e4`, `777688b8`, `c087ddd6`**
+
+These are all recent SGLang versions (latest/0.4.x+) that have compatible dependencies.
+
+---
+
+*Updated: 2026-01-19 16:00 UTC*
 *Tester: Claude Code on L40S instance*
