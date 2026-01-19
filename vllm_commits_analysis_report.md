@@ -421,3 +421,123 @@ The human's optimized vLLM can run this model configuration while the baseline v
 | Failed baselines | 2 (10.5%) |
 | Failure: Corrupted image | 1 (`6ce01f30`) |
 | Failure: Hardware limit | 1 (`e7523c2e`) |
+
+---
+
+## Claude Code Serving Benchmark Fixes (2026-01-19)
+
+### Summary
+
+Fixed 4 Claude Code agent benchmarks that had WRONG METRIC (throughput/latency instead of ttft/tpot/itl for serving mode).
+
+| Commit | Model | TTFT (ms) | TPOT (ms) | ITL (ms) | Throughput (tok/s) |
+|--------|-------|-----------|-----------|----------|-------------------|
+| 99abb8b6 | Llama-3.1-8B | 656.64 | 30.98 | 24.46 | 2810.3 |
+| 22d33bac | Llama-3.1-8B | 651.12 | 30.51 | 24.52 | 2813.8 |
+| 9badee53 | Llama-3.2-1B | 174.68 | 9.85 | 7.98 | 8080.42 |
+| e206b543 | Llama-3.1-8B | 669.91 | 30.88 | 24.56 | 2784.84 |
+
+### Impact
+
+- **Before:** Claude Code had 20 VALID, 12 WRONG METRIC
+- **After:** Claude Code has 24 VALID, 8 WRONG METRIC
+- **Complete 4-way benchmarks enabled:** All 4 commits now have VALID data for all agents (except TRAE-GPT for e206b543)
+
+### Results Location
+
+Files saved to: `/root/OmniPerf-Bench/omniperf_results_3way_claude_code/results/{commit}_agent_result.json`
+
+---
+
+## Remaining Discrepancies Analysis
+
+### Remaining WRONG METRIC Commits (8 Claude Code)
+
+| # | Commit | Mode | Issue | Fixable? |
+|---|--------|------|-------|----------|
+| 1 | 7c01f706 | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+| 2 | 89a84b0b | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+| 3 | 3476ed08 | standalone | Has throughput for serving test | **Different** - standalone needs throughput |
+| 4 | 19d98e0c | serving | Has throughput, needs ttft | Yes - but ALL agents have issues |
+| 5 | 6e36f4fa | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+| 6 | fc7b8d1e | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+| 7 | 3a243095 | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+| 8 | e3580537 | serving | Has throughput, needs ttft | Yes - re-run serving benchmark |
+
+**Summary:** 7 serving mode commits are fixable with same approach as the 4 fixed today. 1 standalone commit (3476ed08) has different issues.
+
+### Cross-Agent Discrepancies
+
+#### Commits Where Claude Code Succeeds but Others Fail
+
+| Commit | Claude Code | Codex | TRAE-Sonnet | TRAE-GPT | Notes |
+|--------|-------------|-------|-------------|----------|-------|
+| b690e348 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| 2deb029d | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| 015069b0 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| a3223766 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| 310aca88 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| bc7c4d20 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| 9474e89b | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| 6a417b86 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+| fe66b347 | ✓ VALID | FAIL | FAIL | FAIL | Only Claude Code succeeded |
+
+**Pattern:** Claude Code has significantly higher patch success rate (74.4%) compared to Codex/TRAE (39.5%/27.9%).
+
+#### Commits Where Others Succeed but Claude Code Fails
+
+| Commit | Claude Code | Codex | TRAE-Sonnet | TRAE-GPT | Notes |
+|--------|-------------|-------|-------------|----------|-------|
+| e7b20426 | FAIL | ✓ VALID | ✓ VALID | FAIL | Claude Code patch failed |
+| 8c1e77fb | FAIL | ✓ VALID | ✓ VALID | ✓ VALID | Claude Code patch failed |
+| 3b61cb45 | FAIL | ✓ VALID | ✓ VALID | ✓ VALID | Claude Code patch failed |
+
+**Analysis:** 3 commits where Claude Code's patch generation failed but others succeeded. These may represent edge cases in Claude Code's approach.
+
+#### Special Case: 19d98e0c
+
+| Agent | Status | Details |
+|-------|--------|---------|
+| Claude Code | WRONG METRIC | Has throughput instead of ttft |
+| Codex | MISSING human_ttft | Agent data exists, human baseline missing |
+| TRAE-Sonnet | MISSING human_ttft | Agent data exists, human baseline missing |
+| TRAE-GPT | PATCH FAILURE | No agent data |
+
+**Verdict:** This commit has issues across ALL agents. Human benchmark data may be incomplete in the HuggingFace dataset.
+
+### Commits with Complete 4-Way Data (All Agents VALID)
+
+After fixes, these commits now have complete benchmark data across all 4 agents:
+
+| Commit | Mode | Status |
+|--------|------|--------|
+| fa63e710 | standalone | ✓ All 4 agents VALID |
+| 4c822298 | standalone | ✓ All 4 agents VALID |
+| b55ed6ef | serving | ✓ All 4 agents VALID |
+| 58eee5f2 | serving | ✓ All 4 agents VALID |
+| 98f47f2a | standalone | ✓ All 4 agents VALID |
+| 99abb8b6 | serving | ✓ All 4 agents VALID (NEW) |
+| 22d33bac | serving | ✓ All 4 agents VALID (NEW) |
+| 9badee53 | serving | ✓ All 4 agents VALID (NEW) |
+
+**Total:** 8 commits with complete 4-way comparison data.
+
+---
+
+## Recommendations
+
+### Immediate Actions
+
+1. **Fix remaining 7 serving WRONG METRIC commits** for Claude Code:
+   - 7c01f706, 89a84b0b, 19d98e0c, 6e36f4fa, fc7b8d1e, 3a243095, e3580537
+   - Same approach as today: `run_3way_benchmarks.py --agent-type claude_code --commits <list> --agent-only`
+
+2. **Investigate 19d98e0c** - all agents have issues, may need human benchmark data fix
+
+3. **Upload new results to HuggingFace** - sync local results with dataset
+
+### Longer-term
+
+1. **Investigate Claude Code patch failures** on e7b20426, 8c1e77fb, 3b61cb45
+2. **Investigate standalone commit 3476ed08** - may have benchmark command mismatch
+3. **Consider re-running TRAE-GPT** for commits where it uniquely failed
