@@ -291,6 +291,35 @@ def parse_throughput_metrics(output: str) -> Dict[str, float]:
     return metrics
 
 
+def parse_prefix_caching_metrics(output: str) -> Dict[str, float]:
+    """Parse metrics from benchmark_prefix_caching.py output."""
+    metrics = {}
+
+    # Find the "start generating" section for actual performance (not warmup)
+    start_gen_idx = output.rfind('------start generating------')
+    if start_gen_idx != -1:
+        gen_output = output[start_gen_idx:]
+    else:
+        gen_output = output
+
+    # Parse speed from the LAST progress line (100% completion)
+    # The format is: est. speed input: X toks/s, output: Y toks/s
+    speed_matches = list(re.finditer(r'est\. speed input:\s*([\d.]+)\s*toks/s,\s*output:\s*([\d.]+)\s*toks/s', gen_output))
+    if speed_matches:
+        # Get the last match (100% progress)
+        last_match = speed_matches[-1]
+        metrics['input_throughput_tok_s'] = float(last_match.group(1))
+        metrics['throughput_tok_s'] = float(last_match.group(2))  # Output throughput
+
+    # Parse cost time (seconds for total run) - use the one after "start generating"
+    cost_matches = list(re.finditer(r'cost time\s+([\d.]+)', gen_output))
+    if cost_matches:
+        # Get the last cost time (after "start generating")
+        metrics['elapsed_time_s'] = float(cost_matches[-1].group(1))
+
+    return metrics
+
+
 def parse_metrics_by_type(output: str, benchmark_type: str) -> Dict[str, float]:
     """Parse metrics based on benchmark type."""
     if benchmark_type == 'latency':
@@ -302,6 +331,9 @@ def parse_metrics_by_type(output: str, benchmark_type: str) -> Dict[str, float]:
         metrics = parse_throughput_metrics(output)
         metrics.update(parse_latency_metrics(output))
         return metrics
+    elif benchmark_type == 'prefix_caching':
+        # Prefix caching has its own output format
+        return parse_prefix_caching_metrics(output)
     else:
         return parse_serving_metrics(output)
 
