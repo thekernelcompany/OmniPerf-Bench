@@ -1,0 +1,74 @@
+# Dockerfile for SGLang v0.4.1.post6 (2bd18e2d)
+# PR #2901: Memory pool: Minor optimize to avoid to
+#
+# VERIFIED DEPS: torch (any), flashinfer==0.1.6
+# This is the easiest v0.4.x build - flexible torch requirement
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+LABEL maintainer="OmniPerf-Bench"
+LABEL description="SGLang v0.4.1.post6 (2bd18e2d) - Memory pool optimization"
+LABEL commit="2bd18e2d767e3a0f8afb5aff427bc8e6e4d297c0"
+LABEL pr="https://github.com/sgl-project/sglang/pull/2901"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-dev python3.10-venv python3-pip \
+    git curl wget build-essential cmake ninja-build \
+    libnuma-dev libibverbs-dev \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# CRITICAL: Create CUDA stubs for building without GPU
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/ && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
+# Install PyTorch 2.4.0 (compatible with flashinfer 0.1.6)
+RUN pip3 install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# Install flashinfer 0.1.6 (as required by this commit)
+RUN pip3 install --no-cache-dir flashinfer==0.1.6 -i https://flashinfer.ai/whl/cu121/torch2.4/
+
+# Clone SGLang at specific commit WITH SUBMODULES
+RUN git clone --recursive https://github.com/sgl-project/sglang.git /sglang
+WORKDIR /sglang
+RUN git checkout 2bd18e2d && git submodule update --init --recursive
+
+# Build sgl-kernel from source with optimized parallelism
+WORKDIR /sglang/sgl-kernel
+ENV MAX_JOBS=32
+ENV NVCC_THREADS=2
+RUN pip3 install --no-cache-dir ninja scikit-build-core cmake numpy && \
+    MAX_JOBS=32 NVCC_THREADS=2 pip install . --no-build-isolation -v
+
+# Install vllm (required by this version)
+RUN pip3 install --no-cache-dir vllm==0.6.3.post1
+
+# Install sglang Python package
+WORKDIR /sglang/python
+RUN pip3 install --no-cache-dir -e ".[all]" || pip3 install --no-cache-dir -e .
+
+# Install additional dependencies
+RUN pip3 install --no-cache-dir \
+    aiohttp fastapi uvicorn uvloop pyzmq \
+    huggingface_hub hf_transfer transformers \
+    orjson decord pillow psutil pydantic torchao
+
+# Verify installation
+RUN python3 -c "import sgl_kernel; print(f'sgl_kernel OK')" && \
+    python3 -c "import sglang; print(f'SGLang {sglang.__version__}')"
+
+WORKDIR /sglang
+CMD ["python3", "-c", "import sglang; print(f'SGLang {sglang.__version__}')"]

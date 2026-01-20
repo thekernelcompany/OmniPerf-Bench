@@ -1,0 +1,71 @@
+# Dockerfile for SGLang v0.4.4.post1 (d1112d85)
+# PR #2797: Add endpoint for file support, purely to speed up processing of input_embeds
+#
+# VERIFIED DEPS: torch==2.5.1, flashinfer_python==0.2.3
+
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+LABEL maintainer="OmniPerf-Bench"
+LABEL description="SGLang v0.4.4.post1 (d1112d85) - input_embeds optimization"
+LABEL commit="d1112d8548eb13c842900b3a8d622345f9737759"
+LABEL pr="https://github.com/sgl-project/sglang/pull/2797"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-dev python3.10-venv python3-pip \
+    git curl wget build-essential cmake ninja-build \
+    libnuma-dev libibverbs-dev \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# CRITICAL: Create CUDA stubs for building without GPU
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/ && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
+# Install PyTorch 2.5.1 (as required by this commit)
+RUN pip3 install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+
+# Install flashinfer 0.2.3 (as required by this commit)
+# Note: flashinfer_python is the new package name
+RUN pip3 install --no-cache-dir flashinfer-python==0.2.3 -i https://flashinfer.ai/whl/cu124/torch2.5/
+
+# Clone SGLang at specific commit WITH SUBMODULES
+RUN git clone --recursive https://github.com/sgl-project/sglang.git /sglang
+WORKDIR /sglang
+RUN git checkout d1112d85 && git submodule update --init --recursive
+
+# Build sgl-kernel from source with optimized parallelism
+WORKDIR /sglang/sgl-kernel
+ENV MAX_JOBS=32
+ENV NVCC_THREADS=2
+RUN pip3 install --no-cache-dir ninja scikit-build-core cmake numpy && \
+    MAX_JOBS=32 NVCC_THREADS=2 pip install . --no-build-isolation -v
+
+# Install sglang Python package
+WORKDIR /sglang/python
+RUN pip3 install --no-cache-dir -e ".[all]" || pip3 install --no-cache-dir -e .
+
+# Install additional dependencies
+RUN pip3 install --no-cache-dir \
+    aiohttp fastapi uvicorn uvloop pyzmq \
+    huggingface_hub hf_transfer transformers \
+    orjson decord pillow psutil pydantic torchao
+
+# Verify installation
+RUN python3 -c "import sgl_kernel; print(f'sgl_kernel OK')" && \
+    python3 -c "import sglang; print(f'SGLang {sglang.__version__}')"
+
+WORKDIR /sglang
+CMD ["python3", "-c", "import sglang; print(f'SGLang {sglang.__version__}')"]

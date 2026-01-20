@@ -1,0 +1,97 @@
+# Template Dockerfile for SGLang v0.4.x commits
+# Build from source with CUDA stubs (no GPU required for building)
+#
+# Key insight: sgl-kernel can be built on CPU-only machines using CUDA stubs
+# The pytorch/manylinux2_28-builder image or nvidia/cuda:*-devel images
+# include libcuda.so stubs that allow NVCC compilation without a GPU.
+#
+# Usage:
+#   docker build -f Dockerfile.v0.4.x.<commit> -t sglang:<commit>-src .
+#
+# Replace <commit> placeholders below:
+#   - COMMIT_SHORT: e.g., 79961afa
+#   - COMMIT_FULL: e.g., 79961afa8281f98f380d11db45c8d4b6e66a574f
+#   - VERSION: e.g., v0.4.6.post2
+#   - PR_NUM: e.g., 6077
+#   - PR_TITLE: e.g., FA3 metadata init
+
+ARG CUDA_VERSION=12.4.1
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+
+# Build args
+ARG COMMIT_SHORT=REPLACE_ME
+ARG COMMIT_FULL=REPLACE_ME
+ARG VERSION=REPLACE_ME
+ARG PYTHON_VERSION=3.12
+
+LABEL maintainer="OmniPerf-Bench"
+LABEL description="SGLang ${VERSION} (${COMMIT_SHORT}) built from source with sgl-kernel"
+LABEL version="${VERSION}"
+LABEL commit="${COMMIT_FULL}"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_HOME=/usr/local/cuda
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-dev python3.12-venv python3-pip \
+    git curl wget build-essential cmake ninja-build \
+    libnuma-dev libibverbs-dev \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# CRITICAL: Create CUDA stubs for building without GPU
+# This allows NVCC to compile CUDA code without actual GPU hardware
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/ && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so && \
+    ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
+           /usr/lib/x86_64-linux-gnu/libcuda.so.1
+
+# Install PyTorch (v0.4.x requires torch 2.5.x+)
+RUN pip3 install --no-cache-dir torch==2.5.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install flashinfer (v0.4.x uses newer versions)
+RUN pip3 install --no-cache-dir flashinfer==0.2.1 -i https://flashinfer.ai/whl/cu124/torch2.5/
+
+# Clone SGLang at specific commit
+RUN git clone https://github.com/sgl-project/sglang.git /sglang
+WORKDIR /sglang
+RUN git checkout ${COMMIT_SHORT}
+
+# Build and install sgl-kernel from source
+# This is the critical step that requires CUDA stubs
+WORKDIR /sglang/sgl-kernel
+RUN pip3 install --no-cache-dir ninja scikit-build-core cmake numpy uv && \
+    pip install . --no-build-isolation -v
+
+# Install sglang Python package
+WORKDIR /sglang/python
+RUN pip3 install --no-cache-dir -e ".[all]"
+
+# Install additional dependencies commonly needed
+RUN pip3 install --no-cache-dir \
+    aiohttp fastapi uvicorn uvloop pyzmq \
+    huggingface_hub hf_transfer transformers \
+    orjson decord pillow psutil pydantic
+
+# Clean up to reduce image size
+RUN rm -rf /root/.cache/pip && \
+    rm -rf /sglang/.git && \
+    find /sglang -name "*.o" -delete && \
+    find /sglang -name "*.cpp" -path "*/build/*" -delete
+
+# Verify installation
+RUN python3 -c "import sgl_kernel; print(f'sgl_kernel version: {sgl_kernel.__version__}')" && \
+    python3 -c "import sglang; print(f'SGLang version: {sglang.__version__}')"
+
+WORKDIR /sglang
+
+# Default command: show version info
+CMD ["python3", "-c", "import sglang; print(f'SGLang {sglang.__version__}')"]

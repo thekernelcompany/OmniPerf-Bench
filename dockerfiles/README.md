@@ -219,3 +219,83 @@ All 9 images built and pushed to DockerHub with `-src` suffix. All pass server m
 | `b1709305-src` | Built, pushed, import test PASS |
 | `b77a02cd-src` | Built, pushed, import test PASS |
 | `8f8f96a6-src` | Built, pushed, import test PASS |
+
+---
+
+## v0.4.x Dockerfiles (NEW - 2026-01-20)
+
+v0.4.x SGLang commits require building `sgl-kernel` from source. The key insight is that
+sgl-kernel can be built on CPU-only machines using CUDA stubs.
+
+### CUDA Stubs Approach
+
+The `nvidia/cuda:*-devel` images include CUDA stubs at:
+```
+/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so
+```
+
+We symlink this to `/usr/lib/x86_64-linux-gnu/libcuda.so` to allow NVCC compilation without a GPU.
+
+### v0.4.x Dockerfiles Summary
+
+| Dockerfile | Commit | Version | PR | Subject |
+|------------|--------|---------|-----|---------|
+| `Dockerfile.v0.4.x.template` | - | - | - | Template for new builds |
+| `Dockerfile.v0.4.6.79961afa` | 79961afa | v0.4.6.post2 | #6077 | FA3 pad optimization |
+| `Dockerfile.v0.4.5.93470a14` | 93470a14 | v0.4.5 | #5090 | FA3 refactor and optimize |
+| `Dockerfile.v0.4.9.3212c2ad` | 3212c2ad | v0.4.9.post4 | #6003 | VLM tensor transport |
+| `Dockerfile.v0.4.1.2bd18e2d` | 2bd18e2d | v0.4.1.post6 | #2901 | Memory pool optimization |
+| `Dockerfile.v0.4.4.d1112d85` | d1112d85 | v0.4.4.post1 | #2797 | input_embeds endpoint |
+
+### Building v0.4.x Images
+
+```bash
+# Build v0.4.6 (79961afa) - ~30-60 min build time
+docker build -f dockerfiles/Dockerfile.v0.4.6.79961afa -t sglang:79961afa-src .
+
+# Build v0.4.5 (93470a14)
+docker build -f dockerfiles/Dockerfile.v0.4.5.93470a14 -t sglang:93470a14-src .
+
+# Build v0.4.9 (3212c2ad)
+docker build -f dockerfiles/Dockerfile.v0.4.9.3212c2ad -t sglang:3212c2ad-src .
+
+# Build v0.4.1 (2bd18e2d)
+docker build -f dockerfiles/Dockerfile.v0.4.1.2bd18e2d -t sglang:2bd18e2d-src .
+
+# Build v0.4.4 (d1112d85)
+docker build -f dockerfiles/Dockerfile.v0.4.4.d1112d85 -t sglang:d1112d85-src .
+```
+
+### v0.4.x Dependency Matrix
+
+| Version | Commit | Torch | FlashInfer | sgl-kernel |
+|---------|--------|-------|------------|------------|
+| v0.4.1 | 2bd18e2d | 2.5.0 | 0.2.1 | Built from source |
+| v0.4.4 | d1112d85 | 2.5.0 | 0.2.1 | Built from source |
+| v0.4.5 | 93470a14 | 2.5.0 | 0.2.1 | Built from source |
+| v0.4.6 | 79961afa | 2.5.0 | 0.2.1 | Built from source |
+| v0.4.9 | 3212c2ad | 2.5.0 | 0.2.1 | Built from source |
+
+### Using the Template
+
+To create a Dockerfile for a new v0.4.x commit:
+
+```bash
+# Copy template
+cp Dockerfile.v0.4.x.template Dockerfile.v0.4.X.COMMIT_SHORT
+
+# Edit and replace:
+# - COMMIT_SHORT (e.g., abcd1234)
+# - git checkout line
+# - LABEL fields
+
+# Build
+docker build -f Dockerfile.v0.4.X.COMMIT_SHORT -t sglang:COMMIT_SHORT-src .
+```
+
+### v0.4.x Build Notes
+
+- **Build time:** 30-60 minutes (sgl-kernel compilation is slow)
+- **No GPU required:** Uses CUDA stubs for compilation
+- **GPU required for runtime:** Needs NVIDIA GPU to actually run SGLang
+- **Build parallelism:** Adjust `CMAKE_BUILD_PARALLEL_LEVEL` if OOM occurs
