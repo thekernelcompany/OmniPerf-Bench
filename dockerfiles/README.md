@@ -198,6 +198,24 @@ if not (arch not in MODEL_REGISTRY):
 
 2. **Event loop (v0.2.x):** Older versions have asyncio event loop issues when using uvloop. The Dockerfiles apply a patch.
 
-3. **Model registry (v0.3.x):** v0.3.0-v0.3.4 have assertion failures when both SGLang and vllm define the same model class. The Dockerfiles apply a patch to allow overrides.
+3. **Model registry (v0.3.x):** v0.3.0-v0.3.4 have assertion failures when both SGLang and vllm define the same model class. The Dockerfiles apply a patch to disable these assertions.
 
-4. **v0.3.5+ works without patches:** 9c745d07 (v0.3.5.post2) and 10189d08 (v0.3.6) work with the v3 images on DockerHub. No Dockerfiles needed.
+4. **pyairports mock module:** The outlines package requires pyairports but the PyPI package is a placeholder. The Dockerfiles create a mock module using airportsdata.
+
+5. **v0.3.5+ works without patches:** 9c745d07 (v0.3.5.post2) and 10189d08 (v0.3.6) work with the v3 images on DockerHub. No Dockerfiles needed.
+
+## Build Status (2026-01-20)
+
+All 9 images built and pushed to DockerHub with `-src` suffix. All pass server module import test.
+
+| Image | Status |
+|-------|--------|
+| `62757db6-src` | Built, pushed, import test PASS |
+| `ab4a83b2-src` | Built, pushed, import test PASS |
+| `2854a5ea-src` | Built, pushed, import test PASS |
+| `c98e84c2-src` | Built, pushed, import test PASS |
+| `9c064bf7-src` | Built, pushed, import test PASS |
+| `e5db40dc-src` | Built, pushed, import test PASS |
+| `b1709305-src` | Built, pushed, import test PASS |
+| `b77a02cd-src` | Built, pushed, import test PASS |
+| `8f8f96a6-src` | Built, pushed, import test PASS |

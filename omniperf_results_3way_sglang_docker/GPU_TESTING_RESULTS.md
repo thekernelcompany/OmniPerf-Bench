@@ -795,12 +795,110 @@ SGLang model registry conflicts with vllm model registry.
 | Phase 4 (v3 Build Machine) | 18 | 11 | - | No GPU |
 | Phase 5 (v3 GPU Validation) | 11 | 11 | **2** | Only v0.3.5+ work |
 
-**TOTAL WORKING IMAGES: 5**
+**TOTAL WORKING IMAGES (Before Phase 6): 5**
 - Original: `021f76e4`, `777688b8`, `c087ddd6`
 - v3: `9c745d07-v3` (v0.3.5.post2), `10189d08-v3` (v0.3.6)
 
 ---
 
-*Updated: 2026-01-19 18:45 UTC*
-*GPU Machine: L40S instance*
-*Test: Actual server startup with TinyLlama-1.1B*
+## Phase 6: Source Builds with Patches (2026-01-20)
+
+Built 9 images from source with patches for event loop and model registry issues. All pass server module import test on build machine (no GPU). GPU validation pending.
+
+### Images Built
+
+| Tag | Version | Commit | Patch Applied |
+|-----|---------|--------|---------------|
+| `62757db6-src` | v0.2.11 | 62757db6 | Event loop fix in detokenizer_manager.py |
+| `ab4a83b2-src` | v0.3.0 | ab4a83b2 | None (clean build from source) |
+| `2854a5ea-src` | v0.3.1.post3 | 2854a5ea | Model registry assertion disabled |
+| `c98e84c2-src` | v0.3.2 | c98e84c2 | Model registry assertion disabled |
+| `9c064bf7-src` | v0.3.2 | 9c064bf7 | Model registry assertion disabled |
+| `e5db40dc-src` | v0.3.3.post1 | e5db40dc | Model registry assertion disabled |
+| `b1709305-src` | v0.3.3.post1 | b1709305 | Model registry assertion disabled |
+| `b77a02cd-src` | v0.3.4.post2 | b77a02cd | Model registry assertion disabled |
+| `8f8f96a6-src` | v0.3.4.post1 | 8f8f96a6 | Model registry assertion disabled |
+
+### Patches Applied
+
+**1. Event Loop Fix (v0.2.x)**
+```python
+# In detokenizer_manager.py
+# Before: loop = asyncio.get_event_loop()
+# After:  loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+```
+
+**2. Model Registry Fix (v0.3.x)**
+```bash
+# Comment out assertions that fail when both SGLang and vllm register same model
+sed -i '/Duplicated model implementation/s/^/# DISABLED: /' model_runner.py
+sed -i '/assert (/,/Duplicated model implementation/s/^/# DISABLED: /' model_runner.py
+```
+
+### Build Machine Test Results
+
+All 9 images pass server module import test (no GPU):
+```
+sglang:62757db6-src: PASS
+sglang:ab4a83b2-src: PASS
+sglang:2854a5ea-src: PASS
+sglang:c98e84c2-src: PASS
+sglang:9c064bf7-src: PASS
+sglang:e5db40dc-src: PASS
+sglang:b1709305-src: PASS
+sglang:b77a02cd-src: PASS
+sglang:8f8f96a6-src: PASS
+```
+
+### Pull Commands
+
+```bash
+docker pull shikhar481/sglang-images:62757db6-src
+docker pull shikhar481/sglang-images:ab4a83b2-src
+docker pull shikhar481/sglang-images:2854a5ea-src
+docker pull shikhar481/sglang-images:c98e84c2-src
+docker pull shikhar481/sglang-images:9c064bf7-src
+docker pull shikhar481/sglang-images:e5db40dc-src
+docker pull shikhar481/sglang-images:b1709305-src
+docker pull shikhar481/sglang-images:b77a02cd-src
+docker pull shikhar481/sglang-images:8f8f96a6-src
+```
+
+### GPU Validation Required
+
+These images need GPU validation with actual server startup test:
+```bash
+docker run -d --gpus all -p 30000:30000 shikhar481/sglang-images:<tag> \
+    python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --port 30000 --host 0.0.0.0
+
+sleep 60
+curl http://localhost:30000/health
+```
+
+---
+
+## Final Summary (All Phases)
+
+| Phase | Images | Module Import | **Actual Server** | Notes |
+|-------|--------|---------------|-------------------|-------|
+| Phase 1 (Original) | 8 | 3 | **3** | GPU tested |
+| Phase 2 (First Rebuild) | 18 | 0 | 0 | Broken |
+| Phase 3 (v2 Rebuild) | 18 | 18 | 0 | All fail at server |
+| Phase 4 (v3 Build Machine) | 18 | 11 | - | No GPU |
+| Phase 5 (v3 GPU Validation) | 11 | 11 | **2** | Only v0.3.5+ work |
+| Phase 6 (Source Builds) | 9 | **9** | **TBD** | GPU validation needed |
+
+**CONFIRMED WORKING IMAGES: 5**
+- Original: `021f76e4`, `777688b8`, `c087ddd6`
+- v3: `9c745d07-v3` (v0.3.5.post2), `10189d08-v3` (v0.3.6)
+
+**PENDING GPU VALIDATION: 9**
+- Source builds: `62757db6-src`, `ab4a83b2-src`, `2854a5ea-src`, `c98e84c2-src`, `9c064bf7-src`, `e5db40dc-src`, `b1709305-src`, `b77a02cd-src`, `8f8f96a6-src`
+
+---
+
+*Updated: 2026-01-20 05:55 UTC*
+*Build Machine: OmniPerf-Bench (no GPU)*
+*Test: Server module import test*
