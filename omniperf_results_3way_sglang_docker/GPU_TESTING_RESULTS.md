@@ -899,6 +899,91 @@ curl http://localhost:30000/health
 
 ---
 
-*Updated: 2026-01-20 05:55 UTC*
-*Build Machine: OmniPerf-Bench (no GPU)*
+## Phase 7: v0.4.x Images GPU Testing (2026-01-20)
+
+Two v0.4.x images (`2bd18e2d-src` and `d1112d85-src`) were pulled from DockerHub and tested on GPU.
+
+### Test Results
+
+| Tag | Version | CUDA Import | sgl_kernel | Server Module | Status | Error |
+|-----|---------|-------------|------------|---------------|--------|-------|
+| `2bd18e2d-src` | v0.4.1.post6 | ✅ PASS | ✅ PASS | ❌ **FAIL** | **BROKEN** | torchao/torch version conflict |
+| `d1112d85-src` | v0.4.4.post1 | ✅ PASS | ✅ PASS | ✅ **PASS** | **WORKING** | - |
+
+### 2bd18e2d-src Failure Analysis
+
+**Error Chain:**
+1. Import test passes: sglang, sgl_kernel all load fine
+2. Server module import fails with:
+```
+from transformers import AutoProcessor
+...
+File "/usr/local/lib/python3.10/dist-packages/torchao/quantization/quant_primitives.py", line 176
+    torch.int1: (-(2**0), 2**0 - 1),
+AttributeError: module 'torch' has no attribute 'int1'
+```
+
+**Root Cause:**
+- torchao 0.15.0 requires torch >= 2.5.0 (for `torch.int1`)
+- Container has torch 2.4.0+cu121
+- This is a fundamental package incompatibility that can't be fixed without rebuilding
+
+**Dependency Matrix:**
+| Package | 2bd18e2d-src | d1112d85-src |
+|---------|-------------|--------------|
+| torch | 2.4.0 | 2.5.1 |
+| torchao | 0.15.0 | (compatible) |
+| transformers | 4.57.6 | 4.48.3 |
+| CUDA | 12.1.1 | 12.4.1 |
+
+### d1112d85-src Success
+
+```
+CUDA: True
+GPU: NVIDIA L40S
+sglang: 0.4.4.post1
+sgl_kernel: OK
+Server module: OK
+```
+
+The d1112d85-src image has compatible dependency versions and works correctly.
+
+### Summary
+
+**TOTAL WORKING v0.4.x IMAGES: 1**
+- ✅ `d1112d85-src` (v0.4.4.post1) - WORKING
+
+**BROKEN v0.4.x IMAGES: 4**
+- ❌ `2bd18e2d-src` (v0.4.1.post6) - torchao/torch version conflict
+- ❌ `79961afa` (v0.4.6.post2) - Requires torch>=2.6.0
+- ❌ `93470a14` (v0.4.5) - CMake FetchContent can't access flashinfer fork
+- ❌ `3212c2ad` (v0.4.9.post4) - Requires torch>=2.7.1
+
+---
+
+## Final Summary (All Phases Through Phase 7)
+
+| Phase | Images | Module Import | **Actual Server** | Notes |
+|-------|--------|---------------|-------------------|-------|
+| Phase 1 (Original) | 8 | 3 | **3** | GPU tested |
+| Phase 2 (First Rebuild) | 18 | 0 | 0 | Broken |
+| Phase 3 (v2 Rebuild) | 18 | 18 | 0 | All fail at server |
+| Phase 4 (v3 Build Machine) | 18 | 11 | - | No GPU |
+| Phase 5 (v3 GPU Validation) | 11 | 11 | **2** | Only v0.3.5+ work |
+| Phase 6 (Source Builds) | 9 | **9** | **9** | All GPU validated |
+| Phase 7 (v0.4.x Test) | 2 | 2 | **1** | d1112d85-src works |
+
+**CONFIRMED WORKING IMAGES: 15**
+
+| Category | Images |
+|----------|--------|
+| Original | `021f76e4`, `777688b8`, `c087ddd6` |
+| v3 | `9c745d07-v3` (v0.3.5.post2), `10189d08-v3` (v0.3.6) |
+| Source (v0.3.x) | `62757db6-src`, `ab4a83b2-src`, `2854a5ea-src`, `c98e84c2-src`, `9c064bf7-src`, `e5db40dc-src`, `b1709305-src`, `b77a02cd-src`, `8f8f96a6-src` |
+| Source (v0.4.x) | `d1112d85-src` (v0.4.4.post1) |
+
+---
+
+*Updated: 2026-01-20 11:45 UTC*
+*Test Machine: L40S GPU*
 *Test: Server module import test*

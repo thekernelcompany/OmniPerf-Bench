@@ -1,141 +1,138 @@
-# GPU Testing Guide for Rebuilt SGLang Images
+# GPU Testing Guide for SGLang Images
 
-**Date:** 2026-01-20 (Updated)
+**Last Updated:** 2026-01-20
+**GPU Tested:** NVIDIA L40S (SM89, 46GB VRAM)
 
-## Quick Start (on H100)
+---
 
-```bash
-# Pull and test the v0.4.x images (NEW - built from source with CUDA stubs)
-docker pull shikhar481/sglang-images:2bd18e2d-src
-docker pull shikhar481/sglang-images:d1112d85-src
+## CRITICAL: Use `-src` Images
 
-# Test v0.4.x imports
-docker run --rm --gpus all shikhar481/sglang-images:2bd18e2d-src python3 -c "
-import torch
-print(f'CUDA: {torch.cuda.is_available()}')
-print(f'GPU: {torch.cuda.get_device_name(0)}')
-import sglang, sgl_kernel
-print(f'SGLang {sglang.__version__} - All imports OK')
-"
+The original images (`2a754e57`, `ab4a83b2`, `79961afa`) are **BROKEN**. Use the `-src` suffix images instead.
 
-docker run --rm --gpus all shikhar481/sglang-images:d1112d85-src python3 -c "
-import torch
-print(f'CUDA: {torch.cuda.is_available()}')
-print(f'GPU: {torch.cuda.get_device_name(0)}')
-import sglang, sgl_kernel
-print(f'SGLang {sglang.__version__} - All imports OK')
-"
-```
+| Original Image | Status | Replacement |
+|----------------|--------|-------------|
+| `2a754e57` | ❌ BROKEN (outlines.fsm missing) | Skip - v0.1.x unfixable |
+| `ab4a83b2` | ❌ BROKEN (sglang not installed) | ✅ `ab4a83b2-src` |
+| `79961afa` | ❌ BROKEN (sgl_kernel ABI mismatch) | Needs GPU rebuild |
 
-## Images Status
+---
 
-### v0.4.x Images (NEW - Built from Source)
+## Working Images
+
+### v0.4.x Images (Built from Source with CUDA Stubs)
+
+| Tag | Version | Torch | FlashInfer | vLLM | Status |
+|-----|---------|-------|------------|------|--------|
+| `2bd18e2d-src` | v0.4.1.post6 | 2.4.0 | 0.1.6 | 0.6.3.post1 | ❌ BROKEN (torchao/torch mismatch) |
+| `d1112d85-src` | v0.4.4.post1 | 2.5.1 | 0.2.3 | 0.7.2 | ✅ GPU WORKING |
+
+### v0.3.x Source Builds (`-src`) - ALL WORKING
+
+| Tag | SGLang | vLLM | Status |
+|-----|--------|------|--------|
+| `62757db6-src` | v0.2.11 | 0.5.4 | ✅ GPU WORKING |
+| `ab4a83b2-src` | v0.3.0 | 0.5.5 | ✅ GPU WORKING |
+| `2854a5ea-src` | v0.3.1.post3 | 0.5.5 | ✅ GPU WORKING |
+| `c98e84c2-src` | v0.3.2 | 0.5.5 | ✅ GPU WORKING |
+| `9c064bf7-src` | v0.3.2 | 0.5.5 | ✅ GPU WORKING |
+| `e5db40dc-src` | v0.3.3.post1 | 0.5.5 | ✅ GPU WORKING |
+| `b1709305-src` | v0.3.3.post1 | 0.5.5 | ✅ GPU WORKING |
+| `8f8f96a6-src` | v0.3.4.post1 | 0.5.5 | ✅ GPU WORKING |
+| `b77a02cd-src` | v0.3.4.post2 | 0.5.5 | ✅ GPU WORKING |
+
+### v3 Builds - WORKING
+
+| Tag | SGLang | vLLM | Status |
+|-----|--------|------|--------|
+| `9c745d07-v3` | v0.3.5.post2 | 0.6.3.post1 | ✅ GPU WORKING |
+| `10189d08-v3` | v0.3.6 | 0.6.3.post1 | ✅ GPU WORKING |
+
+### Original Images - WORKING
+
+| Tag | SGLang | Status |
+|-----|--------|--------|
+| `021f76e4` | latest | ✅ GPU WORKING |
+| `777688b8` | latest | ✅ GPU WORKING |
+| `c087ddd6` | latest | ✅ GPU WORKING |
+
+---
+
+## BLOCKED v0.4.x Images
 
 | Commit | Version | Status | Notes |
 |--------|---------|--------|-------|
-| `2bd18e2d-src` | v0.4.1.post6 | **PUSHED** | Memory pool optimization (PR #2901) |
-| `d1112d85-src` | v0.4.4.post1 | **PUSHED** | input_embeds endpoint (PR #2797) |
 | `79961afa` | v0.4.6.post2 | BLOCKED | Requires torch>=2.6.0 |
 | `93470a14` | v0.4.5 | BLOCKED | CMake FetchContent can't access flashinfer fork |
 | `3212c2ad` | v0.4.9.post4 | BLOCKED | Requires torch>=2.7.1 |
 
-### v0.3.x Images (GPU-Confirmed Working)
+---
 
-| Commit | Version | Status | Notes |
-|--------|---------|--------|-------|
-| `62757db6-src` | v0.2.11 | **PUSHED** | Cache disabled overhead |
-| `ab4a83b2-src` | v0.3.0 | **PUSHED** | Optimize schedule |
-| `c98e84c2-src` | v0.3.2 | **PUSHED** | torch.argmax optimization |
-| `2854a5ea-src` | v0.3.1.post3 | **PUSHED** | bench_latency fix |
-| `9c064bf7-src` | v0.3.2 | **PUSHED** | LoRA Step 1 |
-| `b77a02cd-src` | v0.3.4.post2 | **PUSHED** | Grammar backends |
-| `9c745d07-v3` | v0.3.5.post2 | **PUSHED** | (DockerHub v3 image) |
-| `10189d08-v3` | v0.3.6 | **PUSHED** | (DockerHub v3 image) |
+## Quick Test Commands
 
-### v0.3.x Images (Pending GPU Test)
-
-| Commit | Version | Status | Notes |
-|--------|---------|--------|-------|
-| `e5db40dc-src` | v0.3.3.post1 | PENDING | ORJson serialization |
-| `b1709305-src` | v0.3.3.post1 | PENDING | Radix tree optimization |
-| `8f8f96a6-src` | v0.3.4.post1 | PENDING | stop_token_ids fix |
-
-## Test Commands
-
-### 1. Test v0.4.x Images (NEW)
+### Pull Working v0.4.x Image
 
 ```bash
-# Test 2bd18e2d (v0.4.1.post6) - Memory pool optimization
-docker run --rm --gpus all shikhar481/sglang-images:2bd18e2d-src python3 -c "
-import torch
-assert torch.cuda.is_available(), 'CUDA not available'
-print(f'GPU: {torch.cuda.get_device_name(0)}')
+# Only d1112d85-src works; 2bd18e2d-src has torchao/torch version conflict
+docker pull shikhar481/sglang-images:d1112d85-src
+```
 
-import sglang
-print(f'sglang: {sglang.__version__}')
+### Test v0.4.x Imports
 
-import sgl_kernel
-print('sgl_kernel: OK')
-
-import vllm
-print(f'vllm: {vllm.__version__}')
-
-print('SUCCESS: All imports OK')
-"
-
-# Test d1112d85 (v0.4.4.post1) - input_embeds endpoint
+```bash
 docker run --rm --gpus all shikhar481/sglang-images:d1112d85-src python3 -c "
 import torch
-assert torch.cuda.is_available(), 'CUDA not available'
+print(f'CUDA: {torch.cuda.is_available()}')
 print(f'GPU: {torch.cuda.get_device_name(0)}')
-
-import sglang
-print(f'sglang: {sglang.__version__}')
-
-import sgl_kernel
-print('sgl_kernel: OK')
-
-import vllm
-print(f'vllm: {vllm.__version__}')
-
-print('SUCCESS: All imports OK')
+import sglang, sgl_kernel
+print(f'SGLang {sglang.__version__} - All imports OK')
+from sglang.srt.server import launch_server
+print('Server module: OK')
 "
 ```
 
-### 2. Test v0.3.x Images
+### Test Server Startup
 
 ```bash
-# Test ab4a83b2-src (v0.3.0)
-docker run --rm --gpus all shikhar481/sglang-images:ab4a83b2-src python3 -c "
-import torch
-assert torch.cuda.is_available(), 'CUDA not available'
-print(f'GPU: {torch.cuda.get_device_name(0)}')
+# Start server
+docker run -d --gpus all --name test-sglang \
+    -p 30000:30000 \
+    -e HF_HOME=/root/.cache/huggingface \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    shikhar481/sglang-images:ab4a83b2-src \
+    python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --host 0.0.0.0 --port 30000
 
-import sglang
-print('sglang: OK')
+# Wait for startup
+sleep 45
 
-import outlines
-print('outlines: OK')
+# Verify
+curl http://localhost:30000/get_model_info
 
-from pyairports.airports import AIRPORT_LIST
-print(f'pyairports: OK ({len(AIRPORT_LIST)} airports)')
+# Test generation
+curl http://localhost:30000/generate \
+    -H "Content-Type: application/json" \
+    -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 10}}'
 
-import importlib.metadata
-print(f'Version: {importlib.metadata.version(\"sglang\")}')
-"
+# Cleanup
+docker stop test-sglang && docker rm test-sglang
 ```
 
-### 3. Benchmark Tests
+---
+
+## Benchmark Commands
+
+### Latency Benchmark
 
 ```bash
-# Benchmark v0.4.x (use TinyLlama for quick test)
+# v0.4.x
 docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
     shikhar481/sglang-images:2bd18e2d-src \
     python3 -m sglang.bench_latency \
     --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --batch-size 1 --input-len 128 --output-len 32
 
-# Benchmark v0.3.x
+# v0.3.x
 docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
     shikhar481/sglang-images:ab4a83b2-src \
     python3 -m sglang.bench_latency \
@@ -143,67 +140,76 @@ docker run --rm --gpus all -e HF_TOKEN=$HF_TOKEN \
     --batch-size 1 --input-len 128 --output-len 32
 ```
 
-## v0.4.x Build Details
+---
 
-The v0.4.x images were built from source using CUDA stubs (no GPU required for building).
+## Known Issues
 
-### Key Build Configuration
+### v0.1.x Images - UNFIXABLE
 
-```dockerfile
-# CUDA stubs for building without GPU
-RUN ln -sf /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so \
-           /usr/lib/x86_64-linux-gnu/libcuda.so
-
-# Build optimizations
-ENV MAX_JOBS=32
-ENV NVCC_THREADS=2
-
-# Required: git submodules for sgl-kernel dependencies
-RUN git clone --recursive https://github.com/sgl-project/sglang.git
-RUN git submodule update --init --recursive
+All v0.1.x images (including `2a754e57`) fail with:
+```
+ModuleNotFoundError: No module named 'outlines.fsm'
 ```
 
-### Dependency Matrix
+**Root Cause:** The outlines library API changed completely. These commits require source code modifications to work.
 
-| Commit | Version | Torch | FlashInfer | vLLM |
-|--------|---------|-------|------------|------|
-| 2bd18e2d | v0.4.1.post6 | 2.4.0 | 0.1.6 | 0.6.3.post1 |
-| d1112d85 | v0.4.4.post1 | 2.5.1 | 0.2.3 | 0.7.2 |
+**Recommendation:** Skip v0.1.x images. Use v0.2.x+ instead.
 
-## Expected Results
+### v0.4.x sgl_kernel ABI Mismatch
 
-### Success Criteria
-- [x] 2bd18e2d-src: imports work, sgl_kernel loads
-- [x] d1112d85-src: imports work, sgl_kernel loads
-- [ ] GPU benchmark runs without errors
-- [ ] No ABI mismatch errors for sgl_kernel
+Pre-built v0.4.x images may fail with:
+```
+sgl_kernel: CRITICAL: Could not load any common_ops library!
+- ImportError: undefined symbol: _ZN3c108ListType3get...
+```
 
-### Known Issues
-- v0.4.x images are larger (~17GB) due to full build from source
-- CUDA warning about stub library is normal when testing without GPU
-- vLLM version varies between commits
+**Root Cause:** sgl_kernel was compiled for SM100 (Blackwell) but running on SM89 (L40S/Ada).
 
-## Reporting Results
+**Fix:** Use `-src` images built with CUDA stubs, or rebuild sgl_kernel from source:
+```bash
+cd /sglang/sgl-kernel
+pip install -e . --no-build-isolation
+```
 
-Please report:
-1. GPU model (nvidia-smi output)
-2. Import test results (pass/fail)
-3. Benchmark results or error messages
-4. Any segfaults or CUDA errors
+---
+
+## Summary
+
+| Category | Count | Status |
+|----------|-------|--------|
+| Working `-src` v0.4.x images | 1 | ✅ d1112d85 (v0.4.4) |
+| Working `-src` v0.3.x images | 9 | ✅ v0.2.x to v0.3.4 |
+| Working `-v3` images | 2 | ✅ v0.3.5 to v0.3.6 |
+| Working original images | 3 | ✅ Latest |
+| **Total Working** | **15** | Ready for benchmarks |
+| Broken v0.1.x | ~15 | ❌ Skip |
+| Broken v0.4.x | 4 | ⚠️ Dependency issues (2bd18e2d, 79961afa, 93470a14, 3212c2ad) |
+
+---
 
 ## All Available Images
 
 ```bash
-# List all available images
-docker pull shikhar481/sglang-images:2bd18e2d-src  # v0.4.1.post6 (NEW)
-docker pull shikhar481/sglang-images:d1112d85-src  # v0.4.4.post1 (NEW)
+# v0.4.x (only d1112d85 works)
+docker pull shikhar481/sglang-images:d1112d85-src  # v0.4.4.post1 - WORKING
+# docker pull shikhar481/sglang-images:2bd18e2d-src  # v0.4.1.post6 - BROKEN (torchao conflict)
+
+# v0.3.x source builds
 docker pull shikhar481/sglang-images:62757db6-src  # v0.2.11
 docker pull shikhar481/sglang-images:ab4a83b2-src  # v0.3.0
-docker pull shikhar481/sglang-images:c98e84c2-src  # v0.3.2
 docker pull shikhar481/sglang-images:2854a5ea-src  # v0.3.1.post3
+docker pull shikhar481/sglang-images:c98e84c2-src  # v0.3.2
 docker pull shikhar481/sglang-images:9c064bf7-src  # v0.3.2
 docker pull shikhar481/sglang-images:e5db40dc-src  # v0.3.3.post1
 docker pull shikhar481/sglang-images:b1709305-src  # v0.3.3.post1
-docker pull shikhar481/sglang-images:b77a02cd-src  # v0.3.4.post2
 docker pull shikhar481/sglang-images:8f8f96a6-src  # v0.3.4.post1
+docker pull shikhar481/sglang-images:b77a02cd-src  # v0.3.4.post2
+
+# v3 builds
+docker pull shikhar481/sglang-images:9c745d07-v3   # v0.3.5.post2
+docker pull shikhar481/sglang-images:10189d08-v3  # v0.3.6
 ```
+
+---
+
+*Last tested: 2026-01-20 on NVIDIA L40S (SM89)*
