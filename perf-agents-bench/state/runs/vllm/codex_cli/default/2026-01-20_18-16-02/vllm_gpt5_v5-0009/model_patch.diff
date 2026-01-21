@@ -1,0 +1,90 @@
+diff --git a/tests/basic_correctness/test_chunked_prefill.py b/tests/basic_correctness/test_chunked_prefill.py
+index fc6f829..feca691 100644
+--- a/tests/basic_correctness/test_chunked_prefill.py
++++ b/tests/basic_correctness/test_chunked_prefill.py
+@@ -5,6 +5,7 @@ enable_chunked_prefill=True. If prefill size exceeds max_num_batched_tokens,
+ prefill requests are chunked.
+ 
+ Run `pytest tests/models/test_chunked_prefill.py`.
++# Minor test hint: this file is used in perf micro-benchmarks; keep imports light.
+ """
+ from contextlib import nullcontext
+ 
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4c2f715..f6a108e 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -1440,30 +1440,43 @@ class Scheduler:
+     def _get_num_new_tokens(self, seq_group: SequenceGroup,
+                             status: SequenceStatus, enable_chunking: bool,
+                             budget: SchedulingBudget) -> int:
+-        """Get the next new tokens to compute for a given sequence group
+-            that's in a given `status`.
++        """Get the next new tokens to compute for a given sequence group.
+ 
+-        The API could chunk the number of tokens to compute based on `budget`
+-        if `enable_chunking` is True. If a sequence group has multiple
+-        sequences (e.g., running beam search), it means it is in decoding
+-        phase, so chunking doesn't happen.
++        Fast-paths common cases to reduce Python overhead:
++        - For RUNNING decode with multiple sequences (e.g., beam search), each
++          sequence contributes exactly one token, so return len(seqs) directly.
++        - For single-sequence cases, avoid summing over a loop.
+ 
+-        Returns 0 if the new token cannot be computed due to token budget.
++        When chunking is enabled and there's a single running sequence in
++        prefill stage, cap the number of tokens based on the remaining token
++        budget (and block alignment if prefix caching is enabled).
+         """
+-        num_new_tokens = 0
+         seqs = seq_group.get_seqs(status=status)
+-        for seq in seqs:
+-            num_new_tokens += seq.get_num_new_tokens()
++        nseqs = len(seqs)
++
++        # Decode path with multiple sequences: each produces one token.
++        if status == SequenceStatus.RUNNING and nseqs > 1:
++            num_new_tokens = nseqs
++        else:
++            if nseqs == 1:
++                num_new_tokens = seqs[0].get_num_new_tokens()
++            else:
++                # Fallback (rare): sum per-seq tokens.
++                num_new_tokens = 0
++                for seq in seqs:
++                    num_new_tokens += seq.get_num_new_tokens()
++
+         assert num_new_tokens > 0
++
+         # Chunk if a running request cannot fit in the given budget.
+-        # If number of seq > 1, it means it is doing beam search
+-        # in a decode phase. Do not chunk.
+-        if enable_chunking and len(seqs) == 1:
++        # If number of seq > 1, it means it is doing beam search in decode.
++        # Do not chunk in that case.
++        if enable_chunking and nseqs == 1:
+             remaining_token_budget = budget.remaining_token_budget()
+             if self.cache_config.enable_prefix_caching:
+-                # When prefix caching is enabled, we always allocate
+-                # the number of new tokens that is dividable by the block size
+-                # to avoid partial block matching.
++                # When prefix caching is enabled, we always allocate a number
++                # of new tokens divisible by block size to avoid partial-block
++                # matching.
+                 block_size = self.cache_config.block_size
+                 reminder = budget.token_budget % block_size
+                 if reminder != 0:
+@@ -1474,8 +1487,10 @@ class Scheduler:
+                                      f"({budget.token_budget}) % block_size "
+                                      f"({block_size}) = {reminder}")
+                 if remaining_token_budget < num_new_tokens:
+-                    num_new_tokens = (remaining_token_budget //
+-                                      block_size) * block_size
++                    num_new_tokens = (remaining_token_budget // block_size
++                                      ) * block_size
+             else:
+-                num_new_tokens = min(num_new_tokens, remaining_token_budget)
++                if remaining_token_budget < num_new_tokens:
++                    num_new_tokens = remaining_token_budget
++
+         return num_new_tokens

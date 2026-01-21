@@ -1,0 +1,66 @@
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index fec6d61..fdce5f8 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple, Union
+ 
+ import torch
+ from torch import nn
++import torch.nn.functional as F
+ 
+ from vllm.attention.backends.abstract import AttentionMetadata
+ from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+@@ -68,19 +69,22 @@ class Mixer2RMSNormGated(CustomOp):
+         #   3. The general case can be pretty complicated so we AllGather
+         #      the input and then redundantly compute the RMSNorm.
+         input_dtype = x.dtype
+-        x = x * nn.functional.silu(gate.to(torch.float32))
++        # Compute gate in fp32 for stability; do it in-place to reduce temps.
++        gate32 = gate.to(torch.float32)
++        F.silu(gate32, inplace=True)
++        x = x * gate32
+ 
+         if self.n_groups == 1:
+             if self.tp_size > 1:
+                 # Compute local sum and then reduce to obtain global sum
+-                local_sums = x.pow(2).sum(dim=-1, keepdim=True)
++                local_sums = x.square().sum(dim=-1, keepdim=True)
+                 global_sums = tensor_model_parallel_all_reduce(local_sums)
+                 # Calculate the variance
+                 count = self.tp_size * x.shape[-1]
+                 variance = (global_sums / count)
+ 
+             else:
+-                variance = x.pow(2).mean(-1, keepdim=True)
++                variance = x.square().mean(-1, keepdim=True)
+             x = x * torch.rsqrt(variance + self.variance_epsilon)
+         else:
+             redundant_tp: bool = self.n_groups % self.tp_size != 0
+@@ -91,9 +95,10 @@ class Mixer2RMSNormGated(CustomOp):
+             *prefix_dims, hidden_dim = x.shape
+             group_count = hidden_dim // self.group_size
+             x_grouped = x.view(*prefix_dims, group_count, self.group_size)
+-            variance = x_grouped.pow(2).mean(-1, keepdim=True)
+-            x_grouped = x_grouped * torch.rsqrt(variance +
+-                                                self.variance_epsilon)
++            # Use square() instead of pow(2) and apply in-place scale to reduce
++            # temporaries and memory bandwidth.
++            variance = x_grouped.square().mean(-1, keepdim=True)
++            x_grouped = x_grouped * torch.rsqrt(variance + self.variance_epsilon)
+             x = x_grouped.view(*prefix_dims, hidden_dim)
+ 
+             if redundant_tp:
+@@ -114,9 +119,11 @@ class Mixer2RMSNormGated(CustomOp):
+ 
+         from vllm import _custom_ops as ops
+ 
+-        # cast x and gate to float32 before silu
++        # cast gate to float32 and apply silu in-place before multiply
+         out = torch.empty_like(x)
+-        y = x * nn.functional.silu(gate.to(torch.float32))
++        gate32 = gate.to(torch.float32)
++        F.silu(gate32, inplace=True)
++        y = x * gate32
+         ops.rms_norm(
+             out,
+             y.to(x.dtype),

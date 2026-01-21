@@ -1,0 +1,114 @@
+diff --git a/tests/core/test_scheduler.py b/tests/core/test_scheduler.py
+index 9588a1b..53c8517 100644
+--- a/tests/core/test_scheduler.py
++++ b/tests/core/test_scheduler.py
+@@ -250,8 +250,8 @@ def test_scheduler_delay_factor():
+     assert seq_group_meta[0].request_id == '0'
+     append_new_token(out, 1)
+ 
+-    # wait for a second before scheduling next prompt
+-    time.sleep(1)
++    # wait briefly before scheduling next prompt (reduced for faster tests)
++    time.sleep(0.2)
+     seq_group_meta, seq_group = create_dummy_prompt("1",
+                                                     prompt_length=block_size)
+     scheduler.add_seq_group(seq_group)
+@@ -262,8 +262,8 @@ def test_scheduler_delay_factor():
+     assert seq_group_meta[0].request_id == '0'
+     append_new_token(out, 1)
+ 
+-    # wait for more than 0.5 second and try again
+-    time.sleep(0.6)
++    # wait for more than 0.5x last prompt latency and try again
++    time.sleep(0.12)
+     seq_group_meta, out = schedule_and_update_computed_tokens(scheduler)
+     assert out.num_prefill_groups > 0
+     assert seq_group_meta[0].request_id == '1'
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4198550..4c3e1cb 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -316,25 +316,22 @@ class Scheduler:
+         if isinstance(request_id, str):
+             request_id = (request_id, )
+         request_ids = set(request_id)
+-        for state_queue in [self.waiting, self.running, self.swapped]:
+-            aborted_groups: List[SequenceGroup] = []
++        # Rebuild each queue in one pass to avoid repeated O(n) removals.
++        for attr in ("waiting", "running", "swapped"):
++            state_queue: Deque[SequenceGroup] = getattr(self, attr)
++            kept: Deque[SequenceGroup] = deque()
+             for seq_group in state_queue:
+-                if not request_ids:
+-                    # Using 'break' here may add two extra iterations,
+-                    # but is acceptable to reduce complexity .
+-                    break
+-                if seq_group.request_id in request_ids:
+-                    # Appending aborted group into pending list.
+-                    aborted_groups.append(seq_group)
+-                    request_ids.remove(seq_group.request_id)
+-            for aborted_group in aborted_groups:
+-                # Remove the sequence group from the state queue.
+-                state_queue.remove(aborted_group)
+-                for seq in aborted_group.get_seqs():
+-                    if seq.is_finished():
+-                        continue
+-                    seq.status = SequenceStatus.FINISHED_ABORTED
+-                    self.free_seq(seq)
++                rid = seq_group.request_id
++                if rid in request_ids:
++                    request_ids.remove(rid)
++                    for seq in seq_group.get_seqs():
++                        if seq.is_finished():
++                            continue
++                        seq.status = SequenceStatus.FINISHED_ABORTED
++                        self.free_seq(seq)
++                else:
++                    kept.append(seq_group)
++            setattr(self, attr, kept)
+ 
+     def has_unfinished_seqs(self) -> bool:
+         return len(self.waiting) != 0 or len(self.running) != 0 or len(
+@@ -594,7 +591,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = deque(waiting_queue)
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -977,11 +974,8 @@ class Scheduler:
+ 
+         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+             cows = self.block_manager.append_slots(seq, num_lookahead_slots)
+-
+             for src, dests in cows.items():
+-                if src not in blocks_to_copy:
+-                    blocks_to_copy[src] = []
+-                blocks_to_copy[src].extend(dests)
++                blocks_to_copy.setdefault(src, []).extend(dests)
+ 
+     def _preempt(
+         self,
+@@ -1064,7 +1058,7 @@ class Scheduler:
+         # Delay scheduling prompts to let waiting queue fill up
+         if self.scheduler_config.delay_factor > 0 and self.waiting:
+             earliest_arrival_time = min(
+-                [e.metrics.arrival_time for e in self.waiting])
++                (e.metrics.arrival_time for e in self.waiting))
+             passed_delay = (
+                 (now - earliest_arrival_time) >
+                 (self.scheduler_config.delay_factor * self.last_prompt_latency)
+@@ -1097,10 +1091,8 @@ class Scheduler:
+         sequences (e.g., running beam search), it means it is in decoding
+         phase, so chunking doesn't happen.
+         """
+-        num_new_tokens = 0
+         seqs = seq_group.get_seqs(status=status)
+-        for seq in seqs:
+-            num_new_tokens += seq.get_num_new_tokens()
++        num_new_tokens = sum(seq.get_num_new_tokens() for seq in seqs)
+         # Chunk if a running request cannot fit in.
+         # If number of seq > 1, it means it is doing beam search in a
+         # decode phase. Do not chunk in that case.

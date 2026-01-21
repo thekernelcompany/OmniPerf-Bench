@@ -1,0 +1,127 @@
+diff --git a/tests/core/block/test_prefix_caching_block.py b/tests/core/block/test_prefix_caching_block.py
+index c222687..aa84ee2 100644
+--- a/tests/core/block/test_prefix_caching_block.py
++++ b/tests/core/block/test_prefix_caching_block.py
+@@ -369,6 +369,10 @@ class TestPrefixCachingBlockAllocator:
+         assert allocator_dst.get_num_blocks_touched(
+             blocks_to_swap_in, num_lookahead_slots=block_size) == 3
+ 
++        # Mark blocks as computed bulk path should be a cheap no-op
++        # when invoked with empty list, but must not throw.
++        allocator_dst.mark_blocks_as_computed([])
++
+     @staticmethod
+     @pytest.mark.parametrize("num_blocks", [1024])
+     @pytest.mark.parametrize("block_size", [16])
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..f5372f2 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -1,5 +1,4 @@
+ """Token blocks."""
+-from os.path import commonprefix
+ from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
+ 
+ from vllm.core.block.common import (CacheMetricData, CopyOnWriteTracker,
+@@ -106,7 +105,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly())
+ 
+-        self.metric_data = CacheMetricData()
++        # Track cache effectiveness using block granularity equal to
++        # allocator block size to keep stats representative and cheap.
++        self.metric_data = CacheMetricData(block_size=block_size)
+ 
+     # Implements Block.Factory.
+     def _create_block(
+@@ -507,7 +508,33 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Marks the provided blocks as computed.
++
++        This is a fast-path bulk operation used by the scheduler right after
++        a successful model run. It avoids repeated per-block checks when
++        detecting computed prefixes on the next scheduling iteration.
++
++        Notes:
++        - Passing an empty list is a valid no-op and returns immediately.
++        - For blocks in the evictor (inactive), we do not need to update any
++          state, as they are already considered computed for prefix caching.
++        """
++        if not block_ids:
++            return
++
++        # Update the in-memory tracker only; this is sufficient for
++        # get_computed_block_ids(..) fast-path checks.
++        tracker = self._block_tracker
++        evictor = self.evictor
++        for bid in block_ids:
++            state = tracker.get(bid)
++            if state is not None and state.active:
++                state.computed = True
++            elif bid in evictor:
++                # Already eligible for reuse; nothing to do.
++                continue
++            # If the block id is unknown, silently ignore. This allows callers
++            # to pass mixed device block ids when only GPU ids are tracked.
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+@@ -561,10 +588,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         if len(computed_seq_block_ids) == 1:
+             return computed_seq_block_ids[0]
+ 
+-        return commonprefix([
+-            ids for ids in computed_seq_block_ids  # type: ignore
+-            if ids
+-        ])
++        # Filter out empty lists early.
++        lists = [ids for ids in computed_seq_block_ids if ids]
++        if not lists:
++            return []
++
++        # Compute longest common prefix efficiently without importing
++        # os.path.commonprefix (which is string-oriented and adds overhead).
++        first = lists[0]
++        prefix_len = 0
++        for cols in zip(*lists):
++            v = cols[0]
++            if all(x == v for x in cols[1:]):
++                prefix_len += 1
++            else:
++                break
++        return first[:prefix_len]
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],
+diff --git a/vllm/core/block_manager_v2.py b/vllm/core/block_manager_v2.py
+index b7d9451..cd8d115 100644
+--- a/vllm/core/block_manager_v2.py
++++ b/vllm/core/block_manager_v2.py
+@@ -287,11 +287,19 @@ class BlockSpaceManagerV2(BlockSpaceManager):
+                 seq.seq_id, now)
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+-        # The only need for mark block as computed is for prefix caching,
+-        # while currently we could determine whether one block is computed
+-        # or not by check whether it has content hash.
+-        # So this function is useless for block_v2.
+-        pass
++        """Mark all blocks of scheduled sequences as computed for caching.
++
++        This enables the allocator to acknowledge computed prefixes without
++        re-checking on subsequent iterations. When caching is disabled, this
++        becomes a cheap no-op.
++        """
++        if not self.enable_caching:
++            return
++
++        for seq in seq_group.get_seqs():
++            block_ids = self.block_tables[seq.seq_id].physical_block_ids
++            # Empty or single-block prompts are fine; allocator handles it.
++            self.block_allocator.mark_blocks_as_computed(block_ids)  # type: ignore
+ 
+     def get_common_computed_block_ids(
+             self, seqs: List[Sequence]) -> GenericSequence[int]:

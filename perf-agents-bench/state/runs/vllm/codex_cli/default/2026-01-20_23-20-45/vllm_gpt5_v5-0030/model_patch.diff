@@ -1,0 +1,84 @@
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 1be806b..8b41c41 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -51,12 +51,19 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
+       src_device.is_cuda() ? src_device : dst_device);
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   // NOTE(woosuk): This can be slow if the number of blocks is large.
++  // Avoid per-element Tensor indexing and .item() synchronizations by
++  // reading the mapping through a raw pointer on CPU.
+   const int64_t num_blocks = block_mapping.size(0);
+-  for (size_t i = 0; i < num_blocks; i++) {
+-    int64_t src_block_number = block_mapping[i][0].item<int64_t>();
+-    int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
+-    int64_t src_offset = src_block_number * block_size_in_bytes;
+-    int64_t dst_offset = dst_block_number * block_size_in_bytes;
++  if (num_blocks == 0) {
++    return;
++  }
++  const int64_t* __restrict__ map_ptr =
++      block_mapping.data_ptr<int64_t>();  // shape = [num_blocks, 2]
++  for (int64_t i = 0; i < num_blocks; ++i) {
++    const int64_t src_block_number = map_ptr[2 * i + 0];
++    const int64_t dst_block_number = map_ptr[2 * i + 1];
++    const int64_t src_offset = src_block_number * block_size_in_bytes;
++    const int64_t dst_offset = dst_block_number * block_size_in_bytes;
+     cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
+                     block_size_in_bytes, memcpy_type, stream);
+   }
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index d379890..9761226 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -101,6 +101,10 @@ class FlashAttentionImpl(AttentionImpl):
+                 f"Head size {head_size} is not supported by FlashAttention. "
+                 f"Supported head sizes are: {support_head_sizes}.")
+ 
++        # Cache device-specific copies of constant tensors to avoid
++        # redundant device transfers on every forward.
++        self._alibi_device_cache: Dict[torch.device, torch.Tensor] = {}
++
+     def forward(
+         self,
+         query: torch.Tensor,
+@@ -135,10 +139,12 @@ class FlashAttentionImpl(AttentionImpl):
+             "key/v_scale is not supported in FlashAttention.")
+ 
+         if attn_metadata is None:
+-            # Profiling run.
++            # Profiling run or dry-run where metadata is not provided.
+             return output
+ 
+         num_actual_tokens = attn_metadata.num_actual_tokens
++        if num_actual_tokens == 0:
++            return output
+ 
+         # Reshape the input keys and values and store them in the cache.
+         key_cache = kv_cache[0]
+@@ -155,6 +161,16 @@ class FlashAttentionImpl(AttentionImpl):
+         )
+ 
+         # Compute attention and update output up to `num_actual_tokens`.
++        # Ensure alibi slopes are on the same device without repeated H2D.
++        alibi = None
++        if self.alibi_slopes is not None:
++            qdev = query.device
++            cached = self._alibi_device_cache.get(qdev)
++            if cached is None or cached.device != qdev:
++                cached = self.alibi_slopes.to(device=qdev, non_blocking=True)
++                self._alibi_device_cache[qdev] = cached
++            alibi = cached
++
+         flash_attn_varlen_func(
+             q=query[:num_actual_tokens],
+             k=key_cache,
+@@ -166,7 +182,7 @@ class FlashAttentionImpl(AttentionImpl):
+             max_seqlen_k=attn_metadata.max_seq_len,
+             softmax_scale=self.scale,
+             causal=True,
+-            alibi_slopes=self.alibi_slopes,
++            alibi_slopes=alibi,
+             window_size=self.sliding_window,
+             block_table=attn_metadata.block_table,
+             softcap=self.logits_soft_cap,

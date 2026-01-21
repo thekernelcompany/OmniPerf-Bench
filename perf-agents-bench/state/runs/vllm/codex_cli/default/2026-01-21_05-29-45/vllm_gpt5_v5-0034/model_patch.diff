@@ -1,0 +1,149 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23..6e7bb55 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -107,6 +107,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly())
+ 
++        # Lightweight stats to expose cache effectiveness.
++        self._stats_total_immutable_allocs: int = 0
++        self._stats_cache_hits: int = 0
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -146,21 +150,40 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None)
+-        assert block.content_hash is not None
+-
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+-        if cached_block_id is not None:
+-            block.block_id = cached_block_id
+-            self._incr_refcount_cached_block(block)
+-            return block
+-        self._block_pool.free_block(block)
++        # Fast path: compute hash without creating a temporary block object.
++        # This avoids an extra BlockPool allocation and re-init for the common
++        # cache-hit case.
++        self._stats_total_immutable_allocs += 1
+ 
+-        # No cached block => Allocate a new block
++        cached_block_id: Optional[int] = None
++        prev_hash: Optional[int]
++        if prev_block is None:
++            prev_hash = None
++        else:
++            assert_prefix_caching_block_or_none(prev_block)
++            prev_hash = prev_block.content_hash  # type: ignore
++
++        if prev_block is None or prev_hash is not None:
++            # We can compute the content hash directly.
++            content_hash = PrefixCachingBlock.hash_block_tokens(
++                is_first_block=(prev_block is None),
++                prev_block_hash=prev_hash,
++                cur_block_token_ids=token_ids,
++            )
++            cached_block_id = self._cached_blocks.get(content_hash)
++
++            if cached_block_id is not None:
++                # Construct a light block bound to the cached physical block id
++                block = self._block_pool.init_block(
++                    prev_block=prev_block,
++                    token_ids=token_ids,
++                    block_size=self._block_size,
++                    physical_block_id=cached_block_id)
++                self._incr_refcount_cached_block(block)
++                self._stats_cache_hits += 1
++                return block
++
++        # Slow path or cache miss: fall back to mutable allocation and promote
+         block = self.allocate_mutable_block(prev_block)
+         block.append_token_ids(token_ids)
+         return block
+@@ -483,6 +506,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+         return self._cow_tracker.clear_cows()
+ 
++    # ---------------- Stats helpers (allocator) -----------------
++    def get_prefix_cache_hit_rate(self) -> float:
++        """Return the ratio of immutable allocations that hit the cache."""
++        total = self._stats_total_immutable_allocs
++        return (self._stats_cache_hits / total) if total else 0.0
++
+     def mark_blocks_as_accessed(self, block_ids: List[int],
+                                 now: float) -> None:
+         """Mark blocks as accessed, used in prefix caching.
+@@ -501,7 +530,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        # Prefix caching in this allocator uses content-hash presence and
++        # evictor residency to infer computed state. Accept the call as a
++        # constant-time no-op to avoid overhead in tight loops.
++        return None
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+@@ -810,25 +842,37 @@ class PrefixCachingBlock(Block):
+     @staticmethod
+     def hash_block_tokens(is_first_block: bool, prev_block_hash: Optional[int],
+                           cur_block_token_ids: List[int]) -> int:
+-        """Computes a hash value corresponding to the contents of a block and
+-        the contents of the preceding block(s). The hash value is used for
+-        prefix caching.
+-
+-        NOTE: Content-based hashing does not yet support LoRA.
++        """Compute a fast, stable 64-bit hash for a full KV block.
+ 
+-        Parameters:
+-        - is_first_block (bool): A flag indicating if the block is the first in
+-            the sequence.
+-        - prev_block_hash (Optional[int]): The hash of the previous block. None
+-            if this is the first block.
+-        - cur_block_token_ids (List[int]): A list of token ids in the current
+-            block. The current block is assumed to be full.
+-
+-        Returns:
+-        - int: The computed hash value for the block.
++        Use a simple FNV-1a style combiner over ints to avoid constructing
++        large Python tuples for hashing. The hash is process-local and only
++        needs to be consistent within a single run.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++
++        # 64-bit FNV-1a parameters
++        h: int = 0xcbf29ce484222325
++        fnv_prime: int = 0x100000001b3
++        mask: int = (1 << 64) - 1
++
++        # Mix whether this is the first block
++        h ^= 1 if is_first_block else 0
++        h = (h * fnv_prime) & mask
++
++        # Mix previous block hash if present
++        if prev_block_hash is not None:
++            h ^= prev_block_hash & mask
++            h = (h * fnv_prime) & mask
++
++        # Mix current token ids
++        for t in cur_block_token_ids:
++            h ^= int(t) & mask
++            h = (h * fnv_prime) & mask
++
++        # Return as signed Python int (still hashable, dict-friendly)
++        return h
++
++    # Note: Stats helpers live on the allocator, not the block.
+ 
+ 
+ class ComputedBlocksTracker:

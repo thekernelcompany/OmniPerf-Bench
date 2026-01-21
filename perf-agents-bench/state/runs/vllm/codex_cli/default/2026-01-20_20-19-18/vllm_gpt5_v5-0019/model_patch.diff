@@ -1,0 +1,220 @@
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 5601c62..bc1bdab 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -84,13 +84,21 @@ class RejectionSampler(nn.Module):
+         # NOTE: The following input preparationg can be moved
+         # to the model runner with a persistent manner for better
+         # performance.
+-        # Convert draft token IDs to a tensor, split by sample_lens, then pad.
+-        draft_token_ids = [
+-            torch.tensor(x, dtype=int, device='cpu') for x in draft_token_ids
+-        ]
+-        draft_token_ids_tensor = pad_sequence(draft_token_ids,
+-                                              batch_first=True,
+-                                              padding_value=INVALID_TOKEN_ID)
++        # Convert draft token IDs to a dense 2D tensor with minimal overhead.
++        # Avoids per-row tensor constructions and pad_sequence overhead.
++        max_spec_len = max((len(x) for x in draft_token_ids), default=0)
++        batch_size = len(draft_token_ids)
++        draft_token_ids_tensor = torch.full(
++            (batch_size, max_spec_len),
++            fill_value=INVALID_TOKEN_ID,
++            dtype=torch.int64,
++            device="cpu",
++        )
++        if max_spec_len > 0:
++            for i, seq in enumerate(draft_token_ids):
++                if seq:
++                    draft_token_ids_tensor[i, :len(seq)] = torch.tensor(
++                        seq, dtype=torch.int64)
+ 
+         # NOTE: CPU <-> GPU synchronization happens here.
+         draft_token_ids_tensor = draft_token_ids_tensor.to(target_probs.device)
+@@ -103,6 +111,34 @@ class RejectionSampler(nn.Module):
+                                                      vocab_size,
+                                                      target_probs.device)
+         sample_lens = [len(x) + 1 for x in draft_token_ids]
++
++        # Fast path for greedy: avoid expanding to [B, T, V] by computing
++        # argmax token ids per request directly.
++        if sampling_metadata.all_greedy:
++            batch = len(sample_lens)
++            max_len = max(sample_lens) if sample_lens else 0
++            # [B, max_spec_len + 1] int tensor of target token ids
++            target_token_ids_tensor = torch.full(
++                (batch, max_len),
++                fill_value=INVALID_TOKEN_ID,
++                dtype=torch.int64,
++                device=target_probs.device,
++            )
++            offset = 0
++            for i, l in enumerate(sample_lens):
++                if l > 0:
++                    # argmax over vocab for this request's tokens
++                    target_token_ids_tensor[i, :l] = target_probs[offset:offset
++                                                                  + l].argmax(
++                                                                      dim=-1)
++                    offset += l
++            # Directly execute greedy native path using the token ids.
++            return self.forward_native(draft_token_ids_tensor, draft_probs,
++                                       bonus_token_ids_tensor,
++                                       target_token_ids_tensor,
++                                       sampling_metadata)
++
++        # Non-greedy path needs full probability tensors.
+         target_probs = _convert_2d_probs(target_probs, sample_lens)
+ 
+         return self.forward_native(draft_token_ids_tensor, draft_probs,
+@@ -122,29 +158,24 @@ class RejectionSampler(nn.Module):
+     ) -> torch.Tensor:
+         # Add 1 to include the 'bonus' token.
+         if sampling_metadata.all_greedy:
+-            # Produce a mask that remains 1 (True) until the first
+-            # mismatch (cumprod turns 0 after a mismatch).
+-            target_token_ids_tensor = target_probs.argmax(dim=-1)
++            # Fast path: compute prefix length of accepted tokens per row
++            # and construct the output via a single broadcasted mask.
++            # Here, `target_probs` is actually the token id matrix
++            # when all_greedy=True (constructed in forward()).
++            target_token_ids_tensor = target_probs
+             accept_mask = (target_token_ids_tensor[:, :-1] ==
+                            draft_token_ids_tensor).cumprod(dim=1)
+-
+-            # Identify valid positions (non-padding).
+-            valid_mask = target_token_ids_tensor != INVALID_TOKEN_ID
+-            # Generate mask with bonus token.
+-            generate_mask = torch.cat([
+-                accept_mask,
+-                torch.zeros(accept_mask.size(0), 1, device=accept_mask.device)
+-            ],
+-                                      dim=1).to(torch.bool) & valid_mask
+-            zeros_mask = (generate_mask == 0)
+-            first_zero_idx = zeros_mask.float().argmax(dim=1)
+-            # Figure out which rows actually contain at least one zero.
+-            rows_with_zero = zeros_mask.any(dim=1)
+-            # Use indexing to set the first zero in each of those rows to 1.
+-            generate_mask[rows_with_zero, first_zero_idx[rows_with_zero]] = 1
+-
+-            output_token_ids = target_token_ids_tensor
+-            output_token_ids[~generate_mask] = INVALID_TOKEN_ID
++            # Number of accepted tokens before the first mismatch.
++            prefix_len = accept_mask.sum(dim=1)
++            # Build a mask that includes the first mismatch (or bonus).
++            arange_idx = torch.arange(target_token_ids_tensor.size(1),
++                                      device=target_token_ids_tensor.device)
++            generate_mask = arange_idx.unsqueeze(0) <= prefix_len.unsqueeze(1)
++            output_token_ids = torch.where(generate_mask,
++                                           target_token_ids_tensor,
++                                           torch.full_like(
++                                               target_token_ids_tensor,
++                                               INVALID_TOKEN_ID))
+         else:
+             # Reference: https://arxiv.org/pdf/2211.17192
+             # 1. Extract the probabilities of the draft tokens.
+@@ -176,23 +207,25 @@ class RejectionSampler(nn.Module):
+                                            draft_token_probs,
+                                            torch.finfo(torch.float32).tiny)
+             accepted = uniform_samples <= target_token_probs / safe_draft_probs
++            # Use cumulative product over 0/1 to keep prefix of accepts.
+             accept_mask = accepted.cumprod(dim=1)
+             # Set the token ids to the draft token ids if accepted, otherwise
+             # set them to INVALID_TOKEN_ID.
+-            accepted_token_ids = (draft_token_ids_tensor * accept_mask +
+-                                  INVALID_TOKEN_ID * (1 - accept_mask))
++            accepted_token_ids = torch.where(
++                accept_mask.to(torch.bool), draft_token_ids_tensor,
++                torch.full_like(draft_token_ids_tensor, INVALID_TOKEN_ID))
+ 
+             # 4. Adjust the distribution for the recovered tokens.
+             # Clamp the bonus probabilities to the smallest positive normal
+             # value representable by float32.
+-            bonus_prob = torch.clamp(target_probs[:, :-1, :] - draft_probs,
+-                                     min=torch.finfo(torch.float32).tiny)
+-            normalized_bonus_prob = bonus_prob / bonus_prob.sum(dim=-1,
+-                                                                keepdim=True)
++            bonus_prob = target_probs[:, :-1, :].sub(draft_probs)
++            bonus_prob.clamp_(min=torch.finfo(torch.float32).tiny)
++            denom = bonus_prob.sum(dim=-1, keepdim=True)
++            bonus_prob.div_(denom)
+ 
+             # 5. Sample recovered token ids.
+             recovered_token_ids = random_sample(
+-                normalized_bonus_prob,
++                bonus_prob,
+                 sampling_metadata.generators).reshape(batch_size, max_spec_len)
+ 
+             # 6. Get the final output token ids.
+@@ -202,23 +235,18 @@ class RejectionSampler(nn.Module):
+             recovered_bonus_token_ids = torch.cat(
+                 [recovered_token_ids, bonus_token_ids_tensor], dim=1)
+             # Generate mask with bonus tokens.
+-            generate_mask = torch.cat([
+-                accept_mask,
+-                torch.zeros(batch_size, 1, device=accept_mask.device)
+-            ],
+-                                      dim=1).to(torch.bool)
+-            zeros_mask = (generate_mask == 0)
+-            first_zero_idx = zeros_mask.float().argmax(dim=1)
+-            output_token_ids = torch.cat([
+-                accepted_token_ids,
+-                torch.full((batch_size, 1),
+-                           fill_value=INVALID_TOKEN_ID,
+-                           device=accept_mask.device)
+-            ],
+-                                         dim=1)
+-            output_token_ids[torch.arange(batch_size),
+-                             first_zero_idx] = recovered_bonus_token_ids[
+-                                 torch.arange(batch_size), first_zero_idx]
++            # Index of the first mismatch per row equals number of accepts.
++            first_zero_idx = accept_mask.sum(dim=1)
++            output_token_ids = torch.full(
++                (batch_size, max_spec_len + 1),
++                fill_value=INVALID_TOKEN_ID,
++                dtype=draft_token_ids_tensor.dtype,
++                device=draft_token_ids_tensor.device,
++            )
++            output_token_ids[:, :max_spec_len] = accepted_token_ids
++            rows = torch.arange(batch_size, device=draft_token_ids_tensor.device)
++            output_token_ids[rows, first_zero_idx] = recovered_bonus_token_ids[
++                rows, first_zero_idx]
+ 
+         return output_token_ids
+ 
+@@ -288,21 +316,22 @@ def _convert_2d_probs(
+         probs: torch.Tensor,  # [num_total_tokens, vocab_size]
+         sample_lens: list[int]) -> torch.Tensor:
+     """
+-        Converts a 2D tensor of probabilities to a 3D tensor with padding.
+-        [num_total_tokens, vocab_size] -> 
+-            [batch_size, max_spec_len + 1, vocab_size]
++    Convert a 2D tensor of per-token probabilities to a padded 3D tensor.
++    [num_total_tokens, vocab_size] -> [batch_size, max_spec_len + 1, vocab]
++    This implementation avoids pad_sequence and redundant tensor splits.
+     """
+-    cumulative_lens = torch.cumsum(torch.tensor(sample_lens,
+-                                                device=probs.device),
+-                                   dim=0)
+-    split_indices = cumulative_lens[:-1].tolist()  # Exclude last index
+-
+-    # Split into chunks without loops
+-    chunks = torch.tensor_split(probs, split_indices, dim=0)
+-
+-    # Pad all sequences to maximum length
+-    padded_probs = pad_sequence(chunks, batch_first=True, padding_value=0.0)
+-    return padded_probs
++    if not sample_lens:
++        return probs.new_zeros((0, 0, probs.size(-1)))
++    batch_size = len(sample_lens)
++    max_len = max(sample_lens)
++    vocab_size = probs.size(-1)
++    out = probs.new_zeros((batch_size, max_len, vocab_size))
++    offset = 0
++    for i, l in enumerate(sample_lens):
++        if l > 0:
++            out[i, :l].copy_(probs[offset:offset + l])
++            offset += l
++    return out
+ 
+ 
+ def _create_uniform_samples(seeded_seqs: dict[int, torch.Generator],
