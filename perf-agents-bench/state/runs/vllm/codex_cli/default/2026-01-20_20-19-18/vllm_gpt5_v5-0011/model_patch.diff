@@ -1,0 +1,193 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index dfe7102..f0eb00d 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -10,15 +10,20 @@ def get_token_bin_counts_and_mask(
+     vocab_size: int,
+     num_seqs: int,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    # Compute the bin counts for the tokens.
+-    # vocab_size + 1 for padding.
++    """Compute per-sequence token frequency and presence mask.
++
++    Uses a single scatter_add pass to build counts, then derives the mask.
++    The input may include a padding sentinel equal to ``vocab_size``; we
++    construct the buffer with ``vocab_size + 1`` to safely index it and then
++    slice away the sentinel column.
++    """
+     bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
++    one_src = torch.ones_like(tokens, dtype=bin_counts.dtype)
++    bin_counts.scatter_add_(1, tokens, one_src)
+     bin_counts = bin_counts[:, :vocab_size]
+-    mask = bin_counts > 0
+-
++    mask = bin_counts.ne(0)
+     return bin_counts, mask
+ 
+ 
+@@ -41,18 +46,39 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     repetition_penalties: The repetition penalties of shape (num_seqs, )
+     """
+     num_seqs, vocab_size = logits.shape
+-    _, prompt_mask = get_token_bin_counts_and_mask(prompt_tokens_tensor,
+-                                                   vocab_size, num_seqs)
++    # Prompt presence: only need a mask, not counts.
++    # Build boolean mask with a lightweight scatter.
++    prompt_presence_full = torch.zeros((num_seqs, vocab_size + 1),
++                                       dtype=torch.bool,
++                                       device=logits.device)
++    prompt_presence_full.scatter_(1,
++                                  prompt_tokens_tensor,
++                                  torch.ones_like(prompt_tokens_tensor,
++                                                  dtype=torch.bool))
++    prompt_mask = prompt_presence_full[:, :vocab_size]
++
++    # Output: need both counts and mask for frequency/presence penalties.
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze_(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
+-    # We follow the definition in OpenAI API.
+-    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
++
++    # Repetition penalty: apply per sequence without materializing a repeated
++    # (B, V) tensor. For tokens seen in either prompt or output, scale logits
++    # by penalty depending on their sign per OpenAI API behavior.
++    rep = repetition_penalties.unsqueeze(1)  # (B, 1)
++    seen_mask = prompt_mask | output_mask
++    if seen_mask.any():
++        # For positive logits -> divide by rep; non-positive -> multiply by rep
++        pos_mask = logits > 0
++        # Only modify where seen_mask is true.
++        # Compute scales lazily with broadcasting to avoid large repeats.
++        scale_pos = (1.0 / rep)
++        scale_neg = rep
++        logits = torch.where(seen_mask & pos_mask, logits * scale_pos,
++                             logits)
++        logits = torch.where(seen_mask & (~pos_mask), logits * scale_neg,
++                             logits)
++
++    # Frequency and presence penalties as in OpenAI API.
++    logits -= frequency_penalties.unsqueeze(1) * output_bin_counts
++    logits -= presence_penalties.unsqueeze(1) * output_mask
+     return logits
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 2743100..bfe0379 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -97,6 +97,19 @@ def apply_top_k_top_p(
+     """
+     if no_top_k and no_top_p:
+         return logits
++    # Fast path for top-k only using topk threshold without full sort.
++    if not no_top_k and no_top_p:
++        V = logits.size(1)
++        k_clamped = torch.clamp(k.to(torch.long), 1, V)
++        # Compute top-k values per row; threshold is the smallest among them.
++        topk_vals, _ = torch.topk(logits, k_clamped.max().item(), dim=-1)
++        # For rows with k < k_max, the kth value is at position k-1.
++        # Build per-row thresholds by gathering from topk_vals.
++        kth_indices = (k_clamped - 1).clamp(min=0)
++        thresh = topk_vals.gather(1, kth_indices.unsqueeze(1)).squeeze(1)
++        mask = logits < thresh.unsqueeze(1)
++        return logits.masked_fill(mask, -float("inf"))
++    # General path falls back to sort for combined top-k and top-p
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     if not no_top_k:
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index ec6374d..9624b5c 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -200,18 +200,17 @@ class Sampler(nn.Module):
+         """
+         Filters logits using adaptive probability thresholding.
+         """
+-        # Convert logits to probability distribution
+-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
+-        # Reshape min_p for broadcasting
+-        adjusted_min_p = min_p.unsqueeze(1) * max_probabilities
+-        # Identify valid tokens using threshold comparison
+-        valid_token_mask = probability_values >= adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[~valid_token_mask] = -float('inf')
++        # Avoid softmax; use inequality p_i >= min_p * p_max.
++        # Since p_i / p_max = exp(l_i - l_max), this is equivalent to
++        # l_i - l_max >= log(min_p) when 0 < min_p <= 1.
++        if torch.all(min_p <= 0):
++            return logits
++        l_max, _ = logits.max(dim=-1, keepdim=True)
++        # Clamp min_p to (0,1] to avoid log(0) and undefined values.
++        safe_min_p = torch.clamp(min_p, min=1e-9, max=1.0).unsqueeze(1)
++        thresh = l_max + torch.log(safe_min_p)
++        valid_mask = logits >= thresh
++        logits.masked_fill_(~valid_mask, -float("inf"))
+         return logits
+ 
+     def apply_logits_bias(
+@@ -219,11 +218,20 @@ class Sampler(nn.Module):
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> torch.Tensor:
+-        # TODO(houseroad): this implementation is extremely inefficient.
+-        # One idea is implement this as a PyTorch C++ op, and we may
+-        # even optimize the logit_bias layout.
+-        for i, logit_bias in enumerate(sampling_metadata.logit_bias):
+-            if logit_bias:
+-                for token_id, bias in logit_bias.items():
+-                    logits[i, token_id] += bias
++        # Vectorized application of per-request logit bias using index_put_.
++        rows = []
++        cols = []
++        vals = []
++        for i, bias_map in enumerate(sampling_metadata.logit_bias):
++            if not bias_map:
++                continue
++            for token_id, bias in bias_map.items():
++                rows.append(i)
++                cols.append(int(token_id))
++                vals.append(float(bias))
++        if rows:
++            index = (torch.tensor(rows, device=logits.device, dtype=torch.long),
++                     torch.tensor(cols, device=logits.device, dtype=torch.long))
++            values = torch.tensor(vals, device=logits.device, dtype=logits.dtype)
++            logits.index_put_(index, values, accumulate=True)
+         return logits
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index cb7411a..c699e91 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -484,12 +484,14 @@ class InputBatch:
+             pin_memory=self.pin_memory,
+         )
+         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
+-        prompt_token_ids[:] = self.token_ids_cpu[:self.
+-                                                 num_reqs, :max_prompt_len]
+-        # Use the value of vocab_size as a pad since we don't have a
+-        # token_id of this value.
+-        for i in range(self.num_reqs):
+-            prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
++        # Copy the leading tokens from the flat token buffer.
++        prompt_token_ids[:] = self.token_ids_cpu[:self.num_reqs, :max_prompt_len]
++        # Vectorized padding: set tokens beyond prompt length to vocab_size.
++        if self.num_reqs > 0 and max_prompt_len > 0:
++            lengths = self.num_prompt_tokens[:self.num_reqs]
++            col_idx = np.arange(max_prompt_len, dtype=np.int32)
++            mask = col_idx >= lengths[:, None]
++            prompt_token_ids[mask] = self.vocab_size
+         return prompt_token_ids_cpu_tensor.to(device=self.device,
+                                               non_blocking=True)
+ 

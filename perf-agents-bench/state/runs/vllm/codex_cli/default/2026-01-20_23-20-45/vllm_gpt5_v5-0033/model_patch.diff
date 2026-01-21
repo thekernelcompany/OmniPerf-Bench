@@ -1,0 +1,87 @@
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index 122e2ed..7f641d1 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -1383,12 +1383,15 @@ class LLM:
+                             # Calculate tokens only for RequestOutput
+                             assert output.prompt_token_ids is not None
+                             total_in_toks += len(output.prompt_token_ids)
+-                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
++                            # Access elapsed once to avoid repeated dict lookups
++                            elapsed = pbar.format_dict.get("elapsed", 0.0) or 0.0
++                            in_spd = total_in_toks / elapsed if elapsed else 0.0
+                             total_out_toks += sum(
+                                 len(stp.token_ids) for stp in output.outputs)
+-                            out_spd = (total_out_toks /
+-                                       pbar.format_dict["elapsed"])
+-                            pbar.postfix = (
++                            out_spd = (total_out_toks / elapsed
++                                       if elapsed else 0.0)
++                            # set_postfix_str is marginally cheaper than assigning .postfix
++                            pbar.set_postfix_str(
+                                 f"est. speed input: {in_spd:.2f} toks/s, "
+                                 f"output: {out_spd:.2f} toks/s")
+                         pbar.update(1)
+@@ -1398,4 +1401,5 @@ class LLM:
+         # Sort the outputs by request ID.
+         # This is necessary because some requests may be finished earlier than
+         # its previous requests.
+-        return sorted(outputs, key=lambda x: int(x.request_id))
++        outputs.sort(key=lambda x: int(x.request_id))
++        return outputs
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 98e9ea0..2b00690 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -315,8 +315,9 @@ class OpenAIServingChat(OpenAIServing):
+         # all_previous_token_ids will not be used twice in the same iteration.
+         if tool_choice_auto or should_stream_with_reasoning_parsing:
+             # These are only required in "auto" tool choice case
+-            previous_texts = [""] * num_choices
+-            all_previous_token_ids = [[]] * num_choices
++            # Avoid list aliasing which can cause unintended shared mutation
++            previous_texts = ["" for _ in range(num_choices)]
++            all_previous_token_ids = [[] for _ in range(num_choices)]
+         else:
+             previous_texts, all_previous_token_ids = None, None
+ 
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index ed09af8..67b851b 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -246,10 +246,12 @@ class OpenAIServingCompletion(OpenAIServing):
+         request_metadata: RequestResponseMetadata,
+     ) -> AsyncGenerator[str, None]:
+         num_choices = 1 if request.n is None else request.n
+-        previous_text_lens = [0] * num_choices * num_prompts
+-        previous_num_tokens = [0] * num_choices * num_prompts
+-        has_echoed = [False] * num_choices * num_prompts
+-        num_prompt_tokens = [0] * num_prompts
++        # Avoid list aliasing and pre-size lists without nested references
++        total_slots = num_choices * num_prompts
++        previous_text_lens = [0 for _ in range(total_slots)]
++        previous_num_tokens = [0 for _ in range(total_slots)]
++        has_echoed = [False for _ in range(total_slots)]
++        num_prompt_tokens = [0 for _ in range(num_prompts)]
+ 
+         stream_options = request.stream_options
+         if stream_options:
+diff --git a/vllm/entrypoints/openai/serving_transcription.py b/vllm/entrypoints/openai/serving_transcription.py
+index 77f016a..bd6bf38 100644
+--- a/vllm/entrypoints/openai/serving_transcription.py
++++ b/vllm/entrypoints/openai/serving_transcription.py
+@@ -284,11 +284,9 @@ class OpenAIServingTranscription(OpenAIServing):
+                 lora_request=None,
+                 prompt_adapter_request=None)
+ 
+-            result_generator = self.engine_client.generate(
+-                prompt,
+-                sampling_params,
+-                request_id,
+-            )
++            result_generator = self.engine_client.generate(prompt,
++                                                           sampling_params,
++                                                           request_id)
+         except ValueError as e:
+             # TODO: Use a vllm-specific Validation Error
+             return self.create_error_response(str(e))

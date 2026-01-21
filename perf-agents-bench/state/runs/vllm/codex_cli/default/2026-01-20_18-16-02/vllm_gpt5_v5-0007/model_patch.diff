@@ -1,0 +1,114 @@
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index acc3a94..241194b 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
+ import torch
+ 
+ 
+-@dataclass
++@dataclass(slots=True)
+ class SamplerOutput:
+ 
+     # [num_reqs]
+@@ -22,7 +22,7 @@ class SamplerOutput:
+ 
+ # ModelRunnerOutput is serialized and sent to the scheduler process.
+ # This is expensive for torch.Tensor so prefer to use List instead.
+-@dataclass
++@dataclass(slots=True)
+ class ModelRunnerOutput:
+ 
+     # [num_reqs]
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 7cd42ca..48f7010 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -39,16 +39,19 @@ class Sampler(nn.Module):
+             topk_logprobs = None
+             topk_indices = None
+ 
+-        # Use float32 for the logits.
+-        logits = logits.to(torch.float32)
++        # Use float32 for the logits only if needed.
++        # Avoid unnecessary dtype conversion when already float32.
++        if logits.dtype is not torch.float32:
++            logits = logits.to(torch.float32)
+         # Apply penalties (e.g., min_tokens, freq_penalties).
+         logits = self.apply_penalties(logits, sampling_metadata)
+         # Apply temperature.
+         logits = self.apply_temperature(logits, sampling_metadata.temperature)
+         # Sample the next token.
+         sampled = self.sample(logits, sampling_metadata)
+-        # Use int32 to reduce the tensor size.
+-        sampled = sampled.to(torch.int32)
++        # Use int32 to reduce the tensor size; avoid no-op cast.
++        if sampled.dtype is not torch.int32:
++            sampled = sampled.to(torch.int32)
+ 
+         # NOTE: CPU-GPU synchronization happens here.
+         sampler_output = SamplerOutput(
+@@ -108,7 +111,12 @@ class Sampler(nn.Module):
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        logprobs = logits.log_softmax(dim=-1, dtype=torch.float32)
++        # Compute logprobs in float32 but avoid extra cast if logits is
++        # already float32.
++        if logits.dtype is torch.float32:
++            logprobs = logits.log_softmax(dim=-1)
++        else:
++            logprobs = logits.log_softmax(dim=-1, dtype=torch.float32)
+         # FIXME: Mask the sampled token_id, get topk logprobs,
+         # and concatenate the topk with the sampled token_id.
+         topk_logprobs, topk_indices = torch.topk(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 4b3c325..10cfd72 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -339,16 +339,14 @@ class GPUModelRunner:
+         self.input_batch.block_table.commit(num_reqs)
+ 
+         # Get the number of scheduled tokens for each request.
+-        # TODO: The Python loop can be slow. Optimize.
+-        num_scheduled_tokens = []
+-        max_num_scheduled_tokens = 0
+-        for req_id in self.input_batch.req_ids[:num_reqs]:
+-            assert req_id is not None
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens.append(num_tokens)
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
+-        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
++        # Avoid Python max() in a loop and build the numpy array directly.
++        num_scheduled_tokens = np.fromiter(
++            (scheduler_output.num_scheduled_tokens[req_id]
++             for req_id in self.input_batch.req_ids[:num_reqs]),
++            dtype=np.int32,
++            count=num_reqs,
++        )
++        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+         assert max_num_scheduled_tokens > 0
+ 
+         # Get request indices.
+@@ -799,14 +797,18 @@ class GPUModelRunner:
+                     # This relies on cuda-specific torch-internal impl details
+                     generator.set_offset(generator.get_offset() - 4)
+ 
++        # Avoid creating CPU tensors when not needed; use non_blocking copy
++        # to overlap D2H with subsequent CPU work when possible.
+         if sampler_output.logprob_token_ids is None:
+             logprob_token_ids = None
+         else:
+-            logprob_token_ids = sampler_output.logprob_token_ids.cpu()
++            logprob_token_ids = sampler_output.logprob_token_ids.to(
++                device="cpu", non_blocking=True)
+         if sampler_output.logprobs is None:
+             logprobs = None
+         else:
+-            logprobs = sampler_output.logprobs.cpu()
++            logprobs = sampler_output.logprobs.to(device="cpu",
++                                                  non_blocking=True)
+ 
+         # num_reqs entries should be non-None
+         assert all(

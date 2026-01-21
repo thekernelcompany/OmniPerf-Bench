@@ -1,0 +1,47 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 622aca6..616f00f 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -487,8 +487,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # When forking, we must make sure that each block's `ref_count`
+         # is only incremented by one, so we deduplicate them by wrapping
+         # them in a set.
+-        for block in set(src_block_table):
+-            block.ref_count += 1
++        # Avoid set() overhead when sliding window is disabled
++        if self.block_sliding_window is None:
++            for block in src_block_table:
++                block.ref_count += 1
++        else:
++            for block in set(src_block_table):
++                block.ref_count += 1
+ 
+     def _get_physical_blocks(
+             self, seq_group: SequenceGroup) -> List[PhysicalTokenBlock]:
+@@ -607,7 +612,11 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         blocks_to_free = (block_table[-self.block_sliding_window:]
+                           if self.block_sliding_window is not None else
+                           block_table)
+-        for block in set(blocks_to_free):
++        # Avoid creating a set when no sliding window is used
++        unique_blocks = (set(blocks_to_free)
++                         if self.block_sliding_window is not None else
++                         blocks_to_free)
++        for block in unique_blocks:
+             if block.device == Device.GPU:
+                 self.gpu_allocator.free(block)
+             else:
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477ef..32dc8fe 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -388,7 +388,8 @@ class Sequence:
+         # Compute the number of tokens in the sequence
+         # TODO: The current hashing function is O(L^2). We should optimize
+         # this in the future.
+-        num_tokens = self.num_hashed_tokens_of_block(logical_idx)
++        num_tokens = min(self.get_len(),
++                         self.num_hashed_tokens_of_block(logical_idx))
+         hashed_tokens = self.data.get_prefix_token_ids(num_tokens)
+         return hash((hashed_tokens, self.lora_int_id))
+ 

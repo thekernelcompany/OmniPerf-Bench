@@ -1,0 +1,63 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 0026031..bc84fce 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -532,26 +532,38 @@ def moe_align_block_size_triton(
+     expert_ids: torch.Tensor,
+     num_tokens_post_pad: torch.Tensor,
+ ) -> None:
++    # Ensure contiguous accesses for better memory throughput.
++    if not topk_ids.is_contiguous():
++        topk_ids = topk_ids.contiguous()
++
+     numel = topk_ids.numel()
+     grid = (num_experts, )
+-    tokens_cnts = torch.zeros((num_experts + 1, num_experts),
++    # Allocate once and explicitly zero to avoid repeated small inits.
++    tokens_cnts = torch.empty((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    tokens_cnts.zero_()
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    cumsum.zero_()
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
++    # Tune Triton launch params to reduce latency of these tiny kernels.
+     moe_align_block_size_stage1[grid](
+         topk_ids,
+         tokens_cnts,
+         num_experts,
+         numel,
+         tokens_per_thread,
++        num_warps=4,
++        num_stages=1,
+     )
+     moe_align_block_size_stage2[grid](
+         tokens_cnts,
+         num_experts,
++        num_warps=4,
++        num_stages=1,
+     )
+     moe_align_block_size_stage3[(1, )](
+         num_tokens_post_pad,
+@@ -559,6 +571,8 @@ def moe_align_block_size_triton(
+         cumsum,
+         num_experts,
+         block_size,
++        num_warps=1,
++        num_stages=1,
+     )
+     moe_align_block_size_stage4[grid](
+         topk_ids,
+@@ -570,6 +584,8 @@ def moe_align_block_size_triton(
+         block_size,
+         numel,
+         tokens_per_thread,
++        num_warps=4,
++        num_stages=1,
+     )
+ 
+ 

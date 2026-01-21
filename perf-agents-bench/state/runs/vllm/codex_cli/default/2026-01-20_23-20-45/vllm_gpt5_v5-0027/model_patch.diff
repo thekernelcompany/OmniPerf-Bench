@@ -1,0 +1,251 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..ade63a4 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -193,15 +193,54 @@ class BlockSpaceManager:
+         # Allocate new physical token blocks that will store the prompt tokens.
+         num_prompt_blocks = len(seq.logical_token_blocks)
+ 
++        # Optimization: computing "hash of block" via Sequence.hash_of_block
++        # repeatedly is O(L^2). Instead, compute all prefix-hashes once using
++        # a rolling hash over the prompt tokens, which reduces to O(L) work.
++        def _fnv1a64_update(h: int, x: int) -> int:
++            # 64-bit FNV-1a
++            h ^= (x & 0xFFFFFFFFFFFFFFFF)
++            return (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
++
++        def _compute_prompt_hashes_and_counts(s: Sequence) -> Tuple[List[int],
++                                                                     List[int]]:
++            tokens = s.data.get_token_ids()
++            bsz = s.block_size
++            total = len(tokens)
++            # Start from FNV offset and fold in LoRA id so that prompts from
++            # different LoRAs do not collide.
++            h = 1469598103934665603
++            h = _fnv1a64_update(h, s.lora_int_id)
++            hashes: List[int] = []
++            counts: List[int] = []
++            for i, t in enumerate(tokens, start=1):
++                h = _fnv1a64_update(h, int(t))
++                if i % bsz == 0:
++                    hashes.append(h)
++                    counts.append(i)  # exact token count at block boundary
++            if total % bsz != 0:
++                # Last partial block: hash should be over the entire token
++                # list (same behavior as Sequence.hash_of_block), while the
++                # "num_hashed_tokens" follows the logical block size.
++                hashes.append(h)
++                # Match existing behavior: number of hashed tokens for block k
++                # is (k+1)*block_size, even if the last block is partial.
++                last_idx = total // bsz  # zero-based index of last block
++                counts.append((last_idx + 1) * bsz)
++            # Ensure we match the number of logical blocks.
++            assert len(hashes) == num_prompt_blocks
++            return hashes, counts
++
++        pre_hashes, pre_counts = _compute_prompt_hashes_and_counts(seq)
++
+         block_table: BlockTable = []
+         for logical_idx in range(num_prompt_blocks):
+             if (self.block_sliding_window is not None
+                     and logical_idx >= self.block_sliding_window):
++                # reuse a previously allocated block in the window
+                 block = block_table[logical_idx % self.block_sliding_window]
+             else:
+-                block = self.gpu_allocator.allocate(
+-                    seq.hash_of_block(logical_idx),
+-                    seq.num_hashed_tokens_of_block(logical_idx))
++                block = self.gpu_allocator.allocate(pre_hashes[logical_idx],
++                                                    pre_counts[logical_idx])
+             block_table.append(block)
+ 
+         # Assign the block table for each sequence.
+@@ -221,8 +260,20 @@ class BlockSpaceManager:
+         last_block: PhysicalTokenBlock,
+     ) -> PhysicalTokenBlock:
+         # Compute a new hash for the block so that it can be shared by
+-        # other Sequences
+-        new_hash = seq.hash_of_block(len(seq.logical_token_blocks) - 1)
++        # other Sequences. Use the same rolling-hash scheme as allocate()
++        # to avoid quadratic behavior and ensure consistency.
++        def _fnv1a64_update(h: int, x: int) -> int:
++            h ^= (x & 0xFFFFFFFFFFFFFFFF)
++            return (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
++
++        logical_idx = len(seq.logical_token_blocks) - 1
++        tokens = seq.data.get_token_ids()
++        end = min(len(tokens), (logical_idx + 1) * seq.block_size)
++        h = 1469598103934665603
++        h = _fnv1a64_update(h, seq.lora_int_id)
++        for t in tokens[:end]:
++            h = _fnv1a64_update(h, int(t))
++        new_hash = h
+ 
+         # if new_hash is already in the cached table, then free last_block
+         # and return the cached version
+@@ -256,7 +307,23 @@ class BlockSpaceManager:
+     ) -> PhysicalTokenBlock:
+         block_hash: Optional[int] = None
+         if (self._is_last_block_full(seq)):
+-            block_hash = seq.hash_of_block(len(seq.logical_token_blocks) - 1)
++            # Avoid the quadratic Sequence.hash_of_block by recomputing the
++            # prefix hash once with a rolling hash.
++            logical_idx = len(seq.logical_token_blocks) - 1
++
++            def _fnv1a64_update(h: int, x: int) -> int:
++                h ^= (x & 0xFFFFFFFFFFFFFFFF)
++                return (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
++
++            # Compute prefix hash up to the end of this logical block.
++            tokens = seq.data.get_token_ids()
++            end = min(len(tokens), (logical_idx + 1) * seq.block_size)
++            h = 1469598103934665603
++            h = _fnv1a64_update(h, seq.lora_int_id)
++            for t in tokens[:end]:
++                h = _fnv1a64_update(h, int(t))
++            block_hash = h
++
+         num_hashed_tokens = seq.num_hashed_tokens_of_block(
+             len(seq.logical_token_blocks) - 1)
+         new_block = self.gpu_allocator.allocate(block_hash, num_hashed_tokens)
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..69d414d 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -1,5 +1,5 @@
+ import enum
+-from typing import Dict, List, Optional
++from typing import Dict, List, Optional, Tuple
+ from abc import ABC, abstractmethod, abstractproperty
+ 
+ from vllm.block import PhysicalTokenBlock
+@@ -51,76 +51,79 @@ class Evictor(ABC):
+ 
+ 
+ class LRUEvictor(Evictor):
+-    """Evicts in a least-recently-used order using the last_accessed timestamp
+-    that's recorded in the PhysicalTokenBlock. If there are multiple blocks with
+-    the same last_accessed time, then the one with the largest num_hashed_tokens
+-    will be evicted. If two blocks each have the lowest last_accessed time and
+-    highest num_hashed_tokens value, then one will be chose arbitrarily
++    """LRU evictor with a heap-backed priority queue.
++
++    - Primary key: lowest ``last_accessed`` wins (LRU)
++    - Tiebreaker: larger ``num_hashed_tokens`` wins (evict those first)
++
++    We keep a dict for O(1) membership and a heap for O(log N) eviction.
++    Removal is handled lazily with a tombstone set.
+     """
+ 
+     def __init__(self):
+-        self.free_table: Dict[int, PhysicalTokenBlock] = {}
++        # Active blocks by hash
++        self._table: Dict[int, PhysicalTokenBlock] = {}
++        # Min-heap of (last_accessed, -num_hashed_tokens, seq, block_hash)
++        self._heap: List[Tuple[float, int, int, int]] = []
++        # Tombstones for entries removed from table but still present in heap
++        self._removed: set[int] = set()
++        self._seq: int = 0
+ 
+     def __contains__(self, block_hash: int) -> bool:
+-        return block_hash in self.free_table
++        return block_hash in self._table
++
++    def _push(self, block: PhysicalTokenBlock):
++        self._seq += 1
++        key = (block.last_accessed, -int(block.num_hashed_tokens), self._seq,
++               block.block_hash)
++        # Store in table for O(1) membership and retrieval
++        self._table[block.block_hash] = block
++        # Push to heap for O(log N) best-candidate eviction
++        import heapq
++        heapq.heappush(self._heap, key)
++
++    def _pop_valid(self) -> PhysicalTokenBlock:
++        import heapq
++        while self._heap:
++            _, _, _, h = heapq.heappop(self._heap)
++            if h in self._removed:
++                self._removed.remove(h)
++                continue
++            # Should be in table
++            block = self._table.pop(h, None)
++            if block is None:
++                # Already taken via remove(); skip
++                continue
++            return block
++        raise ValueError("No usable cache memory left")
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
+-            raise ValueError("No usable cache memory left")
+-
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
+-        evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
+-                evicted_block = block
+-                break
+-
+-        assert evicted_block is not None
+-
+-        del self.free_table[evicted_block.block_hash]
+-
+-        evicted_block.computed = False
+-        return evicted_block
++        block = self._pop_valid()
++        block.computed = False
++        return block
+ 
+     def add(self, block: PhysicalTokenBlock):
+-        self.free_table[block.block_hash] = block
++        self._push(block)
+ 
+     def remove(self, block_hash: int) -> PhysicalTokenBlock:
+-        if block_hash not in self.free_table:
++        if block_hash not in self._table:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        block: PhysicalTokenBlock = self.free_table[block_hash]
+-        del self.free_table[block_hash]
++        # Mark tombstone and pop from table
++        block = self._table.pop(block_hash)
++        self._removed.add(block_hash)
+         return block
+ 
+     @property
+     def num_blocks(self) -> int:
+-        return len(self.free_table)
++        return len(self._table)
+ 
+ 
+ class RandomEvictor(Evictor):
+-    """Evicts in a first-in-first-out order"""
++    """Simple FIFO-style evictor using dict insertion order.
++
++    Used when caching is disabled to keep overhead minimal.
++    """
+ 
+     def __init__(self):
+         self.free_table: Dict[int, PhysicalTokenBlock] = {}

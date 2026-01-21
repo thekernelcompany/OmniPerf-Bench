@@ -1,0 +1,113 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c37679..53ac9d7 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -201,7 +201,10 @@ def _apply_min_tokens_penalty(
+         have not been generated yet
+     """
+     # list of indices in logits that will be set to -inf
+-    logits_to_penalize: List[Tuple[int, int]] = []
++    # Accumulate how many rows of logits we touched for validation,
++    # but avoid building large Python lists of index pairs. Doing
++    # vectorized index assignment per group is faster and reduces
++    # Python-side overhead.
+     logits_applied = 0
+     for seq_group in sampling_metadata.seq_groups:
+         seq_ids = seq_group.seq_ids
+@@ -217,23 +220,24 @@ def _apply_min_tokens_penalty(
+         min_tokens = sampling_params.min_tokens
+         token_ids_to_penalize = sampling_params.all_stop_token_ids
+         if min_tokens > 0 and token_ids_to_penalize:
++            # Identify the sequences in this group that still fall under the
++            # min_tokens constraint.
+             seqs_to_penalize: List[int] = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+                 if len(seq_data.output_token_ids) < min_tokens:
+-                    seqs_to_penalize.append(j)
++                    seqs_to_penalize.append(start_idx + j)
+ 
+             if seqs_to_penalize:
+-                # convert to the index into logits
+-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
+-                # itertools.product pairs each seq index with every token id
+-                logits_to_penalize.extend(
+-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
+-
+-    if logits_to_penalize:
+-        # use zip and * to group indices along each dimension
+-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
+-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
++                # Vectorized cross-index assignment on device avoids building
++                # a large Cartesian-product list on CPU.
++                row_idx = torch.as_tensor(seqs_to_penalize,
++                                          device=logits.device)
++                # Ensure a stable, indexable container (set -> list) and move
++                # directly to the target device.
++                col_idx = torch.tensor(list(token_ids_to_penalize),
++                                       device=logits.device)
++                logits[row_idx.unsqueeze(1), col_idx] = -float("inf")
+ 
+     # verifies that no rows in logits were missed unexpectedly
+     assert logits_applied == logits.shape[0]
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d1..4aa92fa 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -266,15 +266,17 @@ def _prepare_seq_groups(
+         """
+ 
+         if sampling_params.prompt_logprobs is not None:
++            # Directly extend from range (no intermediate list).
+             prompt_logprob_indices.extend(
+                 range(logit_idx, logit_idx + prompt_logprob_len))
+             logit_idx += prompt_logprob_len
+         if do_sample:
++            # Avoid creating temporary lists when extending; zip is an
++            # iterator and extend consumes it directly.
+             sample_indices.extend(range(logit_idx, logit_idx + sample_len))
+             categorized_sample_indices[sampling_params.sampling_type].extend(
+-                list(
+-                    zip(range(logit_idx, logit_idx + sample_len),
+-                        range(sample_idx, sample_idx + sample_len))))
++                zip(range(logit_idx, logit_idx + sample_len),
++                    range(sample_idx, sample_idx + sample_len)))
+             logit_idx += sample_len
+             sample_idx += sample_len
+ 
+@@ -437,8 +439,13 @@ class SamplingTensors:
+                 if seq_group.do_sample:
+                     for seq_id in seq_ids:
+                         seq_data = seq_group.seq_data[seq_id]
+-                        prompt_tokens.append(list(seq_data.prompt_token_ids))
+-                        output_tokens.append(list(seq_data.output_token_ids))
++                        # Reuse existing in-memory token lists to minimize
++                        # Python allocations; make_tensor_with_pad copies
++                        # data into a new NumPy array anyway.
++                        prompt_tokens.append(
++                            seq_data.get_prompt_token_ids_list())
++                        output_tokens.append(
++                            seq_data.get_output_token_ids_list())
+ 
+         sampling_tensors = SamplingTensors.from_lists(
+             temperatures, top_ps, top_ks, min_ps, presence_penalties,
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 0cd4c7e..aa74c84 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -221,6 +221,15 @@ class SequenceData:
+     def get_output_token_ids(self) -> Tuple[int, ...]:
+         return self.output_token_ids
+ 
++    # Performance helpers for internal code paths that immediately copy
++    # these containers (e.g., padding into new NumPy arrays). Returning the
++    # underlying lists avoids temporary tuple/list constructions.
++    def get_prompt_token_ids_list(self) -> List[int]:
++        return self._prompt_token_ids
++
++    def get_output_token_ids_list(self) -> List[int]:
++        return self._output_token_ids
++
+     @property
+     def stage(self) -> SequenceStage:
+         return self._stage

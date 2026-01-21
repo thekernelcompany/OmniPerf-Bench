@@ -26,6 +26,7 @@ PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/ex
 AGENT_CONFIGS = {
     "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
     "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
+    "codex_cli": "perf-agents-bench/state/runs/vllm/codex_cli/default",  # Codex CLI GPT-5 runs
     "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",  # Local trajectories
     "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
 }
@@ -34,6 +35,7 @@ AGENT_CONFIGS = {
 AGENT_OUTPUT_DIRS = {
     "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
     "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
+    "codex_cli": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex_cli"),  # Codex CLI results
     "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
     "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
 }
@@ -288,6 +290,12 @@ def parse_throughput_metrics(output: str) -> Dict[str, float]:
         if match:
             metrics[key] = float(match.group(1))
 
+    # Handle old vLLM format: "Throughput: 10.39 requests/s, 4566.62 tokens/s"
+    if 'throughput_tok_s' not in metrics:
+        old_format = re.search(r'Throughput:\s*[\d.]+\s*requests/s,\s*([\d.]+)\s*tokens/s', output)
+        if old_format:
+            metrics['throughput_tok_s'] = float(old_format.group(1))
+
     return metrics
 
 
@@ -398,26 +406,21 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     echo "Running benchmark mode: {benchmark_mode}"
     echo "Original perf command: {perf_command}"
 
-    # Download only the benchmark scripts we need (much faster than cloning entire repo)
-    echo "Downloading benchmark scripts..."
+    # Download benchmark scripts from the HUMAN commit for compatibility
+    echo "Downloading benchmark scripts from commit {human_commit}..."
     mkdir -p /opt/vllm_bench/benchmarks
     cd /opt/vllm_bench/benchmarks
 
-    # Download benchmark scripts from vLLM main branch (they are stable across versions)
-    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py; do
+    # Download benchmark scripts from the human commit (matching the vLLM version in Docker image)
+    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py backend_request_func.py benchmark_prefix_caching.py; do
         if [ ! -f "$script" ]; then
-            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -o "$script" 2>/dev/null || \
-            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -O "$script" 2>/dev/null || true
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/{human_commit}/benchmarks/$script" -o "$script" 2>/dev/null || \
+            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/{human_commit}/benchmarks/$script" -O "$script" 2>/dev/null || \
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/$script" -o "$script" 2>/dev/null || true
         fi
     done
 
-    # Also download backend_request_func.py which is needed by benchmark_serving.py
-    if [ ! -f "backend_request_func.py" ]; then
-        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -o "backend_request_func.py" 2>/dev/null || \
-        wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -O "backend_request_func.py" 2>/dev/null || true
-    fi
-
-    echo "Benchmark scripts downloaded"
+    echo "Benchmark scripts downloaded from human commit"
     ls -la /opt/vllm_bench/benchmarks/
 
     PERF_CMD="{perf_command}"
@@ -1073,26 +1076,21 @@ PATCH
     # Install benchmark deps using the same Python
     $VLLM_PYTHON -m pip install aiohttp pandas datasets -q 2>/dev/null || true
 
-    # Download only the benchmark scripts we need (much faster than cloning entire repo)
-    echo "Downloading benchmark scripts..."
+    # Download benchmark scripts from the HUMAN commit for compatibility
+    echo "Downloading benchmark scripts from commit $COMMIT..."
     mkdir -p /opt/vllm_bench/benchmarks
     cd /opt/vllm_bench/benchmarks
 
-    # Download benchmark scripts from vLLM main branch (they are stable across versions)
-    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py; do
+    # Download benchmark scripts from the human commit (matching the vLLM version in Docker image)
+    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py backend_request_func.py benchmark_prefix_caching.py; do
         if [ ! -f "$script" ]; then
-            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -o "$script" 2>/dev/null || \
-            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/$script" -O "$script" 2>/dev/null || true
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/$script" -o "$script" 2>/dev/null || \
+            wget -q "https://raw.githubusercontent.com/vllm-project/vllm/$COMMIT/benchmarks/$script" -O "$script" 2>/dev/null || \
+            curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/$script" -o "$script" 2>/dev/null || true
         fi
     done
 
-    # Also download backend_request_func.py which is needed by benchmark_serving.py
-    if [ ! -f "backend_request_func.py" ]; then
-        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -o "backend_request_func.py" 2>/dev/null || \
-        wget -q "https://raw.githubusercontent.com/vllm-project/vllm/v0.6.0/benchmarks/backend_request_func.py" -O "backend_request_func.py" 2>/dev/null || true
-    fi
-
-    echo "Benchmark scripts downloaded"
+    echo "Benchmark scripts downloaded from human commit"
     ls -la /opt/vllm_bench/benchmarks/
 
     # Create sonnet.txt dataset if missing
@@ -1348,11 +1346,24 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
         echo "Using Python command: $PERF_CMD"
     fi
 
+    # Translate --dataset-name sharegpt to --dataset /data/sharegpt_dataset.json for old vLLM versions
+    if echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        if echo "$PERF_CMD" | grep -q "\\-\\-dataset-name sharegpt"; then
+            echo "Translating --dataset-name sharegpt to --dataset /data/sharegpt_dataset.json"
+            PERF_CMD=$(echo "$PERF_CMD" | sed 's/--dataset-name sharegpt/--dataset \/data\/sharegpt_dataset.json/')
+        fi
+    fi
+
     # Add default input/output lengths for throughput benchmarks if missing
+    # BUT skip if --dataset is used (old vLLM asserts input_len is None when using dataset file)
     if echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
         if ! echo "$PERF_CMD" | grep -q "\\-\\-input-len"; then
-            PERF_CMD="$PERF_CMD --input-len 512 --output-len 128"
-            echo "Added default input/output lengths for throughput benchmark"
+            if ! echo "$PERF_CMD" | grep -q "\\-\\-dataset "; then
+                PERF_CMD="$PERF_CMD --input-len 512 --output-len 128"
+                echo "Added default input/output lengths for throughput benchmark"
+            else
+                echo "Skipping default input/output lengths - using dataset file"
+            fi
         fi
     fi
 
@@ -1371,6 +1382,12 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
     print(f"  Running agent {benchmark_type} benchmark (offline) with baseline image: {baseline_image}")
     print(f"  Applying patch: {agent_patch}")
 
+    # Mount ShareGPT dataset if perf_command uses it
+    sharegpt_mount = []
+    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
+        sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
+
     try:
         result = subprocess.run(
             [
@@ -1380,6 +1397,7 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
                 '-e', 'VLLM_USE_V1=0',
                 '-v', '/ephemeral/huggingface_cache:/root/.cache/huggingface',
                 '-v', f'{agent_patch}:/agent_patch.diff:ro',
+            ] + sharegpt_mount + [
                 '--shm-size=16g',
                 '--entrypoint', 'bash',
                 baseline_image,
@@ -1426,6 +1444,243 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
         }
 
 
+def check_docker_image_exists(image: str) -> bool:
+    """Check if a Docker image exists locally or can be pulled."""
+    try:
+        result = subprocess.run(
+            ['docker', 'manifest', 'inspect', image],
+            capture_output=True, timeout=30
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+
+def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_token: str, timeout: int = 1200, benchmark_type: str = 'serving') -> dict:
+    """Run benchmark using vLLM wheel from S3 (fallback when Docker image unavailable)."""
+    start_time = time.time()
+
+    human_commit = commit_info.get('human_commit_full', '')
+    human_short = commit_info['human_commit_short']
+    parent_commit = commit_info.get('parent_commit', '')
+    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
+    perf_command = commit_info.get('perf_command', '')
+
+    # vLLM wheel URL
+    wheel_url = f"https://vllm-wheels.s3.us-west-2.amazonaws.com/{parent_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+
+    # Use a recent stable vLLM image as base (has all dependencies)
+    base_image = "vllm/vllm-openai:v0.6.0"
+
+    docker_cmd = f'''
+    set -e
+    PARENT_COMMIT="{parent_commit}"
+    HUMAN_COMMIT="{human_commit}"
+    MODEL="{model}"
+
+    echo "=== Installing vLLM from wheel (fallback mode) ==="
+    echo "Wheel URL: {wheel_url}"
+
+    # Uninstall existing vLLM and install from wheel
+    pip uninstall vllm -y 2>/dev/null || true
+    pip install {wheel_url} 2>&1
+
+    # Verify installation and get vLLM package directory (suppress logging)
+    export VLLM_LOGGING_LEVEL=ERROR
+    VLLM_DIR=$(python3 -c "import logging; logging.disable(logging.CRITICAL); import vllm; import os; print(os.path.dirname(vllm.__file__))" 2>/dev/null)
+    echo "vLLM installed at: $VLLM_DIR"
+    python3 -c "import logging; logging.disable(logging.CRITICAL); import vllm; print('vLLM version:', vllm.__version__)" 2>/dev/null || echo "vLLM version check skipped"
+
+    # Download benchmark scripts from parent commit (without cloning full repo)
+    mkdir -p /tmp/benchmarks
+    cd /tmp/benchmarks
+    for script in benchmark_latency.py benchmark_throughput.py benchmark_serving.py backend_request_func.py benchmark_utils.py benchmark_dataset.py sonnet.py; do
+        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/$PARENT_COMMIT/benchmarks/$script" -o "$script" 2>/dev/null || \\
+        wget -q "https://raw.githubusercontent.com/vllm-project/vllm/$PARENT_COMMIT/benchmarks/$script" -O "$script" 2>/dev/null || \\
+        curl -sL "https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/$script" -o "$script" 2>/dev/null || true
+    done
+    # Create stubs for modules that don't exist in older vLLM
+    if [ ! -s /tmp/benchmarks/benchmark_utils.py ]; then
+        echo "# Stub for older vLLM" > /tmp/benchmarks/benchmark_utils.py
+        echo "def convert_to_pytorch_benchmark_format(*args, **kwargs): pass" >> /tmp/benchmarks/benchmark_utils.py
+    fi
+    if [ ! -s /tmp/benchmarks/benchmark_dataset.py ]; then
+        echo "# Stub for older vLLM" > /tmp/benchmarks/benchmark_dataset.py
+        echo "class AIMODataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class ASRDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class BurstGPTDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class ConversationDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class HumanEvalDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class InstructCoderDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class LongContextDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class ShareGPTDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class SonnetDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class SyntheticDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+        echo "class VisionArenaDataset: pass" >> /tmp/benchmarks/benchmark_dataset.py
+    fi
+    echo "Benchmark scripts downloaded"
+
+    echo "=== Applying agent patch to installed vLLM ==="
+    # Create a temp directory structure matching the patch paths
+    mkdir -p /tmp/patch_work
+    cd /tmp/patch_work
+
+    # Copy installed vLLM to work directory
+    cp -r $VLLM_DIR vllm
+
+    # Apply patch - patches expect vllm/ prefix
+    if patch -p0 --dry-run < /agent_patch.diff 2>&1; then
+        patch -p0 < /agent_patch.diff 2>&1
+        echo "AGENT_PATCH_APPLIED"
+    else
+        echo "Trying patch -p1..."
+        if patch -p1 --dry-run < /agent_patch.diff 2>&1; then
+            patch -p1 < /agent_patch.diff 2>&1
+            echo "AGENT_PATCH_APPLIED_P1"
+        else
+            echo "Patch dry-run failed, trying with --force..."
+            patch -p1 --force < /agent_patch.diff 2>&1 || patch -p0 --force < /agent_patch.diff 2>&1 || true
+            echo "AGENT_PATCH_APPLIED_FALLBACK"
+        fi
+    fi
+
+    # Copy patched files back to installed vLLM
+    cp -r /tmp/patch_work/vllm/* $VLLM_DIR/ 2>/dev/null || true
+
+    # Apply rope_scaling fix for Llama-3.1 models
+    find "$VLLM_DIR" -name "*.py" -exec grep -l 'rope_scaling\\["type"\\]' {{}} \\; 2>/dev/null | while read f; do
+        sed -i 's/rope_scaling\\["type"\\]/rope_scaling.get("type", rope_scaling.get("rope_type"))/g' "$f"
+    done
+
+    # Install benchmark deps
+    pip install aiohttp pandas datasets -q 2>/dev/null || true
+
+    # Run the benchmark based on type
+    PERF_CMD="{perf_command}"
+    cd /tmp/benchmarks
+
+    if echo "$PERF_CMD" | grep -q "benchmark_serving"; then
+        echo "=== Running SERVING benchmark ==="
+        # Start vLLM server
+        python3 -m vllm.entrypoints.openai.api_server \\
+            --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+        SERVER_PID=$!
+
+        # Wait for server
+        for i in $(seq 1 300); do
+            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+                echo "SERVER_READY_AFTER=${{i}}s"
+                break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+                echo "SERVER_CRASHED"
+                exit 1
+            fi
+            sleep 1
+        done
+
+        # Run benchmark
+        python3 /tmp/benchmarks/benchmark_serving.py \\
+            --model $MODEL \\
+            --backend vllm \\
+            --port 8000 \\
+            --dataset-name random \\
+            --random-input-len 256 \\
+            --random-output-len 64 \\
+            --num-prompts 100 \\
+            --request-rate inf \\
+            2>&1 | tee /tmp/benchmark_output.txt
+
+        kill $SERVER_PID 2>/dev/null || true
+    elif echo "$PERF_CMD" | grep -q "benchmark_latency"; then
+        echo "=== Running LATENCY benchmark ==="
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_latency\\.py\\s*||')
+        python3 /tmp/benchmarks/benchmark_latency.py $ARGS 2>&1 | tee /tmp/benchmark_output.txt
+    elif echo "$PERF_CMD" | grep -q "benchmark_throughput"; then
+        echo "=== Running THROUGHPUT benchmark ==="
+        ARGS=$(echo "$PERF_CMD" | sed -E 's|.*benchmark_throughput\\.py\\s*||')
+        # Handle dataset-name sharegpt
+        if echo "$ARGS" | grep -q "\\-\\-dataset-name sharegpt"; then
+            ARGS=$(echo "$ARGS" | sed 's/--dataset-name sharegpt/--dataset \/data\/sharegpt_dataset.json/')
+        fi
+        python3 /tmp/benchmarks/benchmark_throughput.py $ARGS 2>&1 | tee /tmp/benchmark_output.txt
+    fi
+
+    echo "BENCHMARK_DONE"
+    cat /tmp/benchmark_output.txt 2>/dev/null || true
+    '''
+
+    print(f"  Running agent benchmark from WHEEL: {wheel_url[:60]}...")
+    print(f"  Applying patch: {agent_patch}")
+
+    # Mount ShareGPT dataset if needed
+    sharegpt_mount = []
+    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
+        sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
+
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm', '--gpus', 'all',
+                '--network=host',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-e', 'VLLM_USE_V1=0',
+                '-v', '/ephemeral/huggingface_cache:/root/.cache/huggingface',
+                '-v', f'{agent_patch}:/agent_patch.diff:ro',
+            ] + sharegpt_mount + [
+                '--shm-size=16g',
+                '--entrypoint', 'bash',
+                base_image,
+                '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        if 'SERVER_CRASHED' in output:
+            return {
+                'status': 'error',
+                'error': 'Server crashed after applying patch (wheel mode)',
+                'duration_s': duration,
+                'raw_output': output[-10000:]
+            }
+
+        metrics = parse_metrics_by_type(output, benchmark_type)
+
+        if not metrics:
+            return {
+                'status': 'error',
+                'error': f'No {benchmark_type} metrics in agent output (wheel mode)',
+                'duration_s': duration,
+                'raw_output': output[-10000:]
+            }
+
+        return {
+            'status': 'success',
+            'metrics': metrics,
+            'duration_s': duration,
+            'benchmark_type': benchmark_type,
+            'raw_output': output[-5000:]
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            'status': 'timeout',
+            'error': f'Agent benchmark (wheel mode) timed out after {timeout}s',
+            'duration_s': timeout
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'error': str(e),
+            'duration_s': time.time() - start_time
+        }
+
+
 def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, timeout: int = 900) -> dict:
     """Run benchmark by applying agent patch to baseline vLLM."""
     start_time = time.time()
@@ -1443,6 +1698,12 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
             'error': 'Missing parent_commit - cannot determine baseline image',
             'duration_s': time.time() - start_time
         }
+
+    # Check if baseline Docker image exists
+    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+    if not check_docker_image_exists(baseline_image):
+        print(f"  Baseline image {baseline_image} not found, trying wheel-based fallback...")
+        return run_agent_benchmark_from_wheel(commit_info, agent_patch, hf_token, timeout, benchmark_type)
 
     # Route based on perf_command type - offline vs server-based
     if not needs_server(perf_command):

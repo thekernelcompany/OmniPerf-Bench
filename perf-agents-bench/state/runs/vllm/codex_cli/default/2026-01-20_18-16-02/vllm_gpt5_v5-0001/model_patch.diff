@@ -1,0 +1,79 @@
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4198550..c2d778c 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -316,25 +316,26 @@ class Scheduler:
+         if isinstance(request_id, str):
+             request_id = (request_id, )
+         request_ids = set(request_id)
+-        for state_queue in [self.waiting, self.running, self.swapped]:
+-            aborted_groups: List[SequenceGroup] = []
++        # Rebuild each queue once to avoid repeated O(n) deque.remove calls.
++        for attr in ("waiting", "running", "swapped"):
++            state_queue: Deque[SequenceGroup] = getattr(self, attr)
++            if not state_queue:
++                continue
++
++            kept: Deque[SequenceGroup] = deque()
+             for seq_group in state_queue:
+-                if not request_ids:
+-                    # Using 'break' here may add two extra iterations,
+-                    # but is acceptable to reduce complexity .
+-                    break
+-                if seq_group.request_id in request_ids:
+-                    # Appending aborted group into pending list.
+-                    aborted_groups.append(seq_group)
+-                    request_ids.remove(seq_group.request_id)
+-            for aborted_group in aborted_groups:
+-                # Remove the sequence group from the state queue.
+-                state_queue.remove(aborted_group)
+-                for seq in aborted_group.get_seqs():
+-                    if seq.is_finished():
+-                        continue
+-                    seq.status = SequenceStatus.FINISHED_ABORTED
+-                    self.free_seq(seq)
++                rid = seq_group.request_id
++                if rid in request_ids:
++                    request_ids.remove(rid)
++                    for seq in seq_group.get_seqs():
++                        if seq.is_finished():
++                            continue
++                        seq.status = SequenceStatus.FINISHED_ABORTED
++                        self.free_seq(seq)
++                else:
++                    kept.append(seq_group)
++
++            setattr(self, attr, kept)
+ 
+     def has_unfinished_seqs(self) -> bool:
+         return len(self.waiting) != 0 or len(self.running) != 0 or len(
+@@ -594,7 +595,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = deque(waiting_queue)
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -1064,7 +1065,7 @@ class Scheduler:
+         # Delay scheduling prompts to let waiting queue fill up
+         if self.scheduler_config.delay_factor > 0 and self.waiting:
+             earliest_arrival_time = min(
+-                [e.metrics.arrival_time for e in self.waiting])
++                e.metrics.arrival_time for e in self.waiting)
+             passed_delay = (
+                 (now - earliest_arrival_time) >
+                 (self.scheduler_config.delay_factor * self.last_prompt_latency)
+@@ -1097,10 +1098,8 @@ class Scheduler:
+         sequences (e.g., running beam search), it means it is in decoding
+         phase, so chunking doesn't happen.
+         """
+-        num_new_tokens = 0
+         seqs = seq_group.get_seqs(status=status)
+-        for seq in seqs:
+-            num_new_tokens += seq.get_num_new_tokens()
++        num_new_tokens = sum(seq.get_num_new_tokens() for seq in seqs)
+         # Chunk if a running request cannot fit in.
+         # If number of seq > 1, it means it is doing beam search in a
+         # decode phase. Do not chunk in that case.

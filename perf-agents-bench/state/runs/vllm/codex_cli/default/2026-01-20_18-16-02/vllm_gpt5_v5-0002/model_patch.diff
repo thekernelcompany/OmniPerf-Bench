@@ -1,0 +1,101 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..6aae521 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -153,11 +153,13 @@ def _apply_min_tokens_penalty(
+     logits: torch.Tensor,
+     sampling_metadata: SamplingMetadata,
+ ) -> torch.Tensor:
+-    """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
+-        have not been generated yet
++    """Apply ``min_tokens`` penalty by setting stop tokens to ``-inf``.
++
++    If a sequence has generated fewer than ``min_tokens`` tokens, we mask out
++    all stop tokens for that sequence to prevent early stopping. This
++    implementation avoids building large Python lists of index pairs and uses
++    vectorized advanced indexing on the device for better performance.
+     """
+-    # list of indices in logits that will be set to -inf
+-    logits_to_penalize: List[Tuple[int, int]] = []
+     logits_applied = 0
+     for seq_group in sampling_metadata.seq_groups:
+         seq_ids = seq_group.seq_ids
+@@ -172,24 +174,28 @@ def _apply_min_tokens_penalty(
+         start_idx = sample_indices[0]
+         min_tokens = sampling_params.min_tokens
+         token_ids_to_penalize = sampling_params.all_stop_token_ids
+-        if min_tokens > 0 and token_ids_to_penalize:
+-            seqs_to_penalize = []
+-            for j, seq_id in enumerate(seq_ids):
+-                seq_data = seq_group.seq_data[seq_id]
+-                if len(seq_data.output_token_ids) < min_tokens:
+-                    seqs_to_penalize.append(j)
+-
+-            if seqs_to_penalize:
+-                # convert to the index into logits
+-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
+-                # itertools.product pairs each seq index with every token id
+-                logits_to_penalize.extend(
+-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
+-
+-    if logits_to_penalize:
+-        # use zip and * to group indices along each dimension
+-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
+-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
++        if min_tokens <= 0 or not token_ids_to_penalize:
++            continue
++
++        # Identify parent sequences that still need the penalty applied.
++        seqs_to_penalize: List[int] = []
++        for j, seq_id in enumerate(seq_ids):
++            seq_data = seq_group.seq_data[seq_id]
++            if len(seq_data.output_token_ids) < min_tokens:
++                seqs_to_penalize.append(start_idx + j)
++
++        if not seqs_to_penalize:
++            continue
++
++        # Vectorized in-device masking for all (row, stop_token) combinations.
++        row_idx = torch.tensor(seqs_to_penalize,
++                               device=logits.device,
++                               dtype=torch.long)
++        col_idx = torch.tensor(list(token_ids_to_penalize),
++                               device=logits.device,
++                               dtype=torch.long)
++        # Broadcasting advanced indexing creates a (num_rows, num_cols) view.
++        logits[row_idx.unsqueeze(1), col_idx] = -float("inf")
+ 
+     # verifies that no rows in logits were missed unexpectedly
+     assert logits_applied == logits.shape[0]
+@@ -255,16 +261,22 @@ def _apply_min_p(
+     logits: torch.Tensor,
+     min_p: torch.Tensor,
+ ) -> torch.Tensor:
++    """Apply minimum probability filtering without an extra softmax pass.
++
++    A token is kept only if ``p_i >= min_p * p_max`` where ``p_i`` are the
++    softmax probabilities and ``p_max`` is the maximum probability in the row.
++    Since ``p_i / p_max = exp(logit_i - logit_max)``, this inequality is
++    equivalent to ``logit_i >= logit_max + log(min_p)``. We therefore avoid
++    computing a full softmax by comparing logits directly using a row-wise
++    threshold computed in float32 for numerical stability.
+     """
+-    Adapted from
+-    https://github.com/oobabooga/text-generation-webui/blob/3146124ec01f02c8fb1650a6517cf1b60b537aaf/modules/sampler_hijack.py#L16C17-L16C17
+-    """
+-    probs = torch.softmax(logits, dim=-1)
+-    top_probs, _ = probs.max(dim=-1, keepdim=True)
+-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+-    tokens_to_remove = probs < scaled_min_p
+-    logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
+-
++    # Compute row-wise maximum logits in float32 for numerical stability.
++    max_logits_f32 = logits.max(dim=-1, keepdim=True).values.to(torch.float32)
++    # Per-row log(min_p). log(0) -> -inf is correct (keeps all tokens).
++    log_min_p_f32 = torch.log(min_p.to(torch.float32)).unsqueeze(1)
++    threshold = max_logits_f32 + log_min_p_f32
++    # Mask tokens whose logits fall below the threshold.
++    logits = logits.masked_fill(logits < threshold, -float("inf"))
+     return logits
+ 
+ 

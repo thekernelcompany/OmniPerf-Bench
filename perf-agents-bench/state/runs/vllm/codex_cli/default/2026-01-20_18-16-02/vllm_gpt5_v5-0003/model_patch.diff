@@ -1,0 +1,43 @@
+diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py
+index 3dd12e2..14d5053 100644
+--- a/vllm/core/evictor_v2.py
++++ b/vllm/core/evictor_v2.py
+@@ -60,6 +60,8 @@ class BlockMetaData():
+     blocks with the same content hash, but their physical id is unique.
+     """
+ 
++    __slots__ = ("content_hash", "num_hashed_tokens", "last_accessed")
++
+     def __init__(self, content_hash: int, num_hashed_tokens: int,
+                  last_accessed: float):
+         self.content_hash = content_hash
+@@ -82,23 +84,16 @@ class LRUEvictor(Evictor):
+         return block_id in self.free_table
+ 
+     def evict(self) -> Tuple[int, int]:
+-        if len(self.free_table) == 0:
++        if not self.free_table:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block = next(iter(self.free_table.values()))
+-        evicted_block_id = next(iter(self.free_table.keys()))
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block.last_accessed > block.last_accessed or (
+-                    evicted_block.last_accessed == block.last_accessed and
+-                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):
+-                evicted_block = block
+-                evicted_block_id = _id
++        # Choose the block with the smallest last_accessed; break ties by
++        # evicting the one with the largest num_hashed_tokens.
++        evicted_block_id, evicted_block = min(
++            self.free_table.items(),
++            key=lambda kv: (kv[1].last_accessed, -kv[1].num_hashed_tokens))
+ 
+         self.free_table.pop(evicted_block_id)
+-
+         return evicted_block_id, evicted_block.content_hash
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,

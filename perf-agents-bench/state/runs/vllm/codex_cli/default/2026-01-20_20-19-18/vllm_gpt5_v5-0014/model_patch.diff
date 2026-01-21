@@ -1,0 +1,54 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e791453..f544700 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -385,18 +385,28 @@ class InputBatch:
+ 
+     def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
+         max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
++        # Allocate once on CPU (pinned if available) and use vectorized ops
++        # to avoid per-request Python loops.
+         prompt_token_ids_cpu_tensor = torch.empty(
+             (self.num_reqs, max_prompt_len),
+             device="cpu",
+             dtype=torch.int64,
+             pin_memory=self.pin_memory)
+         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
++
++        # Copy token ids for all requests at once.
+         prompt_token_ids[:] = (
+             self.token_ids_cpu[:self.num_reqs, :max_prompt_len])
+-        # Use the value of vocab_size as a pad since we don't have a
+-        # token_id of this value.
+-        for i in range(self.num_reqs):
+-            prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
++
++        # Pad trailing positions in a single vectorized step instead of a loop.
++        # Use vocab_size as the padding token since it is guaranteed to be an
++        # out-of-vocabulary id.
++        if max_prompt_len > 0 and self.num_reqs > 0:
++            cols = np.arange(max_prompt_len, dtype=np.int32)
++            lens = self.num_prompt_tokens[:self.num_reqs]
++            mask = cols >= lens[:, None]
++            prompt_token_ids[mask] = self.vocab_size
++
+         return prompt_token_ids_cpu_tensor.to(device=self.device,
+                                               non_blocking=True)
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54..784c7fe 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -333,8 +333,10 @@ class GPUModelRunner:
+         # NOTE(woosuk): We use torch.index_select instead of np.take here
+         # because torch.index_select is much faster than np.take for large
+         # tensors.
+-        block_numbers = (self.input_batch.block_table_cpu_tensor.flatten()
+-                         [block_table_indices].numpy())
++        # Use torch.index_select for better performance vs. advanced indexing.
++        block_numbers = torch.index_select(
++            self.input_batch.block_table_cpu_tensor.flatten(), 0,
++            torch.from_numpy(block_table_indices)).numpy()
+         block_offsets = positions_np % self.block_size
+         np.add(block_numbers * self.block_size,
+                block_offsets,

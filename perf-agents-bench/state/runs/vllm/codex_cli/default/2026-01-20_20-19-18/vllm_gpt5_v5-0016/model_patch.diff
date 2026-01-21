@@ -1,0 +1,43 @@
+diff --git a/csrc/moe/moe_permute_unpermute_op.cu b/csrc/moe/moe_permute_unpermute_op.cu
+index 13aecd8..3c8810c 100644
+--- a/csrc/moe/moe_permute_unpermute_op.cu
++++ b/csrc/moe/moe_permute_unpermute_op.cu
+@@ -197,24 +197,28 @@ void shuffle_rows(const torch::Tensor& input_tensor,
+   int64_t const num_src_rows = input_tensor.size(0);
+   int64_t const num_cols = input_tensor.size(1);
+ 
+-  if (num_cols % (128 / sizeof(input_tensor.scalar_type()) / 8)) {
+-    // use slow kernel if num_cols can't be aligned to 128 bits
+-    MOE_DISPATCH(input_tensor.scalar_type(), [&] {
+-      shuffleInputRowsKernelSlow<scalar_t><<<blocks, threads, 0, stream>>>(
++  // Launch a vectorized kernel when each row length is a multiple of 128 bits.
++  // Compute alignment using the element size of the dispatch type to avoid
++  // selecting the slow path unnecessarily.
++  MOE_DISPATCH(input_tensor.scalar_type(), [&] {
++    constexpr int64_t kBitsPerVec = 128;
++    constexpr int64_t kBitsPerByte = 8;
++    const int64_t elems_per_vec = kBitsPerVec / (sizeof(scalar_t) * kBitsPerByte);
++    const bool use_vectorized = (num_cols % elems_per_vec) == 0;
++    if (use_vectorized) {
++      shuffleInputRowsKernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           reinterpret_cast<scalar_t*>(input_tensor.data_ptr()),
+           dst2src_map.data_ptr<int32_t>(),
+           reinterpret_cast<scalar_t*>(output_tensor.data_ptr()), num_src_rows,
+           num_dest_rows, num_cols);
+-    });
+-  } else {
+-    MOE_DISPATCH(input_tensor.scalar_type(), [&] {
+-      shuffleInputRowsKernel<scalar_t><<<blocks, threads, 0, stream>>>(
++    } else {
++      shuffleInputRowsKernelSlow<scalar_t><<<blocks, threads, 0, stream>>>(
+           reinterpret_cast<scalar_t*>(input_tensor.data_ptr()),
+           dst2src_map.data_ptr<int32_t>(),
+           reinterpret_cast<scalar_t*>(output_tensor.data_ptr()), num_src_rows,
+           num_dest_rows, num_cols);
+-    });
+-  }
++    }
++  });
+ }
+ 
+ #else
