@@ -1,0 +1,185 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..2be6124 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -156,9 +156,11 @@ def _apply_min_tokens_penalty(
+     """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
+         have not been generated yet
+     """
+-    # list of indices in logits that will be set to -inf
+-    logits_to_penalize: List[Tuple[int, int]] = []
++    # Collect all sequence indices and token ids that need penalizing
++    seq_indices_to_penalize: List[int] = []
++    token_ids_to_penalize_list: List[int] = []
+     logits_applied = 0
++    
+     for seq_group in sampling_metadata.seq_groups:
+         seq_ids = seq_group.seq_ids
+         sampling_params = seq_group.sampling_params
+@@ -173,23 +175,23 @@ def _apply_min_tokens_penalty(
+         min_tokens = sampling_params.min_tokens
+         token_ids_to_penalize = sampling_params.all_stop_token_ids
+         if min_tokens > 0 and token_ids_to_penalize:
+-            seqs_to_penalize = []
++            # Find sequences that need penalizing
++            seqs_needing_penalty = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+                 if len(seq_data.output_token_ids) < min_tokens:
+-                    seqs_to_penalize.append(j)
++                    seqs_needing_penalty.append(start_idx + j)
+ 
+-            if seqs_to_penalize:
+-                # convert to the index into logits
+-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
+-                # itertools.product pairs each seq index with every token id
+-                logits_to_penalize.extend(
+-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
++            if seqs_needing_penalty:
++                # For each sequence, penalize all stop tokens
++                num_tokens = len(token_ids_to_penalize)
++                for seq_idx in seqs_needing_penalty:
++                    seq_indices_to_penalize.extend([seq_idx] * num_tokens)
++                    token_ids_to_penalize_list.extend(token_ids_to_penalize)
+ 
+-    if logits_to_penalize:
+-        # use zip and * to group indices along each dimension
+-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
+-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
++    # Apply penalties using advanced indexing if there are any
++    if seq_indices_to_penalize:
++        logits[seq_indices_to_penalize, token_ids_to_penalize_list] = -float("inf")
+ 
+     # verifies that no rows in logits were missed unexpectedly
+     assert logits_applied == logits.shape[0]
+@@ -207,10 +209,22 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    # Compute combined mask
++    combined_mask = prompt_mask | output_mask
++    
++    # Apply repetition penalties using masked operations
++    # Expand penalties for broadcasting: (num_seqs,) -> (num_seqs, 1)
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(1)
++    
++    # Apply penalties only where tokens appeared (combined_mask is True)
++    # For positive logits: divide by penalty
++    # For negative/zero logits: multiply by penalty
++    # For non-masked positions: keep original value
++    positive_mask = (logits > 0) & combined_mask
++    negative_mask = (logits <= 0) & combined_mask
++    
++    logits = torch.where(positive_mask, logits / repetition_penalties_expanded, logits)
++    logits = torch.where(negative_mask, logits * repetition_penalties_expanded, logits)
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+@@ -242,8 +256,11 @@ def _apply_top_k_top_p(
+     logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    src = torch.arange(logits_idx.shape[-1],
+-                       device=logits_idx.device).expand_as(logits_idx)
++    # Create inverse permutation to unsort
++    vocab_size = logits_idx.shape[-1]
++    src = torch.arange(vocab_size, device=logits_idx.device, dtype=logits_idx.dtype)
++    # Expand only once using unsqueeze and expand
++    src = src.unsqueeze(0).expand_as(logits_idx)
+     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+                                                            index=logits_idx,
+                                                            src=src)
+@@ -829,26 +846,32 @@ def _get_prompt_logprob_if_needed(
+     # Find prompt logprobs
+     prompt_logprobs: Optional[PromptLogprobs] = None
+     if (is_prompt and sampling_params.prompt_logprobs is not None):
+-        prompt_logprobs = []
+         num_logprobs = sampling_params.prompt_logprobs
+         next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+-        for token_id in next_prompt_tokens:
++        num_tokens = len(next_prompt_tokens)
++        
++        # Batch extract selected logprobs and ranks for all prompt tokens
++        selected_logprobs_slice = selected_logprobs[selected_logprobs_idx:selected_logprobs_idx + num_tokens]
++        ranks_slice = ranks[selected_logprobs_idx:selected_logprobs_idx + num_tokens]
++        
++        prompt_logprobs = []
++        for i, token_id in enumerate(next_prompt_tokens):
+             # Calculate the prompt logprob of the real prompt tokens.
+             # Use tuple here for performance (to use to_list()).
+             # {token_id: (logprob, rank_from_vocab)}
+             prompt_logprobs_dict: Dict[int, Tuple[float, int]] = {
+-                token_id: (selected_logprobs[selected_logprobs_idx].item(),
+-                           ranks[selected_logprobs_idx].item())
++                token_id: (selected_logprobs_slice[i].item(),
++                           ranks_slice[i].item())
+             }
+ 
+             # Add top K prompt logprobs along with its rank.
+             if num_logprobs > 0:
+                 prompt_logprobs_dict.update(
+                     zip(
+-                        top_token_ids[top_logprob_idx, :num_logprobs].tolist(),
++                        top_token_ids[top_logprob_idx + i, :num_logprobs].tolist(),
+                         zip(
+                             top_logprobs[
+-                                top_logprob_idx, :num_logprobs].tolist(),
++                                top_logprob_idx + i, :num_logprobs].tolist(),
+                             # This is ranks. Since top_logprob is sorted,
+                             # we can just use a range here.
+                             range(1, num_logprobs + 1))))
+@@ -856,9 +879,9 @@ def _get_prompt_logprob_if_needed(
+                 token_id: Logprob(*logprob_and_rank)
+                 for token_id, logprob_and_rank in prompt_logprobs_dict.items()
+             })
+-            # + 1 to go to the next prompt token.
+-            top_logprob_idx += 1
+-            selected_logprobs_idx += 1
++        
++        top_logprob_idx += num_tokens
++        selected_logprobs_idx += num_tokens
+     return prompt_logprobs, top_logprob_idx, selected_logprobs_idx
+ 
+ 
+@@ -882,19 +905,21 @@ def _get_sampled_logprob_if_needed(
+ 
+     if seq_group.do_sample:
+         assert len(next_token_ids) > 0
+-        for (next_token_id, parent_id) in zip(next_token_ids, parent_seq_ids):
++        num_samples = len(next_token_ids)
++        
++        # Batch extract selected logprobs and ranks for all sampled tokens
++        selected_logprobs_slice = selected_logprobs[selected_logprobs_idx:selected_logprobs_idx + num_samples]
++        ranks_slice = ranks[selected_logprobs_idx:selected_logprobs_idx + num_samples]
++        
++        for i, (next_token_id, parent_id) in enumerate(zip(next_token_ids, parent_seq_ids)):
+             # Calculate the sample logprob of the real sampled tokens.
+             # Use tuple here for performance (to use to_list()).
+             # token_id: (logprob, rank_from_vocab)
+             sampled_logprobs_dict: Dict[int, Tuple[float, int]] = {
+                 next_token_id:
+-                (selected_logprobs[selected_logprobs_idx].item(),
+-                 ranks[selected_logprobs_idx].item())
++                (selected_logprobs_slice[i].item(),
++                 ranks_slice[i].item())
+             }
+-            # +1 to go to the next sampled token. Note that
+-            # selected_logprobs can contain duplicates unlike top_logprobs
+-            # when beam search is enabled.
+-            selected_logprobs_idx += 1
+ 
+             # Second, add top K logprobs along with its rank.
+             if num_logprobs >= 0:
+@@ -913,6 +938,8 @@ def _get_sampled_logprob_if_needed(
+                 for token_id, logprob_and_rank in
+                 sampled_logprobs_dict.items()
+             })
++        
++        selected_logprobs_idx += num_samples
+         # There are len(seq_ids) number of sampled tokens for the current
+         # sequence group in top_logprobs. Jump to the next seq_group.
+         top_logprob_idx += len(seq_ids)
