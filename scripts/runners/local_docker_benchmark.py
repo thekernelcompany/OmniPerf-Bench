@@ -44,6 +44,9 @@ AGENT_CONFIGS = {
     "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
     "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",
     "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
+    # TRAE specific run paths:
+    "trae_gpt5_0123": "perf-agents-bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
+    "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
 }
 
 # Output directories per agent type
@@ -52,6 +55,9 @@ AGENT_OUTPUT_DIRS = {
     "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
     "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
     "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+    # TRAE specific run output dirs:
+    "trae_gpt5_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5_0123"),
+    "trae_sonnet45_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45_0123"),
 }
 
 
