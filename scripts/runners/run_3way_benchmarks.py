@@ -29,6 +29,9 @@ AGENT_CONFIGS = {
     "codex_cli": "perf-agents-bench/state/runs/vllm/codex_cli/default",  # Codex CLI GPT-5 runs
     "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",  # Local trajectories
     "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
+    # TRAE specific run paths:
+    "trae_gpt5_0123": "perf-agents-bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
+    "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
 }
 
 # Output directories per agent type
@@ -38,6 +41,18 @@ AGENT_OUTPUT_DIRS = {
     "codex_cli": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex_cli"),  # Codex CLI results
     "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
     "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+    # TRAE specific run output dirs:
+    "trae_gpt5_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5_0123"),
+    "trae_sonnet45_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45_0123"),
+}
+
+# Model overrides for compatibility issues (e.g., RoPE scaling)
+# Old vLLM versions don't support Llama-3.1's "llama3" RoPE scaling type
+MODEL_OVERRIDES = {
+    "meta-llama/Llama-3.1-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "meta-llama/Llama-3.1-70B-Instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
+    "ibm-ai-platform/Bamba-9B-v2": "meta-llama/Meta-Llama-3-8B-Instruct",  # Bamba not well supported
+    "ibm-ai-platform/Bamba-9B": "meta-llama/Meta-Llama-3-8B-Instruct",  # Bamba not well supported
 }
 
 # Default (for backward compatibility)
@@ -146,9 +161,14 @@ def build_benchmark_mapping(agent_patches_dir: Path, perf_data: Dict[str, dict])
                 if human_short in mapping:
                     continue
 
+                # Get full commit hash from perf_data if available (benchmark_mode_mapping.json has commit_full)
+                full_hash = perf_data[human_short].get('commit_hash_full', human_commit)
+                if not full_hash or len(full_hash) < 40:
+                    full_hash = human_commit  # Fallback to short hash if full not available
+
                 mapping[human_short] = {
                     'human_commit_short': human_short,
-                    'human_commit_full': human_commit,
+                    'human_commit_full': full_hash,  # Use full hash from perf_data
                     'parent_commit': parent_commit,
                     'parent_short': parent_commit[:12],
                     'patch_path': str(patch_path),
@@ -353,7 +373,15 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     human_commit = commit_info['human_commit_full']
     human_short = commit_info['human_commit_short']
     model = commit_info.get('model', '')
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
 
     docker_image = f"{HUMAN_IMAGE_PREFIX}:{human_commit}"
 
@@ -526,7 +554,15 @@ def run_baseline_benchmark_offline(commit_info: dict, hf_token: str, timeout: in
     human_short = commit_info['human_commit_short']
     parent_commit = commit_info.get('parent_commit', '')
     model = commit_info.get('model', '')
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
 
     if not parent_commit:
         return {
@@ -861,7 +897,18 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     human_commit = commit_info['human_commit_full']
     human_short = commit_info['human_commit_short']
     model = commit_info.get('model', '')
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
+        commit_info = dict(commit_info)  # Copy to avoid modifying original
+        commit_info['model'] = model
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
+        commit_info['perf_command'] = perf_command
     benchmark_type = get_benchmark_type(perf_command)
 
     # Route based on perf_command type - offline vs server-based
@@ -1231,8 +1278,16 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
 
     human_short = commit_info['human_commit_short']
     parent_commit = commit_info.get('parent_commit')
-    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
+    model = commit_info.get('model', '') or 'meta-llama/Meta-Llama-3-8B-Instruct'
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
 
     # Skip if parent_commit is missing
     if not parent_commit:
@@ -1463,8 +1518,16 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
     human_commit = commit_info.get('human_commit_full', '')
     human_short = commit_info['human_commit_short']
     parent_commit = commit_info.get('parent_commit', '')
-    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
+    model = commit_info.get('model', '') or 'meta-llama/Meta-Llama-3-8B-Instruct'
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
 
     # vLLM wheel URL
     wheel_url = f"https://vllm-wheels.s3.us-west-2.amazonaws.com/{parent_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
@@ -1687,8 +1750,19 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
 
     human_short = commit_info['human_commit_short']
     parent_commit = commit_info.get('parent_commit')
-    model = commit_info.get('model', '') or 'meta-llama/Llama-3.1-8B-Instruct'
+    model = commit_info.get('model', '') or 'meta-llama/Meta-Llama-3-8B-Instruct'
+    # Apply model override for compatibility (e.g., RoPE scaling issues)
+    original_model = model
+    model = MODEL_OVERRIDES.get(model, model)
+    if model != original_model:
+        print(f"  Model override: {original_model} -> {model}")
+        commit_info = dict(commit_info)  # Copy to avoid modifying original
+        commit_info['model'] = model
     perf_command = commit_info.get('perf_command', '')
+    # Also replace model in perf_command if overridden
+    if model != original_model and original_model in perf_command:
+        perf_command = perf_command.replace(original_model, model)
+        commit_info['perf_command'] = perf_command
     benchmark_type = get_benchmark_type(perf_command)
 
     # Skip if parent_commit is missing
