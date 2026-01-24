@@ -1,0 +1,72 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 0000000..e8e764d
+--- /dev/null
++++ b/model_patch.diff
+@@ -0,0 +1,46 @@
++diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
++index 3a4c259..347a851 100644
++--- a/vllm/v1/sample/logits_processor.py
+++++ b/vllm/v1/sample/logits_processor.py
++@@ -246,6 +246,8 @@ class MinPLogitsProcessor(LogitsProcessor):
++             self.min_p_device = self.min_p_cpu_tensor
++         # Current slice of the device tensor
++         self.min_p: torch.Tensor = self.min_p_device[:0]
+++        # Cached log(min_p) slice for efficient masking
+++        self.log_min_p: torch.Tensor = self.min_p_device[:0]
++ 
++     def is_argmax_invariant(self) -> bool:
++         """Min-p never impacts greedy sampling"""
++@@ -294,23 +296,20 @@ class MinPLogitsProcessor(LogitsProcessor):
++                 self.min_p.copy_(self.min_p_cpu_tensor[:size],
++                                  non_blocking=True)
++             self.min_p.unsqueeze_(1)
+++            # Cache log(min_p) for use during apply; sequences with min_p==0
+++            # will produce -inf which results in no masking for that row.
+++            self.log_min_p = self.min_p.log()
++ 
++     def apply(self, logits: torch.Tensor) -> torch.Tensor:
++         if not self.min_p_count:
++             return logits
++ 
++-        # Convert logits to probability distribution
++-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
++-        # Calculate maximum probabilities per sequence
++-        max_probabilities = torch.amax(probability_values,
++-                                       dim=-1,
++-                                       keepdim=True)
++-        # Adjust min_p
++-        adjusted_min_p = max_probabilities.mul_(self.min_p)
++-        # Identify valid tokens using threshold comparison
++-        invalid_token_mask = probability_values < adjusted_min_p
++-        # Apply mask using boolean indexing
++-        logits[invalid_token_mask] = -float('inf')
+++        # Identify tokens that fall below the relative threshold in logit space:
+++        # p_i < min_p * p_max  <=>  (l_i - l_max) < log(min_p)
+++        max_logits = torch.amax(logits, dim=-1, keepdim=True)
+++        delta = logits - max_logits
+++        invalid_token_mask = delta < self.log_min_p
+++        logits.masked_fill_(invalid_token_mask, -float('inf'))
++         return logits
++ 
++ 
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 347a851..5d9cfbe 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -304,12 +304,10 @@ class MinPLogitsProcessor(LogitsProcessor):
+         if not self.min_p_count:
+             return logits
+ 
+-        # Identify tokens that fall below the relative threshold in logit space:
+-        # p_i < min_p * p_max  <=>  (l_i - l_max) < log(min_p)
++        # p_i < min_p * p_max  <=>  l_i < l_max + log(min_p)
+         max_logits = torch.amax(logits, dim=-1, keepdim=True)
+-        delta = logits - max_logits
+-        invalid_token_mask = delta < self.log_min_p
+-        logits.masked_fill_(invalid_token_mask, -float('inf'))
++        threshold_logits = max_logits + self.log_min_p
++        logits.masked_fill_(logits < threshold_logits, -float('inf'))
+         return logits
+ 
+ 
