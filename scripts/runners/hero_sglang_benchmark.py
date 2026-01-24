@@ -25,6 +25,20 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from datasets import load_dataset
 
+# Import local Docker benchmark functions (when available)
+try:
+    from local_docker_sglang_benchmark import (
+        run_human_serving_benchmark as local_run_human,
+        run_baseline_serving_benchmark as local_run_baseline,
+        run_agent_serving_benchmark as local_run_agent,
+        run_combined_3way_serving as local_run_3way,
+        get_sglang_image,
+        get_hf_token,
+    )
+    LOCAL_DOCKER_AVAILABLE = True
+except ImportError:
+    LOCAL_DOCKER_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -347,6 +361,140 @@ def run_3way_benchmark(
         }
 
 
+def run_3way_benchmark_local_docker(
+    base_commit: str,
+    human_commit: str,
+    agent_patch: Optional[str],
+    perf_command: str,
+    model: str,
+    gpu_config: str = DEFAULT_GPU_CONFIG,
+    human_only: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run benchmark using local Docker containers instead of Modal.
+
+    This is useful for:
+    - Machines with local GPUs
+    - Debugging without Modal costs
+    - Commits that fail on Modal due to network issues
+
+    Requires local_docker_sglang_benchmark.py to be importable.
+    """
+    if not LOCAL_DOCKER_AVAILABLE:
+        return {
+            "status": "error",
+            "error": "Local Docker benchmark module not available. Import local_docker_sglang_benchmark failed.",
+            "baseline_metrics": {},
+            "human_metrics": {},
+            "agent_metrics": None,
+            "benchmark_mode": "local_docker",
+        }
+
+    print(f"Running SGLang benchmark using LOCAL DOCKER...")
+    print(f"  Human commit: {human_commit[:8]}")
+    print(f"  Model: {model}")
+    print(f"  Command: {perf_command[:80]}...")
+    print(f"  Mode: {'human-only' if human_only else '3-way'}")
+
+    # Get HuggingFace token
+    hf_token = get_hf_token()
+
+    result = {
+        "status": "error",
+        "baseline_metrics": {},
+        "human_metrics": {},
+        "agent_metrics": None,
+        "benchmark_mode": "local_docker",
+        "human_only": human_only,
+    }
+
+    try:
+        if human_only:
+            # Run human-only benchmark
+            human_result = local_run_human(
+                human_commit=human_commit,
+                model=model,
+                perf_command=perf_command,
+                hf_token=hf_token,
+                timeout=1800
+            )
+
+            if human_result.status == 'success':
+                result["status"] = "success"
+                result["human_metrics"] = {
+                    "request_throughput": human_result.request_throughput,
+                    "output_throughput": human_result.output_throughput,
+                    "ttft_mean": human_result.ttft_mean,
+                    "ttft_median": human_result.ttft_median,
+                    "ttft_p99": human_result.ttft_p99,
+                    "tpot_mean": human_result.tpot_mean,
+                    "itl_mean": human_result.itl_mean,
+                }
+            else:
+                result["error"] = human_result.error or "Human benchmark failed"
+
+        else:
+            # Run 3-way benchmark
+            agent_patch_path = None
+            if agent_patch:
+                # Write patch to temp file
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.diff', delete=False) as f:
+                    f.write(agent_patch)
+                    agent_patch_path = Path(f.name)
+
+            baseline_result, human_result, agent_result = local_run_3way(
+                human_commit=human_commit,
+                base_commit=base_commit,
+                model=model,
+                perf_command=perf_command,
+                agent_patch_path=agent_patch_path,
+                hf_token=hf_token,
+                timeout=5400
+            )
+
+            # Convert results
+            if baseline_result.status == 'success':
+                result["baseline_metrics"] = {
+                    "request_throughput": baseline_result.request_throughput,
+                    "output_throughput": baseline_result.output_throughput,
+                    "ttft_mean": baseline_result.ttft_mean,
+                }
+
+            if human_result.status == 'success':
+                result["human_metrics"] = {
+                    "request_throughput": human_result.request_throughput,
+                    "output_throughput": human_result.output_throughput,
+                    "ttft_mean": human_result.ttft_mean,
+                }
+
+            if agent_result and agent_result.status == 'success':
+                result["agent_metrics"] = {
+                    "request_throughput": agent_result.request_throughput,
+                    "output_throughput": agent_result.output_throughput,
+                    "ttft_mean": agent_result.ttft_mean,
+                }
+
+            # Determine overall status
+            if human_result.status == 'success':
+                result["status"] = "success"
+            else:
+                result["status"] = "error"
+                result["error"] = human_result.error or "Benchmark failed"
+
+            # Cleanup temp file
+            if agent_patch_path:
+                try:
+                    agent_patch_path.unlink()
+                except:
+                    pass
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 def save_result(commit_hash: str, result: Dict, results_dir: Path):
     """Save benchmark result to JSON file."""
     commit_dir = results_dir / "sglang" / commit_hash
@@ -359,10 +507,16 @@ def save_result(commit_hash: str, result: Dict, results_dir: Path):
     logger.info(f"Saved result to {result_file}")
 
 
-def run_single_benchmark(commit_data: Dict, results_dir: Path) -> Dict:
+def run_single_benchmark(commit_data: Dict, results_dir: Path, use_local_docker: bool = False, human_only: bool = True) -> Dict:
     """Run a single benchmark - used for parallel execution.
 
     This function is self-contained and can be called from ThreadPoolExecutor.
+
+    Args:
+        commit_data: Dict with 'item' and 'patch_info'
+        results_dir: Directory to save results
+        use_local_docker: If True, use local Docker instead of Modal
+        human_only: If True, only run human benchmark (skip baseline/agent)
     """
     item = commit_data["item"]
     patch_info = commit_data["patch_info"]
@@ -410,14 +564,28 @@ def run_single_benchmark(commit_data: Dict, results_dir: Path) -> Dict:
     # Run benchmark
     start_time = time.time()
 
-    result = run_3way_benchmark(
-        base_commit=parent_commit,
-        human_commit=commit_hash,
-        agent_patch=patch_info["patch_content"],
-        perf_command=item["perf_command"],
-        model=model,
-        gpu_config=gpu_config,
-    )
+    if use_local_docker:
+        # Use local Docker benchmark
+        result = run_3way_benchmark_local_docker(
+            base_commit=parent_commit,
+            human_commit=commit_hash,
+            agent_patch=patch_info["patch_content"],
+            perf_command=item["perf_command"],
+            model=model,
+            gpu_config=gpu_config,
+            human_only=human_only,
+        )
+    else:
+        # Use Modal benchmark (original path)
+        result = run_3way_benchmark(
+            base_commit=parent_commit,
+            human_commit=commit_hash,
+            agent_patch=patch_info["patch_content"],
+            perf_command=item["perf_command"],
+            model=model,
+            gpu_config=gpu_config,
+            human_only=human_only,
+        )
 
     duration = time.time() - start_time
 
@@ -431,6 +599,7 @@ def run_single_benchmark(commit_data: Dict, results_dir: Path) -> Dict:
     result["duration_s"] = duration
     result["has_agent_patch"] = True
     result["gpu_config"] = gpu_config
+    result["use_local_docker"] = use_local_docker
 
     # Save result immediately
     save_result(short_hash, result, results_dir)
@@ -445,7 +614,23 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Don't run benchmarks, just show what would run")
     parser.add_argument("--commit", type=str, help="Run specific commit only")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel benchmarks (default: 1)")
+    parser.add_argument("--use-local-docker", action="store_true",
+                       help="Run benchmarks in local Docker containers instead of Modal")
+    parser.add_argument("--human-only", action="store_true", default=True,
+                       help="Only run human benchmark (skip baseline/agent)")
+    parser.add_argument("--3way", dest="three_way", action="store_true",
+                       help="Run 3-way benchmark (baseline, human, agent)")
     args = parser.parse_args()
+
+    # Check local Docker availability if requested
+    if args.use_local_docker and not LOCAL_DOCKER_AVAILABLE:
+        print("ERROR: --use-local-docker requested but local_docker_sglang_benchmark module not available")
+        print("Make sure local_docker_sglang_benchmark.py is in the same directory")
+        sys.exit(1)
+
+    # 3-way overrides human-only
+    if args.three_way:
+        args.human_only = False
 
     # Setup
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -466,6 +651,8 @@ def main():
     logger.info("HERO SGLANG 3-WAY BENCHMARK RUN")
     logger.info(f"Start time: {datetime.now().isoformat()}")
     logger.info(f"Log file: {log_file}")
+    logger.info(f"Execution mode: {'LOCAL DOCKER' if args.use_local_docker else 'Modal'}")
+    logger.info(f"Benchmark mode: {'human-only' if args.human_only else '3-way'}")
     logger.info("=" * 80)
 
     # Load Claude Code patches
@@ -661,7 +848,11 @@ def main():
             logger.info("=" * 80)
 
             # Run benchmark using the helper function
-            result = run_single_benchmark(commit_data, results_dir)
+            result = run_single_benchmark(
+                commit_data, results_dir,
+                use_local_docker=args.use_local_docker,
+                human_only=args.human_only
+            )
 
             # Log outcome
             if result["status"] == "success":

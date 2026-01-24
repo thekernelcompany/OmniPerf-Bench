@@ -40,6 +40,12 @@ DOCKER_REPO = "ayushnangia16/nvidia-sglang-docker"
 CLAUDE_CODE_PATCHES_DIR = Path("perf-agents-bench/state/runs/sglang/claude_code")
 WORK_DIR = Path("/tmp/sglang_docker_build")
 
+# Commit mapping file for baseline builds
+COMMIT_MAPPING_FILE = Path(__file__).parent.parent / "fixes" / "sglang_commit_mapping.json"
+
+# Build status tracking file
+BUILD_STATUS_FILE = Path(__file__).parent.parent.parent.parent / "sglang_docker_builds_full.csv"
+
 # Build configuration
 # Using a simpler Dockerfile for benchmarking (not the full production Dockerfile)
 BENCHMARK_DOCKERFILE = '''
@@ -191,6 +197,220 @@ def get_parent_commit(commit: str, repo_path: Path) -> Optional[str]:
     return None
 
 
+def load_commit_mapping() -> List[Dict]:
+    """Load SGLang commit mapping (human commit -> base commit)."""
+    if not COMMIT_MAPPING_FILE.exists():
+        print(f"Warning: Commit mapping file not found: {COMMIT_MAPPING_FILE}")
+        return []
+
+    with open(COMMIT_MAPPING_FILE) as f:
+        data = json.load(f)
+        return data.get("commits", [])
+
+
+def get_base_commits_to_build() -> List[Dict]:
+    """Get list of base commits that need baseline images."""
+    mapping = load_commit_mapping()
+    if not mapping:
+        return []
+
+    # Get existing baseline images
+    existing_baselines = set()
+    try:
+        url = f"https://hub.docker.com/v2/repositories/{DOCKER_REPO}/tags?page_size=100"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read())
+            for tag in data.get('results', []):
+                name = tag.get('name', '')
+                if name.startswith('baseline-'):
+                    # Extract commit hash from baseline-{commit[:12]}
+                    commit_part = name[9:]  # Remove 'baseline-' prefix
+                    existing_baselines.add(commit_part[:8])
+    except Exception as e:
+        print(f"Warning: Could not fetch existing baseline images: {e}")
+
+    # Filter to commits that need baseline images
+    to_build = []
+    for entry in mapping:
+        base_commit = entry.get("base_commit", "")
+        base_short = entry.get("base_commit_short", base_commit[:12] if base_commit else "")
+
+        if not base_commit:
+            continue
+
+        # Skip if baseline already exists
+        if base_short[:8] in existing_baselines:
+            continue
+
+        to_build.append({
+            "short_commit": base_short[:8],
+            "full_commit": base_commit,
+            "human_commit": entry.get("human_commit", ""),
+            "subject": f"Baseline for {entry.get('human_commit_short', '')[:8]} (PR #{entry.get('pr_number', 'N/A')})",
+        })
+
+    return to_build
+
+
+def build_baseline_image(
+    commit: str,
+    work_dir: Path,
+    push: bool = True,
+    verbose: bool = True
+) -> Tuple[bool, str]:
+    """
+    Build baseline Docker image for a specific SGLang commit.
+
+    Uses the 'baseline-{commit[:12]}' tagging convention.
+
+    Args:
+        commit: Full commit hash (base/parent commit)
+        work_dir: Working directory for build
+        push: Whether to push to DockerHub
+        verbose: Print detailed output
+
+    Returns:
+        Tuple of (success, message)
+    """
+    short_commit = commit[:8]
+    baseline_tag = f"baseline-{commit[:12]}"
+    full_commit = commit[:40] if len(commit) >= 40 else commit
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Building SGLang BASELINE Docker image: {baseline_tag}")
+        print(f"{'='*60}")
+
+    # Create work directory
+    work_dir.mkdir(parents=True, exist_ok=True)
+    repo_dir = work_dir / "sglang"
+
+    try:
+        # Clone or update repo
+        if not repo_dir.exists():
+            if verbose:
+                print(f"Cloning SGLang repository...")
+            result = subprocess.run(
+                ["git", "clone", "--depth", "100", SGLANG_REPO_URL, str(repo_dir)],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                return False, f"Git clone failed: {result.stderr[:500]}"
+
+        # Fetch and checkout commit
+        if verbose:
+            print(f"Checking out baseline commit {short_commit}...")
+
+        subprocess.run(
+            ["git", "fetch", "origin", commit],
+            cwd=repo_dir, capture_output=True, timeout=120
+        )
+
+        result = subprocess.run(
+            ["git", "checkout", commit],
+            cwd=repo_dir, capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return False, f"Git checkout failed: {result.stderr[:500]}"
+
+        # Write Dockerfile
+        dockerfile_path = repo_dir / "Dockerfile.benchmark"
+        dockerfile_content = BENCHMARK_DOCKERFILE.replace(
+            "ARG COMMIT_HASH=main",
+            f"ARG COMMIT_HASH={full_commit}"
+        ).replace(
+            "${SGLANG_REPO_URL}",
+            SGLANG_REPO_URL
+        ).replace(
+            "git checkout ${COMMIT_HASH}",
+            f"git checkout {full_commit}"
+        )
+
+        dockerfile_path.write_text(dockerfile_content)
+
+        # Build Docker image with baseline tag
+        image_tag = f"{DOCKER_REPO}:{baseline_tag}"
+
+        if verbose:
+            print(f"Building Docker image: {image_tag}")
+
+        build_cmd = [
+            "docker", "build",
+            "-f", str(dockerfile_path),
+            "-t", image_tag,
+            "--build-arg", f"COMMIT_HASH={full_commit}",
+            str(repo_dir)
+        ]
+
+        result = subprocess.run(
+            build_cmd,
+            capture_output=not verbose,
+            text=True,
+            timeout=3600  # 1 hour timeout for build
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr if hasattr(result, 'stderr') else "Build failed"
+            return False, f"Docker build failed: {error_msg[:500]}"
+
+        if verbose:
+            print(f"Docker image built successfully: {image_tag}")
+
+        # Push to DockerHub
+        if push:
+            if verbose:
+                print(f"Pushing baseline image to DockerHub...")
+
+            result = subprocess.run(
+                ["docker", "push", image_tag],
+                capture_output=not verbose,
+                text=True,
+                timeout=1800  # 30 min timeout for push
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr if hasattr(result, 'stderr') else "Push failed"
+                return False, f"Docker push failed: {error_msg[:500]}"
+
+            if verbose:
+                print(f"Baseline image pushed successfully: {image_tag}")
+
+        # Update build status tracking
+        update_build_status(full_commit, baseline_tag, "success")
+
+        return True, f"Successfully built baseline {baseline_tag}"
+
+    except subprocess.TimeoutExpired as e:
+        update_build_status(full_commit, baseline_tag, "timeout")
+        return False, f"Timeout during build: {str(e)}"
+    except Exception as e:
+        update_build_status(full_commit, baseline_tag, "error")
+        return False, f"Build exception: {str(e)}"
+
+
+def update_build_status(commit: str, tag: str, status: str):
+    """Update build status in tracking CSV."""
+    import csv
+    from datetime import datetime
+
+    BUILD_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if file exists and has header
+    file_exists = BUILD_STATUS_FILE.exists()
+
+    with open(BUILD_STATUS_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "commit", "tag", "status", "type"])
+        writer.writerow([
+            datetime.now().isoformat(),
+            commit[:12],
+            tag,
+            status,
+            "baseline" if tag.startswith("baseline-") else "human"
+        ])
+
+
 def build_docker_image(
     commit: str,
     work_dir: Path,
@@ -323,6 +543,8 @@ def main():
     parser = argparse.ArgumentParser(description="Build SGLang Docker images")
     parser.add_argument("--commit", type=str, help="Build image for specific commit")
     parser.add_argument("--all", action="store_true", help="Build images for all runnable commits")
+    parser.add_argument("--build-baselines", action="store_true", help="Build baseline images for base commits")
+    parser.add_argument("--baseline", action="store_true", help="Build as baseline image (with --commit)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be built")
     parser.add_argument("--no-push", action="store_true", help="Don't push to DockerHub")
     parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip commits with existing images")
@@ -330,13 +552,67 @@ def main():
     parser.add_argument("--work-dir", type=str, default=str(WORK_DIR), help="Working directory")
     args = parser.parse_args()
 
-    if not args.commit and not args.all:
+    if not args.commit and not args.all and not args.build_baselines:
         parser.print_help()
-        print("\nError: Must specify --commit or --all")
+        print("\nError: Must specify --commit, --all, or --build-baselines")
         sys.exit(1)
 
     work_dir = Path(args.work_dir)
 
+    # Handle baseline building mode
+    if args.build_baselines or (args.commit and args.baseline):
+        print("=" * 60)
+        print("BASELINE IMAGE BUILD MODE")
+        print("=" * 60)
+
+        if args.commit and args.baseline:
+            # Build single baseline image
+            commits = [{"short_commit": args.commit[:8], "full_commit": args.commit, "subject": "Manual baseline build"}]
+        else:
+            # Build all baseline images
+            commits = get_base_commits_to_build()
+            print(f"Found {len(commits)} base commits needing baseline images")
+
+        if not commits:
+            print("No baseline images to build")
+            sys.exit(0)
+
+        if args.dry_run:
+            print("\n=== DRY RUN - Would build baseline images: ===")
+            for i, c in enumerate(commits, 1):
+                print(f"  {i}. baseline-{c['full_commit'][:12]} - {c.get('subject', 'N/A')[:50]}...")
+            sys.exit(0)
+
+        success_count = 0
+        error_count = 0
+
+        for i, c in enumerate(commits, 1):
+            print(f"\n[{i}/{len(commits)}] Building baseline-{c['full_commit'][:12]}: {c.get('subject', '')[:40]}...")
+
+            success, msg = build_baseline_image(
+                commit=c['full_commit'],
+                work_dir=work_dir,
+                push=not args.no_push,
+                verbose=args.verbose
+            )
+
+            if success:
+                success_count += 1
+                print(f"  SUCCESS: {msg}")
+            else:
+                error_count += 1
+                print(f"  ERROR: {msg}")
+
+        # Summary
+        print(f"\n{'='*60}")
+        print("BASELINE BUILD SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Total: {len(commits)}")
+        print(f"  Success: {success_count}")
+        print(f"  Errors: {error_count}")
+        sys.exit(0)
+
+    # Regular human image building mode
     # Get commits to build
     if args.commit:
         commits = [{"short_commit": args.commit[:8], "full_commit": args.commit, "subject": "Manual build"}]
