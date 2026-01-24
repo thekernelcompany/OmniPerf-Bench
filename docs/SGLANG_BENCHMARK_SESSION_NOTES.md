@@ -15,11 +15,12 @@
 5. [Benchmark Results on H100](#benchmark-results-on-h100)
 6. [Known Issues and Root Causes](#known-issues-and-root-causes)
 7. [Building sgl-kernel from Source](#building-sgl-kernel-from-source)
-8. [Blackwell-Specific Considerations](#blackwell-specific-considerations)
+8. [Blackwell-Specific Considerations](#blackwell-specific-considerations) **(UPDATED)**
 9. [Recommended Approach](#recommended-approach)
 10. [Step-by-Step Instructions](#step-by-step-instructions)
 11. [File Locations Reference](#file-locations-reference)
 12. [Troubleshooting Guide](#troubleshooting-guide)
+13. [Appendix: Blackwell Testing Session Log](#appendix-blackwell-testing-session-log-january-24-2026) **(NEW)**
 
 ---
 
@@ -37,10 +38,20 @@ Run 3-way benchmarks (baseline vs human vs agent) on 67 SGLang performance optim
 | **59% of Docker images fail** on H100 | Due to missing deps, not GPU issues |
 | **17 commits benchmark successfully** on H100 | These are the reliable ones |
 
+### CRITICAL UPDATE (January 24, 2026): Blackwell Testing Results
+
+| Finding | Impact |
+|---------|--------|
+| **ALL 67 Docker images have PyTorch < 2.7** | NONE can run on Blackwell (SM120) |
+| PyTorch 2.7+ required for SM120 CUDA kernels | Hard blocker, not just a warning |
+| 4 of 17 "working" commits have NO Docker images | Only 13 actually have images on DockerHub |
+| Official `lmsysorg/sglang:latest` works | Has PyTorch 2.9.1 with SM120 support |
+
 ### Bottom Line
-- **Blackwell (SM100)**: PyPI sgl-kernel will work
-- **Main blocker**: Docker image quality issues (missing libnuma, module errors)
-- **Solution**: Either fix Docker images or focus on the 17 working commits
+- **Blackwell (SM120)**: **NONE of the dataset Docker images work** - all have PyTorch < 2.7
+- **H100 (SM90)**: 17 commits work (as originally documented)
+- **A100 (SM80)**: Blocked by sgl_kernel (no SM80 binaries in PyPI)
+- **Solution for Blackwell**: Must rebuild ALL 67 images with PyTorch 2.7+
 
 ---
 
@@ -462,9 +473,23 @@ docker run --rm --gpus all -p 30000:30000 sglang-test:sm100 \
 
 ### Hardware Specs
 
-- **Architecture**: SM100 (Blackwell)
-- **PyPI sgl-kernel**: Supported (has SM100 binaries)
+- **Architecture**: SM120 (Blackwell RTX PRO 6000 Server Edition)
+- **Note**: Earlier documentation incorrectly stated SM100 - actual compute capability is **12.0**
+- **PyPI sgl-kernel**: NOT tested on SM120
 - **CUDA Version**: Requires CUDA 12.6+ for full support
+
+### CRITICAL: PyTorch Version Requirements
+
+| PyTorch Version | SM120 (Blackwell) Support | Status |
+|-----------------|---------------------------|--------|
+| 2.1.x - 2.6.x | NO | CUDA kernels not compiled |
+| 2.7+ | YES | SM120 support added |
+| 2.9.1 (current latest) | YES | Verified working |
+
+**This is a HARD requirement, not just a warning.** PyTorch < 2.7 will show a warning but then CRASH:
+```
+RuntimeError: CUDA error: no kernel image is available for execution on the device
+```
 
 ### Driver Requirements
 
@@ -473,14 +498,46 @@ docker run --rm --gpus all -p 30000:30000 sglang-test:sm100 \
 nvidia-smi --query-gpu=driver_version --format=csv,noheader
 
 # Blackwell requires driver 550+ for full support
-# Recommended: 560+ for best performance
+# Tested with: Driver 580.126.09, CUDA 13.0
 ```
 
-### Potential Issues on Blackwell
+### Actual Test Results (January 24, 2026)
 
-1. **New architecture bugs**: Some libraries may have untested code paths for SM100
-2. **Triton support**: Verify Triton has SM100 support in your version
-3. **FlashInfer**: Check if FlashInfer has Blackwell-optimized kernels
+**Docker images tested on NVIDIA RTX PRO 6000 Blackwell Server Edition:**
+
+| Image | PyTorch | SGLang | Result |
+|-------|---------|--------|--------|
+| `ayushnangia16/...:148254d4...` | 2.5.1+cu121 | 0.4.1.post3 | CRASH - no SM120 kernels |
+| `ayushnangia16/...:187b85b7...` | 2.6.0+cu124 | 0.4.x | CRASH - no SM120 kernels |
+| `shikhar481/...:fixed-9c745d07...` | 2.4.0+cu124 | 0.3.5.post2 | CRASH - no SM120 kernels |
+| `shikhar481/...:2a754e57-v3` | 2.1.2+cu121 | 0.1.x | CRASH - no SM120 kernels |
+| `lmsysorg/sglang:latest` | **2.9.1+cu129** | latest | **SUCCESS** |
+
+### Why Docker Doesn't Help Here
+
+A common misconception: "Docker provides isolation, so version mismatches shouldn't matter."
+
+**Reality**: Docker does NOT abstract GPU architecture.
+```
+┌─────────────────────────────────────────────┐
+│            Docker Container                  │
+│  ┌────────────────────────────────────────┐ │
+│  │ PyTorch 2.5.1 (compiled for SM50-SM90) │ │
+│  │ CUDA kernels: must match GPU arch      │ │
+│  └────────────────────────────────────────┘ │
+└─────────────────────────────────────────────┘
+                      │
+                      ▼ nvidia-container-toolkit
+┌─────────────────────────────────────────────┐
+│            Host GPU (Blackwell SM120)        │
+│  "I need SM120 kernels, not SM90!"          │
+└─────────────────────────────────────────────┘
+```
+
+Docker containers:
+- ✅ Isolate Python dependencies, libraries, OS packages
+- ✅ Share host kernel and GPU drivers
+- ❌ **Cannot translate GPU architecture** - CUDA code compiled for SM90 won't run on SM120
 
 ### Testing Blackwell Compatibility
 
@@ -491,7 +548,25 @@ print(f"CUDA version: {torch.version.cuda}")
 print(f"GPU: {torch.cuda.get_device_name(0)}")
 print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
 
-# Should show (10, 0) for Blackwell
+# RTX PRO 6000 Blackwell shows: (12, 0) = SM120
+# Note: torch.cuda.is_available() returns True even if kernels won't work!
+# The actual crash happens when you try to run CUDA operations.
+```
+
+### Verified Working Configuration on Blackwell
+
+```bash
+# Official SGLang image works:
+docker pull lmsysorg/sglang:latest
+
+# Test it:
+docker run --rm --gpus all lmsysorg/sglang:latest \
+    python3 -m sglang.launch_server \
+    --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --port 30000 --host 0.0.0.0 \
+    --tp-size 1 --mem-fraction-static 0.3
+
+# Successfully runs inference on Blackwell!
 ```
 
 ---
@@ -698,10 +773,13 @@ shikhar481/sglang-images:v05-hf-{8-char}  # Problematic base
 
 ### Error: "no kernel image is available for execution on the device"
 
-**Cause**: sgl-kernel binaries don't support your GPU architecture
-**Solution**:
-- On Blackwell: Use PyPI sgl-kernel (should work)
-- On A100: Build from source with `TORCH_CUDA_ARCH_LIST="8.0"`
+**Cause**: PyTorch CUDA kernels not compiled for your GPU architecture
+**Solution by GPU**:
+- **Blackwell (SM120)**: Requires PyTorch 2.7+ - rebuild Docker images
+- **H100 (SM90)**: PyTorch 2.1+ works, use existing images
+- **A100 (SM80)**: Build sgl-kernel from source with `TORCH_CUDA_ARCH_LIST="8.0"`
+
+**NOTE**: On Blackwell, this error occurs even with SGLang 0.3.x (which doesn't use sgl-kernel) because PyTorch itself lacks SM120 kernels.
 
 ### Error: "libnuma.so.1: cannot open shared object file"
 
@@ -774,14 +852,20 @@ Sample structure:
 
 ## Summary Checklist for Blackwell
 
-- [ ] Verify Blackwell GPU detected (`nvidia-smi`)
-- [ ] Confirm CUDA 12.6+ installed
-- [ ] Test PyPI sgl-kernel imports successfully
-- [ ] Pull working Docker images
-- [ ] Run test benchmark on one commit
-- [ ] Decide: focus on 17 working commits OR fix failing images
-- [ ] Run batch benchmarks
+### Current Status (as of January 24, 2026)
+- [x] Verify Blackwell GPU detected (`nvidia-smi`) - **RTX PRO 6000 Blackwell Server Edition detected**
+- [x] Confirm CUDA 12.6+ installed - **Driver 580.126.09, CUDA 13.0**
+- [x] Test PyPI sgl-kernel imports - **NOT TESTED on SM120**
+- [x] Test dataset Docker images - **ALL FAILED - PyTorch < 2.7**
+- [x] Test official SGLang image - **SUCCESS with PyTorch 2.9.1**
+- [ ] Rebuild dataset images with PyTorch 2.7+ - **REQUIRED for Blackwell**
+- [ ] Run batch benchmarks on Blackwell
 - [ ] Collect and analyze results
+
+### For Future Blackwell Testing
+1. **DO NOT** use existing dataset Docker images - they will all crash
+2. **DO** use `lmsysorg/sglang:latest` for testing latest SGLang
+3. **DO** rebuild images with PyTorch 2.7+ to test specific commits
 
 ---
 
@@ -794,4 +878,118 @@ If you encounter issues not covered here:
 
 ---
 
-*Document generated from Claude Code session on January 24, 2025*
+## Appendix: Blackwell Testing Session Log (January 24, 2026)
+
+### Session Overview
+
+Attempted to run the 17 "working" commits from the dataset on NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120).
+
+### Key Discoveries
+
+#### 1. Docker Image Availability Check
+
+Checked all 17 "working" commits for Docker image availability:
+
+| Commit | ayushnangia16 | shikhar481 |
+|--------|--------------|------------|
+| 187b85b7 | EXISTS | NO |
+| 6b231325 | EXISTS | NO |
+| 4418f599 | **NO IMAGE** | NO |
+| 6cb00c63 | EXISTS | NO |
+| 148254d4 | EXISTS | EXISTS (-src) |
+| 2bd18e2d | EXISTS | EXISTS (-src) |
+| 2a413829 | **NO IMAGE** | NO |
+| 2a754e57 | EXISTS | EXISTS (-v3) |
+| 5e023301 | **NO IMAGE** | NO |
+| 880221bd | EXISTS | NO |
+| b1e5a33a | EXISTS | NO |
+| c087ddd6 | **NO IMAGE** | NO |
+| da47621c | EXISTS | NO |
+| dd1012fc | EXISTS | NO |
+| ddcf9fe3 | EXISTS | EXISTS (-src) |
+| df7f61ee | EXISTS | NO |
+| e3ec6bf4 | EXISTS | NO |
+
+**Finding**: 4 of 17 "working" commits have NO Docker images at all.
+
+#### 2. PyTorch Version Analysis
+
+| Repository | Image Type | PyTorch Version | SM120 Support |
+|------------|-----------|-----------------|---------------|
+| ayushnangia16 | Various | 2.5.1 - 2.6.0 | NO |
+| shikhar481 | -v3 | 2.1.2 | NO |
+| shikhar481 | fixed-* | 2.4.0 | NO |
+| lmsysorg | latest | 2.9.1 | YES |
+
+#### 3. Actual Test Results
+
+**Test 1: ayushnangia16/nvidia-sglang-docker:148254d4...**
+```
+PyTorch: 2.5.1+cu121
+SGLang: 0.4.1.post3
+sgl_kernel: FAILED (SM100 binaries only, GPU is SM120)
+Result: CRASH
+```
+
+**Test 2: shikhar481/sglang-images:fixed-9c745d078e29**
+```
+PyTorch: 2.4.0+cu124
+SGLang: 0.3.5.post2
+sgl_kernel: NOT REQUIRED (0.3.x)
+Result: CRASH - "RuntimeError: CUDA error: no kernel image is available"
+```
+
+**Test 3: lmsysorg/sglang:latest**
+```
+PyTorch: 2.9.1+cu129
+SGLang: latest
+Result: SUCCESS - Server started, inference completed
+```
+
+#### 4. Root Cause Analysis
+
+The issue is NOT sgl_kernel architecture mismatch (as initially suspected for A100).
+
+The ACTUAL issue is that **PyTorch itself** doesn't have CUDA kernels for SM120 until version 2.7.
+
+Even basic PyTorch operations fail:
+```python
+torch.arange(0, 10, device='cuda')  # CRASH on SM120 with PyTorch < 2.7
+```
+
+#### 5. SGLang Version vs sgl_kernel Dependency
+
+| SGLang Version | sgl_kernel Required? | Notes |
+|----------------|---------------------|-------|
+| 0.1.x - 0.3.x | NO | Pure Python + Triton |
+| 0.4.x+ | YES | Requires compiled CUDA extension |
+
+The 0.3.x images don't need sgl_kernel, but they STILL fail on Blackwell because PyTorch lacks SM120 kernels.
+
+### Conclusions
+
+1. **ALL 67 dataset Docker images are incompatible with Blackwell** - none have PyTorch 2.7+
+2. **The "17 working commits" only work on H100** (SM90) where PyTorch 2.1-2.6 is sufficient
+3. **To benchmark on Blackwell**, must rebuild all images with PyTorch 2.7+
+4. **Official `lmsysorg/sglang:latest` works** and can be used for testing latest SGLang on Blackwell
+
+### Recommended Next Steps
+
+1. **For immediate Blackwell testing**: Use `lmsysorg/sglang:latest` (but this only tests latest code, not specific commits)
+2. **For dataset benchmarking**: Either:
+   - Use H100/A100 machines (where existing images work)
+   - Rebuild all 67 Docker images with PyTorch 2.7+ base
+
+### Environment Details
+
+```
+GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition
+Compute Capability: SM120 (12.0)
+Driver: 580.126.09
+CUDA: 13.0
+Docker data-root: /opt/dlami/nvme/docker (1.7TB ephemeral storage)
+```
+
+---
+
+*Document updated from Claude Code session on January 24, 2026*
