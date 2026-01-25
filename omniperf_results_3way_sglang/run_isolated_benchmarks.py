@@ -39,17 +39,22 @@ VENV_BASE_DIR = Path("/tmp/sglang-venvs")
 AGENT_BASE_DIR = BASE_DIR / "perf-agents-bench/state/runs/sglang"
 
 # Agent patch directories (verified paths with patches for all 17 target commits)
-# NOTE: trae_sonnet45 uses the SGLAN directory (different from sglang) with different naming
+# NOTE: trae_sonnet45 has patches in TWO locations:
+#   1. sglang/trae/claude-sonnet-45/ - Has ALL 17 target commits (primary)
+#   2. sglan/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/ - Has 8 commits (backup)
 SGLAN_BASE_DIR = BASE_DIR / "perf-agents-bench/state/runs/sglan"
 SGLAN_SONNET45_BASE = SGLAN_BASE_DIR / "trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0"
+
+# Primary trae_sonnet45 directory (has all 17 target commits!)
+SGLANG_SONNET45_PRIMARY = AGENT_BASE_DIR / "trae/claude-sonnet-45/2025-11-28_15-26-15"
 
 AGENT_CONFIGS = {
     "claude_code": AGENT_BASE_DIR / "claude_code/default/2025-12-23_06-28-44",
     "codex": AGENT_BASE_DIR / "codex/gpt-5/389be848",
     # trae_gpt5 searches across multiple subdirectories
     "trae_gpt5": AGENT_BASE_DIR / "trae/gpt-5",  # Base dir, will search subdirs
-    # trae_sonnet45 searches across all sglan subdirectories
-    "trae_sonnet45": SGLAN_SONNET45_BASE,  # Base dir, will search subdirs
+    # trae_sonnet45 searches primary dir first, then sglan subdirectories
+    "trae_sonnet45": SGLANG_SONNET45_PRIMARY,  # Primary dir with all 17 commits
 }
 
 # Ordered list of trae-gpt5 subdirectories to search (2nd dir has more patches)
@@ -898,14 +903,25 @@ def find_agent_patch(commit_short: str, agent: str, index_mapping: dict, mapping
         print(f"  Codex patch not found for commit {commit_short}")
         return None
 
-    # For trae_sonnet45, search across all sglan subdirectories
+    # For trae_sonnet45, search primary directory first (has all 17 commits),
+    # then fall back to sglan subdirectories
     if agent == "trae_sonnet45":
+        # 1. Check primary directory (sglang/trae/claude-sonnet-45/) - uses sglang_XXX_<commit> naming
+        if agent_path.exists():
+            for folder in agent_path.iterdir():
+                if folder.is_dir() and commit_short in folder.name:
+                    patch_file = folder / "model_patch.diff"
+                    if patch_file.exists() and patch_file.stat().st_size > 0:
+                        return patch_file
+
+        # 2. Fall back to sglan subdirectories - uses sglang_sonnet45_rerun_<commit> naming
         for subdir in SGLAN_SONNET45_SUBDIRS:
-            patch_folder = agent_path / subdir / f"sglang_sonnet45_rerun_{commit_short}"
+            patch_folder = SGLAN_SONNET45_BASE / subdir / f"sglang_sonnet45_rerun_{commit_short}"
             patch_file = patch_folder / "model_patch.diff"
             if patch_file.exists() and patch_file.stat().st_size > 0:
                 return patch_file
-        print(f"  trae_sonnet45 patch not found for commit {commit_short} in any sglan subdir")
+
+        print(f"  trae_sonnet45 patch not found for commit {commit_short}")
         return None
 
     # For trae_gpt5, search across multiple subdirectories

@@ -130,29 +130,23 @@ sglang_core-0059/
 2025-11-14_21-05-32/sglang_059_c087ddd6/model_patch.diff  # 0 bytes (skip)
 ```
 
-#### 4. Trae Sonnet 4.5 (8/17 coverage)
+#### 4. Trae Sonnet 4.5 (17/17 coverage)
 
-**Path:** `perf-agents-bench/state/runs/sglan/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/`
+**Primary Path:** `perf-agents-bench/state/runs/sglang/trae/claude-sonnet-45/2025-11-28_15-26-15/`
 
-> **Note:** Directory is `sglan` (typo), not `sglang`
+**Naming Convention:** `sglang_XXX_<commit_hash>/model_patch.diff`
 
-**Subdirectories (searched in order):**
-1. `2025-12-24_19-36-38/` - 34 patches (main batch)
-2. `2025-12-24_14-38-37/` - 5 patches
-3. `2025-12-24_12-47-47/` - 2 patches
-4. `2025-12-24_10-23-32/` - 2 patches
-5. `2025-12-24_09-35-05/` - 2 patches
-6. `2025-12-24_19-11-55/` - 1 patch (2a413829)
-7. `2025-12-24_18-19-35/` - 1 patch
-8. `2025-12-24_09-21-46/` - 1 patch
+**Example:**
+```
+sglang_059_c087ddd6/model_patch.diff
+sglang_027_6b231325/model_patch.diff
+```
 
-**Naming Convention:** `sglang_sonnet45_rerun_<commit_hash>/model_patch.diff`
+> **Important:** This directory has ALL 17 target commits with non-empty patches!
 
-**Available for Target Commits:**
-- `6cb00c63`, `148254d4`, `2a413829`, `2a754e57`, `b1e5a33a`, `c087ddd6`, `ddcf9fe3`, `df7f61ee`
+**Backup Path (8 commits):** `perf-agents-bench/state/runs/sglan/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/`
 
-**Missing (patches were never generated):**
-- `187b85b7`, `6b231325`, `4418f599`, `2bd18e2d`, `5e023301`, `880221bd`, `da47621c`, `dd1012fc`, `e3ec6bf4`
+> **Note:** The backup directory uses `sglan` (typo) and different naming: `sglang_sonnet45_rerun_<commit>/`
 
 ### Patch Coverage Summary
 
@@ -161,7 +155,7 @@ sglang_core-0059/
 | claude_code | 17/17 (100%) | All target commits have patches |
 | codex | 17/17 (100%) | All target commits have patches |
 | trae_gpt5 | 17/17 (100%) | Must search both subdirectories |
-| trae_sonnet45 | 8/17 (47%) | Patches never generated for 9 commits |
+| trae_sonnet45 | 17/17 (100%) | Primary dir has all commits |
 
 ---
 
