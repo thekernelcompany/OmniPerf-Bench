@@ -1,0 +1,45 @@
+# SGLang Docker Fix for H100 (SM90)
+# General Dockerfile that can fix most common issues
+#
+# Usage: docker build --build-arg BASE_IMAGE=shikhar481/sglang-images:148254d4-src -t fixed-148254d4 .
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Fix 1: Install missing system dependencies
+RUN apt-get update && apt-get install -y \
+    libnuma1 libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fix 2: Install missing Python dependencies (common across many images)
+RUN pip install --no-cache-dir \
+    aiohttp>=3.9.0 \
+    einops \
+    dill \
+    msgspec \
+    python-multipart \
+    partial-json-parser \
+    pynvml \
+    orjson \
+    2>/dev/null || true
+
+# Fix 3: Pin Triton to a version that works on SM90
+RUN pip install --no-cache-dir triton==3.1.0 2>/dev/null || \
+    pip install --no-cache-dir triton==3.2.0 2>/dev/null || \
+    echo "Triton upgrade failed, using existing version"
+
+# Fix 4: CRITICAL - Remove vllm first to avoid dependency conflicts
+RUN pip uninstall -y vllm 2>/dev/null || true
+
+# Fix 5: Pin transformers to version compatible with SGLang 0.4.x
+# AutoProcessor was moved/renamed in newer transformers versions
+RUN pip install --no-cache-dir transformers==4.44.0 2>/dev/null || true
+
+# Fix 6: Check and fix sgl_kernel issues
+# For SGLang 0.4.1 and earlier, sgl_kernel is NOT required
+RUN python3 -c "import sgl_kernel; print(f'sgl_kernel: {sgl_kernel.__version__}')" 2>/dev/null || \
+    (pip uninstall -y sgl-kernel 2>/dev/null || true)
+
+# Set environment for better compatibility
+ENV CUDA_VISIBLE_DEVICES=0
+ENV PYTHONUNBUFFERED=1

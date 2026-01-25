@@ -1,0 +1,157 @@
+# SGLang Docker Rebuild for H100 (SM90)
+# Rebuilds SGLang from specific commit with proper dependencies
+#
+# Usage:
+#   docker build --build-arg COMMIT=148254d4db8bf3bffee23710cd1acbd5711ebd1b -t sglang-148254d4 .
+#   docker build --build-arg COMMIT=2a754e57b052e249ed4f8572cb6f0069ba6a495e -t sglang-2a754e57 .
+
+ARG BASE_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ARG COMMIT
+ARG PYTHON_VERSION=3.11
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-venv \
+    python3-pip \
+    git \
+    wget \
+    curl \
+    libnuma1 \
+    libnuma-dev \
+    build-essential \
+    cmake \
+    ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.11 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
+
+# Upgrade pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Clone SGLang
+WORKDIR /opt
+RUN git clone https://github.com/sgl-project/sglang.git
+
+# Checkout specific commit
+WORKDIR /opt/sglang
+RUN git checkout ${COMMIT}
+
+# Determine SGLang version from commit date to install compatible deps
+# This script checks the commit and installs appropriate versions
+RUN COMMIT_DATE=$(git show -s --format=%ci ${COMMIT} | cut -d' ' -f1) && \
+    echo "Commit date: $COMMIT_DATE" && \
+    # Determine which dependency set to use based on commit date
+    if [ "$COMMIT_DATE" \< "2024-09-01" ]; then \
+        # Very old commits (pre-0.3.0) - use vllm 0.4.x era deps
+        echo "Installing deps for pre-0.3 SGLang" && \
+        pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121 && \
+        pip install vllm==0.4.3 && \
+        pip install "outlines==0.0.37" && \
+        pip install triton==2.3.0; \
+    elif [ "$COMMIT_DATE" \< "2025-01-15" ]; then \
+        # SGLang 0.3.x - 0.4.1 era
+        echo "Installing deps for SGLang 0.3.x-0.4.1" && \
+        pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124 && \
+        pip install vllm==0.6.3.post1 && \
+        pip install "outlines==0.0.46" && \
+        pip install triton==3.1.0; \
+    else \
+        # SGLang 0.4.2+ era - needs sgl_kernel
+        echo "Installing deps for SGLang 0.4.2+" && \
+        pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124 && \
+        pip install "outlines==0.0.46" && \
+        pip install triton==3.2.0; \
+    fi
+
+# Install common dependencies
+RUN pip install --no-cache-dir \
+    transformers \
+    tokenizers \
+    huggingface_hub \
+    safetensors \
+    numpy \
+    einops \
+    dill \
+    msgspec \
+    aiohttp \
+    python-multipart \
+    partial-json-parser \
+    pynvml \
+    orjson \
+    "uvloop==0.17.0" \
+    uvicorn \
+    fastapi \
+    requests \
+    tqdm \
+    pyyaml \
+    packaging \
+    filelock \
+    typing_extensions \
+    regex \
+    sentencepiece \
+    protobuf
+
+# Try to install sgl-kernel from PyPI (works for SM90)
+# If it fails, we'll build from source
+RUN pip install sgl-kernel 2>/dev/null || echo "sgl-kernel PyPI install failed, may need source build"
+
+# Install SGLang from source
+WORKDIR /opt/sglang
+RUN pip install -e "python[all]" 2>/dev/null || pip install -e "python" || pip install -e .
+
+# CRITICAL: Reinstall pinned versions that may have been overridden
+# For pre-Sept-2024 commits: Use outlines 0.0.44 (has fsm.guide) + vllm 0.5.0
+# pyairports on PyPI is broken, so we create a mock module
+RUN COMMIT_DATE=$(git show -s --format=%ci ${COMMIT} | cut -d' ' -f1) && \
+    if [ "$COMMIT_DATE" \< "2024-09-01" ]; then \
+        pip install "numpy<2.0" pycountry && \
+        # Create mock pyairports since PyPI version is broken
+        mkdir -p /usr/local/lib/python3.11/dist-packages/pyairports && \
+        echo 'AIRPORT_LIST = []' > /usr/local/lib/python3.11/dist-packages/pyairports/airports.py && \
+        echo '' > /usr/local/lib/python3.11/dist-packages/pyairports/__init__.py && \
+        pip install "outlines==0.0.44" && \
+        # vllm 0.5.0 requires outlines>=0.0.43, torch==2.4.0
+        pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121 && \
+        pip install "vllm==0.5.0" --no-deps && \
+        pip install vllm_flash_attn==2.5.9 && \
+        pip install flashinfer==0.0.9 -i https://flashinfer.ai/whl/cu121/torch2.3/ && \
+        python3 -c "from outlines.fsm.guide import RegexGuide; print('outlines OK')"; \
+    elif [ "$COMMIT_DATE" \< "2025-01-15" ]; then \
+        pip install "vllm==0.6.3.post1"; \
+    else \
+        echo "SGLang 0.4.2+ - dependencies should be correct"; \
+    fi
+
+# Build settings for parallel compilation
+ENV MAX_JOBS=32
+ENV NVCC_THREADS=2
+
+# If sgl-kernel is in this repo and PyPI failed, build from source
+RUN if [ -d "sgl-kernel" ] && ! python3 -c "import sgl_kernel" 2>/dev/null; then \
+        echo "Building sgl-kernel from source..." && \
+        cd sgl-kernel && \
+        pip install scikit-build-core cmake ninja pybind11 && \
+        TORCH_CUDA_ARCH_LIST="9.0" pip install . --no-build-isolation -v; \
+    fi
+
+# Verify installation
+RUN python3 -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+    python3 -c "import sglang; print(f'SGLang installed')" || true
+
+# Set environment
+ENV CUDA_VISIBLE_DEVICES=0
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /workspace
+
+# Default command
+CMD ["python3", "-m", "sglang.launch_server", "--help"]

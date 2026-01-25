@@ -44,6 +44,9 @@ SGLANG_DOCKER_REPOS = [
     "ayushnangia16/nvidia-sglang-docker",  # Original repo with full hashes
 ]
 
+# Official SGLang image (works on H100)
+OFFICIAL_SGLANG_IMAGE = "lmsysorg/sglang:v0.4.6.post5-cu124"
+
 # Results directory
 RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_sglang")
 OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
@@ -57,6 +60,8 @@ COMMIT_MAPPING_FILE = Path("/root/OmniPerf-Bench/src/benchmark/fixes/sglang_comm
 AGENT_RUNS_DIRS = {
     "claude_code": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/claude_code"),
     "codex": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/codex"),
+    "trae_gpt5": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/trae/gpt-5"),
+    "trae_sonnet45": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/trae/claude-sonnet-45"),
 }
 
 # HuggingFace cache mount path
@@ -142,31 +147,43 @@ def get_sglang_image(commit: str, phase: str = "human") -> Optional[str]:
     """
     Find a Docker image for an SGLang commit.
 
-    Search strategy:
-    1. For 'human' phase: Try shikhar481 repo with -src, -v3, -v2, '' suffixes
-    2. For 'human' phase: Fall back to ayushnangia16 repo with full hash
-    3. For 'baseline' phase: Try baseline-{commit[:12]} tag in both repos
+    Search strategy (in priority order):
+    1. shikhar481 repo with simple 8-char hash (known to work on H100)
+    2. shikhar481 repo with v04x-fixed-{12char}, v04x-triton-{12char} patterns
+    3. shikhar481 repo with v05-improved-{12char}, v05-hf-{12char} patterns
+    4. shikhar481 repo with -src suffix
+    5. ayushnangia16 repo with full hash (often has ABI issues)
 
     Returns full image tag or None if not found.
     """
-    short = commit[:8]
+    short8 = commit[:8]
+    short12 = commit[:12]
     full = commit[:40] if len(commit) >= 40 else commit
 
     if phase == "baseline":
         # Look for baseline-tagged images
         candidates = [
-            f"shikhar481/sglang-images:baseline-{commit[:12]}",
-            f"ayushnangia16/nvidia-sglang-docker:baseline-{commit[:12]}",
+            f"shikhar481/sglang-images:baseline-{short12}",
+            f"ayushnangia16/nvidia-sglang-docker:baseline-{short12}",
         ]
     else:
         # Human/agent phase - look for commit images
+        # Priority: simple hash (known to work) > v04x-fixed > v04x-triton > v05 > src > ayushnangia16
         candidates = [
-            # shikhar481 repo (newer, multiple versions per commit)
-            f"shikhar481/sglang-images:{short}-src",
-            f"shikhar481/sglang-images:{short}-v3",
-            f"shikhar481/sglang-images:{short}-v2",
-            f"shikhar481/sglang-images:{short}",
-            # ayushnangia16 repo (full hashes)
+            # Simple 8-char hash (like c087ddd6 which works on H100)
+            f"shikhar481/sglang-images:{short8}",
+            # v04x-fixed pattern (12-char hash) - fixed dependency versions
+            f"shikhar481/sglang-images:v04x-fixed-{short12}",
+            # v04x-triton pattern (12-char hash)
+            f"shikhar481/sglang-images:v04x-triton-{short12}",
+            # v05 patterns (12-char hash) - newer builds
+            f"shikhar481/sglang-images:v05-improved-{short12}",
+            f"shikhar481/sglang-images:v05-hf-{short12}",
+            # fixed- prefix pattern (8-char hash)
+            f"shikhar481/sglang-images:fixed-{short8}",
+            # -src suffix pattern
+            f"shikhar481/sglang-images:{short8}-src",
+            # ayushnangia16 repo (full hashes) - often has ABI issues
             f"ayushnangia16/nvidia-sglang-docker:{full}",
         ]
 
@@ -179,17 +196,21 @@ def get_sglang_image(commit: str, phase: str = "human") -> Optional[str]:
 
 def find_all_available_images(commit: str) -> Dict[str, List[str]]:
     """Find all available Docker images for a commit across both repos."""
-    short = commit[:8]
+    short8 = commit[:8]
+    short12 = commit[:12]
     full = commit[:40] if len(commit) >= 40 else commit
 
     available = {"human": [], "baseline": []}
 
-    # Human/commit images
+    # Human/commit images - check all known patterns
     human_candidates = [
-        f"shikhar481/sglang-images:{short}-src",
-        f"shikhar481/sglang-images:{short}-v3",
-        f"shikhar481/sglang-images:{short}-v2",
-        f"shikhar481/sglang-images:{short}",
+        f"shikhar481/sglang-images:{short8}",
+        f"shikhar481/sglang-images:v04x-fixed-{short12}",
+        f"shikhar481/sglang-images:v04x-triton-{short12}",
+        f"shikhar481/sglang-images:v05-improved-{short12}",
+        f"shikhar481/sglang-images:v05-hf-{short12}",
+        f"shikhar481/sglang-images:fixed-{short8}",
+        f"shikhar481/sglang-images:{short8}-src",
         f"ayushnangia16/nvidia-sglang-docker:{full}",
     ]
 
@@ -199,8 +220,8 @@ def find_all_available_images(commit: str) -> Dict[str, List[str]]:
 
     # Baseline images
     baseline_candidates = [
-        f"shikhar481/sglang-images:baseline-{commit[:12]}",
-        f"ayushnangia16/nvidia-sglang-docker:baseline-{commit[:12]}",
+        f"shikhar481/sglang-images:baseline-{short12}",
+        f"ayushnangia16/nvidia-sglang-docker:baseline-{short12}",
     ]
 
     for image_tag in baseline_candidates:
@@ -258,6 +279,12 @@ def load_agent_patches(agent_type: str = "claude_code") -> Dict[str, Dict[str, A
         search_patterns = [
             runs_dir.glob("*/*/sglang_*"),
             runs_dir.glob("gpt-5/*/sglang_*"),
+        ]
+    elif agent_type in ("trae_gpt5", "trae_sonnet45"):
+        # Pattern: trae/gpt-5|claude-sonnet-45/*/sglang_*
+        # The runs_dir already points to trae/gpt-5 or trae/claude-sonnet-45
+        search_patterns = [
+            runs_dir.glob("*/sglang_*"),
         ]
     else:
         search_patterns = [runs_dir.glob("*/*/sglang_*")]
@@ -375,18 +402,136 @@ def extract_model_from_command(perf_command: str) -> Optional[str]:
     return None
 
 
+def run_official_image_benchmark(
+    model: str,
+    hf_token: str,
+    num_prompts: int = 100,
+    timeout: int = 900,
+    label: str = "baseline"
+) -> BenchmarkResult:
+    """Run a benchmark using the official SGLang image (works on H100)."""
+    start_time = time.time()
+    docker_image = OFFICIAL_SGLANG_IMAGE
+
+    print(f"  Using official image: {docker_image}")
+
+    docker_cmd = f'''
+    set -e
+    MODEL="{model}"
+
+    echo "=== Starting SGLang server ==="
+    python3 -m sglang.launch_server \\
+        --model-path $MODEL \\
+        --port 30000 \\
+        --host 0.0.0.0 \\
+        --disable-cuda-graph \\
+        --log-level warning 2>&1 &
+    SERVER_PID=$!
+
+    echo "Waiting for server..."
+    for i in $(seq 1 180); do
+        if curl -s http://localhost:30000/v1/models 2>/dev/null | grep -q "model\\|data"; then
+            echo "SERVER_READY_AFTER=${{i}}s"
+            break
+        fi
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "SERVER_CRASHED"
+            exit 1
+        fi
+        sleep 1
+    done
+
+    # Run benchmark
+    echo "=== Running benchmark ==="
+    python3 -m sglang.bench_serving \\
+        --backend sglang \\
+        --host 127.0.0.1 \\
+        --port 30000 \\
+        --num-prompts {num_prompts} \\
+        --random-input-len 128 \\
+        --random-output-len 64 \\
+        --dataset-name random \\
+        2>&1
+
+    echo "BENCHMARK_DONE"
+    kill $SERVER_PID 2>/dev/null || true
+    '''
+
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'run', '--rm',
+                '--gpus', 'all',
+                '-e', f'HF_TOKEN={hf_token}',
+                '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
+                '-v', f'{HF_CACHE_PATH}:/root/.cache/huggingface',
+                '--shm-size=16g',
+                docker_image,
+                'bash', '-c', docker_cmd
+            ],
+            capture_output=True, text=True, timeout=timeout
+        )
+
+        output = result.stdout + result.stderr
+        duration = time.time() - start_time
+
+        if 'SERVER_CRASHED' in output:
+            return BenchmarkResult(
+                commit_hash="official", status='error', benchmark_type='serving',
+                model=model, duration_s=duration, phase=label,
+                error='Server crashed during startup',
+                raw_output=output[-5000:]
+            )
+
+        metrics = parse_sglang_metrics(output)
+
+        if not metrics:
+            return BenchmarkResult(
+                commit_hash="official", status='error', benchmark_type='serving',
+                model=model, duration_s=duration, phase=label,
+                error='No metrics in output',
+                raw_output=output[-5000:]
+            )
+
+        return BenchmarkResult(
+            commit_hash="official", status='success', benchmark_type='serving',
+            model=model, duration_s=duration, phase=label,
+            raw_output=output[-5000:],
+            **metrics
+        )
+
+    except subprocess.TimeoutExpired:
+        return BenchmarkResult(
+            commit_hash="official", status='timeout', benchmark_type='serving',
+            model=model, duration_s=timeout, phase=label,
+            error=f'Benchmark timed out after {timeout}s'
+        )
+    except Exception as e:
+        return BenchmarkResult(
+            commit_hash="official", status='error', benchmark_type='serving',
+            model=model, duration_s=time.time() - start_time, phase=label,
+            error=str(e)
+        )
+
+
 def run_human_serving_benchmark(
     human_commit: str,
     model: str,
     perf_command: str,
     hf_token: str,
-    timeout: int = 1800
+    timeout: int = 1800,
+    use_official_image: bool = False
 ) -> BenchmarkResult:
     """Run a serving benchmark for human commit inside Docker."""
     start_time = time.time()
 
-    # Find Docker image
-    docker_image = get_sglang_image(human_commit, phase="human")
+    # Option to use official image for H100 compatibility
+    if use_official_image:
+        docker_image = OFFICIAL_SGLANG_IMAGE
+    else:
+        # Find Docker image
+        docker_image = get_sglang_image(human_commit, phase="human")
+
     if not docker_image:
         return BenchmarkResult(
             commit_hash=human_commit, status='error', benchmark_type='serving',
