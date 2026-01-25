@@ -453,6 +453,225 @@ if _is_cuda:
         print("    Could not find expected pattern in awq.py, skipping patch")
 
 
+def patch_sgl_kernel_quantization():
+    """Patch SGLang quantization/__init__.py to skip sgl_kernel-dependent imports.
+
+    This disables W8A8Int8Config and other sgl_kernel-dependent quantization methods
+    when sgl_kernel fails to load, allowing benchmarks to run on non-quantized workloads.
+
+    Files that import from sgl_kernel:
+    - awq.py: awq_dequantize (already patched by patch_sgl_kernel_import)
+    - w8a8_int8.py: int8_scaled_mm (causes failures)
+    - fp8_utils.py: various FP8 ops
+    """
+    quant_init = SGLANG_REPO_DIR / "python/sglang/srt/layers/quantization/__init__.py"
+    if not quant_init.exists():
+        print("    quantization/__init__.py not found, skipping patch")
+        return False
+
+    content = quant_init.read_text()
+
+    # Check if already patched
+    if "# PATCHED: sgl_kernel quantization optional" in content:
+        print("    quantization/__init__.py already patched")
+        return True
+
+    # Pattern 1: Wrap W8A8Int8Config import in try/except
+    old_w8a8_import = "from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config"
+    new_w8a8_import = """# PATCHED: sgl_kernel quantization optional
+try:
+    from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+except ImportError:
+    W8A8Int8Config = None"""
+
+    patched = False
+    if old_w8a8_import in content:
+        content = content.replace(old_w8a8_import, new_w8a8_import)
+        patched = True
+        print("    Patched W8A8Int8Config import to be optional")
+
+    # Pattern 2: Wrap W8A8Fp8Config import in try/except (if exists)
+    old_fp8_import = "from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config"
+    new_fp8_import = """try:
+    from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+except ImportError:
+    W8A8Fp8Config = None"""
+
+    if old_fp8_import in content and "try:\n    from sglang.srt.layers.quantization.w8a8_fp8" not in content:
+        content = content.replace(old_fp8_import, new_fp8_import)
+        patched = True
+        print("    Patched W8A8Fp8Config import to be optional")
+
+    # Pattern 3: Patch the w8a8_int8.py file directly if it exists
+    w8a8_file = SGLANG_REPO_DIR / "python/sglang/srt/layers/quantization/w8a8_int8.py"
+    if w8a8_file.exists():
+        w8a8_content = w8a8_file.read_text()
+        if "from sgl_kernel import" in w8a8_content and "# PATCHED: sgl_kernel optional" not in w8a8_content:
+            # Wrap the sgl_kernel import in a try/except
+            w8a8_content = w8a8_content.replace(
+                "from sgl_kernel import int8_scaled_mm",
+                """# PATCHED: sgl_kernel optional
+try:
+    from sgl_kernel import int8_scaled_mm
+except ImportError:
+    int8_scaled_mm = None"""
+            )
+            w8a8_file.write_text(w8a8_content)
+            patched = True
+            print("    Patched w8a8_int8.py to make sgl_kernel optional")
+
+    # Pattern 4: Patch fp8_utils.py if it exists
+    fp8_utils_file = SGLANG_REPO_DIR / "python/sglang/srt/layers/quantization/fp8_utils.py"
+    if fp8_utils_file.exists():
+        fp8_content = fp8_utils_file.read_text()
+        if "from sgl_kernel import" in fp8_content and "# PATCHED: sgl_kernel optional" not in fp8_content:
+            # Common sgl_kernel imports in fp8_utils.py
+            for old_import in [
+                "from sgl_kernel import fp8_scaled_mm",
+                "from sgl_kernel import per_token_group_quant_fp8",
+            ]:
+                if old_import in fp8_content:
+                    func_name = old_import.split(" import ")[1]
+                    new_import = f"""# PATCHED: sgl_kernel optional
+try:
+    {old_import}
+except ImportError:
+    {func_name} = None"""
+                    fp8_content = fp8_content.replace(old_import, new_import)
+                    patched = True
+                    print(f"    Patched fp8_utils.py ({func_name})")
+
+            if patched:
+                fp8_utils_file.write_text(fp8_content)
+
+    if patched:
+        quant_init.write_text(content)
+        return True
+
+    print("    No sgl_kernel patterns found to patch in quantization")
+    return False
+
+
+def patch_deep_gemm_import():
+    """Patch deep_gemm.py to make deep_gemm imports optional.
+
+    The deep_gemm API changed significantly in sgl-kernel 0.3.7 (switched to C++ JIT).
+    Older commits expect the old Python JIT interface which no longer exists.
+    This patch makes the imports optional for non-quantized workloads.
+
+    Handles imports inside `if is_cuda():` blocks (indented with 4 spaces).
+    Handles multi-line imports with parentheses.
+    """
+    deep_gemm_file = SGLANG_REPO_DIR / "python/sglang/srt/layers/quantization/deep_gemm.py"
+    if not deep_gemm_file.exists():
+        print("    deep_gemm.py not found, skipping patch")
+        return False
+
+    content = deep_gemm_file.read_text()
+
+    # Check if already patched
+    if "# PATCHED: deep_gemm optional" in content:
+        print("    deep_gemm.py already patched")
+        return True
+
+    def extract_var_names(import_part):
+        """Extract variable names from import statement, handling 'as' aliases.
+
+        Examples:
+          'get_num_sms' -> ['get_num_sms']
+          'includes as deep_gemm_includes' -> ['deep_gemm_includes']
+          'FP8GemmRuntime, GemmType' -> ['FP8GemmRuntime', 'GemmType']
+          'template as deep_gemm_template, includes' -> ['deep_gemm_template', 'includes']
+        """
+        names = []
+        # Handle parenthesized imports like "from X import (\n    A,\n    B\n)"
+        import_part = import_part.replace('(', '').replace(')', '').strip()
+        for item in import_part.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if ' as ' in item:
+                # Use the alias name
+                names.append(item.split(' as ')[1].strip())
+            else:
+                names.append(item)
+        return names
+
+    patched = False
+    lines = content.split('\n')
+    new_lines = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        line_stripped = line.strip()
+
+        # Check for deep_gemm imports (both top-level and indented in if blocks)
+        # Look for lines like "    from deep_gemm..." or "from deep_gemm..."
+        if ('from deep_gemm' in line or line_stripped == 'import deep_gemm') and 'import' in line:
+            # Determine the indentation level
+            indent = len(line) - len(line.lstrip())
+            indent_str = ' ' * indent
+
+            # Check for multi-line import (line ends with '(' or contains '(' without ')')
+            full_import_lines = [line_stripped]
+            full_import = line_stripped
+
+            if '(' in line_stripped and ')' not in line_stripped:
+                # Multi-line import - collect all lines until closing ')'
+                i += 1
+                while i < len(lines) and ')' not in lines[i]:
+                    full_import_lines.append(lines[i])
+                    full_import += '\n' + lines[i]
+                    i += 1
+                # Include the closing line
+                if i < len(lines):
+                    full_import_lines.append(lines[i])
+                    full_import += '\n' + lines[i]
+
+            # Extract the imported names for the except block
+            if 'from deep_gemm' in line:
+                import_part = full_import.split('import', 1)[1].strip()
+                names = extract_var_names(import_part)
+                none_assignments = f'\n{indent_str}    '.join([f"{n} = None" for n in names])
+            else:
+                # "import deep_gemm" case
+                names = ['deep_gemm']
+                none_assignments = "deep_gemm = None"
+
+            # Create the patched version with proper indentation
+            new_lines.append(f"{indent_str}# PATCHED: deep_gemm optional")
+            new_lines.append(f"{indent_str}try:")
+            # Add all lines of the import with extra indentation (indent + 4 spaces)
+            for j, import_line in enumerate(full_import_lines):
+                if import_line.strip():
+                    if j == 0:
+                        # First line - use base indent + 4
+                        new_lines.append(f"{indent_str}    {import_line.strip()}")
+                    else:
+                        # Continuation lines - preserve their relative indentation + 4 extra
+                        orig_line_indent = len(import_line) - len(import_line.lstrip())
+                        new_lines.append(' ' * (orig_line_indent + 4) + import_line.strip())
+                else:
+                    new_lines.append('')
+            new_lines.append(f"{indent_str}except (ImportError, ModuleNotFoundError):")
+            new_lines.append(f"{indent_str}    {none_assignments}")
+
+            patched = True
+            print(f"    Patched: {line_stripped[:60]}...")
+        else:
+            new_lines.append(line)
+
+        i += 1
+
+    if patched:
+        deep_gemm_file.write_text('\n'.join(new_lines))
+        return True
+
+    print("    No deep_gemm imports found to patch")
+    return False
+
+
 def patch_torchao_import():
     """Patch torchao_utils.py to check for None config BEFORE importing torchao.
 
@@ -769,8 +988,12 @@ def install_sglang(venv_path: Path, commit_short: str) -> bool:
 
     # 7. Install additional critical deps that may be missing
     print("  Installing additional critical deps...")
-    extra_deps = ["transformers>=4.40.0", "numpy<2", "pillow", "requests", "tqdm", "rpyc"]
+    extra_deps = ["transformers>=4.40.0", "numpy<2", "pillow", "requests", "tqdm", "rpyc", "setuptools"]
     uv_pip("install", *extra_deps, timeout=180)
+
+    # 7b. Force reinstall transformers after vllm (vllm may have downgraded it)
+    print("  Force reinstalling transformers (ensuring AutoProcessor is available)...")
+    uv_pip("install", "--reinstall", "transformers>=4.44.0", timeout=120)
 
     # 8. Handle sgl_kernel if needed (always try for late_2024 era)
     if era == "late_2024":
@@ -784,12 +1007,16 @@ def install_sglang(venv_path: Path, commit_short: str) -> bool:
             print(f"  {out.strip()}")
         else:
             print(f"  sgl_kernel: import failed - {err[:100]}")
-            # Patch SGLang to make sgl_kernel optional
-            print("  Patching SGLang to make sgl_kernel import optional...")
-            patch_sgl_kernel_import()
+            # Patch SGLang to make sgl_kernel optional (comprehensive patching)
+            print("  Patching SGLang to make sgl_kernel imports optional...")
+            patch_sgl_kernel_import()  # Patches awq.py
+            patch_sgl_kernel_quantization()  # Patches w8a8_int8.py, fp8_utils.py, __init__.py
 
     # 8b. Patch torchao_utils.py to defer imports (avoids needing torchao when not used)
     patch_torchao_import()
+
+    # 8c. Patch deep_gemm.py to make deep_gemm imports optional (API changed in sgl-kernel 0.3.7)
+    patch_deep_gemm_import()
 
     # 9. Verify key packages
     rc, out, _ = run_command([str(python_path), "-c",
@@ -997,7 +1224,7 @@ def apply_patch(patch_path: Path) -> tuple[bool, str]:
 
 
 SERVER_PORT = 30000
-SERVER_TIMEOUT = 120  # Wait up to 2 minutes for server to start
+SERVER_TIMEOUT = 300  # Wait up to 5 minutes for server to start (increased from 120s)
 
 
 def get_benchmark_config(commit_short: str) -> dict:
@@ -1022,6 +1249,9 @@ def start_sglang_server(venv_path: Path, model: str) -> Optional[subprocess.Pope
     """Start SGLang server in the background."""
     python_path = venv_path / "bin" / "python"
 
+    # Create log file for server output (for debugging)
+    log_file = venv_path / "server_startup.log"
+
     # Use sglang.launch_server module
     cmd = [
         str(python_path), "-m", "sglang.launch_server",
@@ -1033,17 +1263,21 @@ def start_sglang_server(venv_path: Path, model: str) -> Optional[subprocess.Pope
     ]
 
     print(f"  Starting server: {' '.join(cmd[:6])}...")
+    print(f"  Server log: {log_file}")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SGLANG_REPO_DIR / "python")
     env["HF_TOKEN"] = os.environ.get("HF_TOKEN", "")
 
     try:
+        # Open log file for capturing stderr
+        log_handle = open(log_file, 'w')
+
         proc = subprocess.Popen(
             cmd,
             cwd=SGLANG_REPO_DIR,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=log_handle,  # Capture stderr to log file for debugging
             env=env,
             preexec_fn=os.setsid,  # Create new process group for clean kill
         )
@@ -1051,6 +1285,16 @@ def start_sglang_server(venv_path: Path, model: str) -> Optional[subprocess.Pope
         # Wait for server to be ready
         start_time = time.time()
         while time.time() - start_time < SERVER_TIMEOUT:
+            # Check if process has died
+            if proc.poll() is not None:
+                log_handle.close()
+                print(f"  Server process died with code {proc.returncode}")
+                # Read and print log file for debugging
+                if log_file.exists():
+                    log_content = log_file.read_text()
+                    print(f"  Server log (last 1000 chars):\n{log_content[-1000:]}")
+                return None
+
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 result = sock.connect_ex(('localhost', SERVER_PORT))
@@ -1062,8 +1306,12 @@ def start_sglang_server(venv_path: Path, model: str) -> Optional[subprocess.Pope
                 pass
             time.sleep(2)
 
-        # Timeout - kill server
+        # Timeout - capture logs before killing
+        log_handle.close()
         print(f"  Server failed to start within {SERVER_TIMEOUT}s")
+        if log_file.exists():
+            log_content = log_file.read_text()
+            print(f"  Server log (last 1000 chars):\n{log_content[-1000:]}")
         stop_sglang_server(proc)
         return None
 
@@ -1207,9 +1455,15 @@ def run_benchmark(venv_path: Path, commit_short: str, use_dataset_config: bool =
         # Start server, run benchmark, stop server
         server_proc = start_sglang_server(venv_path, model)
         if server_proc is None:
+            # Try to read the server log for error details
+            server_log = venv_path / "server_startup.log"
+            server_error = "No log available"
+            if server_log.exists():
+                log_content = server_log.read_text()
+                server_error = log_content[-1000:] if log_content else "Empty log"
             return {
                 "status": "failed",
-                "error": "Failed to start SGLang server",
+                "error": f"Failed to start SGLang server. Log: {server_error}",
                 "bench_type": "serving",
             }
 
