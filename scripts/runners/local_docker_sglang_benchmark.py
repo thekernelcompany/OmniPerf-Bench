@@ -45,16 +45,25 @@ SGLANG_DOCKER_REPOS = [
 ]
 
 # Results directory
-RESULTS_DIR = Path("/home/ubuntu/OmniPerf-Bench/omniperf_results_3way_sglang")
+RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_sglang")
 OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
 BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 
 # Commit mapping file
-COMMIT_MAPPING_FILE = Path("/home/ubuntu/OmniPerf-Bench/src/benchmark/fixes/sglang_commit_mapping.json")
+COMMIT_MAPPING_FILE = Path("/root/OmniPerf-Bench/src/benchmark/fixes/sglang_commit_mapping.json")
 
-# Agent patches configuration
-CLAUDE_CODE_RUNS_DIR = Path("/home/ubuntu/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/claude_code")
+# Agent patches configuration - support multiple agents
+AGENT_RUNS_DIRS = {
+    "claude_code": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/claude_code"),
+    "codex": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/codex"),
+}
+
+# HuggingFace cache mount path
+HF_CACHE_PATH = Path("/root/.cache/huggingface")
+
+# Legacy compatibility
+CLAUDE_CODE_RUNS_DIR = AGENT_RUNS_DIRS["claude_code"]
 
 # SGLang repo URL
 SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
@@ -69,6 +78,7 @@ class BenchmarkResult:
     model: str
     duration_s: float
     phase: str = "human"  # human, baseline, agent
+    agent_type: Optional[str] = None  # claude_code, codex, etc.
     error: Optional[str] = None
     # Metrics
     ttft_mean: Optional[float] = None
@@ -221,43 +231,82 @@ def find_commit_info(commit: str, mapping: List[Dict]) -> Optional[Dict]:
     return None
 
 
-def load_agent_patches() -> Dict[str, Dict[str, Any]]:
-    """Load agent patches from Claude Code runs."""
+def load_agent_patches(agent_type: str = "claude_code") -> Dict[str, Dict[str, Any]]:
+    """Load agent patches from runs directory.
+
+    Args:
+        agent_type: "claude_code" or "codex"
+
+    Returns:
+        Dict mapping short commit hash to patch info
+    """
     patches = {}
 
-    if not CLAUDE_CODE_RUNS_DIR.exists():
-        print(f"WARNING: Claude Code runs directory not found: {CLAUDE_CODE_RUNS_DIR}")
+    runs_dir = AGENT_RUNS_DIRS.get(agent_type)
+    if not runs_dir or not runs_dir.exists():
+        print(f"WARNING: {agent_type} runs directory not found: {runs_dir}")
         return patches
 
-    for run_dir in CLAUDE_CODE_RUNS_DIR.glob("*/*/sglang_*"):
-        patch_file = run_dir / "model_patch.diff"
-        journal_file = run_dir / "journal.json"
+    # Search patterns differ by agent type
+    if agent_type == "claude_code":
+        # Pattern: claude_code/default/*/sglang_*
+        search_patterns = [
+            runs_dir.glob("*/*/sglang_*"),
+        ]
+    elif agent_type == "codex":
+        # Pattern: codex/gpt-5/*/sglang_*
+        search_patterns = [
+            runs_dir.glob("*/*/sglang_*"),
+            runs_dir.glob("gpt-5/*/sglang_*"),
+        ]
+    else:
+        search_patterns = [runs_dir.glob("*/*/sglang_*")]
 
-        if patch_file.exists() and journal_file.exists():
-            try:
-                journal = json.loads(journal_file.read_text())
-                commits = journal.get("commits", {})
-                full_commit = commits.get("human", "")
+    for pattern in search_patterns:
+        for run_dir in pattern:
+            patch_file = run_dir / "model_patch.diff"
+            journal_file = run_dir / "journal.json"
 
-                if not full_commit:
-                    continue
+            if patch_file.exists() and journal_file.exists():
+                try:
+                    journal = json.loads(journal_file.read_text())
+                    commits = journal.get("commits", {})
+                    full_commit = commits.get("human", "")
 
-                short_hash = full_commit[:8]
-                patch_content = patch_file.read_text()
+                    if not full_commit:
+                        continue
 
-                if not patch_content.strip():
-                    continue
+                    short_hash = full_commit[:8]
+                    patch_content = patch_file.read_text()
 
-                patches[short_hash] = {
-                    "patch_path": str(patch_file),
-                    "patch_content": patch_content,
-                    "full_commit": full_commit,
-                    "parent_commit": commits.get("pre", ""),
-                }
-            except Exception as e:
-                print(f"Warning: Failed to read patch from {run_dir}: {e}")
+                    if not patch_content.strip():
+                        continue
+
+                    # Only keep first patch found for each commit (avoid duplicates)
+                    if short_hash not in patches:
+                        patches[short_hash] = {
+                            "patch_path": str(patch_file),
+                            "patch_content": patch_content,
+                            "full_commit": full_commit,
+                            "parent_commit": commits.get("pre", ""),
+                            "agent_type": agent_type,
+                        }
+                except Exception as e:
+                    print(f"Warning: Failed to read patch from {run_dir}: {e}")
 
     return patches
+
+
+def load_all_agent_patches() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Load patches from all agent types.
+
+    Returns:
+        Dict[agent_type -> Dict[commit_short -> patch_info]]
+    """
+    all_patches = {}
+    for agent_type in AGENT_RUNS_DIRS.keys():
+        all_patches[agent_type] = load_agent_patches(agent_type)
+    return all_patches
 
 
 def get_benchmark_type(perf_command: str) -> str:
@@ -355,9 +404,19 @@ def run_human_serving_benchmark(
     COMMIT="{human_commit}"
     MODEL="{model}"
 
-    # Fix dependencies
+    # Install required system dependencies (libnuma is needed by sgl_kernel)
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq libnuma-dev 2>/dev/null || true
+
+    # Fix Python dependencies
     pip install typing_extensions>=4.10.0 --upgrade -q 2>/dev/null || true
     pip install numpy"<2.0" tqdm requests aiohttp -q 2>/dev/null || true
+
+    # Try to upgrade sgl_kernel if import fails (ABI compatibility issues)
+    if ! python3 -c "from sgl_kernel import common_ops" 2>/dev/null; then
+        echo "Upgrading sgl_kernel..."
+        pip install --upgrade sgl_kernel -q 2>/dev/null || true
+    fi
 
     # Set PYTHONPATH for SGLang (check common paths)
     if [ -d "/sglang/python" ]; then
@@ -438,7 +497,7 @@ def run_human_serving_benchmark(
                 '--gpus', gpu_flag,
                 '-e', f'HF_TOKEN={hf_token}',
                 '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
-                '-v', '/home/ubuntu/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{HF_CACHE_PATH}:/root/.cache/huggingface',
                 '--shm-size=16g',
                 '--entrypoint', 'bash',
                 docker_image,
@@ -530,9 +589,19 @@ def run_baseline_serving_benchmark(
     COMMIT="{base_commit}"
     MODEL="{model}"
 
-    # Fix dependencies
+    # Install required system dependencies (libnuma is needed by sgl_kernel)
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq libnuma-dev 2>/dev/null || true
+
+    # Fix Python dependencies
     pip install typing_extensions>=4.10.0 --upgrade -q 2>/dev/null || true
     pip install numpy"<2.0" tqdm requests aiohttp -q 2>/dev/null || true
+
+    # Try to upgrade sgl_kernel if import fails (ABI compatibility issues)
+    if ! python3 -c "from sgl_kernel import common_ops" 2>/dev/null; then
+        echo "Upgrading sgl_kernel..."
+        pip install --upgrade sgl_kernel -q 2>/dev/null || true
+    fi
 
     # Set PYTHONPATH for SGLang
     export PYTHONPATH="/sgl-workspace/sglang/python:$PYTHONPATH"
@@ -596,7 +665,7 @@ def run_baseline_serving_benchmark(
                 '--gpus', gpu_flag,
                 '-e', f'HF_TOKEN={hf_token}',
                 '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
-                '-v', '/home/ubuntu/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{HF_CACHE_PATH}:/root/.cache/huggingface',
                 '--shm-size=16g',
                 '--entrypoint', 'bash',
                 docker_image,
@@ -766,9 +835,19 @@ def run_agent_serving_benchmark(
     set -e
     MODEL="{model}"
 
-    # Fix dependencies
+    # Install required system dependencies (libnuma is needed by sgl_kernel)
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq libnuma-dev 2>/dev/null || true
+
+    # Fix Python dependencies
     pip install typing_extensions>=4.10.0 --upgrade -q 2>/dev/null || true
     pip install numpy"<2.0" tqdm requests aiohttp -q 2>/dev/null || true
+
+    # Try to upgrade sgl_kernel if import fails (ABI compatibility issues)
+    if ! python3 -c "from sgl_kernel import common_ops" 2>/dev/null; then
+        echo "Upgrading sgl_kernel..."
+        pip install --upgrade sgl_kernel -q 2>/dev/null || true
+    fi
 
     # Set PYTHONPATH for SGLang
     export PYTHONPATH="/sgl-workspace/sglang/python:$PYTHONPATH"
@@ -851,7 +930,7 @@ def run_agent_serving_benchmark(
                 '--gpus', gpu_flag,
                 '-e', f'HF_TOKEN={hf_token}',
                 '-e', f'HUGGING_FACE_HUB_TOKEN={hf_token}',
-                '-v', '/home/ubuntu/.cache/huggingface:/root/.cache/huggingface',
+                '-v', f'{HF_CACHE_PATH}:/root/.cache/huggingface',
                 '-v', f'{agent_patch_path}:/agent_patch.diff:ro',
                 '--shm-size=16g',
                 '--entrypoint', 'bash',
@@ -923,7 +1002,11 @@ def save_result(result: BenchmarkResult, output_dir: Path):
     """Save benchmark result to JSON file."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"{result.commit_hash[:8]}_{result.phase}_{result.benchmark_type}.json"
+    # Include agent_type in filename for agent results
+    if result.phase == "agent" and result.agent_type:
+        filename = f"{result.commit_hash[:8]}_{result.phase}_{result.agent_type}_{result.benchmark_type}.json"
+    else:
+        filename = f"{result.commit_hash[:8]}_{result.phase}_{result.benchmark_type}.json"
     output_file = output_dir / filename
 
     with open(output_file, 'w') as f:
@@ -938,10 +1021,15 @@ def main():
     parser.add_argument("--model", type=str, help="Override model (default: from dataset)")
     parser.add_argument("--human-only", action="store_true", help="Only run human benchmark")
     parser.add_argument("--3way", dest="three_way", action="store_true", help="Run 3-way benchmark")
+    parser.add_argument("--agents", type=str, default="claude_code,codex",
+                        help="Comma-separated list of agent types to benchmark (default: claude_code,codex)")
     parser.add_argument("--check-images", action="store_true", help="Check available images and exit")
     parser.add_argument("--timeout", type=int, default=1800, help="Timeout per benchmark (seconds)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be run without executing")
     args = parser.parse_args()
+
+    # Parse agent types
+    agent_types = [a.strip() for a in args.agents.split(",") if a.strip()]
 
     commit = args.commit
 
@@ -1026,15 +1114,82 @@ def main():
             print("ERROR: No base commit found in mapping for 3-way benchmark")
             return 1
 
-        # Load agent patches
-        agent_patches = load_agent_patches()
-        agent_patch_info = agent_patches.get(human_commit[:8])
-        agent_patch_path = Path(agent_patch_info["patch_path"]) if agent_patch_info else None
+        # Load agent patches for all agent types
+        all_agent_patches = load_all_agent_patches()
 
-        baseline_result, human_result, agent_result = run_combined_3way_serving(
-            human_commit, base_commit, model, perf_command,
-            agent_patch_path, hf_token, timeout=args.timeout * 3
-        )
+        # Print available agent patches
+        print(f"\n  Agent patches available:")
+        for agent_type in agent_types:
+            patches = all_agent_patches.get(agent_type, {})
+            has_patch = human_commit[:8] in patches
+            print(f"    {agent_type}: {'Yes' if has_patch else 'No'}")
+
+        # Run baseline benchmark first
+        print(f"\n{'='*60}")
+        print(f"[1/{2 + len(agent_types)}] Running BASELINE benchmark...")
+        print(f"{'='*60}")
+
+        baseline_image = get_sglang_image(base_commit, phase="baseline")
+        if not baseline_image:
+            baseline_image = get_sglang_image(base_commit, phase="human")
+
+        if baseline_image:
+            baseline_result = run_baseline_serving_benchmark(
+                base_commit, model, perf_command, hf_token, timeout=args.timeout
+            )
+        else:
+            baseline_result = BenchmarkResult(
+                commit_hash=base_commit, status='error', benchmark_type='serving',
+                model=model, duration_s=0, phase='baseline',
+                error='No baseline Docker image available'
+            )
+        print(f"  Baseline: {baseline_result.status}")
+        save_result(baseline_result, BASELINE_OUTPUT_DIR)
+
+        # Run human benchmark
+        print(f"\n{'='*60}")
+        print(f"[2/{2 + len(agent_types)}] Running HUMAN benchmark...")
+        print(f"{'='*60}")
+
+        human_image = get_sglang_image(human_commit, phase="human")
+        if human_image:
+            human_result = run_human_serving_benchmark(
+                human_commit, model, perf_command, hf_token, timeout=args.timeout
+            )
+        else:
+            human_result = BenchmarkResult(
+                commit_hash=human_commit, status='error', benchmark_type='serving',
+                model=model, duration_s=0, phase='human',
+                error='No human Docker image available'
+            )
+        print(f"  Human: {human_result.status}")
+        save_result(human_result, OUTPUT_DIR)
+
+        # Run agent benchmarks for each agent type
+        agent_results = {}
+        for idx, agent_type in enumerate(agent_types, start=3):
+            print(f"\n{'='*60}")
+            print(f"[{idx}/{2 + len(agent_types)}] Running AGENT ({agent_type}) benchmark...")
+            print(f"{'='*60}")
+
+            agent_patches = all_agent_patches.get(agent_type, {})
+            agent_patch_info = agent_patches.get(human_commit[:8])
+
+            if agent_patch_info:
+                agent_patch_path = Path(agent_patch_info["patch_path"])
+                agent_result = run_agent_serving_benchmark(
+                    base_commit, model, perf_command, agent_patch_path, hf_token, timeout=args.timeout
+                )
+                agent_result.agent_type = agent_type
+            else:
+                agent_result = BenchmarkResult(
+                    commit_hash=base_commit, status='skipped', benchmark_type='serving',
+                    model=model, duration_s=0, phase='agent', agent_type=agent_type,
+                    error=f'No {agent_type} patch available for {human_commit[:8]}'
+                )
+            print(f"  Agent ({agent_type}): {agent_result.status}")
+            agent_results[agent_type] = agent_result
+            save_result(agent_result, AGENT_OUTPUT_DIR)
 
         # Print summary
         print(f"\n{'='*60}")
@@ -1042,8 +1197,8 @@ def main():
         print(f"{'='*60}")
         print(f"  Baseline: {baseline_result.status}")
         print(f"  Human:    {human_result.status}")
-        if agent_result:
-            print(f"  Agent:    {agent_result.status}")
+        for agent_type, result in agent_results.items():
+            print(f"  Agent ({agent_type}): {result.status}")
 
         if baseline_result.status == 'success' and human_result.status == 'success':
             base_throughput = baseline_result.request_throughput or 0
@@ -1051,12 +1206,6 @@ def main():
             if base_throughput > 0:
                 improvement = (human_throughput - base_throughput) / base_throughput * 100
                 print(f"\n  Human improvement: {improvement:+.1f}% throughput")
-
-        # Save results
-        save_result(baseline_result, BASELINE_OUTPUT_DIR)
-        save_result(human_result, OUTPUT_DIR)
-        if agent_result:
-            save_result(agent_result, AGENT_OUTPUT_DIR)
 
     else:
         print("ERROR: Specify --human-only or --3way")
