@@ -30,7 +30,7 @@ from typing import Optional
 # ============================================================================
 
 # Paths
-BASE_DIR = Path("/root/OmniPerf-Bench")
+BASE_DIR = Path("/home/ubuntu/OmniPerf-Bench")
 RESULTS_DIR = BASE_DIR / "omniperf_results_3way_sglang/isolated_benchmark_results"
 COMMIT_MAPPING_FILE = BASE_DIR / "src/benchmark/fixes/sglang_commit_mapping.json"
 SGLANG_REPO_DIR = BASE_DIR / "omniperf_results_3way_sglang/sglang-repo"
@@ -992,8 +992,9 @@ def install_sglang(venv_path: Path, commit_short: str) -> bool:
     uv_pip("install", *extra_deps, timeout=180)
 
     # 7b. Force reinstall transformers after vllm (vllm may have downgraded it)
+    # Pin to <5.0.0 to avoid AutoImageProcessor.register() API breaking changes
     print("  Force reinstalling transformers (ensuring AutoProcessor is available)...")
-    uv_pip("install", "--reinstall", "transformers>=4.44.0", timeout=120)
+    uv_pip("install", "--reinstall", "transformers>=4.44.0,<5.0.0", timeout=120)
 
     # 8. Handle sgl_kernel if needed (always try for late_2024 era)
     if era == "late_2024":

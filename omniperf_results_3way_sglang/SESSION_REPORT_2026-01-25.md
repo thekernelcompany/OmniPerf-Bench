@@ -468,3 +468,149 @@ Server log content now included in error messages when server fails to start.
 - **Python:** 3.10
 - **Torch:** 2.5.1+cu124
 - **Branch:** feature/sglang-modal-benchmarks
+
+---
+
+# Addendum: trae_gpt5 Rerun Session (2026-01-26)
+
+## Problem Identified
+
+Analysis revealed that **6 trae_gpt5 commits used empty (0-byte) patches** from an older run directory instead of valid patches from a newer run. This caused "unrecognized input" errors.
+
+### Root Cause Timeline
+| Time | Event |
+|------|-------|
+| 16:00-17:00 | trae_gpt5 benchmarks ran |
+| 21:47:35 | Script fix committed (proper directory ordering + `st_size > 0` check) |
+
+The benchmarks ran BEFORE the fix was committed, causing them to pick up empty patches from `2025-11-14_21-05-32` instead of valid patches from `2025-11-16_09-27-51`.
+
+### Affected Commits
+| Commit | Old Run (Empty) | New Run (Valid) |
+|--------|-----------------|-----------------|
+| e3ec6bf4 | 0 bytes | 2,850 bytes |
+| da47621c | 0 bytes | 4,525 bytes |
+| a191a0e4 | 0 bytes | 2,473 bytes |
+| 31589e17 | 0 bytes | 5,022 bytes |
+| 73b13e69 | 0 bytes | 9,080 bytes |
+| 205d5cb4 | 0 bytes | 7,106 bytes |
+
+## Fixes Applied During Rerun
+
+1. **NVIDIA Driver Mismatch**: Kernel module 570.195.03 vs library 570.211.01
+   - Fixed by reloading nvidia kernel modules: `sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia && sudo modprobe nvidia_uvm`
+
+2. **Missing `uv` Package Manager**: Installed via direct binary download
+
+3. **SGLang Repo Missing**: Cloned and unshallowed for full commit history
+
+4. **Transformers API Breaking Change**: AutoImageProcessor.register() incompatible with v5.0
+   - Fixed by pinning: `transformers>=4.44.0,<5.0.0`
+
+## Rerun Results
+
+All 6 commits successfully benchmarked:
+
+| Commit | PR# | Subject | Throughput |
+|--------|-----|---------|------------|
+| e3ec6bf4 | 6814 | Minor speed up block_quant_dequant | 900.72 tok/s |
+| da47621c | 7058 | Minor speedup topk postprocessing | 1013.95 tok/s |
+| a191a0e4 | 6593 | Improve performance of two batch overlap | 1288.50 tok/s |
+| 31589e17 | 6668 | Speed up when having padding tokens | 1422.07 tok/s |
+| 73b13e69 | 7285 | Optimize DP attn scheduling | 1215.77 tok/s |
+| 205d5cb4 | 6356 | Optimize local attention memory allocation | 1288.33 tok/s |
+
+## Critical Analysis: Model Mismatch
+
+### Verification Against HuggingFace Dataset
+
+Cross-referenced `perf_command` from `Ayushnangia/omniperf_v1` dataset:
+
+| Commit | Dataset Model (Ground Truth) | Actually Ran | Status |
+|--------|------------------------------|--------------|--------|
+| e3ec6bf4 | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-8B-Instruct | ✅ Correct |
+| da47621c | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-8B-Instruct | ✅ Correct |
+| a191a0e4 | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-8B-Instruct | ✅ Correct |
+| 31589e17 | **deepseek-ai/DeepSeek-V3-0324** | Llama-3.1-8B-Instruct | ⚠️ **FALLBACK** |
+| 73b13e69 | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-8B-Instruct | ✅ Correct |
+| 205d5cb4 | **Llama-4-Maverick-17B-128E-FP8** | Llama-3.1-8B-Instruct | ⚠️ **FALLBACK** |
+
+### Why Fallback Was Used
+
+| Commit | Original Model | Reason for Fallback |
+|--------|----------------|---------------------|
+| 31589e17 | DeepSeek-V3-0324 | 671B MoE model requires tp=8 (8× GPUs) |
+| 205d5cb4 | Llama-4-Maverick-17B-128E-FP8 | Large model doesn't fit on single H100 80GB |
+
+### Impact Assessment
+
+- **4 of 6 commits (67%)**: Ran with correct model per dataset specification
+- **2 of 6 commits (33%)**: Ran with fallback model (Llama-3.1-8B-Instruct)
+
+**Implication**: Results for 31589e17 and 205d5cb4 are **NOT representative** of the original PR's performance testing intent. These PRs were designed to optimize for large models (DeepSeek-V3, Llama-4-Maverick), but were tested with a much smaller model (Llama-3.1-8B).
+
+## Updated Statistics
+
+### trae_gpt5 Success Rate
+| Metric | Before Rerun | After Rerun | Change |
+|--------|--------------|-------------|--------|
+| Successful | 2/17 | 8/17 | +6 |
+| Rate | 12% | 47% | +35pp |
+
+### Complete Results Table (Updated)
+
+```
+Commit     │ PR#   │   baseline │      human │    claude_code │          codex │      trae_gpt5 │  trae_sonnet45
+───────────┼───────┼────────────┼────────────┼────────────────┼────────────────┼────────────────┼───────────────
+c087ddd6   │ 6627  │     2675.7 │     2233.7 │         2745.3 │         2266.0 │         2743.6 │         2684.8
+6b231325   │ 6649  │     1251.6 │     1275.9 │         1284.6 │         1268.9 │         1268.2 │        TIMEOUT
+dd1012fc   │ 6764  │     1187.4 │     1038.4 │         1060.7 │         1043.4 │         FAILED │         1286.2
+df7f61ee   │ 6812  │     1277.2 │     1079.0 │         1056.6 │         1056.8 │         FAILED │         1051.4
+e3ec6bf4   │ 6814  │     1284.3 │      879.5 │       CONFLICT │       CONFLICT │     **900.7** │         1279.3
+da47621c   │ 7058  │     1283.0 │     1007.8 │     PATCH_FAIL │     PATCH_FAIL │    **1014.0** │         1269.8
+a191a0e4   │ 6593  │     1282.1 │     1137.8 │     PATCH_FAIL │     PATCH_FAIL │    **1288.5** │     PATCH_FAIL
+31589e17   │ 6668  │     1275.6 │     1279.2 │         1242.7 │     PATCH_FAIL │  **1422.1**⚠️ │     PATCH_FAIL
+6cb00c63   │ 6761  │ ABI_MISMATCH │ ABI_MISMATCH │   ABI_MISMATCH │     PATCH_FAIL │     PATCH_FAIL │   ABI_MISMATCH
+132dad87   │ 6922  │     1272.2 │     1015.5 │         1050.0 │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL
+b1e5a33a   │ 6960  │ ABI_MISMATCH │ ABI_MISMATCH │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL │   ABI_MISMATCH
+021f76e4   │ 6994  │     1295.9 │     1052.6 │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL
+2ed68d7a   │ 7236  │     1024.2 │     1051.7 │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL
+73b13e69   │ 7285  │     1037.6 │     1292.1 │     PATCH_FAIL │     PATCH_FAIL │    **1215.8** │     PATCH_FAIL
+187b85b7   │ 7393  │     1282.9 │     1039.5 │         1028.5 │     PATCH_FAIL │     PATCH_FAIL │     HTTP_ERROR
+205d5cb4   │ 6356  │     1252.4 │     1255.8 │ BUG:zeros→empty │ BUG:zeros→empty │  **1288.3**⚠️ │ BUG:zeros→empty
+1acca3a2   │ 5969  │     1022.5 │     1258.1 │ BUG:zeros→empty │     PATCH_FAIL │     PATCH_FAIL │     PATCH_FAIL
+───────────┼───────┼────────────┼────────────┼────────────────┼────────────────┼────────────────┼───────────────
+SUCCESS    │       │      15/17 │      15/17 │           7/17 │           4/17 │         **8/17** │           5/17
+RATE       │       │        88% │        88% │           41% │           24% │         **47%** │           29%
+```
+
+**Legend:**
+- **Bold** = New results from 2026-01-26 rerun
+- ⚠️ = Used fallback model (not original `perf_command` model)
+- FAILED = Patch applied but benchmark failed
+
+## Recommendations (Updated)
+
+### For Model Mismatch Issues
+
+1. **Multi-GPU Setup Required**: Commits 31589e17 and 205d5cb4 need tp=8 for accurate benchmarking
+2. **Flag Results**: Mark these commits with caveat that fallback model was used
+3. **Alternative**: Consider using smaller representative models from same family if multi-GPU unavailable
+
+### For Remaining PATCH_FAIL commits
+
+The following trae_gpt5 commits still fail with PATCH_FAIL (not EMPTY_PATCH):
+- 6cb00c63, 132dad87, b1e5a33a, 021f76e4, 2ed68d7a, 187b85b7, 1acca3a2
+
+These have valid patches but fail to apply due to context mismatch with base commit.
+
+---
+
+## Rerun Session Metadata
+
+- **Date:** 2026-01-26
+- **GPU:** NVIDIA H100 PCIe (SM90) - 80GB
+- **Driver:** 570.211.01 (after module reload)
+- **CUDA:** 12.8
+- **Transformers:** 4.57.6 (pinned <5.0.0)
+- **Duration:** ~10 minutes for all 6 commits
