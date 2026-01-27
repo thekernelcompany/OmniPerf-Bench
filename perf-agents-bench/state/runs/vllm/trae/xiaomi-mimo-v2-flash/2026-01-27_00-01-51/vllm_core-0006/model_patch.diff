@@ -1,0 +1,56 @@
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index acc3a94..2187882 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from typing import Dict, List, Optional
++from typing import Dict, List, Optional, Union
+ 
+ import torch
+ 
+@@ -7,8 +7,8 @@ import torch
+ @dataclass
+ class SamplerOutput:
+ 
+-    # [num_reqs]
+-    sampled_token_ids: List[int]
++    # [num_reqs] - Can be either a tensor (deferred CPU transfer) or a list (immediate)
++    sampled_token_ids: Union[torch.Tensor, List[int]]
+ 
+     # [num_reqs, max_num_logprobs + 1]
+     logprob_token_ids: Optional[torch.Tensor]
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 7cd42ca..98b5b97 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -50,9 +50,11 @@ class Sampler(nn.Module):
+         # Use int32 to reduce the tensor size.
+         sampled = sampled.to(torch.int32)
+ 
+-        # NOTE: CPU-GPU synchronization happens here.
++        # NOTE: CPU-GPU synchronization happens in .tolist() call.
++        # Keep sampled_token_ids as tensor to defer CPU transfer and reduce
++        # scheduling overhead. The conversion will be done later when needed.
+         sampler_output = SamplerOutput(
+-            sampled_token_ids=sampled.tolist(),
++            sampled_token_ids=sampled,
+             logprob_token_ids=topk_indices,
+             logprobs=topk_logprobs,
+             prompt_logprob_token_ids=None,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 4b3c325..1f5dd34 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -776,6 +776,11 @@ class GPUModelRunner:
+         )
+ 
+         sampled_token_ids = sampler_output.sampled_token_ids
++        # Convert to list if it's a tensor (deferred CPU transfer).
++        # This happens here to reduce scheduling overhead in the sampler.
++        if isinstance(sampled_token_ids, torch.Tensor):
++            sampled_token_ids = sampled_token_ids.tolist()
++
+         # TODO(woosuk): The following loop can be slow since it iterates over
+         # the requests one by one. Optimize.
+         num_reqs = self.input_batch.num_reqs

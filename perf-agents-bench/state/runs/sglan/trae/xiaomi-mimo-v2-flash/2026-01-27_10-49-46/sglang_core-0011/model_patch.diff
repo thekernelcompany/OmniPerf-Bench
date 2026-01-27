@@ -1,0 +1,248 @@
+diff --git a/python/sglang/bench_one_batch.py b/python/sglang/bench_one_batch.py
+index cca7d5a..4768857 100644
+--- a/python/sglang/bench_one_batch.py
++++ b/python/sglang/bench_one_batch.py
+@@ -58,6 +58,7 @@ import torch.distributed as dist
+ 
+ from sglang.srt.configs.model_config import ModelConfig
+ from sglang.srt.distributed.parallel_state import destroy_distributed_environment
++from sglang.srt.disaggregation.utils import DeepEPMode
+ from sglang.srt.entrypoints.engine import _set_envs_and_config
+ from sglang.srt.hf_transformers_utils import get_tokenizer
+ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+@@ -271,11 +272,16 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
+             batch,
+             dp_size=model_runner.server_args.dp_size,
+             attn_tp_size=1,
++            attn_tp_rank=0,
+             tp_cpu_group=model_runner.tp_group.cpu_group,
++            dp_attn_coordination_cpu_group=None,
+             get_idle_batch=None,
+             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,
+             spec_algorithm=SpeculativeAlgorithm.NONE,
+             speculative_num_draft_tokens=None,
++            enable_two_batch_overlap=False,
++            enable_deepep_moe=False,
++            deepep_mode=DeepEPMode.NVLINK,
+             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+         )
+ 
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..33e7c95 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -362,6 +362,19 @@ class Scheduler(
+         self.pp_group = get_pp_group()
+         self.world_group = get_world_group()
+ 
++        # Create a group containing only the first TP rank of each DP worker
++        # This is used for efficient DP attention coordination
++        self.dp_attn_coordination_cpu_group = None
++        if self.server_args.enable_dp_attention and self.attn_tp_size > 1:
++            # Ranks that are the first TP rank in each DP worker
++            dp_attn_coordination_ranks = [
++                i * self.attn_tp_size for i in range(self.dp_size)
++            ]
++            self.dp_attn_coordination_cpu_group = torch.distributed.new_group(
++                ranks=dp_attn_coordination_ranks,
++                backend="gloo",
++            )
++
+         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+         global_server_args_dict.update(worker_global_server_args_dict)
+         set_random_seed(self.random_seed)
+@@ -1408,18 +1421,51 @@ class Scheduler(
+             ],
+             dtype=torch.int64,
+         )
+-        global_info = torch.empty(
+-            (self.server_args.dp_size, self.attn_tp_size, 1),
+-            dtype=torch.int64,
+-        )
+-        torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=self.tp_cpu_group,
+-        )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
++        
++        # Only the first TP rank of each DP worker participates in coordination
++        if self.attn_tp_rank == 0:
++            # Use the dedicated group for DP attention coordination
++            if self.dp_attn_coordination_cpu_group is not None:
++                global_info = torch.empty(
++                    (self.server_args.dp_size, 1),
++                    dtype=torch.int64,
++                )
++                torch.distributed.all_gather_into_tensor(
++                    global_info.flatten(),
++                    local_info,
++                    group=self.dp_attn_coordination_cpu_group,
++                )
++                any_new_batch = any(global_info[:, 0].tolist())
++            else:
++                # Fallback to the original behavior when group is not created
++                global_info = torch.empty(
++                    (self.server_args.dp_size, self.attn_tp_size, 1),
++                    dtype=torch.int64,
++                )
++                torch.distributed.all_gather_into_tensor(
++                    global_info.flatten(),
++                    local_info,
++                    group=self.tp_cpu_group,
++                )
++                any_new_batch = any(global_info[:, 0, 0].tolist())
++            
++            # Broadcast the result to other TP ranks in the same DP worker
++            result_tensor = torch.tensor([int(any_new_batch)], dtype=torch.int64)
++            torch.distributed.broadcast(
++                result_tensor,
++                src=0,
++                group=self.attn_tp_cpu_group,
++            )
++        else:
++            # Non-first TP ranks receive the result from rank 0
++            result_tensor = torch.tensor([0], dtype=torch.int64)
++            torch.distributed.broadcast(
++                result_tensor,
++                src=0,
++                group=self.attn_tp_cpu_group,
++            )
++            any_new_batch = bool(result_tensor.item())
++            
+         return any_new_batch
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+@@ -1781,7 +1827,9 @@ class Scheduler(
+             local_batch,
+             dp_size=self.server_args.dp_size,
+             attn_tp_size=self.attn_tp_size,
++            attn_tp_rank=self.attn_tp_rank,
+             tp_cpu_group=self.tp_cpu_group,
++            dp_attn_coordination_cpu_group=self.dp_attn_coordination_cpu_group,
+             get_idle_batch=self.get_idle_batch,
+             disable_cuda_graph=self.server_args.disable_cuda_graph,
+             spec_algorithm=self.spec_algorithm,
+@@ -1797,7 +1845,9 @@ class Scheduler(
+         local_batch: ScheduleBatch,
+         dp_size,
+         attn_tp_size: int,
++        attn_tp_rank: int,
+         tp_cpu_group,
++        dp_attn_coordination_cpu_group,
+         get_idle_batch,
+         disable_cuda_graph: bool,
+         spec_algorithm,
+@@ -1857,23 +1907,94 @@ class Scheduler(
+             ],
+             dtype=torch.int64,
+         )
+-        global_info = torch.empty(
+-            (dp_size, attn_tp_size, 6),
+-            dtype=torch.int64,
+-        )
+-        torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=tp_cpu_group,
+-        )
+-        global_num_tokens = global_info[:, 0, 0].tolist()
+-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
+-        global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+-        is_extend_in_batch = global_info[:, 0, 3].tolist()
++        
++        # Only the first TP rank of each DP worker participates in coordination
++        if attn_tp_rank == 0:
++            # Use the dedicated group for DP attention coordination
++            if dp_attn_coordination_cpu_group is not None:
++                global_info = torch.empty(
++                    (dp_size, 6),
++                    dtype=torch.int64,
++                )
++                torch.distributed.all_gather_into_tensor(
++                    global_info.flatten(),
++                    local_info,
++                    group=dp_attn_coordination_cpu_group,
++                )
++                global_num_tokens = global_info[:, 0].tolist()
++                can_cuda_graph = min(global_info[:, 1].tolist())
++                global_num_tokens_for_logprob = global_info[:, 2].tolist()
++                is_extend_in_batch = global_info[:, 3].tolist()
+ 
+-        tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
+-            global_info[:, :, 4:6]
+-        )
++                tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
++                    global_info[:, 4:6].unsqueeze(1)
++                )
++            else:
++                # Fallback to the original behavior when group is not created
++                global_info = torch.empty(
++                    (dp_size, attn_tp_size, 6),
++                    dtype=torch.int64,
++                )
++                torch.distributed.all_gather_into_tensor(
++                    global_info.flatten(),
++                    local_info,
++                    group=tp_cpu_group,
++                )
++                global_num_tokens = global_info[:, 0, 0].tolist()
++                can_cuda_graph = min(global_info[:, 0, 1].tolist())
++                global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
++                is_extend_in_batch = global_info[:, 0, 3].tolist()
++
++                tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
++                    global_info[:, :, 4:6]
++                )
++            
++            # Broadcast the results to other TP ranks in the same DP worker
++            result_tensor = torch.tensor(
++                [
++                    can_cuda_graph,
++                    int(tbo_split_seq_index is not None) if tbo_split_seq_index is not None else 0,
++                    int(global_forward_mode.value) if global_forward_mode is not None else 0,
++                ],
++                dtype=torch.int64,
++            )
++            torch.distributed.broadcast(
++                result_tensor,
++                src=0,
++                group=tp_cpu_group,
++            )
++        else:
++            # Non-first TP ranks receive the results from rank 0
++            result_tensor = torch.tensor([0, 0, 0], dtype=torch.int64)
++            torch.distributed.broadcast(
++                result_tensor,
++                src=0,
++                group=tp_cpu_group,
++            )
++            can_cuda_graph = result_tensor[0].item()
++            tbo_split_seq_index = result_tensor[1].item() if result_tensor[1].item() > 0 else None
++            global_forward_mode = ForwardMode(result_tensor[2].item()) if result_tensor[2].item() > 0 else None
++            
++            # Other ranks still need to participate in all_gather for global_num_tokens
++            # but they don't need the full tensor
++            if attn_tp_size > 1:
++                global_info = torch.empty(
++                    (dp_size, attn_tp_size, 6),
++                    dtype=torch.int64,
++                )
++                torch.distributed.all_gather_into_tensor(
++                    global_info.flatten(),
++                    local_info,
++                    group=tp_cpu_group,
++                )
++                global_num_tokens = global_info[:, 0, 0].tolist()
++                global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
++                is_extend_in_batch = global_info[:, 0, 3].tolist()
++            else:
++                # This shouldn't happen, but just in case
++                global_num_tokens = [num_tokens]
++                global_num_tokens_for_logprob = [num_tokens_for_logprob]
++                is_extend_in_batch = [is_extend_in_batch]
+ 
+         if local_batch is None and max(global_num_tokens) > 0:
+             local_batch = get_idle_batch()

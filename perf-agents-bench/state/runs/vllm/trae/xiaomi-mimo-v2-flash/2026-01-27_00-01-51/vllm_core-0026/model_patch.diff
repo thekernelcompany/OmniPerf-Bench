@@ -1,0 +1,127 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..f519284 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -199,8 +199,11 @@ class BlockSpaceManager:
+                     and logical_idx >= self.block_sliding_window):
+                 block = block_table[logical_idx % self.block_sliding_window]
+             else:
++                # When caching is disabled, we don't need to compute the hash
++                block_hash = (seq.hash_of_block(logical_idx)
++                              if self.enable_caching else None)
+                 block = self.gpu_allocator.allocate(
+-                    seq.hash_of_block(logical_idx),
++                    block_hash,
+                     seq.num_hashed_tokens_of_block(logical_idx))
+             block_table.append(block)
+ 
+@@ -245,6 +248,9 @@ class BlockSpaceManager:
+         seq: Sequence,
+         last_block: PhysicalTokenBlock,
+     ) -> PhysicalTokenBlock:
++        # When caching is disabled, we don't need to promote blocks
++        if not self.enable_caching:
++            return last_block
+         if self._is_last_block_full(seq):
+             return self._promote_last_block(seq, last_block)
+         else:
+@@ -255,7 +261,8 @@ class BlockSpaceManager:
+         seq: Sequence,
+     ) -> PhysicalTokenBlock:
+         block_hash: Optional[int] = None
+-        if (self._is_last_block_full(seq)):
++        # When caching is enabled and the last block is full, compute the hash
++        if self.enable_caching and self._is_last_block_full(seq):
+             block_hash = seq.hash_of_block(len(seq.logical_token_blocks) - 1)
+         num_hashed_tokens = seq.num_hashed_tokens_of_block(
+             len(seq.logical_token_blocks) - 1)
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..759ddcc 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -64,37 +64,24 @@ class LRUEvictor(Evictor):
+     def __contains__(self, block_hash: int) -> bool:
+         return block_hash in self.free_table
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
++        # Find the block with the lowest timestamp and highest num_hashed_tokens
++        # in a single pass for better performance
+         evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
++        for block in self.free_table.values():
++            if evicted_block is None:
+                 evicted_block = block
+-                break
++            else:
++                # Prefer blocks with lower timestamp
++                if block.last_accessed < evicted_block.last_accessed:
++                    evicted_block = block
++                elif block.last_accessed == evicted_block.last_accessed:
++                    # If timestamps are equal, prefer blocks with higher num_hashed_tokens
++                    if block.num_hashed_tokens > evicted_block.num_hashed_tokens:
++                        evicted_block = block
+ 
+         assert evicted_block is not None
+ 
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 4a002ed..4bfb558 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -181,18 +181,27 @@ class Sequence:
+         self.read_offset = 0
+         # Input + output tokens
+         self.tokens: Optional[List[str]] = None
++        
++        # Cache for block hashes to avoid recomputation
++        self._block_hash_cache: Dict[int, int] = {}
+ 
+     @property
+     def lora_int_id(self) -> int:
+         return self.lora_request.lora_int_id if self.lora_request else 0
+ 
+     def hash_of_block(self, logical_idx: int) -> int:
++        # Check if the hash is already cached
++        if logical_idx in self._block_hash_cache:
++            return self._block_hash_cache[logical_idx]
++        
+         # Compute the number of tokens in the sequence
+-        # TODO: The current hashing function is O(L^2). We should optimize
+-        # this in the future.
+         num_tokens = self.num_hashed_tokens_of_block(logical_idx)
+-        return hash(
++        block_hash = hash(
+             (tuple(self.data.get_token_ids()[0:num_tokens]), self.lora_int_id))
++        
++        # Cache the hash for future use
++        self._block_hash_cache[logical_idx] = block_hash
++        return block_hash
+ 
+     def num_hashed_tokens_of_block(self, logical_idx: int):
+         return logical_idx * self.block_size + self.block_size

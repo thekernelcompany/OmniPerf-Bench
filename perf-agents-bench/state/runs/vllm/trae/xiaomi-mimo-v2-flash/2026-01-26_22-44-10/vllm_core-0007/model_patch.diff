@@ -1,0 +1,190 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..e4f9640 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -778,15 +778,29 @@ def _get_logprobs(
+ 
+     # Logprobs of topk tokens for a batch of sequence groups.
+     # (num_query_tokens_across_batch).
++    # Optimization: Only compute top-k for the tokens we actually need
++    # (query_indices) instead of all tokens in the batch.
+     if largest_num_logprobs > 0:
+-        top_logprobs, top_token_ids = torch.topk(logprobs,
+-                                                 largest_num_logprobs,
+-                                                 dim=-1)
++        # Get unique query indices to avoid redundant computation
++        # (beam search can have duplicates)
++        unique_query_indices = torch.unique(query_indices_gpu)
++        top_logprobs, top_token_ids = torch.topk(
++            logprobs[unique_query_indices],
++            largest_num_logprobs,
++            dim=-1
++        )
++        # Create a mapping from original index to position in unique_query_indices
++        index_mapping = {
++            idx.item(): i for i, idx in enumerate(unique_query_indices)
++        }
++        # Batch the CPU transfer
+         top_logprobs = top_logprobs.cpu()
+         top_token_ids = top_token_ids.cpu()
+     else:
+         top_logprobs, top_token_ids = None, None
++        index_mapping = {}
+ 
++    # Batch the CPU transfer for selected_logprobs and ranks
+     selected_logprobs = selected_logprobs.cpu()
+     ranks = ranks.cpu()
+ 
+@@ -801,13 +815,13 @@ def _get_logprobs(
+         (prompt_logprobs, top_logprob_idx,
+          selected_logprobs_idx) = _get_prompt_logprob_if_needed(
+              seq_group, selected_logprobs, ranks, top_token_ids, top_logprobs,
+-             selected_logprobs_idx, top_logprob_idx)
++             selected_logprobs_idx, top_logprob_idx, index_mapping)
+         prompt_logprobs_per_seq_group.append(prompt_logprobs)
+ 
+         (sampled_logprobs, top_logprob_idx,
+          selected_logprobs_idx) = _get_sampled_logprob_if_needed(
+              seq_group, sample_result, selected_logprobs, ranks, top_token_ids,
+-             top_logprobs, selected_logprobs_idx, top_logprob_idx)
++             top_logprobs, selected_logprobs_idx, top_logprob_idx, index_mapping)
+         sample_logprobs_per_seq_group.append(sampled_logprobs)
+ 
+     return prompt_logprobs_per_seq_group, sample_logprobs_per_seq_group
+@@ -821,6 +835,7 @@ def _get_prompt_logprob_if_needed(
+     top_logprobs: torch.Tensor,
+     selected_logprobs_idx: int,
+     top_logprob_idx: int,
++    index_mapping: Dict[int, int],
+ ):
+     """Compute the prompt logprob from a sequence group if needed."""
+     sampling_params = seq_group.sampling_params
+@@ -832,33 +847,41 @@ def _get_prompt_logprob_if_needed(
+         prompt_logprobs = []
+         num_logprobs = sampling_params.prompt_logprobs
+         next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+-        for token_id in next_prompt_tokens:
+-            # Calculate the prompt logprob of the real prompt tokens.
+-            # Use tuple here for performance (to use to_list()).
+-            # {token_id: (logprob, rank_from_vocab)}
+-            prompt_logprobs_dict: Dict[int, Tuple[float, int]] = {
+-                token_id: (selected_logprobs[selected_logprobs_idx].item(),
+-                           ranks[selected_logprobs_idx].item())
+-            }
+-
+-            # Add top K prompt logprobs along with its rank.
+-            if num_logprobs > 0:
+-                prompt_logprobs_dict.update(
+-                    zip(
+-                        top_token_ids[top_logprob_idx, :num_logprobs].tolist(),
++        
++        # Optimization: Batch all .item() calls for the current sequence group
++        num_tokens = len(next_prompt_tokens)
++        if num_tokens > 0:
++            # Get all selected logprobs and ranks at once
++            end_idx = selected_logprobs_idx + num_tokens
++            batch_selected_logprobs = selected_logprobs[selected_logprobs_idx:end_idx].tolist()
++            batch_ranks = ranks[selected_logprobs_idx:end_idx].tolist()
++            
++            for i, token_id in enumerate(next_prompt_tokens):
++                # Calculate the prompt logprob of the real prompt tokens.
++                # {token_id: (logprob, rank_from_vocab)}
++                prompt_logprobs_dict: Dict[int, Tuple[float, int]] = {
++                    token_id: (batch_selected_logprobs[i], batch_ranks[i])
++                }
++
++                # Add top K prompt logprobs along with its rank.
++                if num_logprobs > 0:
++                    # Use index_mapping to get the correct position in top_logprobs
++                    mapped_idx = index_mapping.get(top_logprob_idx, top_logprob_idx)
++                    prompt_logprobs_dict.update(
+                         zip(
+-                            top_logprobs[
+-                                top_logprob_idx, :num_logprobs].tolist(),
+-                            # This is ranks. Since top_logprob is sorted,
+-                            # we can just use a range here.
+-                            range(1, num_logprobs + 1))))
+-            prompt_logprobs.append({
+-                token_id: Logprob(*logprob_and_rank)
+-                for token_id, logprob_and_rank in prompt_logprobs_dict.items()
+-            })
+-            # + 1 to go to the next prompt token.
+-            top_logprob_idx += 1
+-            selected_logprobs_idx += 1
++                            top_token_ids[mapped_idx, :num_logprobs].tolist(),
++                            zip(
++                                top_logprobs[mapped_idx, :num_logprobs].tolist(),
++                                # This is ranks. Since top_logprob is sorted,
++                                # we can just use a range here.
++                                range(1, num_logprobs + 1))))
++                prompt_logprobs.append({
++                    token_id: Logprob(*logprob_and_rank)
++                    for token_id, logprob_and_rank in prompt_logprobs_dict.items()
++                })
++                # + 1 to go to the next prompt token.
++                top_logprob_idx += 1
++            selected_logprobs_idx += num_tokens
+     return prompt_logprobs, top_logprob_idx, selected_logprobs_idx
+ 
+ 
+@@ -871,6 +894,7 @@ def _get_sampled_logprob_if_needed(
+     top_logprobs: torch.Tensor,
+     selected_logprobs_idx: int,
+     top_logprob_idx: int,
++    index_mapping: Dict[int, int],
+ ):
+     """Compute the sample logprob if needed."""
+     seq_ids = seq_group.seq_ids
+@@ -882,29 +906,30 @@ def _get_sampled_logprob_if_needed(
+ 
+     if seq_group.do_sample:
+         assert len(next_token_ids) > 0
+-        for (next_token_id, parent_id) in zip(next_token_ids, parent_seq_ids):
++        
++        # Optimization: Batch all .item() calls for the current sequence group
++        num_tokens = len(next_token_ids)
++        end_idx = selected_logprobs_idx + num_tokens
++        batch_selected_logprobs = selected_logprobs[selected_logprobs_idx:end_idx].tolist()
++        batch_ranks = ranks[selected_logprobs_idx:end_idx].tolist()
++        
++        for i, (next_token_id, parent_id) in enumerate(zip(next_token_ids, parent_seq_ids)):
+             # Calculate the sample logprob of the real sampled tokens.
+-            # Use tuple here for performance (to use to_list()).
+-            # token_id: (logprob, rank_from_vocab)
++            # {token_id: (logprob, rank_from_vocab)}
+             sampled_logprobs_dict: Dict[int, Tuple[float, int]] = {
+                 next_token_id:
+-                (selected_logprobs[selected_logprobs_idx].item(),
+-                 ranks[selected_logprobs_idx].item())
++                (batch_selected_logprobs[i], batch_ranks[i])
+             }
+-            # +1 to go to the next sampled token. Note that
+-            # selected_logprobs can contain duplicates unlike top_logprobs
+-            # when beam search is enabled.
+-            selected_logprobs_idx += 1
+ 
+             # Second, add top K logprobs along with its rank.
+             if num_logprobs >= 0:
++                # Use index_mapping to get the correct position in top_logprobs
++                mapped_idx = index_mapping.get(top_logprob_idx + parent_id, top_logprob_idx + parent_id)
+                 sampled_logprobs_dict.update(
+                     zip(
+-                        top_token_ids[top_logprob_idx +
+-                                      parent_id, :num_logprobs].tolist(),
++                        top_token_ids[mapped_idx, :num_logprobs].tolist(),
+                         zip(
+-                            top_logprobs[top_logprob_idx +
+-                                         parent_id, :num_logprobs].tolist(),
++                            top_logprobs[mapped_idx, :num_logprobs].tolist(),
+                             # This is rank. Since top_logprob is sorted, we
+                             # can just use a range here.
+                             range(1, num_logprobs + 1))))
+@@ -913,6 +938,8 @@ def _get_sampled_logprob_if_needed(
+                 for token_id, logprob_and_rank in
+                 sampled_logprobs_dict.items()
+             })
++        # +num_tokens to go to the next sampled tokens.
++        selected_logprobs_idx += num_tokens
+         # There are len(seq_ids) number of sampled tokens for the current
+         # sequence group in top_logprobs. Jump to the next seq_group.
+         top_logprob_idx += len(seq_ids)

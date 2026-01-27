@@ -1,0 +1,81 @@
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index 5fa7ce0..9bbfc81 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -280,7 +280,15 @@ def dp_scatter(
+     # since local_tokens may be padded for cuda graph
+     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+ 
+-    local_tokens.fill_(0)
++    # Only zero out the padding portion to avoid unnecessary work
++    # when there are many padding tokens
++    if local_tokens.shape[0] > local_num_tokens:
++        # Buffer has padding: only zero out the padding portion
++        local_tokens[local_num_tokens:].fill_(0)
++    else:
++        # Buffer has no padding or is exactly the right size: zero out entire buffer
++        local_tokens.fill_(0)
++    
+     assert local_tokens.is_contiguous()
+     assert global_tokens.is_contiguous()
+     if local_tokens.shape[0] > 0:
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 60091b9..bb94fcd 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -191,7 +191,9 @@ class LogitsMetadata:
+         else:
+             dp_local_start_pos = cumtokens[dp_rank - 1]
+         dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+-        gathered_buffer = torch.zeros(
++        # Use torch.empty instead of torch.zeros to avoid redundant initialization
++        # The buffer will be zeroed out by _dp_gather as needed
++        gathered_buffer = torch.empty(
+             (
+                 sum(self.global_num_tokens_for_logprob_cpu),
+                 hidden_states.shape[1],
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 341cce0..0015a54 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -299,7 +299,9 @@ class CudaGraphRunner:
+                 self.encoder_lens = None
+             if self.enable_dp_attention or self.enable_sp_layernorm:
+                 # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
+-                self.gathered_buffer = torch.zeros(
++                # Use torch.empty instead of torch.zeros to avoid redundant initialization
++                # The buffer will be zeroed out by dp_gather_partial/_dp_gather/dp_scatter as needed
++                self.gathered_buffer = torch.empty(
+                     (
+                         self.max_bs * self.dp_size * self.num_tokens_per_bs,
+                         self.model_runner.model_config.hidden_size,
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index de462e4..b9c2702 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -319,7 +319,9 @@ class ForwardBatch:
+             ).to(device, non_blocking=True)
+ 
+             sum_len = sum(batch.global_num_tokens)
+-            ret.gathered_buffer = torch.zeros(
++            # Use torch.empty instead of torch.zeros to avoid redundant initialization
++            # The buffer will be zeroed out by dp_gather_partial/_dp_gather as needed
++            ret.gathered_buffer = torch.empty(
+                 (sum_len, model_runner.model_config.hidden_size),
+                 dtype=model_runner.dtype,
+                 device=device,
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f..55aa77d 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -324,7 +324,9 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            # Use torch.empty instead of torch.zeros to avoid redundant initialization
++            # The buffer will be zeroed out by dp_scatter as needed
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,

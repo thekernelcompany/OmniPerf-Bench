@@ -1,0 +1,50 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 0026031..707dc71 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -1240,16 +1240,6 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+ 
+     config = get_config_func(M)
+ 
+-    intermediate_cache1 = torch.empty((M, top_k_num, N),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
+-    intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
+-    intermediate_cache3 = torch.empty((M, top_k_num, w2.shape[1]),
+-                                      device=hidden_states.device,
+-                                      dtype=hidden_states.dtype)
+-
+     if hidden_states.dtype == torch.bfloat16:
+         compute_type = tl.bfloat16
+     elif hidden_states.dtype == torch.float16:
+@@ -1274,15 +1264,20 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+         if tokens_in_chunk == 0:
+             break
+ 
++        # Allocate intermediate caches per chunk to avoid wasting memory
++        # when processing the last chunk which may be smaller
++        intermediate_cache1 = torch.empty((tokens_in_chunk, top_k_num, N),
++                                          device=hidden_states.device,
++                                          dtype=hidden_states.dtype)
++        intermediate_cache2 = torch.empty((tokens_in_chunk * top_k_num, N // 2),
++                                          device=hidden_states.device,
++                                          dtype=hidden_states.dtype)
++        intermediate_cache3 = torch.empty((tokens_in_chunk, top_k_num, w2.shape[1]),
++                                          device=hidden_states.device,
++                                          dtype=hidden_states.dtype)
++
+         if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+-            # Adjust the intermediate cache size and config for the last
+-            # chunk. Note that in most cases we only have one chunk
+-            # so the cache size and config are already set correctly and
+-            # do not need to be adjusted.
+-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
+-                                                      topk_ids.shape[1]]
+-            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
++            # Adjust config for the last chunk if it's smaller
+             config = get_config_func(tokens_in_chunk)
+ 
+         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]

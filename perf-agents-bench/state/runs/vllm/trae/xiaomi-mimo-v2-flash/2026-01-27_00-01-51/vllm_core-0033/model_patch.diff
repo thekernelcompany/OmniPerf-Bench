@@ -1,0 +1,94 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23..43561ee 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -1,6 +1,5 @@
+ """Token blocks."""
+ 
+-from os.path import commonprefix
+ from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
+ 
+ from vllm.core.block.common import (CopyOnWriteTracker,
+@@ -501,7 +500,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark blocks as computed, used in prefix caching.
++        
++        For the prefix caching allocator, blocks are marked as computed
++        when they are allocated as immutable blocks with a content hash.
++        This method is a no-op because the computed status is tracked
++        incrementally through the block's content hash.
++        
++        Args:
++            block_ids: List of block IDs to mark as computed (currently ignored)
++        """
++        # No-op: computed status is tracked incrementally through content_hash
++        pass
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+@@ -551,11 +561,34 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.
+ 
+-        # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
+-            ids for ids in computed_seq_block_ids  # type: ignore
+-            if ids != []
+-        ])
++        # Filter out empty lists
++        non_empty_ids = [ids for ids in computed_seq_block_ids if ids != []]
++        
++        if not non_empty_ids:
++            return []
++        
++        # Find the common prefix efficiently
++        # Start with the first list as reference
++        common_prefix = non_empty_ids[0]
++        
++        # Compare with each subsequent list
++        for ids in non_empty_ids[1:]:
++            # Find the minimum length to compare
++            min_len = min(len(common_prefix), len(ids))
++            # Find where the common prefix ends
++            common_len = 0
++            for i in range(min_len):
++                if common_prefix[i] == ids[i]:
++                    common_len += 1
++                else:
++                    break
++            # Truncate the common prefix to the common length
++            common_prefix = common_prefix[:common_len]
++            # If there's no common prefix, we can stop early
++            if not common_prefix:
++                break
++        
++        return common_prefix
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 1cebf68..b4c6db1 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -131,8 +131,16 @@ class SequenceData:
+         self._update_cached_all_tokens()
+ 
+     def _update_cached_all_tokens(self):
+-        self._cached_all_token_ids: List[int] = (self._prompt_token_ids +
+-                                                 self._output_token_ids)
++        # Efficiently update the cached token IDs by extending the existing list
++        # instead of creating a new one
++        if not hasattr(self, '_cached_all_token_ids'):
++            self._cached_all_token_ids: List[int] = (self._prompt_token_ids +
++                                                     self._output_token_ids)
++        else:
++            # Clear and rebuild to avoid creating new list objects
++            self._cached_all_token_ids.clear()
++            self._cached_all_token_ids.extend(self._prompt_token_ids)
++            self._cached_all_token_ids.extend(self._output_token_ids)
+ 
+     @property
+     def prompt_token_ids(self) -> Tuple[int, ...]:

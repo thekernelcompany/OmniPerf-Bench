@@ -1,0 +1,105 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..14648d3 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -722,6 +722,8 @@ def _get_logprobs(
+     # The largest requested number of logprobs. We find logprobs as many as the
+     # largest num logprobs in this API.
+     largest_num_logprobs = 1
++    # Indices of query tokens that need topk logprobs computed.
++    topk_query_indices: List[int] = []
+ 
+     # Select indices to compute logprob from, ranks of token ids, and the top
+     # k token ids from logprobs.
+@@ -737,6 +739,9 @@ def _get_logprobs(
+             next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+             query_indices.extend(seq_group.prompt_logprob_indices)
+             next_token_ids.extend(next_prompt_tokens)
++            # Track which query indices need topk computation
++            if sampling_params.prompt_logprobs > 0:
++                topk_query_indices.extend(seq_group.prompt_logprob_indices)
+ 
+         # Update indices and next tokenes for sample logprob.
+         if seq_group.do_sample:
+@@ -753,6 +758,10 @@ def _get_logprobs(
+             if sampling_params.logprobs is not None:
+                 largest_num_logprobs = max(largest_num_logprobs,
+                                            sampling_params.logprobs)
++                # Track which query indices need topk computation
++                if sampling_params.logprobs > 0:
++                    topk_query_indices.extend(
++                        [query_idx + parent_id for parent_id in parent_seq_ids])
+ 
+         assert len(next_token_ids) == len(query_indices)
+ 
+@@ -770,18 +779,24 @@ def _get_logprobs(
+         query_indices_gpu,
+         next_token_ids_gpu,
+     ]]
++    # Get the logprobs for the selected query indices to compute ranks
++    selected_logprobs_for_ranks = logprobs[query_indices_gpu]
+     ranks = _get_ranks(
+-        logprobs[query_indices_gpu],
++        selected_logprobs_for_ranks,
+         next_token_ids_gpu,
+     )
+     assert selected_logprobs.shape[0] == ranks.shape[0]
+ 
+     # Logprobs of topk tokens for a batch of sequence groups.
++    # Only compute topk for rows that actually need it.
+     # (num_query_tokens_across_batch).
+-    if largest_num_logprobs > 0:
+-        top_logprobs, top_token_ids = torch.topk(logprobs,
+-                                                 largest_num_logprobs,
+-                                                 dim=-1)
++    if largest_num_logprobs > 0 and len(topk_query_indices) > 0:
++        topk_query_indices_gpu = torch.tensor(topk_query_indices,
++                                              device=logprobs.device)
++        top_logprobs, top_token_ids = torch.topk(
++            logprobs[topk_query_indices_gpu],
++            largest_num_logprobs,
++            dim=-1)
+         top_logprobs = top_logprobs.cpu()
+         top_token_ids = top_token_ids.cpu()
+     else:
+@@ -843,12 +858,16 @@ def _get_prompt_logprob_if_needed(
+ 
+             # Add top K prompt logprobs along with its rank.
+             if num_logprobs > 0:
++                # Cache tolist() results to avoid redundant conversions
++                top_token_ids_list = top_token_ids[
++                    top_logprob_idx, :num_logprobs].tolist()
++                top_logprobs_list = top_logprobs[
++                    top_logprob_idx, :num_logprobs].tolist()
+                 prompt_logprobs_dict.update(
+                     zip(
+-                        top_token_ids[top_logprob_idx, :num_logprobs].tolist(),
++                        top_token_ids_list,
+                         zip(
+-                            top_logprobs[
+-                                top_logprob_idx, :num_logprobs].tolist(),
++                            top_logprobs_list,
+                             # This is ranks. Since top_logprob is sorted,
+                             # we can just use a range here.
+                             range(1, num_logprobs + 1))))
+@@ -898,13 +917,16 @@ def _get_sampled_logprob_if_needed(
+ 
+             # Second, add top K logprobs along with its rank.
+             if num_logprobs >= 0:
++                # Cache tolist() results to avoid redundant conversions
++                top_token_ids_list = top_token_ids[
++                    top_logprob_idx + parent_id, :num_logprobs].tolist()
++                top_logprobs_list = top_logprobs[
++                    top_logprob_idx + parent_id, :num_logprobs].tolist()
+                 sampled_logprobs_dict.update(
+                     zip(
+-                        top_token_ids[top_logprob_idx +
+-                                      parent_id, :num_logprobs].tolist(),
++                        top_token_ids_list,
+                         zip(
+-                            top_logprobs[top_logprob_idx +
+-                                         parent_id, :num_logprobs].tolist(),
++                            top_logprobs_list,
+                             # This is rank. Since top_logprob is sorted, we
+                             # can just use a range here.
+                             range(1, num_logprobs + 1))))

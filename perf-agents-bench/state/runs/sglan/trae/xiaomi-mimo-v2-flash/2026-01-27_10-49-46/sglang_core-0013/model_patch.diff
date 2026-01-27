@@ -1,0 +1,91 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 2f974ea..be3a942 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -167,11 +167,25 @@ def make_local_attention_virtual_batches(
+     # Then we would get:
+     #   new_tokens_in_first_block = [2, 1, 4]
+     #   local_blocks = [2, 4, 2]
+-    q_tokens_in_first_block = np.minimum(
+-        attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size), q_seqlens
++    # OPTIMIZATION: Combine operations to reduce intermediate arrays
++    q_tokens_in_first_block = (
++        attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size)
+     ).astype(np.int32)
+-    tokens_in_last_block = attn_chunk_size + (seq_lens_np % -attn_chunk_size)
+-    local_blocks = 1 + cdiv(q_seqlens - q_tokens_in_first_block, attn_chunk_size)
++    # Apply minimum in-place to avoid creating another array
++    np.minimum(q_tokens_in_first_block, q_seqlens, out=q_tokens_in_first_block)
++    
++    # OPTIMIZATION: Optimize tokens_in_last_block calculation
++    # Original: attn_chunk_size + (seq_lens_np % -attn_chunk_size)
++    # This is equivalent to: seq_lens_np % attn_chunk_size, but if result is 0, use attn_chunk_size
++    tokens_in_last_block = seq_lens_np % attn_chunk_size
++    # Where result is 0, use attn_chunk_size
++    tokens_in_last_block = np.where(
++        tokens_in_last_block == 0, attn_chunk_size, tokens_in_last_block
++    )
++    
++    # OPTIMIZATION: Compute local_blocks more efficiently using integer division
++    remaining_tokens = q_seqlens - q_tokens_in_first_block
++    local_blocks = 1 + (-(remaining_tokens // -attn_chunk_size)).astype(np.int32)
+ 
+     # Once we know the number of local blocks we can compute the request spans
+     #  for each batch idx, we can figure out the number of "virtual" requests we
+@@ -201,14 +215,19 @@ def make_local_attention_virtual_batches(
+     )[arange > 0]
+ 
+     # convert from q_seqlens to cu_seqlens_q
+-    cu_seqlens_q_local = np.pad(np.cumsum(seqlens_q_local), (1, 0)).astype(np.int32)
++    # OPTIMIZATION: Pre-allocate and compute cumsum in-place to avoid intermediate arrays
++    cu_seqlens_q_local = np.empty(virtual_batches + 1, dtype=np.int32)
++    cu_seqlens_q_local[0] = 0
++    np.cumsum(seqlens_q_local, out=cu_seqlens_q_local[1:])
+ 
+     # compute the seqlens_k_local,
+     #  basically a full local attention block for all but the last block in each
+     #  batch
+     # For our example this will be:
+     #   seqlens_k_local = [4, 2, 4, 4, 4, 1, 4, 1]
+-    seqlens_k_local = np.full(cu_num_blocks[-1], attn_chunk_size, dtype=np.int32)
++    # OPTIMIZATION: Use np.empty and fill instead of np.full to avoid intermediate allocation
++    seqlens_k_local = np.empty(virtual_batches, dtype=np.int32)
++    seqlens_k_local.fill(attn_chunk_size)
+     seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
+ 
+     k_seqstarts_absolute = np.repeat(seq_lens_np, local_blocks) - (
+@@ -243,20 +262,24 @@ def make_local_attention_virtual_batches(
+     #     [ 22, 23 ], < local-batch 6, (batch 2, starting from k[4])
+     #     [ 24, 25 ], < local-batch 7, (batch 2, starting from k[8])
+     #   ]
+-    block_indices = np.broadcast_to(
+-        np.arange(pages_per_local_batch, dtype=np.int32),
+-        (virtual_batches, pages_per_local_batch),
+-    ) + np.expand_dims(block_starts, axis=1)
+-    # Ensure block_indices doesn't exceed block_table dimensions
+-    # This is a critical safety check that prevents index out of bounds errors
+-    # when dealing with large sequences (>8192 tokens) or when the block_table
+-    # dimensions are smaller than what would be needed for the full attention chunk size.
+-    block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
++    # OPTIMIZATION: Compute block_indices more efficiently without full broadcasting
++    pages_arr = np.arange(pages_per_local_batch, dtype=np.int32)
++    block_starts_expanded = block_starts[:, np.newaxis]
++    block_indices = pages_arr + block_starts_expanded
++    
++    # OPTIMIZATION: Flatten and clip in one step
++    block_indices_flat = block_indices.ravel()
++    max_idx = block_table.shape[1] - 1
++    np.clip(block_indices_flat, None, max_idx, out=block_indices_flat)
++    
++    # OPTIMIZATION: Compute batch_indices efficiently
+     batch_indices = np.repeat(
+         np.arange(actual_batch_size, dtype=np.int32),
+         local_blocks * pages_per_local_batch,
+     )
+-    block_table_local = block_table[batch_indices, block_indices].view(
++    
++    # OPTIMIZATION: Direct indexing and reshaping
++    block_table_local = block_table[batch_indices, block_indices_flat].view(
+         virtual_batches, -1
+     )
+ 

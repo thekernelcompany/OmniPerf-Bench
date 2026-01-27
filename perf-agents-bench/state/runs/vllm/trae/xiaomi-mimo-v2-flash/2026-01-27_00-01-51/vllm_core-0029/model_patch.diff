@@ -1,0 +1,100 @@
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 1be806b..d7ffe6a 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -21,6 +21,26 @@
+ typedef __hip_bfloat16 __nv_bfloat16;
+ #endif
+ 
++namespace vllm {
++
++// Grid: (num_pairs)
++__global__ void swap_blocks_kernel(const int64_t* __restrict__ block_mapping,
++                                   char* __restrict__ src_ptr,
++                                   char* __restrict__ dst_ptr,
++                                   int64_t block_size_in_bytes,
++                                   cudaMemcpyKind memcpy_type,
++                                   cudaStream_t stream) {
++  const int64_t pair_idx = blockIdx.x;
++  int64_t src_block_number = block_mapping[2 * pair_idx];
++  int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
++  int64_t src_offset = src_block_number * block_size_in_bytes;
++  int64_t dst_offset = dst_block_number * block_size_in_bytes;
++  cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
++                  block_size_in_bytes, memcpy_type, stream);
++}
++
++}  // namespace vllm
++
+ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
+                  const torch::Tensor& block_mapping) {
+   torch::Device src_device = src.device();
+@@ -50,16 +70,20 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
+   const at::cuda::OptionalCUDAGuard device_guard(
+       src_device.is_cuda() ? src_device : dst_device);
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+-  // NOTE(woosuk): This can be slow if the number of blocks is large.
+-  const int64_t num_blocks = block_mapping.size(0);
+-  for (size_t i = 0; i < num_blocks; i++) {
+-    int64_t src_block_number = block_mapping[i][0].item<int64_t>();
+-    int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
+-    int64_t src_offset = src_block_number * block_size_in_bytes;
+-    int64_t dst_offset = dst_block_number * block_size_in_bytes;
+-    cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
+-                    block_size_in_bytes, memcpy_type, stream);
+-  }
++  const int64_t num_pairs = block_mapping.size(0);
++
++  // Move block_mapping to the GPU to avoid per-element CPU-GPU synchronization
++  torch::Tensor block_mapping_tensor =
++      torch::from_blob(block_mapping.data_ptr<int64_t>(), {num_pairs * 2},
++                       torch::kInt64)
++          .to(src_device.is_cuda() ? src_device : dst_device);
++
++  // Launch the kernel.
++  dim3 grid(num_pairs);
++  dim3 block(1);
++  vllm::swap_blocks_kernel<<<grid, block, 0, stream>>>(
++      block_mapping_tensor.data_ptr<int64_t>(), src_ptr, dst_ptr,
++      block_size_in_bytes, memcpy_type, stream);
+ }
+ 
+ namespace vllm {
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index d379890..478674b 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -143,9 +143,14 @@ class FlashAttentionImpl(AttentionImpl):
+         # Reshape the input keys and values and store them in the cache.
+         key_cache = kv_cache[0]
+         value_cache = kv_cache[1]
++        
++        # Avoid slicing if not needed to reduce CPU overhead
++        key_slice = key[:num_actual_tokens] if num_actual_tokens < key.size(0) else key
++        value_slice = value[:num_actual_tokens] if num_actual_tokens < value.size(0) else value
++        
+         torch.ops._C_cache_ops.reshape_and_cache_flash(
+-            key[:num_actual_tokens],
+-            value[:num_actual_tokens],
++            key_slice,
++            value_slice,
+             key_cache,
+             value_cache,
+             attn_metadata.slot_mapping,
+@@ -155,11 +160,14 @@ class FlashAttentionImpl(AttentionImpl):
+         )
+ 
+         # Compute attention and update output up to `num_actual_tokens`.
++        query_slice = query[:num_actual_tokens] if num_actual_tokens < query.size(0) else query
++        output_slice = output[:num_actual_tokens] if num_actual_tokens < output.size(0) else output
++        
+         flash_attn_varlen_func(
+-            q=query[:num_actual_tokens],
++            q=query_slice,
+             k=key_cache,
+             v=value_cache,
+-            out=output[:num_actual_tokens],
++            out=output_slice,
+             cu_seqlens_q=attn_metadata.query_start_loc,
+             max_seqlen_q=attn_metadata.max_query_len,
+             cu_seqlens_k=attn_metadata.seq_start_loc,

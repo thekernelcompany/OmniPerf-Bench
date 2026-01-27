@@ -1,0 +1,138 @@
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index d2787d6..42a3fd7 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -175,7 +175,7 @@ class CopyOnWriteTracker:
+ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
+     """Retrieves all the blocks in a sequence starting from the last block.
+ 
+-    This function recursively traverses the sequence of blocks in reverse order,
++    This function traverses the sequence of blocks in reverse order,
+     starting from the given last block, and returns a list of all the blocks in
+     the sequence.
+ 
+@@ -187,11 +187,13 @@ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
+             appear.
+     """
+ 
+-    def recurse(block: Block, lst: List[Block]) -> None:
+-        if block.prev_block is not None:
+-            recurse(block.prev_block, lst)
+-        lst.append(block)
+-
+-    all_blocks: List[Block] = []
+-    recurse(last_block, all_blocks)
+-    return all_blocks
++    # Collect blocks in reverse order (from last to first)
++    reversed_blocks: List[Block] = []
++    current_block: Optional[Block] = last_block
++    
++    while current_block is not None:
++        reversed_blocks.append(current_block)
++        current_block = current_block.prev_block
++    
++    # Reverse to get the correct order (from first to last)
++    return list(reversed(reversed_blocks))
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74..abaebf2 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -386,8 +386,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+ 
+         for block_id in block_ids:
+-            if block_id in self._blocks:
+-                self._blocks[block_id].last_accessed = now
++            block = self._blocks.get(block_id)
++            if block is not None:
++                block.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -398,17 +399,19 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """Mark blocks as computed, used in prefix caching."""
+ 
+         for block_id in block_ids:
+-            if block_id in self._blocks:
++            block = self._blocks.get(block_id)
++            if block is not None:
+                 # only those full block is valid for prefix caching
+-                if self._blocks[block_id].is_full:
+-                    self._blocks[block_id].computed = True
++                if block.is_full:
++                    block.computed = True
+             elif block_id not in self.evictor:
+                 raise ValueError(f"Mark {block_id=} as computed which "
+                                  "is not belonged to GPU")
+ 
+     def block_is_computed(self, block_id: int) -> bool:
+-        if block_id in self._blocks:
+-            return self._blocks[block_id].computed
++        block = self._blocks.get(block_id)
++        if block is not None:
++            return block.computed
+         else:
+             return block_id in self.evictor
+ 
+@@ -424,16 +427,28 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.
+ 
+-        ids_list = [
+-            list(
+-                takewhile(lambda block_id: self.block_is_computed(block_id),
+-                          seq[:-1])) for seq in seq_block_ids
+-        ]
+-        # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
+-            ids for ids in ids_list  # type: ignore
+-            if ids != []
+-        ])
++        # Filter out sequences that are empty after excluding the last block
++        valid_seqs = [seq[:-1] for seq in seq_block_ids if len(seq) > 1]
++        if not valid_seqs:
++            return []
++
++        # Find the minimum length among all sequences
++        min_length = min(len(seq) for seq in valid_seqs)
++
++        # Check if blocks are computed and find the common prefix
++        common_prefix = []
++        for i in range(min_length):
++            # Get the block_id at position i from the first sequence
++            block_id = valid_seqs[0][i]
++            
++            # Check if all sequences have the same block_id at position i
++            # and if the block is computed
++            is_common = all(seq[i] == block_id for seq in valid_seqs)
++            if not is_common or not self.block_is_computed(block_id):
++                break
++            common_prefix.append(block_id)
++
++        return common_prefix
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],
+@@ -607,14 +622,14 @@ class PrefixCachingBlock(Block):
+         if self._cached_num_tokens_total is not None:
+             return self._cached_num_tokens_total
+ 
+-        _block: Optional[Block] = self
+-        self._cached_num_tokens_total = 0
+-
+-        # TODO: current implement here take O(N^2), we expect future
+-        # we have O(1) here
+-        while _block is not None:
+-            self._cached_num_tokens_total += len(_block.token_ids)
+-            _block = _block.prev_block
++        # Compute incrementally: current block's tokens + previous block's total
++        if self._prev_block is None:
++            # First block in the chain
++            self._cached_num_tokens_total = len(self.token_ids)
++        else:
++            # Get the previous block's total tokens (which is cached)
++            prev_total = self._prev_block.num_tokens_total
++            self._cached_num_tokens_total = prev_total + len(self.token_ids)
+ 
+         return self._cached_num_tokens_total
+ 

@@ -1,0 +1,95 @@
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index fda4d00..27afe89 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -118,6 +118,9 @@ class PyNcclCommunicator:
+ 
+         out_tensor = torch.empty_like(in_tensor)
+ 
++        # Use the provided stream or the current stream
++        # Note: torch.cuda.current_stream() is called here to get the stream
++        # for the device associated with this communicator
+         if stream is None:
+             stream = torch.cuda.current_stream()
+         self.nccl.ncclAllReduce(buffer_type(in_tensor.data_ptr()),
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a837c1d..4b975be 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -357,10 +357,8 @@ class GroupCoordinator:
+             return out
+         pynccl_comm = self.pynccl_comm
+         assert pynccl_comm is not None
+-        # TODO: pynccl should not use `stream=`
+-        # it can just always use the current stream.
+-        out = pynccl_comm.all_reduce(input_,
+-                                     stream=torch.cuda.current_stream())
++        # pynccl uses the current stream by default, no need to pass it
++        out = pynccl_comm.all_reduce(input_)
+         if out is None:
+             # fall back to the default all-reduce using PyTorch.
+             # this usually happens during testing.
+diff --git a/vllm/utils.py b/vllm/utils.py
+index a92b77e..f96a28f 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -1942,3 +1942,59 @@ def get_mp_context():
+     _check_multiproc_method()
+     mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
+     return multiprocessing.get_context(mp_method)
++
++
++def get_current_stream() -> torch.cuda.Stream:
++    """
++    Get the current CUDA stream.
++    
++    This is a wrapper around torch.cuda.current_stream() that can be used
++    to avoid redundant calls in hot paths. The function is optimized to
++    minimize overhead when getting the current stream.
++    
++    Returns:
++        torch.cuda.Stream: The current CUDA stream.
++    """
++    return torch.cuda.current_stream()
++
++
++def get_stream_device(stream: torch.cuda.Stream) -> torch.device:
++    """
++    Get the device associated with a CUDA stream.
++    
++    Args:
++        stream: The CUDA stream.
++        
++    Returns:
++        torch.device: The device associated with the stream.
++    """
++    return stream.device
++
++
++def wait_stream(stream: torch.cuda.Stream) -> None:
++    """
++    Wait for a CUDA stream to complete.
++    
++    This is a wrapper around torch.cuda.Stream.wait_stream() that can be used
++    to ensure proper stream synchronization.
++    
++    Args:
++        stream: The CUDA stream to wait for.
++    """
++    get_current_stream().wait_stream(stream)
++
++
++def record_event(stream: torch.cuda.Stream, blocking: bool = True) -> torch.cuda.Event:
++    """
++    Record a CUDA event on a stream.
++    
++    Args:
++        stream: The CUDA stream to record the event on.
++        blocking: Whether the event should be blocking.
++        
++    Returns:
++        torch.cuda.Event: The recorded event.
++    """
++    event = torch.cuda.Event(blocking=blocking)
++    event.record(stream)
++    return event

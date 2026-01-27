@@ -1,0 +1,40 @@
+diff --git a/csrc/moe/moe_align_sum_kernels.cu b/csrc/moe/moe_align_sum_kernels.cu
+index d609ce1..bb81c0e 100644
+--- a/csrc/moe/moe_align_sum_kernels.cu
++++ b/csrc/moe/moe_align_sum_kernels.cu
+@@ -211,6 +211,22 @@ __global__ void moe_sum_kernel(
+   }
+ }
+ 
++template <typename scalar_t>
++__global__ void moe_sum_kernel(
++    scalar_t* __restrict__ out,          // [..., d]
++    const scalar_t* __restrict__ input,  // [..., topk, d]
++    const int d,
++    const int topk) {
++  const int64_t token_idx = blockIdx.x;
++  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
++    scalar_t x = 0.0;
++    for (int k = 0; k < topk; ++k) {
++      x += VLLM_LDG(&input[token_idx * topk * d + k * d + idx]);
++    }
++    out[token_idx * d + idx] = x;
++  }
++}
++
+ }  // namespace moe
+ }  // namespace vllm
+ 
+@@ -341,7 +357,11 @@ void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
+       break;
+ 
+     default:
+-      at::sum_out(output, input, 1);
++      VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
++        vllm::moe::moe_sum_kernel<scalar_t><<<grid, block, 0, stream>>>(
++            output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
++            hidden_size, topk);
++      });
+       break;
+   }
+ }

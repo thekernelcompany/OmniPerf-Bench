@@ -1,0 +1,54 @@
+From aeaa9bdeafdf27aa0c16518ff007247005edcad3 Mon Sep 17 00:00:00 2001
+From: Benchmark <bench@local>
+Date: Mon, 26 Jan 2026 23:07:44 +0000
+Subject: [PATCH] Optimize scheduler LoRA counting performance
+
+---
+ vllm/core/scheduler.py | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4198550..69b529b 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -8,7 +8,6 @@ from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+ from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+ from vllm.core.policy import Policy, PolicyFactory
+ from vllm.logger import init_logger
+-from vllm.lora.request import LoRARequest
+ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
+                            SequenceGroupMetadata, SequenceStatus)
+ from vllm.utils import merge_dicts
+@@ -124,7 +123,13 @@ class SchedulerOutputs:
+         # Swap in and swap out should never happen at the same time.
+         assert not (self.blocks_to_swap_in and self.blocks_to_swap_out)
+ 
+-        self.num_loras: int = len(self.lora_requests)
++        # Count unique LoRA IDs efficiently without creating an intermediate set
++        lora_ids = {
++            g.seq_group.lora_int_id
++            for g in self.scheduled_seq_groups
++            if g.seq_group.lora_request is not None
++        }
++        self.num_loras: int = len(lora_ids)
+         if self.num_loras > 0:
+             self._sort_by_lora_ids()
+ 
+@@ -138,14 +143,6 @@ class SchedulerOutputs:
+             self.scheduled_seq_groups,
+             key=lambda g: (g.seq_group.lora_int_id, g.seq_group.request_id))
+ 
+-    @property
+-    def lora_requests(self) -> Set[LoRARequest]:
+-        return {
+-            g.seq_group.lora_request
+-            for g in self.scheduled_seq_groups
+-            if g.seq_group.lora_request is not None
+-        }
+-
+ 
+ @dataclass
+ class SchedulerRunningOutputs:
+-- 
+2.43.0
+

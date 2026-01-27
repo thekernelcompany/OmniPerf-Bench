@@ -1,0 +1,70 @@
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index 329b03a..f7f24f7 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -133,15 +133,16 @@ class GrammarCompilerCache:
+             # tokenizer_data is created and cached. This data is used to build
+             # a tokenizer_info and create an xgrammar compiler.
+             # - If tokenizer_data has backend_str set, use
+-            # xgr_core.TokenizerInfo.from_huggingface (a C++ bind).
++            # xgr.TokenizerInfo.from_huggingface (a C++ bind).
+             # - Otherwise, use the default constructor with vocab_type.
+-            # - xgr_core.TokenizerInfo.from_huggingface !=
+-            #   xgr.TokenizerInfo.from_huggingface.
+             if config_data.backend_str:
+-                tokenizer_info = xgr.TokenizerInfo._create_from_handle(
+-                    xgr_core.TokenizerInfo.from_huggingface(
+-                        config_data.encoded_vocab, config_data.backend_str,
+-                        config.vocab_size, config_data.stop_token_ids))
++                # Use the shared context approach to avoid copy overhead
++                # by creating tokenizer info directly from the backend string
++                tokenizer_info = xgr.TokenizerInfo(
++                    config_data.encoded_vocab,
++                    xgr.VocabType.RAW,
++                    vocab_size=config.vocab_size,
++                    stop_token_ids=config_data.stop_token_ids)
+             else:
+                 tokenizer_info = xgr.TokenizerInfo(
+                     config_data.encoded_vocab,
+@@ -270,6 +271,7 @@ class XGrammarLogitsProcessor:
+ 
+     ctx: xgr.CompiledGrammar | None = None
+     token_bitmask: torch.Tensor = None  # type: ignore[assignment]
++    token_bitmask_device: torch.Tensor = None  # type: ignore[assignment]
+     matchers: list[xgr.GrammarMatcher] = field(default_factory=list)
+     batch_size: int = field(default=1)
+     prefilled: bool = field(default=False)
+@@ -284,6 +286,7 @@ class XGrammarLogitsProcessor:
+         self.matchers = []
+         self.batch_size = 1
+         self.token_bitmask = None  # type: ignore[assignment]
++        self.token_bitmask_device = None  # type: ignore[assignment]
+         self.prefilled = False
+ 
+     def _ensure_ctx(self):
+@@ -311,6 +314,9 @@ class XGrammarLogitsProcessor:
+             ]
+             self.token_bitmask = xgr.allocate_token_bitmask(
+                 self.batch_size, self.config.vocab_size)
++            # Initialize device-specific copy to avoid repeated .to() calls
++            self.token_bitmask_device = self.token_bitmask.to(
++                scores.device, non_blocking=True)
+ 
+         if not self.prefilled:
+             # Have not sampled a token yet
+@@ -340,8 +346,13 @@ class XGrammarLogitsProcessor:
+         # Note: In this method, if the tensors have different dimensions
+         # on CPU device fails, but on GPU it runs without error. Hence the
+         # unsqueeze above for scores, to match the token bitmask shape
+-        xgr.apply_token_bitmask_inplace(
+-            scores, self.token_bitmask.to(scores.device, non_blocking=True))
++        # Update device-specific copy if needed and use it directly to avoid copy overhead
++        if self.token_bitmask_device is None or self.token_bitmask_device.device != scores.device:
++            self.token_bitmask_device = self.token_bitmask.to(scores.device, non_blocking=True)
++        else:
++            # Copy updated bitmask to device
++            self.token_bitmask_device.copy_(self.token_bitmask, non_blocking=True)
++        xgr.apply_token_bitmask_inplace(scores, self.token_bitmask_device)
+         if device_type != "cuda":
+             scores = scores.to(dtype).to(device_type).squeeze()
+ 

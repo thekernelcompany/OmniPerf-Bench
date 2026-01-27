@@ -1,0 +1,66 @@
+diff --git a/tests/core/block/test_prefix_caching_block.py b/tests/core/block/test_prefix_caching_block.py
+index c222687..b043581 100644
+--- a/tests/core/block/test_prefix_caching_block.py
++++ b/tests/core/block/test_prefix_caching_block.py
+@@ -708,6 +708,44 @@ class TestPrefixCachingBlockAllocator:
+                                                token_ids=token_ids)
+         assert allocator.get_prefix_cache_hit_rate() > 0.99
+ 
++    @staticmethod
++    @pytest.mark.parametrize("num_blocks", [4])
++    @pytest.mark.parametrize("block_size", [16])
++    @pytest.mark.parametrize("num_sequences", [8])
++    def test_mark_blocks_as_computed_is_noop(num_blocks: int, block_size: int,
++                                              num_sequences: int):
++        """Verify that mark_blocks_as_computed is a no-op and doesn't raise
++        NotImplementedError. This is an optimization to avoid unnecessary
++        operations since computed status is tracked incrementally.
++        """
++        allocator = PrefixCachingBlockAllocator(num_blocks=num_blocks,
++                                                block_size=block_size)
++        
++        # Common token IDs for shared prefix
++        common_prefix_blocks = 4
++        common_token_ids = list(range(block_size * common_prefix_blocks))
++        
++        # Allocate blocks for multiple sequences with common prefixes
++        for seq_idx in range(num_sequences):
++            prev_block = None
++            for block_idx in range(common_prefix_blocks):
++                start_idx = block_idx * block_size
++                end_idx = start_idx + block_size
++                token_ids = common_token_ids[start_idx:end_idx]
++                
++                block = allocator.allocate_immutable_block(
++                    prev_block=prev_block,
++                    token_ids=token_ids
++                )
++                prev_block = block
++        
++        # This should not raise NotImplementedError and should be a no-op
++        allocator.mark_blocks_as_computed([])
++        
++        # Verify cache hit rate is correct (all sequences after the first
++        # should hit the cache)
++        assert allocator.get_prefix_cache_hit_rate() > 0.8
++
+     @staticmethod
+     def create_immutable_chain(
+         block_size: int,
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..e12e8e6 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -507,7 +507,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        # The only need for mark block as computed is for prefix caching,
++        # while currently we could determine whether one block is computed
++        # or not by check whether it has content hash.
++        # So this function is useless for prefix caching block allocator.
++        pass
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:

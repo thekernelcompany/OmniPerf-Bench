@@ -1,0 +1,108 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74..5f158e8 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -72,6 +72,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             allocator=self,
+         )
+ 
++        # Track cache hit rate statistics
++        self._total_allocations = 0
++        self._cache_hits = 0
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -111,20 +115,44 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        block = self._create_block(
+-            prev_block=prev_block,
+-            token_ids=token_ids,
+-            block_size=self._block_size,
+-            allocator=self,
++        self._total_allocations += 1
++
++        # Compute the content hash without creating a block object first
++        # This avoids unnecessary block creation when the block is cached
++        is_first_block = prev_block is None
++        prev_block_hash = (
++            None if is_first_block else prev_block.content_hash  # type: ignore
+         )
+-        assert block.content_hash is not None
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        # If previous block exists but doesn't have a hash yet, we can't cache
++        # this block, so allocate it as mutable
++        if prev_block_hash is None and not is_first_block:
++            block = self.allocate_mutable(prev_block)
++            block.append_token_ids(token_ids)
++            return block
++
++        # Compute the content hash
++        content_hash = PrefixCachingBlock.hash_block_tokens(
++            is_first_block,
++            prev_block_hash,
++            cur_block_token_ids=token_ids)
++
++        # Check if we have a cached block with this content hash
++        cached_block_id = self._cached_blocks.get(content_hash, None)
+         if cached_block_id is not None:
++            self._cache_hits += 1
++            # Create a block object that references the cached block
++            block = self._create_block(
++                prev_block=prev_block,
++                token_ids=token_ids,
++                block_size=self._block_size,
++                allocator=self,
++            )
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block, block.block_id)
+             return block
+ 
++        # Block is not cached, allocate it as mutable and append tokens
+         block = self.allocate_mutable(prev_block)
+         block.append_token_ids(token_ids)
+         assert block.content_hash is not None
+@@ -299,6 +327,17 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+     def get_num_total_blocks(self) -> int:
+         return self._hashless_allocator.get_num_total_blocks()
+ 
++    def get_prefix_cache_hit_rate(self) -> float:
++        """Returns the cache hit rate for prefix caching.
++        
++        Returns:
++            float: The ratio of cache hits to total allocations, or 0.0 if no
++                allocations have been made.
++        """
++        if self._total_allocations == 0:
++            return 0.0
++        return self._cache_hits / self._total_allocations
++
+     def get_physical_block_id(self, absolute_id: int) -> int:
+         """Returns the zero-offset block id on certain block allocator
+         given the absolute block id.
+@@ -607,14 +646,14 @@ class PrefixCachingBlock(Block):
+         if self._cached_num_tokens_total is not None:
+             return self._cached_num_tokens_total
+ 
+-        _block: Optional[Block] = self
+-        self._cached_num_tokens_total = 0
+-
+-        # TODO: current implement here take O(N^2), we expect future
+-        # we have O(1) here
+-        while _block is not None:
+-            self._cached_num_tokens_total += len(_block.token_ids)
+-            _block = _block.prev_block
++        # Compute incrementally from previous block if available
++        # This is O(1) instead of O(N) where N is the number of blocks
++        if self._prev_block is not None:
++            prev_total = self._prev_block.num_tokens_total
++            self._cached_num_tokens_total = prev_total + len(self.token_ids)
++        else:
++            # This is the first block
++            self._cached_num_tokens_total = len(self.token_ids)
+ 
+         return self._cached_num_tokens_total
+ 

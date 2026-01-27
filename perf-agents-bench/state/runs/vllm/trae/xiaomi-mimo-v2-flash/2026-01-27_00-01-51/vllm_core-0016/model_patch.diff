@@ -1,0 +1,95 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 1dea711..9f889fa 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -115,11 +115,36 @@ class TopKTopPSampler(nn.Module):
+         # If only top-k is specified, use pytorch's builtin topk op. This leads
+         # to significant speed up on TPU compared to using apply_top_k_top_p.
+         if k is not None and p is None:
+-            topk_values, topk_indices = torch.topk(logits, k, dim=-1)
++            vocab_size = logits.shape[-1]
++            
++            # Check if all k values are the same (common case)
++            if torch.all(k == k[0]):
++                # Fast path: all k values are the same
++                k_val = k[0].item()
++                # If k >= vocab_size, no filtering needed
++                if k_val < vocab_size:
++                    topk_values, topk_indices = torch.topk(logits, k_val, dim=-1)
++                    mask = torch.ones_like(logits, dtype=torch.bool)
++                    mask.scatter_(-1, topk_indices, False)
++                    logits.masked_fill_(mask, float('-inf'))
++            else:
++                # Slow path: different k values per batch item
++                # Process each batch item separately
++                batch_size = logits.shape[0]
++                topk_indices = torch.empty_like(logits, dtype=torch.long, device=logits.device)
++                for i in range(batch_size):
++                    k_val = k[i].item()
++                    # If k >= vocab_size, no filtering needed for this batch item
++                    if k_val >= vocab_size:
++                        # Keep all values for this batch item
++                        topk_indices[i:i+1] = torch.arange(vocab_size, device=logits.device).unsqueeze(0)
++                    else:
++                        _, indices = torch.topk(logits[i:i+1], k_val, dim=-1)
++                        topk_indices[i:i+1] = indices
+ 
+-            mask = torch.ones_like(logits, dtype=torch.bool)
+-            mask.scatter_(-1, topk_indices, False)
+-            logits.masked_fill_(mask, float('-inf'))
++                mask = torch.ones_like(logits, dtype=torch.bool)
++                mask.scatter_(-1, topk_indices, False)
++                logits.masked_fill_(mask, float('-inf'))
+         else:
+             # TODO Placeholder for TPU optimized topp kernel
+             # logits = apply_top_k_top_p(logits, k, p)
+@@ -140,6 +165,49 @@ def apply_top_k_top_p(
+     """
+     if k is None and p is None:
+         return logits
++    
++    # Optimization: For top-k only (no top-p), use torch.topk to avoid full sorting
++    if k is not None and p is None:
++        # For top-k only, we can avoid the full sort by using torch.topk
++        # However, k can be different per batch item, so we need to handle that
++        batch_size = logits.shape[0]
++        vocab_size = logits.shape[-1]
++        
++        # Check if all k values are the same (common case)
++        if torch.all(k == k[0]):
++            # Fast path: all k values are the same
++            k_val = k[0].item()
++            # If k >= vocab_size, no filtering needed
++            if k_val >= vocab_size:
++                return logits
++            topk_values, topk_indices = torch.topk(logits, k_val, dim=-1)
++            
++            # Create a mask to keep only top-k values
++            mask = torch.ones_like(logits, dtype=torch.bool)
++            mask.scatter_(-1, topk_indices, False)
++            
++            # Apply the mask
++            logits = logits.masked_fill(mask, -float('inf'))
++        else:
++            # Slow path: different k values per batch item
++            # Process each batch item separately
++            for i in range(batch_size):
++                k_val = k[i].item()
++                # If k >= vocab_size, no filtering needed for this batch item
++                if k_val >= vocab_size:
++                    continue
++                topk_values, topk_indices = torch.topk(logits[i:i+1], k_val, dim=-1)
++                
++                # Create a mask to keep only top-k values
++                mask = torch.ones_like(logits[i:i+1], dtype=torch.bool)
++                mask.scatter_(-1, topk_indices, False)
++                
++                # Apply the mask
++                logits[i:i+1] = logits[i:i+1].masked_fill(mask, -float('inf'))
++        
++        return logits
++    
++    # Original implementation for top-p or combined top-k/top-p
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     if k is not None:

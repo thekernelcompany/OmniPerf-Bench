@@ -1,0 +1,88 @@
+diff --git a/vllm/reasoning/qwen3_reasoning_parser.py b/vllm/reasoning/qwen3_reasoning_parser.py
+index f588f40..18fec15 100644
+--- a/vllm/reasoning/qwen3_reasoning_parser.py
++++ b/vllm/reasoning/qwen3_reasoning_parser.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import re
+ from collections.abc import Sequence
+ from typing import Optional, Union
+ 
+@@ -31,9 +30,6 @@ class Qwen3ReasoningParser(ReasoningParser):
+         self.think_start_token = "<think>"
+         self.think_end_token = "</think>"
+ 
+-        self.reasoning_regex = re.compile(
+-            rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL)
+-
+         if not self.model_tokenizer:
+             raise ValueError(
+                 "The model tokenizer must be passed to the ReasoningParser "
+@@ -121,29 +117,26 @@ class Qwen3ReasoningParser(ReasoningParser):
+     def extract_reasoning_content(
+             self, model_output: str, request: ChatCompletionRequest
+     ) -> tuple[Optional[str], Optional[str]]:
++        """
++        Extract reasoning content from the model output.
++
++        For text <think>abc</think>xyz:
++        - 'abc' goes to reasoning_content
++        - 'xyz' goes to content
+ 
+-        # Check if the model output contains the <think> tokens.
++        Returns:
++            tuple[Optional[str], Optional[str]]: reasoning content and content
++        """
++
++        # Check if both start and end tokens are present in the model output
+         if (self.think_start_token not in model_output
+                 or self.think_end_token not in model_output):
+             return None, model_output
+-        else:
+-            # Use a regex to find the reasoning content
+-            reasoning_content = self.reasoning_regex.findall(model_output)[0]
+-
+-            # Remove the reasoning content from the model output
+-            # Although <think> token is always at the
+-            # beginning of the line, we cannot guarantee that the
+-            # other models will follow this convention.
+-            # Therefore, we need to add :start_index.
+-            start_index = model_output.find(self.think_start_token)
+-            if start_index != -1:
+-                end_index = start_index + len(
+-                    f"{self.think_start_token}{reasoning_content}{self.think_end_token}"
+-                )
+-                model_output = model_output[:start_index] + \
+-                                model_output[end_index:]
+-
+-                if len(model_output) == 0:
+-                    return reasoning_content, None
+-
+-            return reasoning_content, model_output
++
++        # Use partition to split on the end token - this is faster than regex
++        reasoning_content, _, content = model_output.partition(
++            self.think_end_token)
++
++        # If generation stops right after end-of-think, return null content
++        final_content = content or None
++        return reasoning_content, final_content
+\ No newline at end of file
+diff --git a/vllm/transformers_utils/configs/ovis2.py b/vllm/transformers_utils/configs/ovis2.py
+index 437a16e..fc0a840 100644
+--- a/vllm/transformers_utils/configs/ovis2.py
++++ b/vllm/transformers_utils/configs/ovis2.py
+@@ -72,7 +72,11 @@ IMAGE_TOKEN = "<image>"
+ IMAGE_ATOM_ID = -300
+ IMAGE_INDICATOR_IDS = [-301, -302, -303, -304, -305]
+ 
+-AutoConfig.register("aimv2", AIMv2Config)
++try:
++    AutoConfig.register("aimv2", AIMv2Config)
++except ValueError:
++    # "aimv2" is already registered in transformers
++    pass
+ 
+ 
+ # ----------------------------------------------------------------------

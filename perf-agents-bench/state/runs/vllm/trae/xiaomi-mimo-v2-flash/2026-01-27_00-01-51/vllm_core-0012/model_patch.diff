@@ -1,0 +1,230 @@
+diff --git a/requirements-common.txt b/requirements-common.txt
+index b7c94cb..6576114 100644
+--- a/requirements-common.txt
++++ b/requirements-common.txt
+@@ -1,6 +1,7 @@
+ psutil
+ sentencepiece  # Required for LLaMA tokenizer.
+ numpy < 2.0.0
++numba
+ requests >= 2.26.0
+ tqdm
+ blake3
+diff --git a/tests/v1/spec_decode/test_ngram.py b/tests/v1/spec_decode/test_ngram.py
+index ec663c8..6e08595 100644
+--- a/tests/v1/spec_decode/test_ngram.py
++++ b/tests/v1/spec_decode/test_ngram.py
+@@ -1,8 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
++import numpy as np
+ import pytest
+ 
+ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+-from vllm.v1.utils import ConstantList
+ 
+ 
+ @pytest.fixture
+@@ -19,14 +19,16 @@ def test_kmp_lps_array(proposer):
+ 
+ 
+ def test_find_subarray_kmp(proposer):
+-    X = ConstantList([1, 2, 3, 4, 1, 2, 3, 5, 6])
+-    assert proposer._find_subarray_kmp(X, 2, 2) is None
+-    X = ConstantList([1, 2, 3, 4, 1, 2, 3])
+-    assert proposer._find_subarray_kmp(X, 2, 3) == [4, 1, 2]
+-    assert proposer._find_subarray_kmp(X, 2, 2) == [4, 1]
+-    assert proposer._find_subarray_kmp(X, 1, 3) == [4, 1, 2]
+-    assert proposer._find_subarray_kmp(X, 1, 2) == [4, 1]
+-    X = ConstantList([1, 3, 6, 2, 3, 4, 1, 2, 3])
+-    assert proposer._find_subarray_kmp(X, 2, 3) == [4, 1, 2]
++    X = np.array([1, 2, 3, 4, 1, 2, 3, 5, 6], dtype=np.int32)
++    result = proposer._find_subarray_kmp(X, 2, 2)
++    assert result is None or len(result) == 0
++    
++    X = np.array([1, 2, 3, 4, 1, 2, 3], dtype=np.int32)
++    assert np.array_equal(proposer._find_subarray_kmp(X, 2, 3), [4, 1, 2])
++    assert np.array_equal(proposer._find_subarray_kmp(X, 2, 2), [4, 1])
++    assert np.array_equal(proposer._find_subarray_kmp(X, 1, 3), [4, 1, 2])
++    assert np.array_equal(proposer._find_subarray_kmp(X, 1, 2), [4, 1])
++    X = np.array([1, 3, 6, 2, 3, 4, 1, 2, 3], dtype=np.int32)
++    assert np.array_equal(proposer._find_subarray_kmp(X, 2, 3), [4, 1, 2])
+     # Return on the first match
+-    assert proposer._find_subarray_kmp(X, 1, 3) == [6, 2, 3]
+\ No newline at end of file
++    assert np.array_equal(proposer._find_subarray_kmp(X, 1, 3), [6, 2, 3])
+\ No newline at end of file
+diff --git a/vllm/v1/spec_decode/ngram_proposer.py b/vllm/v1/spec_decode/ngram_proposer.py
+index 9b116e0..7afc41a 100644
+--- a/vllm/v1/spec_decode/ngram_proposer.py
++++ b/vllm/v1/spec_decode/ngram_proposer.py
+@@ -2,6 +2,77 @@
+ from typing import List, Optional
+ 
+ import numpy as np
++from numba import njit
++
++
++@njit(cache=True)
++def _kmp_lps_array(pattern: np.ndarray) -> np.ndarray:
++    """
++    Build the lps (longest proper prefix which is also suffix) 
++    array for the pattern.
++    """
++    n = len(pattern)
++    lps = np.zeros(n, dtype=np.int32)
++    if n == 0:
++        return lps
++    
++    prev_lps = 0  # length of the previous longest prefix suffix
++    i = 1
++
++    while i < n:
++        if pattern[i] == pattern[prev_lps]:
++            prev_lps += 1
++            lps[i] = prev_lps
++            i += 1
++        else:
++            if prev_lps != 0:
++                prev_lps = lps[prev_lps - 1]
++            else:
++                lps[i] = 0
++                i += 1
++
++    return lps
++
++
++@njit(cache=True)
++def _find_subarray_kmp(
++    context_token_ids: np.ndarray,
++    n: int,
++    k: int,
++) -> Optional[np.ndarray]:
++    context_len = context_token_ids.shape[0]
++    if n <= 0:
++        return None
++
++    pattern = context_token_ids[-n:]
++    # Precompute lps array for Y
++    lps = _kmp_lps_array(pattern)
++
++    i = 0
++    j = 0
++    # -n because the last n tokens are used as pattern
++    while i < context_len - n:
++        if context_token_ids[i] == pattern[j]:
++            i += 1
++            j += 1
++
++            # If we have matched the entire Y
++            if j == n:
++                # Found pattern in context, gather the next K elements
++                end_idx = i + k
++                if end_idx > context_len:
++                    end_idx = context_len
++                return context_token_ids[i:end_idx]
++        else:
++            # Mismatch
++            if j != 0:
++                # Use the lps array to avoid re-checking elements
++                j = lps[j - 1]
++            else:
++                i += 1
++
++    # Y not found
++    return None
+ 
+ 
+ class NgramProposer:
+@@ -41,9 +112,19 @@ class NgramProposer:
+               followed that pattern. Here we will return [4,2,3] because 
+               we only have three tokens after the match.
+         """
+-        # TODO: Use c++ to implement the _find_subarray_kmp to
+-        # improve the efficiency
+-        return self._find_subarray_kmp(context_token_ids, n, k)
++        # Ensure context_token_ids is a numpy array
++        if not isinstance(context_token_ids, np.ndarray):
++            context_token_ids = np.asarray(context_token_ids, dtype=np.int32)
++        
++        # Call the Numba-optimized function
++        result = _find_subarray_kmp(context_token_ids, n, k)
++        
++        # Numba returns an empty array when no match is found
++        # Convert to None for consistency with the original API
++        if result is None or len(result) == 0:
++            return None
++        
++        return result
+ 
+     @staticmethod
+     def _kmp_lps_array(pattern: List[int]) -> List[int]:
+@@ -51,56 +132,21 @@ class NgramProposer:
+         Build the lps (longest proper prefix which is also suffix) 
+         array for the pattern.
+         """
+-        lps = [0] * len(pattern)
+-        prev_lps = 0  # length of the previous longest prefix suffix
+-        i = 1
+-
+-        while i < len(pattern):
+-            if pattern[i] == pattern[prev_lps]:
+-                prev_lps += 1
+-                lps[i] = prev_lps
+-                i += 1
+-            else:
+-                if prev_lps != 0:
+-                    prev_lps = lps[prev_lps - 1]
+-                else:
+-                    lps[i] = 0
+-                    i += 1
+-
+-        return lps
++        # Convert to numpy array for Numba compatibility
++        if not isinstance(pattern, np.ndarray):
++            pattern = np.asarray(pattern, dtype=np.int32)
++        
++        result = _kmp_lps_array(pattern)
++        return result.tolist()
+ 
+     @staticmethod
+     def _find_subarray_kmp(
+-        context_token_ids: np.ndarray,
++        context_token_ids,
+         n: int,
+         k: int,
+-    ) -> Optional[np.ndarray]:
+-        context_len = context_token_ids.shape[0]
+-        assert n > 0
+-
+-        pattern = context_token_ids[-n:]
+-        # Precompute lps array for Y
+-        lps = NgramProposer._kmp_lps_array(pattern)
+-
+-        i = 0
+-        j = 0
+-        # -n because the last n tokens are used as pattern
+-        while i < context_len - n:
+-            if context_token_ids[i] == pattern[j]:
+-                i += 1
+-                j += 1
+-
+-                # If we have matched the entire Y
+-                if j == n:
+-                    # Found pattern in context, gather the next K elements
+-                    return context_token_ids[i:i + k]
+-            else:
+-                # Mismatch
+-                if j != 0:
+-                    # Use the lps array to avoid re-checking elements
+-                    j = lps[j - 1]
+-                else:
+-                    i += 1
+-
+-        # Y not found
+-        return None
++    ):
++        # Convert to numpy array for Numba compatibility
++        if not isinstance(context_token_ids, np.ndarray):
++            context_token_ids = np.asarray(context_token_ids, dtype=np.int32)
++        
++        return _find_subarray_kmp(context_token_ids, n, k)

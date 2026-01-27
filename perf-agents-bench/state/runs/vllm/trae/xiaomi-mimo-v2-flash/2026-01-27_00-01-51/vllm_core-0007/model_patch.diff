@@ -1,0 +1,241 @@
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer.py b/vllm/model_executor/layers/mamba/mamba_mixer.py
+index 796c8d9..7136aa1 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer.py
+@@ -205,6 +205,8 @@ class MambaMixer(CustomOp):
+ 
+         if attn_metadata.query_start_loc is not None \
+             and attn_metadata.context_lens_tensor is not None:
++            # Ensure gate is contiguous to avoid device-to-device copy in selective_scan_fn
++            gate_contiguous = gate.contiguous()
+             scan_outputs = selective_scan_fn(
+                 hidden_states,
+                 mamba_cache_params.ssm_state,
+@@ -213,13 +215,15 @@ class MambaMixer(CustomOp):
+                 B.transpose(-2, -1),
+                 C.transpose(-2, -1),
+                 self.D.float(),
+-                gate,
++                gate_contiguous,
+                 time_proj_bias,
+                 delta_softplus=True,
+                 cache_indices=mamba_cache_params.state_indices_tensor,
+                 has_initial_state=attn_metadata.context_lens_tensor > 0,
+                 query_start_loc=attn_metadata.query_start_loc)
+         else:
++            # Ensure gate is contiguous to avoid device-to-device copy in selective_state_update
++            gate_transposed = gate.transpose(0, 1).contiguous()
+             scan_outputs = selective_state_update(
+                 mamba_cache_params.ssm_state,
+                 hidden_states.transpose(0, 1),
+@@ -228,7 +232,7 @@ class MambaMixer(CustomOp):
+                 B,
+                 C,
+                 self.D,
+-                gate.transpose(0, 1),
++                gate_transposed,
+                 time_proj_bias,
+                 dt_softplus=True,
+                 state_batch_indices=mamba_cache_params.state_indices_tensor)
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index 36edac2..f42bc70 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -623,6 +623,13 @@ class MambaMixer2(MambaBase, CustomOp):
+                         has_initial_states_p[:num_prefills, None, None, None],
+                         ssm_state[state_indices_tensor_p], 0)
+ 
++            # Preallocate output tensor to avoid device-to-device copy overhead
++            scan_output = torch.empty(1, num_prefill_tokens,
++                                      self.num_heads // self.tp_size,
++                                      self.head_dim,
++                                      device=hidden_states_p.device,
++                                      dtype=hidden_states_p.dtype)
++            
+             scan_output, varlen_state = mamba_chunk_scan_combined(
+                 hidden_states_p.view(1, num_prefill_tokens,
+                                      self.num_heads // self.tp_size,
+@@ -646,6 +653,7 @@ class MambaMixer2(MambaBase, CustomOp):
+                 return_final_states=False,
+                 dt_softplus=True,
+                 dt_limit=(0.0, float("inf")),
++                out=scan_output,
+             )
+ 
+             # update ssm states
+diff --git a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
+index 61eff0c..b6d1481 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
++++ b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
+@@ -454,6 +454,8 @@ def _chunk_scan_fwd(
+     chunk_indices=None,
+     chunk_offsets=None,
+     initial_states=None,
++    out=None,
++    out_x=None,
+ ):
+     batch, seqlen, nheads, headdim = x.shape
+     _, _, nchunks, chunk_size = dt.shape
+@@ -483,20 +485,22 @@ def _chunk_scan_fwd(
+     else:
+         chunk_indices, chunk_offsets = None, None
+ 
+-    # Allocates output.
+-    out = torch.empty(batch,
+-                      seqlen,
+-                      nheads,
+-                      headdim,
+-                      device=x.device,
+-                      dtype=x.dtype)
++    # Allocates output if not provided.
++    if out is None:
++        out = torch.empty(batch,
++                          seqlen,
++                          nheads,
++                          headdim,
++                          device=x.device,
++                          dtype=x.dtype)
+     if z is not None:
+-        out_x = torch.empty(batch,
+-                            seqlen,
+-                            nheads,
+-                            headdim,
+-                            device=x.device,
+-                            dtype=x.dtype)
++        if out_x is None:
++            out_x = torch.empty(batch,
++                                seqlen,
++                                nheads,
++                                headdim,
++                                device=x.device,
++                                dtype=x.dtype)
+         assert out_x.stride() == out.stride()
+     else:
+         out_x = None
+diff --git a/vllm/model_executor/layers/mamba/ops/ssd_combined.py b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+index b121275..fbe0ab8 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssd_combined.py
++++ b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+@@ -36,7 +36,9 @@ def _mamba_chunk_scan_combined_fwd(x,
+                                    chunk_offsets=None,
+                                    cu_seqlens=None,
+                                    dt_softplus=False,
+-                                   dt_limit=(0.0, float("inf"))):
++                                   dt_limit=(0.0, float("inf")),
++                                   out=None,
++                                   out_x=None):
+     batch, seqlen, nheads, headdim = x.shape
+     _, _, ngroups, dstate = B.shape
+     assert nheads % ngroups == 0
+@@ -147,6 +149,8 @@ def _mamba_chunk_scan_combined_fwd(x,
+         chunk_indices=chunk_indices,
+         chunk_offsets=chunk_offsets,
+         initial_states=initial_states,
++        out=out,
++        out_x=out_x,
+     )
+     if cu_seqlens is None:
+         return out, out_x, dt, dA_cumsum, states, final_states
+@@ -181,7 +185,9 @@ def mamba_chunk_scan_combined(x,
+                               dt_softplus=False,
+                               dt_limit=(0.0, float("inf")),
+                               return_final_states=False,
+-                              return_varlen_states=False):
++                              return_varlen_states=False,
++                              out=None,
++                              out_x=None):
+     """
+     Argument:
+         x: (batch, seqlen, nheads, headdim)
+@@ -197,6 +203,8 @@ def mamba_chunk_scan_combined(x,
+         seq_idx: (batch, seqlen)
+         cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
+         dt_softplus: Whether to apply softplus to dt
++        out: (batch, seqlen, nheads, headdim) - preallocated output tensor (optional)
++        out_x: (batch, seqlen, nheads, headdim) - preallocated output tensor for z (optional)
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -221,7 +229,9 @@ def mamba_chunk_scan_combined(x,
+         chunk_offsets=chunk_offsets,
+         cu_seqlens=cu_seqlens,
+         dt_softplus=dt_softplus,
+-        dt_limit=dt_limit)
++        dt_limit=dt_limit,
++        out=out,
++        out_x=out_x)
+     if not return_varlen_states:
+         return out if not return_final_states else (out, final_states)
+     else:
+diff --git a/vllm/model_executor/models/phi4flash.py b/vllm/model_executor/models/phi4flash.py
+index a4ded2b..160ae7c 100644
+--- a/vllm/model_executor/models/phi4flash.py
++++ b/vllm/model_executor/models/phi4flash.py
+@@ -371,6 +371,8 @@ class Phi4Mamba(nn.Module):
+ 
+         if attn_metadata.query_start_loc is not None \
+             and attn_metadata.context_lens_tensor is not None:
++            # Ensure gate is contiguous to avoid device-to-device copy in selective_scan_fn
++            gate_contiguous = None if self.yoco_kv else gate.contiguous()
+             scan_outputs = selective_scan_fn(
+                 hidden_states,
+                 mamba_cache_params.ssm_state,
+@@ -380,13 +382,15 @@ class Phi4Mamba(nn.Module):
+                 C.transpose(-2, -1),
+                 self.D.float(),
+                 # z,
+-                None if self.yoco_kv else gate,
++                gate_contiguous,
+                 time_proj_bias,
+                 delta_softplus=True,
+                 cache_indices=mamba_cache_params.state_indices_tensor,
+                 has_initial_state=attn_metadata.context_lens_tensor > 0,
+                 query_start_loc=attn_metadata.query_start_loc)
+         else:
++            # Ensure gate is contiguous to avoid device-to-device copy in selective_state_update
++            gate_transposed = None if self.yoco_kv else gate.transpose(0, 1).contiguous()
+             scan_outputs = selective_state_update(
+                 mamba_cache_params.ssm_state,
+                 hidden_states.transpose(0, 1),
+@@ -397,7 +401,7 @@ class Phi4Mamba(nn.Module):
+                 self.D,
+                 # z
+                 # gate.transpose(0, 1),
+-                None if self.yoco_kv else gate.transpose(0, 1),
++                gate_transposed,
+                 time_proj_bias,
+                 dt_softplus=True,
+                 state_batch_indices=mamba_cache_params.state_indices_tensor)
+diff --git a/vllm/model_executor/models/plamo2.py b/vllm/model_executor/models/plamo2.py
+index 9bc577c..8236b03 100644
+--- a/vllm/model_executor/models/plamo2.py
++++ b/vllm/model_executor/models/plamo2.py
+@@ -290,6 +290,19 @@ class Plamo2MambaMixer(nn.Module):
+                 initial_states = torch.where(
+                     mamba2_metadata.has_initial_states[:, None, None, None],
+                     mamba_cache_params.ssm_state[state_indices_tensor_p], 0)
++            
++            # Preallocate output tensors to avoid device-to-device copy overhead
++            scan_output = torch.empty(1, num_prefill_tokens,
++                                      self.num_heads // self.tp_size,
++                                      self.head_dim,
++                                      device=hidden_states_p.device,
++                                      dtype=hidden_states_p.dtype)
++            out_x = torch.empty(1, num_prefill_tokens,
++                                self.num_heads // self.tp_size,
++                                self.head_dim,
++                                device=hidden_states_p.device,
++                                dtype=hidden_states_p.dtype)
++            
+             scan_output, varlen_state = mamba_chunk_scan_combined(
+                 hidden_states_p.view(1, num_prefill_tokens,
+                                      self.num_heads // self.tp_size,
+@@ -312,6 +325,8 @@ class Plamo2MambaMixer(nn.Module):
+                 return_final_states=False,
+                 dt_softplus=True,
+                 dt_limit=(0.0, float("inf")),
++                out=scan_output,
++                out_x=out_x,
+             )
+ 
+             # update ssm states

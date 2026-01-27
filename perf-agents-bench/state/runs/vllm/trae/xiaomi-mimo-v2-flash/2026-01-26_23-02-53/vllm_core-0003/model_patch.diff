@@ -1,0 +1,414 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c37679..abab5e4 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -200,40 +200,74 @@ def _apply_min_tokens_penalty(
+     """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
+         have not been generated yet
+     """
+-    # list of indices in logits that will be set to -inf
+-    logits_to_penalize: List[Tuple[int, int]] = []
+-    logits_applied = 0
++    # Pre-calculate total number of penalized indices to avoid list expansions
++    total_penalized = 0
+     for seq_group in sampling_metadata.seq_groups:
+-        seq_ids = seq_group.seq_ids
+-        sampling_params = seq_group.sampling_params
+-
+-        sample_indices = seq_group.sample_indices
+-        logits_applied += len(sample_indices) + len(
+-            seq_group.prompt_logprob_indices)
+         if not seq_group.do_sample:
+             continue
+-
+-        start_idx = sample_indices[0]
++        sampling_params = seq_group.sampling_params
+         min_tokens = sampling_params.min_tokens
+         token_ids_to_penalize = sampling_params.all_stop_token_ids
+         if min_tokens > 0 and token_ids_to_penalize:
+-            seqs_to_penalize: List[int] = []
+-            for j, seq_id in enumerate(seq_ids):
++            seq_ids = seq_group.seq_ids
++            for seq_id in seq_ids:
+                 seq_data = seq_group.seq_data[seq_id]
+                 if len(seq_data.output_token_ids) < min_tokens:
+-                    seqs_to_penalize.append(j)
++                    total_penalized += len(token_ids_to_penalize)
++    
++    # Pre-allocate arrays for indices
++    if total_penalized > 0:
++        logits_applied = 0
++        row_indices = [0] * total_penalized
++        col_indices = [0] * total_penalized
++        idx_pos = 0
++        
++        for seq_group in sampling_metadata.seq_groups:
++            seq_ids = seq_group.seq_ids
++            sampling_params = seq_group.sampling_params
+ 
+-            if seqs_to_penalize:
+-                # convert to the index into logits
+-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
+-                # itertools.product pairs each seq index with every token id
+-                logits_to_penalize.extend(
+-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
++            sample_indices = seq_group.sample_indices
++            logits_applied += len(sample_indices) + len(
++                seq_group.prompt_logprob_indices)
++            if not seq_group.do_sample:
++                continue
+ 
+-    if logits_to_penalize:
+-        # use zip and * to group indices along each dimension
+-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
+-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
++            start_idx = sample_indices[0]
++            min_tokens = sampling_params.min_tokens
++            token_ids_to_penalize = sampling_params.all_stop_token_ids
++            if min_tokens > 0 and token_ids_to_penalize:
++                seqs_to_penalize: List[int] = []
++                for j, seq_id in enumerate(seq_ids):
++                    seq_data = seq_group.seq_data[seq_id]
++                    if len(seq_data.output_token_ids) < min_tokens:
++                        seqs_to_penalize.append(j)
++
++                if seqs_to_penalize:
++                    # convert to the index into logits
++                    seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
++                    # Fill pre-allocated arrays directly
++                    for seq_idx in seqs_to_penalize:
++                        for token_id in token_ids_to_penalize:
++                            row_indices[idx_pos] = seq_idx
++                            col_indices[idx_pos] = token_id
++                            idx_pos += 1
++        
++        # Use tensor indexing directly instead of zip
++        if idx_pos > 0:
++            row_indices_tensor = torch.tensor(row_indices[:idx_pos], 
++                                            device=logits.device, 
++                                            dtype=torch.long)
++            col_indices_tensor = torch.tensor(col_indices[:idx_pos], 
++                                            device=logits.device, 
++                                            dtype=torch.long)
++            logits[row_indices_tensor, col_indices_tensor] = -float("inf")
++    else:
++        # Still need to count logits_applied for assertion
++        logits_applied = 0
++        for seq_group in sampling_metadata.seq_groups:
++            sample_indices = seq_group.sample_indices
++            logits_applied += len(sample_indices) + len(
++                seq_group.prompt_logprob_indices)
+ 
+     # verifies that no rows in logits were missed unexpectedly
+     assert logits_applied == logits.shape[0]
+@@ -768,14 +802,32 @@ def _get_logprobs(
+     Returns:
+         A tuple of prompt and sample logprobs per sequence group in a batch.
+     """
+-    # The index of query token to calculate logprobs. It includes both
+-    # prompt and sample logprob indices.
+-    query_indices: List[int] = []
+-    # The next token ids to get the logprob value from.
+-    next_token_ids: List[int] = []
+-    # The largest requested number of logprobs. We find logprobs as many as the
+-    # largest num logprobs in this API.
++    # Pre-calculate total sizes to avoid repeated list expansions
++    total_query_indices = 0
+     largest_num_logprobs = 1
++    
++    for (seq_group, sample_result) in zip(sampling_metadata.seq_groups,
++                                          sample_results):
++        sampling_params = seq_group.sampling_params
++        
++        if (seq_group.is_prompt
++                and sampling_params.prompt_logprobs is not None):
++            largest_num_logprobs = max(largest_num_logprobs,
++                                       sampling_params.prompt_logprobs)
++            total_query_indices += len(seq_group.prompt_logprob_indices)
++        
++        if seq_group.do_sample:
++            token_ids, parent_seq_ids = sample_result
++            total_query_indices += len(parent_seq_ids)
++            
++            if sampling_params.logprobs is not None:
++                largest_num_logprobs = max(largest_num_logprobs,
++                                           sampling_params.logprobs)
++    
++    # Pre-allocate arrays
++    query_indices: List[int] = [0] * total_query_indices
++    next_token_ids: List[int] = [0] * total_query_indices
++    query_idx_pos = 0
+ 
+     # Select indices to compute logprob from, ranks of token ids, and the top
+     # k token ids from logprobs.
+@@ -786,11 +838,12 @@ def _get_logprobs(
+         # Update indices and tokens for prompt logprobs.
+         if (seq_group.is_prompt
+                 and sampling_params.prompt_logprobs is not None):
+-            largest_num_logprobs = max(largest_num_logprobs,
+-                                       sampling_params.prompt_logprobs)
+             next_prompt_tokens = _get_next_prompt_tokens(seq_group)
+-            query_indices.extend(seq_group.prompt_logprob_indices)
+-            next_token_ids.extend(next_prompt_tokens)
++            prompt_indices = seq_group.prompt_logprob_indices
++            prompt_len = len(prompt_indices)
++            query_indices[query_idx_pos:query_idx_pos + prompt_len] = prompt_indices
++            next_token_ids[query_idx_pos:query_idx_pos + prompt_len] = next_prompt_tokens
++            query_idx_pos += prompt_len
+ 
+         # Update indices and next tokenes for sample logprob.
+         if seq_group.do_sample:
+@@ -800,15 +853,13 @@ def _get_logprobs(
+             # The current step may have different number of seq_ids, and
+             # we can obtain it from `sample_result[1]`.
+             query_idx = seq_group.sample_indices[0]
+-            query_indices.extend(
+-                [query_idx + parent_id for parent_id in parent_seq_ids])
+-            next_token_ids.extend(token_ids)
+-
+-            if sampling_params.logprobs is not None:
+-                largest_num_logprobs = max(largest_num_logprobs,
+-                                           sampling_params.logprobs)
++            sample_len = len(parent_seq_ids)
++            query_indices[query_idx_pos:query_idx_pos + sample_len] = \
++                [query_idx + parent_id for parent_id in parent_seq_ids]
++            next_token_ids[query_idx_pos:query_idx_pos + sample_len] = token_ids
++            query_idx_pos += sample_len
+ 
+-        assert len(next_token_ids) == len(query_indices)
++    assert query_idx_pos == total_query_indices
+ 
+     if len(query_indices) == 0:
+         empty_sampled_logprob: SampleLogprobs = []
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d1..0373150 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -182,6 +182,7 @@ def _prepare_seq_groups(
+     seq_groups: List[SequenceGroupToSample] = []
+     # A list of token indices to sample/compute logprob. It is used to
+     # prune the outcome logits from the model for the performance.
++    # Pre-allocate with estimated size to avoid repeated list expansions
+     selected_token_indices: List[int] = []
+     # Used for selected_token_indices.
+     model_output_idx = 0
+@@ -201,7 +202,38 @@ def _prepare_seq_groups(
+     sample_idx = 0
+     # Total number of prompts from given sequence groups.
+     num_prompts = 0
+-
++    
++    # Pre-calculate total sizes to avoid repeated list expansions
++    # This optimization reduces memory allocations and improves cache locality
++    total_prompt_logprob_tokens = 0
++    total_sample_tokens = 0
++    for i, seq_group_metadata in enumerate(seq_group_metadata_list):
++        sampling_params = seq_group_metadata.sampling_params
++        is_prompt = seq_group_metadata.is_prompt
++        do_sample = seq_group_metadata.do_sample
++        
++        if is_prompt:
++            assert query_lens is not None and seq_lens is not None
++            query_len, seq_len = query_lens[i], seq_lens[i]
++            num_prefill_sample = len(list(seq_group_metadata.seq_data.keys()))
++            prompt_logprob_len = (query_len - num_prefill_sample
++                                  if do_sample else query_len)
++            sample_len = num_prefill_sample if do_sample else 0
++        else:
++            prompt_logprob_len = 0
++            sample_len = len(list(seq_group_metadata.seq_data.keys())) if do_sample else 0
++        
++        if sampling_params.prompt_logprobs is not None:
++            total_prompt_logprob_tokens += prompt_logprob_len
++        if do_sample:
++            total_sample_tokens += sample_len
++    
++    # Pre-allocate selected_token_indices with exact size
++    selected_token_indices = [0] * (total_prompt_logprob_tokens + total_sample_tokens)
++
++    # Track position in pre-allocated arrays
++    selected_token_idx_pos = 0
++    
+     for i, seq_group_metadata in enumerate(seq_group_metadata_list):
+         seq_ids = list(seq_group_metadata.seq_data.keys())
+         sampling_params = seq_group_metadata.sampling_params
+@@ -244,12 +276,16 @@ def _prepare_seq_groups(
+         """
+ 
+         if sampling_params.prompt_logprobs is not None:
+-            selected_token_indices.extend(
+-                range(model_output_idx, model_output_idx + prompt_logprob_len))
++            # Use array slice assignment instead of extend for better performance
++            selected_token_indices[selected_token_idx_pos:selected_token_idx_pos + prompt_logprob_len] = \
++                range(model_output_idx, model_output_idx + prompt_logprob_len)
++            selected_token_idx_pos += prompt_logprob_len
+         model_output_idx += prompt_logprob_len
+         if do_sample:
+-            selected_token_indices.extend(
+-                range(model_output_idx, model_output_idx + sample_len))
++            # Use array slice assignment instead of extend for better performance
++            selected_token_indices[selected_token_idx_pos:selected_token_idx_pos + sample_len] = \
++                range(model_output_idx, model_output_idx + sample_len)
++            selected_token_idx_pos += sample_len
+         model_output_idx += sample_len
+ 
+         # We now find indices for logprob computation and sampling.
+@@ -271,10 +307,10 @@ def _prepare_seq_groups(
+             logit_idx += prompt_logprob_len
+         if do_sample:
+             sample_indices.extend(range(logit_idx, logit_idx + sample_len))
++            # Optimize: use list comprehension instead of list(zip(...))
++            # This avoids creating intermediate tuple objects
+             categorized_sample_indices[sampling_params.sampling_type].extend(
+-                list(
+-                    zip(range(logit_idx, logit_idx + sample_len),
+-                        range(sample_idx, sample_idx + sample_len))))
++                [(logit_idx + j, sample_idx + j) for j in range(sample_len)])
+             logit_idx += sample_len
+             sample_idx += sample_len
+ 
+@@ -329,17 +365,38 @@ class SamplingTensors:
+             user-defined seed for each sequence.
+         extra_entropy: extra entropy to use when generating seeds.
+         """
+-        prompt_tokens: List[List[int]] = []
+-        output_tokens: List[List[int]] = []
+-        top_ks: List[int] = []
+-        temperatures: List[float] = []
+-        top_ps: List[float] = []
+-        min_ps: List[float] = []
+-        presence_penalties: List[float] = []
+-        frequency_penalties: List[float] = []
+-        repetition_penalties: List[float] = []
+-        sampling_seeds: List[int] = []
+-        sample_indices: List[int] = []
++        # Pre-calculate total sizes to avoid repeated list expansions
++        # This optimization reduces memory allocations and improves cache locality
++        total_prefill_tokens = 0
++        total_sample_tokens = 0
++        total_seq_groups = 0
++        
++        for seq_group in sampling_metadata.seq_groups:
++            seq_ids = seq_group.seq_ids
++            sampling_params = seq_group.sampling_params
++            
++            if (seq_group.is_prompt
++                    and sampling_params.prompt_logprobs is not None):
++                prefill_len = len(seq_group.prompt_logprob_indices)
++                total_prefill_tokens += prefill_len
++            
++            if seq_group.do_sample:
++                total_sample_tokens += len(seq_ids)
++            
++            total_seq_groups += len(seq_ids)
++        
++        # Pre-allocate arrays with exact sizes
++        prompt_tokens: List[List[int]] = [None] * total_prefill_tokens  # type: ignore
++        output_tokens: List[List[int]] = [None] * total_prefill_tokens  # type: ignore
++        top_ks: List[int] = [0] * (total_prefill_tokens + total_sample_tokens)
++        temperatures: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        top_ps: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        min_ps: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        presence_penalties: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        frequency_penalties: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        repetition_penalties: List[float] = [0.0] * (total_prefill_tokens + total_sample_tokens)
++        sampling_seeds: List[int] = [0] * total_seq_groups
++        sample_indices: List[int] = [0] * total_seq_groups
+         prompt_best_of: List[int] = []
+         do_penalties = False
+         do_top_p_top_k = False
+@@ -349,6 +406,11 @@ class SamplingTensors:
+         seeds_to_generate = (extra_seeds_to_generate +
+                              get_num_triton_sampler_splits(vocab_size))
+ 
++        # Track positions in pre-allocated arrays
++        prefill_pos = 0
++        sample_pos = 0
++        seq_pos = 0
++        
+         assert sampling_metadata.seq_groups is not None
+         for seq_group in sampling_metadata.seq_groups:
+             seq_ids = seq_group.seq_ids
+@@ -389,24 +451,29 @@ class SamplingTensors:
+                 query_len = seq_group.query_len
+                 assert query_len is not None
+                 prefill_len = len(seq_group.prompt_logprob_indices)
+-                temperatures += [temperature] * prefill_len
+-                top_ps += [top_p] * prefill_len
+-                top_ks += [top_k] * prefill_len
+-                min_ps += [min_p] * prefill_len
+-                presence_penalties += [0] * prefill_len
+-                frequency_penalties += [0] * prefill_len
+-                repetition_penalties += [1] * prefill_len
++                # Use slice assignment instead of extend for better performance
++                temperatures[prefill_pos:prefill_pos + prefill_len] = [temperature] * prefill_len
++                top_ps[prefill_pos:prefill_pos + prefill_len] = [top_p] * prefill_len
++                top_ks[prefill_pos:prefill_pos + prefill_len] = [top_k] * prefill_len
++                min_ps[prefill_pos:prefill_pos + prefill_len] = [min_p] * prefill_len
++                presence_penalties[prefill_pos:prefill_pos + prefill_len] = [0] * prefill_len
++                frequency_penalties[prefill_pos:prefill_pos + prefill_len] = [0] * prefill_len
++                repetition_penalties[prefill_pos:prefill_pos + prefill_len] = [1] * prefill_len
++                prefill_pos += prefill_len
+ 
+             if seq_group.do_sample:
+                 sample_lens = len(seq_group.sample_indices)
+                 assert sample_lens == len(seq_ids)
+-                temperatures += [temperature] * len(seq_ids)
+-                top_ps += [top_p] * len(seq_ids)
+-                top_ks += [top_k] * len(seq_ids)
+-                min_ps += [min_p] * len(seq_ids)
+-                presence_penalties += [p] * len(seq_ids)
+-                frequency_penalties += [f] * len(seq_ids)
+-                repetition_penalties += [r] * len(seq_ids)
++                num_seqs = len(seq_ids)
++                # Use slice assignment instead of extend for better performance
++                temperatures[sample_pos:sample_pos + num_seqs] = [temperature] * num_seqs
++                top_ps[sample_pos:sample_pos + num_seqs] = [top_p] * num_seqs
++                top_ks[sample_pos:sample_pos + num_seqs] = [top_k] * num_seqs
++                min_ps[sample_pos:sample_pos + num_seqs] = [min_p] * num_seqs
++                presence_penalties[sample_pos:sample_pos + num_seqs] = [p] * num_seqs
++                frequency_penalties[sample_pos:sample_pos + num_seqs] = [f] * num_seqs
++                repetition_penalties[sample_pos:sample_pos + num_seqs] = [r] * num_seqs
++                sample_pos += num_seqs
+ 
+             if is_prompt:
+                 prompt_best_of.append(sampling_params.best_of)
+@@ -423,22 +490,32 @@ class SamplingTensors:
+                     seq_id,
+                     seeds_to_generate=seeds_to_generate,
+                     is_greedy=is_greedy)
+-                sampling_seeds.append(seq_seeds)
+-            sample_indices.extend(seq_group.sample_indices)
++                sampling_seeds[seq_pos] = seq_seeds
++                seq_pos += 1
++            # Use slice assignment for sample_indices
++            sample_len = len(seq_group.sample_indices)
++            sample_indices[seq_pos - sample_len:seq_pos] = seq_group.sample_indices
+ 
+         if do_penalties:
++            # Reset prefill_pos for the second pass
++            prefill_pos = 0
++            sample_pos = 0
+             for seq_group in sampling_metadata.seq_groups:
+                 seq_ids = seq_group.seq_ids
+                 if (seq_group.is_prompt
+                         and sampling_params.prompt_logprobs is not None):
+                     prefill_len = len(seq_group.prompt_logprob_indices)
+-                    prompt_tokens.extend([] for _ in range(prefill_len))
+-                    output_tokens.extend([] for _ in range(prefill_len))
++                    # Fill with empty lists
++                    for j in range(prefill_len):
++                        prompt_tokens[prefill_pos + j] = []
++                        output_tokens[prefill_pos + j] = []
++                    prefill_pos += prefill_len
+                 if seq_group.do_sample:
+                     for seq_id in seq_ids:
+                         seq_data = seq_group.seq_data[seq_id]
+-                        prompt_tokens.append(list(seq_data.prompt_token_ids))
+-                        output_tokens.append(list(seq_data.output_token_ids))
++                        prompt_tokens[prefill_pos + sample_pos] = list(seq_data.prompt_token_ids)
++                        output_tokens[prefill_pos + sample_pos] = list(seq_data.output_token_ids)
++                        sample_pos += 1
+ 
+         sampling_tensors = SamplingTensors.from_lists(
+             temperatures, top_ps, top_ks, min_ps, presence_penalties,

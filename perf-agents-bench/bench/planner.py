@@ -18,16 +18,27 @@ class MatrixPlanner:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                parts = line.split()
-                human = parts[0]
-                pre = None
-                parent_idx = None
-                if len(parts) > 1:
-                    token = parts[1]
-                    if token.startswith("parent="):
-                        parent_idx = int(token.split("=", 1)[1])
-                    else:
-                        pre = token
+
+                # Support pipe-separated format: "commit_hash | date | subject"
+                # or whitespace-separated format: "commit_hash [pre_sha|parent=N]"
+                if " | " in line:
+                    # Pipe-separated format - extract just the commit hash
+                    human = line.split(" | ")[0].strip()
+                    pre = None
+                    parent_idx = 1
+                else:
+                    # Traditional whitespace-separated format
+                    parts = line.split()
+                    human = parts[0]
+                    pre = None
+                    parent_idx = None
+                    if len(parts) > 1:
+                        token = parts[1]
+                        if token.startswith("parent="):
+                            parent_idx = int(token.split("=", 1)[1])
+                        else:
+                            pre = token
+
                 item_id = f"{task_cfg['id']}-{i:04d}"
                 items.append({"item_id": item_id, "human": human, "pre": pre or "", "pre_parent_index": parent_idx or 1})
         else:
