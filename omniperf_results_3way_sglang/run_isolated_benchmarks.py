@@ -55,6 +55,8 @@ AGENT_CONFIGS = {
     "trae_gpt5": AGENT_BASE_DIR / "trae/gpt-5",  # Base dir, will search subdirs
     # trae_sonnet45 searches primary dir first, then sglan subdirectories
     "trae_sonnet45": SGLANG_SONNET45_PRIMARY,  # Primary dir with all 17 commits
+    # MIMO agent (xiaomi-mimo-v2-flash) - searches sglang_core-XXXX dirs by journal.json
+    "mimo": SGLAN_BASE_DIR / "trae/xiaomi-mimo-v2-flash/2026-01-27_10-49-46",
 }
 
 # Ordered list of trae-gpt5 subdirectories to search (2nd dir has more patches)
@@ -1134,6 +1136,33 @@ def find_agent_patch(commit_short: str, agent: str, index_mapping: dict, mapping
                     except (json.JSONDecodeError, KeyError):
                         pass
         print(f"  Codex patch not found for commit {commit_short}")
+        return None
+
+    # For MIMO, search sglang_core-XXXX directories by reading journal.json
+    if agent == "mimo":
+        if not agent_path.exists():
+            print(f"  MIMO agent path not found: {agent_path}")
+            return None
+        for folder in agent_path.iterdir():
+            if folder.is_dir() and folder.name.startswith("sglang_core-"):
+                journal_file = folder / "journal.json"
+                if journal_file.exists():
+                    try:
+                        with open(journal_file) as f:
+                            journal_data = json.load(f)
+                        mimo_commit = journal_data.get("commits", {}).get("human", "")[:8]
+                        if mimo_commit == commit_short:
+                            patch_file = folder / "model_patch.diff"
+                            if patch_file.exists() and patch_file.stat().st_size > 0:
+                                # Verify patch_loc > 0 (use 0 as default if key missing)
+                                patch_loc = journal_data.get("metrics", {}).get("patch_size_loc") or 0
+                                if patch_loc > 0:
+                                    return patch_file
+                                print(f"  MIMO patch has patch_loc=0 for {commit_short}")
+                                return None
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+        print(f"  MIMO patch not found for commit {commit_short}")
         return None
 
     # For trae_sonnet45, search primary directory first (has all 17 commits),
