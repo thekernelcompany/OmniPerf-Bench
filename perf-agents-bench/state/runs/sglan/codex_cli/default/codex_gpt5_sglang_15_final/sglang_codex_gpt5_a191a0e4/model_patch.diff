@@ -1,0 +1,128 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..29f06b3 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -114,12 +114,14 @@ class TboDPAttentionPreparer:
+         return local_can_run_tbo, local_forward_mode
+ 
+     def compute_output(self, partial_global_info):
+-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
+-        forward_modes = partial_global_info[:, 0, 1].tolist()
++        # Avoid Python list materialization to reduce sync/overhead on large DP
++        # partial_global_info shape: [dp, 1, 2] where [:,0,0] is can_run flag and [:,0,1] is forward_mode
++        # Use tensor reductions which are faster and avoid host-GPU sync storms.
++        flags = partial_global_info[:, 0, 0]
++        local_can_run_tbo_aggregated = int(flags.min().item())
++        forward_modes = partial_global_info[:, 0, 1]
+ 
+-        global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
+-            forward_modes
+-        )
++        global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(forward_modes)
+ 
+         can_run_tbo = (
+             self.enable_two_batch_overlap
+@@ -139,17 +141,40 @@ class TboDPAttentionPreparer:
+ 
+     @staticmethod
+     def _compute_global_forward_mode(forward_modes):
+-        converted_forward_modes = [
+-            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+-            for x in forward_modes
+-        ]
+-        forward_mode_agree = TboDPAttentionPreparer._is_all_same(
+-            converted_forward_modes
+-        )
+-        global_forward_mode = (
+-            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
+-        )
+-        return global_forward_mode, forward_mode_agree
++        """Compute a global forward mode in a DP group.
++
++        Accepts either a 1D tensor of integer modes or a Python list. IDLE is
++        treated as DECODE for the purpose of agreement check.
++        """
++        if isinstance(forward_modes, torch.Tensor):
++            # Map IDLE -> DECODE without leaving tensor land
++            mapped = torch.where(
++                forward_modes == ForwardMode.IDLE.value,
++                torch.as_tensor(
++                    ForwardMode.DECODE.value,
++                    device=forward_modes.device,
++                    dtype=forward_modes.dtype,
++                ),
++                forward_modes,
++            )
++            forward_mode_agree = bool((mapped.min() == mapped.max()).item())
++            global_forward_mode = (
++                ForwardMode(int(mapped[0].item())) if forward_mode_agree else None
++            )
++            return global_forward_mode, forward_mode_agree
++        else:
++            # Fallback to original list-based path (kept for API stability)
++            converted_forward_modes = [
++                ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
++                for x in forward_modes
++            ]
++            forward_mode_agree = TboDPAttentionPreparer._is_all_same(
++                converted_forward_modes
++            )
++            global_forward_mode = (
++                ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
++            )
++            return global_forward_mode, forward_mode_agree
+ 
+     @staticmethod
+     def _is_all_same(x):
+diff --git a/test/srt/test_two_batch_overlap.py b/test/srt/test_two_batch_overlap.py
+index 89e793c..c8e7de6 100644
+--- a/test/srt/test_two_batch_overlap.py
++++ b/test/srt/test_two_batch_overlap.py
+@@ -3,6 +3,7 @@ import unittest
+ from types import SimpleNamespace
+ 
+ import requests
++import torch
+ 
+ from sglang.srt.utils import kill_process_tree
+ from sglang.test.run_eval import run_eval
+@@ -12,6 +13,8 @@ from sglang.test.test_utils import (
+     DEFAULT_URL_FOR_TEST,
+     popen_launch_server,
+ )
++from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ 
+ 
+ class TestTwoBatchOverlap(unittest.TestCase):
+@@ -67,6 +70,30 @@ class TestTwoBatchOverlap(unittest.TestCase):
+         metrics = run_eval(args)
+         self.assertGreater(metrics["score"], 0.5)
+ 
++    def test_global_forward_mode_tensor_fastpath(self):
++        # IDLE should be treated as DECODE for agreement
++        modes = torch.tensor([ForwardMode.DECODE.value, ForwardMode.IDLE.value])
++        global_mode, agree = TboDPAttentionPreparer._compute_global_forward_mode(modes)
++        self.assertTrue(agree)
++        self.assertEqual(global_mode, ForwardMode.DECODE)
++
++    def test_compute_output_no_python_lists(self):
++        # Simulate 2-DP ranks reporting flags and forward modes
++        p = TboDPAttentionPreparer()
++        # emulate prepare_all_gather outcomes
++        p.enable_two_batch_overlap = True
++        p.local_tbo_split_seq_index = 0
++        partial_global_info = torch.tensor(
++            [
++                [[1, ForwardMode.DECODE.value]],
++                [[1, ForwardMode.IDLE.value]],
++            ],
++            dtype=torch.int64,
++        )
++        split_idx, global_mode = p.compute_output(partial_global_info)
++        self.assertIsNotNone(global_mode)
++        self.assertEqual(global_mode, ForwardMode.DECODE)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

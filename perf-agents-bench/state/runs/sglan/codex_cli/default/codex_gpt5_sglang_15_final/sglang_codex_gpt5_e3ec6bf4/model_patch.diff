@@ -1,0 +1,71 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 0e1640f..3586601 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -332,22 +332,17 @@ def block_quant_to_tensor_quant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = x_q_block.to(torch.float32)
+-
+-    x_dq_block_tiles = [
+-        [
+-            x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            for i in range(k_tiles)
+-        ]
+-        for j in range(n_tiles)
+-    ]
+-
+-    for i in range(k_tiles):
+-        for j in range(n_tiles):
+-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
++    # Vectorized dequant of all tiles to reduce Python-loop overhead and kernel launches.
++    # Upsample tile scales to element-wise scales and crop to exact shape.
++    if n_tiles == 1 and k_tiles == 1:
++        # Fast path: single scale for whole tensor
++        x_dq_block = x_q_block.to(torch.float32) * x_s.view(-1)[0]
++    else:
++        scale_full = x_s.repeat_interleave(block_n, dim=0).repeat_interleave(
++            block_k, dim=1
++        )
++        scale_full = scale_full[:n, :k]
++        x_dq_block = x_q_block.to(torch.float32) * scale_full
+ 
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_block)
+@@ -375,21 +370,17 @@ def block_quant_dequant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+-
+-    for j in range(n_tiles):
+-        for i in range(k_tiles):
+-            x_q_block_tile = x_q_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile = x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+-
+-    return x_dq_block
++    # Vectorized implementation to avoid nested Python loops and per-tile kernel launches.
++    if n_tiles == 1 and k_tiles == 1:
++        out = x_q_block.to(torch.float32) * x_s.view(-1)[0]
++    else:
++        scale_full = x_s.repeat_interleave(block_n, dim=0).repeat_interleave(
++            block_k, dim=1
++        )
++        scale_full = scale_full[:n, :k]
++        out = x_q_block.to(torch.float32) * scale_full
++
++    return out.to(dtype)
+ 
+ 
+ def channel_quant_to_tensor_quant(

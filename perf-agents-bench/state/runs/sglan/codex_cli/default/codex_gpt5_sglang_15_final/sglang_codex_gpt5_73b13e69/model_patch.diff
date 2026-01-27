@@ -1,0 +1,166 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..e1a31b7 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1401,26 +1401,18 @@ class Scheduler(
+ 
+     def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+         """Coordinate the DP attention batch."""
+-
+-        local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
+-            dtype=torch.int64,
+-        )
++        # Keep this path as lean as possible: avoid Python list conversion and
++        # compute reductions directly on tensors. This reduces overhead while
++        # coordinating batches across DP ranks for speculative decoding.
++        local_info = torch.tensor([int(new_batch is not None)], dtype=torch.int64)
+         global_info = torch.empty(
+-            (self.server_args.dp_size, self.attn_tp_size, 1),
+-            dtype=torch.int64,
++            (self.server_args.dp_size, self.attn_tp_size, 1), dtype=torch.int64
+         )
+         torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=self.tp_cpu_group,
++            global_info.flatten(), local_info, group=self.tp_cpu_group
+         )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
+-        return any_new_batch
++        # Any DP worker has forward batch
++        return bool(global_info[:, 0, 0].any().item())
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         # Merge the prefill batch into the running batch
+@@ -1456,22 +1448,22 @@ class Scheduler(
+ 
+         new_batch = self.get_new_batch_prefill()
+ 
+-        # TODO(ch-wan): minor refactor is needed here to improve readability
+-        any_new_batch = (
+-            self.server_args.enable_dp_attention
+-            and not self.spec_algorithm.is_none()
+-            and self.coordinate_spec_dp_attn_batch(new_batch)
+-        )
+-        if new_batch is not None or any_new_batch:
+-            # Run prefill first if possible
++        # Fast path: if we already have local prefill, skip DP coordination.
++        if new_batch is not None:
+             ret = new_batch
+         else:
+-            # Run decode
+-            if not self.running_batch.is_empty():
+-                self.running_batch = self.update_running_batch(self.running_batch)
+-                ret = self.running_batch if not self.running_batch.is_empty() else None
++            # Only coordinate across DP ranks when no local prefill work exists.
++            need_coord = self.server_args.enable_dp_attention and not self.spec_algorithm.is_none()
++            any_new_batch = self.coordinate_spec_dp_attn_batch(new_batch) if need_coord else False
++            if any_new_batch:
++                ret = new_batch
+             else:
+-                ret = None
++                # Run decode path
++                if not self.running_batch.is_empty():
++                    self.running_batch = self.update_running_batch(self.running_batch)
++                    ret = self.running_batch if not self.running_batch.is_empty() else None
++                else:
++                    ret = None
+ 
+         if require_mlp_sync(self.server_args):
+             ret, _ = self.prepare_mlp_sync_batch(ret)
+@@ -1816,14 +1808,12 @@ class Scheduler(
+             num_tokens_for_logprob = num_tokens
+         else:
+             num_tokens = local_batch.extend_num_tokens
++            # Use generator to avoid creating intermediate list each step.
+             num_tokens_for_logprob = sum(
+-                [
+-                    # We should have at least 1 token for sample in every case.
+-                    max(extend_len - logprob_start_len, 1)
+-                    for logprob_start_len, extend_len in zip(
+-                        local_batch.extend_logprob_start_lens, local_batch.extend_lens
+-                    )
+-                ]
++                max(extend_len - logprob_start_len, 1)
++                for logprob_start_len, extend_len in zip(
++                    local_batch.extend_logprob_start_lens, local_batch.extend_lens
++                )
+             )
+ 
+         if local_batch is None or local_batch.forward_mode.is_decode_or_idle():
+@@ -1847,7 +1837,7 @@ class Scheduler(
+                 num_tokens,
+                 can_cuda_graph,
+                 num_tokens_for_logprob,
+-                is_extend_in_batch,
++                int(is_extend_in_batch),
+                 *tbo_preparer.prepare_all_gather(
+                     local_batch,
+                     deepep_mode,
+@@ -1857,38 +1847,35 @@ class Scheduler(
+             ],
+             dtype=torch.int64,
+         )
+-        global_info = torch.empty(
+-            (dp_size, attn_tp_size, 6),
+-            dtype=torch.int64,
+-        )
++        global_info = torch.empty((dp_size, attn_tp_size, 6), dtype=torch.int64)
+         torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=tp_cpu_group,
++            global_info.flatten(), local_info, group=tp_cpu_group
+         )
+-        global_num_tokens = global_info[:, 0, 0].tolist()
+-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
+-        global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+-        is_extend_in_batch = global_info[:, 0, 3].tolist()
++        # Compute reductions on tensors to avoid Python overhead.
++        dp0 = global_info[:, 0, :]
++        global_num_tokens_t = dp0[:, 0]
++        can_cuda_graph = int(dp0[:, 1].min().item())
++        global_num_tokens_for_logprob_t = dp0[:, 2]
++        is_extend_in_batch_t = dp0[:, 3]
+ 
+         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
+             global_info[:, :, 4:6]
+         )
+ 
+-        if local_batch is None and max(global_num_tokens) > 0:
++        if local_batch is None and int(global_num_tokens_t.max().item()) > 0:
+             local_batch = get_idle_batch()
+ 
+         if local_batch is not None:
+             # TODO: handle the case when moe_dense_tp_size != 1
+             if not require_mlp_tp_gather:
+-                local_batch.global_num_tokens = [num_tokens]
+-                local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
++                local_batch.global_num_tokens = [int(num_tokens)]
++                local_batch.global_num_tokens_for_logprob = [int(num_tokens_for_logprob)]
+             else:
+-                local_batch.global_num_tokens = global_num_tokens
++                local_batch.global_num_tokens = global_num_tokens_t.tolist()
+                 local_batch.global_num_tokens_for_logprob = (
+-                    global_num_tokens_for_logprob
++                    global_num_tokens_for_logprob_t.tolist()
+                 )
+-            local_batch.is_extend_in_batch = any(is_extend_in_batch)
++            local_batch.is_extend_in_batch = bool(is_extend_in_batch_t.any().item())
+             local_batch.tbo_split_seq_index = tbo_split_seq_index
+             local_batch.global_forward_mode = global_forward_mode
+ 
+@@ -1897,7 +1884,7 @@ class Scheduler(
+                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
+ 
+         # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
+-        return local_batch, any(is_extend_in_batch)
++        return local_batch, bool(is_extend_in_batch_t.any().item())
+ 
+     def get_idle_batch(self):
+         idle_batch = ScheduleBatch.init_new(

@@ -1,0 +1,66 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index f5dceac..820672c 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -49,15 +49,13 @@ def fused_topk_native(
+     assert (
+         hidden_states.shape[0] == gating_output.shape[0]
+     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+-    M, _ = hidden_states.shape
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
++    # Avoid unnecessary pre-allocation; compute directly to reduce overhead.
+     topk_weights = F.softmax(gating_output.float(), dim=-1)
+     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+     if renormalize:
+-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++        # Normalize in-place to save an intermediate tensor.
++        denom = topk_weights.sum(dim=-1, keepdim=True)
++        topk_weights.mul_(denom.reciprocal_())
+     return topk_weights, topk_ids
+ 
+ 
+@@ -107,7 +105,10 @@ def _fused_topk_postprocess(
+     num_token_non_padded,
+ ):
+     if renormalize:
+-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++        # Do renormalization using in-place multiply with the reciprocal to
++        # reduce temporary allocations and improve memory locality.
++        denom = topk_weights.sum(dim=-1, keepdim=True)
++        topk_weights.mul_(denom.reciprocal_())
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+     return topk_weights, topk_ids
+@@ -163,7 +164,8 @@ def grouped_topk(
+             if num_fused_shared_experts == 0
+             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+         )
+-        topk_weights = topk_weights / topk_weights_sum
++        # Use reciprocal-multiply to avoid building a fresh tensor for division.
++        topk_weights.mul_(topk_weights_sum.reciprocal_())
+ 
+     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+@@ -243,10 +245,17 @@ def _mask_topk_ids_padded_region(
+     topk_ids: torch.Tensor,
+     num_token_non_padded: Optional[torch.Tensor] = None,
+ ):
++    # Avoid creating a boolean mask and arange; directly slice the padded
++    # region for better performance and lower memory traffic.
+     if num_token_non_padded is None:
+         return
+-    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+-    topk_ids[indices >= num_token_non_padded, :] = -1
++    if isinstance(num_token_non_padded, int):
++        n = num_token_non_padded
++    else:
++        # Expect a 0-dim tensor indicating number of valid tokens.
++        n = int(num_token_non_padded.item())
++    if n < topk_ids.shape[0]:
++        topk_ids[n:, :].fill_(-1)
+ 
+ 
+ def biased_grouped_topk(

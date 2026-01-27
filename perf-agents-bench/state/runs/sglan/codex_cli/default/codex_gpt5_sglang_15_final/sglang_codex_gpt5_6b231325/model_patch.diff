@@ -1,0 +1,132 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 8ab5066..32fbad0 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
+ from sglang.srt.disaggregation.utils import (
+     DisaggregationMode,
+     group_concurrent_contiguous,
++    FastQueue,
+ )
+ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.utils import (
+@@ -151,7 +152,8 @@ class MooncakeKVManager(BaseKVManager):
+         self.server_socket = zmq.Context().socket(zmq.PULL)
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-            self.transfer_queue = queue.Queue()
++            # Use a lightweight FastQueue to reduce overhead under contention
++            self.transfer_queue = FastQueue()
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+             self.start_prefill_thread()
+@@ -339,7 +341,8 @@ class MooncakeKVManager(BaseKVManager):
+             # TODO: Shall we use KVPoll.Transferring state?
+             while True:
+                 try:
+-                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
++                    # Block until work arrives to avoid busy-wait CPU burn
++                    kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=1.0)
+                     reqs_to_be_processed = (
+                         self.transfer_infos[kv_chunk.room].values()
+                         if kv_chunk.room in self.transfer_infos
+@@ -454,6 +457,7 @@ class MooncakeKVManager(BaseKVManager):
+                             self.transfer_infos.pop(kv_chunk.room)
+ 
+                 except queue.Empty:
++                    # No work within timeout; loop to check status again
+                     continue
+                 except Exception as e:
+                     # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+@@ -461,8 +465,8 @@ class MooncakeKVManager(BaseKVManager):
+                         f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                     )
+ 
+-        threading.Thread(target=bootstrap_thread).start()
+-        threading.Thread(target=transfer_thread).start()
++        threading.Thread(target=bootstrap_thread, daemon=True).start()
++        threading.Thread(target=transfer_thread, daemon=True).start()
+ 
+     def start_decode_thread(self):
+         self.rank_port = get_free_port()
+@@ -532,8 +536,8 @@ class MooncakeKVManager(BaseKVManager):
+                             if bootstrap_addr in self.session_pool:
+                                 del self.session_pool[bootstrap_addr]
+ 
+-        threading.Thread(target=decode_thread).start()
+-        threading.Thread(target=heartbeat_checker).start()
++        threading.Thread(target=decode_thread, daemon=True).start()
++        threading.Thread(target=heartbeat_checker, daemon=True).start()
+ 
+     def add_transfer_request(
+         self,
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index 8841d5f..8bb793f 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -5,8 +5,11 @@ import os
+ import random
+ import warnings
+ from collections import deque
++from threading import Condition
++import queue as _queue
+ from enum import Enum
+ from typing import TYPE_CHECKING, List, Optional
++import numpy.typing as npt
+ 
+ import numpy as np
+ import requests
+@@ -289,10 +292,48 @@ def group_concurrent_contiguous(
+         return [], []
+ 
+     brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+-    src_groups = np.split(src_indices, brk)
+-    dst_groups = np.split(dst_indices, brk)
+-
+-    src_groups = [g.tolist() for g in src_groups]
+-    dst_groups = [g.tolist() for g in dst_groups]
++    # Keep the result as NumPy arrays to avoid Python list overhead
++    # in downstream hot loops that only need len() and first element.
++    src_groups = list(np.split(src_indices, brk))
++    dst_groups = list(np.split(dst_indices, brk))
+ 
+     return src_groups, dst_groups
++
++
++class FastQueue:
++    """
++    A minimal, faster queue for producer/consumer threads.
++
++    - Uses a simple deque guarded by a Condition.
++    - Omits task_done/join bookkeeping from queue.Queue.
++    - Exposes put() and get(timeout=...) with queue.Empty compatibility.
++
++    Intended as a drop-in for the subset used by MoE disaggregation.
++    """
++
++    def __init__(self):
++        self._dq = deque()
++        self._cv = Condition()
++
++    def put(self, item) -> None:
++        with self._cv:
++            self._dq.append(item)
++            # Wake a single waiter
++            self._cv.notify(1)
++
++    def get(self, timeout: Optional[float] = None):
++        with self._cv:
++            if not self._dq:
++                # Wait until an item arrives or timeout expires
++                if not self._cv.wait(timeout=timeout):
++                    # Align with queue.Queue's Empty for caller compatibility
++                    raise _queue.Empty
++            return self._dq.popleft()
++
++    def empty(self) -> bool:
++        with self._cv:
++            return not self._dq
++
++    def qsize(self) -> int:
++        with self._cv:
++            return len(self._dq)

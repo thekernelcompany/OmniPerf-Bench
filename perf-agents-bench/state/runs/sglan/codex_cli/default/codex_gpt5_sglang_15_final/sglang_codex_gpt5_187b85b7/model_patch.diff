@@ -1,0 +1,208 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/memory_pool.py b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+index 6e8edaf..a38c24c 100644
+--- a/python/sglang/srt/disaggregation/mooncake/memory_pool.py
++++ b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+@@ -11,37 +11,63 @@ from torch.cuda.memory import CUDAPluggableAllocator
+ class MooncakeNVLinkAllocator:
+     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+     _lock: Final = threading.Lock()
++    _so_path: Optional[str] = None
+ 
+     @classmethod
+     def _get_so_path(cls) -> str:
+-        """Dynamically locate hook.so in the mooncake package installation"""
++        """Locate the mooncake NVLink hook shared object once.
++
++        Order of resolution (fastest-first):
++        - Env var `SGLANG_MOONCAKE_HOOK_SO`
++        - importlib.resources from the `mooncake` package
++        - Adjacent to `mooncake.__file__` (best-effort)
++        """
++        # Fast path: cached result
++        if cls._so_path is not None:
++            return cls._so_path
++
++        # Highest priority: user override via env var
++        env_path = os.environ.get("SGLANG_MOONCAKE_HOOK_SO")
++        if env_path and os.path.exists(env_path):
++            cls._so_path = env_path
++            return cls._so_path
++
++        # Try importlib.resources (no import side effects for the package)
+         try:
+-            # Attempt to locate package resource
+             with resources.path("mooncake", "hook.so") as so_path:
+                 if so_path.exists():
+-                    return str(so_path)
+-        except (ImportError, FileNotFoundError, TypeError):
++                    cls._so_path = str(so_path)
++                    return cls._so_path
++        except Exception:
+             pass
+ 
+-        # Fallback strategy: check in package location via import metadata
++        # Fallback to package directory probing
+         try:
+             import mooncake
+ 
+             base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
+             so_path = os.path.join(base_path, "hook.so")
+             if os.path.exists(so_path):
+-                return so_path
+-        except (ImportError, FileNotFoundError, TypeError):
+-            raise ImportError(
+-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+-            )
++                cls._so_path = so_path
++                return cls._so_path
++        except Exception:
++            pass
++
++        # If all attempts fail, raise with helpful hint.
++        raise ImportError(
++            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL requires mooncake-transfer-engine >= 0.3.3.post2 "
++            "and a valid hook.so. Set SGLANG_MOONCAKE_HOOK_SO to override lookup."
++        )
+ 
+     @classmethod
+     def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
++        # Reuse per-device allocators to avoid repeated dlopen/registration.
+         with cls._lock:
+-            if device not in cls._instances:
++            alloc = cls._instances.get(device)
++            if alloc is None:
+                 so_path = cls._get_so_path()
+-                cls._instances[device] = CUDAPluggableAllocator(
++                alloc = CUDAPluggableAllocator(
+                     so_path, "mc_nvlink_malloc", "mc_nvlink_free"
+                 )
+-            return cls._instances[device]
++                cls._instances[device] = alloc
++            return alloc
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f..8635a4c 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -173,7 +173,12 @@ class TokenToKVPoolAllocator:
+         self.device = device
+         self.page_size = 1
+ 
++        # NOTE: keep `free_slots` as a 1-D torch tensor for API
++        # compatibility, but avoid frequent reallocations by staging
++        # frees into a Python list and only consolidating when needed.
+         self.free_slots = None
++        self._staged_frees = []  # list[torch.Tensor]
++        self._staged_free_count = 0
+         self.is_not_in_free_group = True
+         self.free_group = []
+         self.clear()
+@@ -181,7 +186,9 @@ class TokenToKVPoolAllocator:
+         self._kvcache = kvcache
+ 
+     def available_size(self):
+-        return len(self.free_slots)
++        # Account both consolidated free slots and staged frees
++        # without forcing a concat.
++        return int(self.free_slots.numel()) + int(self._staged_free_count)
+ 
+     def debug_print(self) -> str:
+         return ""
+@@ -190,19 +197,52 @@ class TokenToKVPoolAllocator:
+         return self._kvcache
+ 
+     def alloc(self, need_size: int):
+-        if need_size > len(self.free_slots):
++        # Fast-path: not enough overall capacity
++        total_free = self.free_slots.numel() + self._staged_free_count
++        if need_size > total_free:
+             return None
+ 
+-        select_index = self.free_slots[:need_size]
+-        self.free_slots = self.free_slots[need_size:]
+-        return select_index
++        # Serve from consolidated tensor first, then from staged pieces
++        take_from_main = min(need_size, self.free_slots.numel())
++        segments = []
++        if take_from_main:
++            segments.append(self.free_slots[:take_from_main])
++            self.free_slots = self.free_slots[take_from_main:]
++
++        remaining = need_size - take_from_main
++        while remaining > 0:
++            # Pop from the end (LIFO) to keep slices contiguous
++            piece = self._staged_frees.pop()
++            piece_len = int(piece.numel())
++            if piece_len <= remaining:
++                segments.append(piece)
++                self._staged_free_count -= piece_len
++                remaining -= piece_len
++            else:
++                # Split the piece into two to avoid materializing
++                # a new tensor via cat.
++                segments.append(piece[:remaining])
++                self._staged_frees.append(piece[remaining:])
++                self._staged_free_count -= remaining
++                remaining = 0
++
++        # Return a single 1-D tensor view for external callers
++        if len(segments) == 1:
++            return segments[0]
++        return torch.cat(segments, dim=0)
+ 
+     def free(self, free_index: torch.Tensor):
+         if free_index.numel() == 0:
+             return
+ 
+         if self.is_not_in_free_group:
+-            self.free_slots = torch.cat((self.free_slots, free_index))
++            # Stage frees to avoid repeated torch.cat allocations.
++            # Keep tensors 1-D and on the same device/dtype.
++            if free_index.is_contiguous():
++                self._staged_frees.append(free_index)
++            else:
++                self._staged_frees.append(free_index.contiguous())
++            self._staged_free_count += int(free_index.numel())
+         else:
+             self.free_group.append(free_index)
+ 
+@@ -216,16 +256,25 @@ class TokenToKVPoolAllocator:
+             self.free(torch.cat(self.free_group))
+ 
+     def backup_state(self):
++        # Ensure staged frees are materialized to form a single snapshot.
++        if self._staged_frees:
++            self.free_slots = torch.cat([self.free_slots] + self._staged_frees)
++            self._staged_frees.clear()
++            self._staged_free_count = 0
+         return self.free_slots
+ 
+     def restore_state(self, free_slots):
+         self.free_slots = free_slots
++        self._staged_frees = []
++        self._staged_free_count = 0
+ 
+     def clear(self):
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+         self.free_slots = torch.arange(
+             1, self.size + 1, dtype=torch.int64, device=self.device
+         )
++        self._staged_frees = []
++        self._staged_free_count = 0
+         self.is_not_in_free_group = True
+         self.free_group = []
+ 
+diff --git a/scripts/ci_install_dependency.sh b/scripts/ci_install_dependency.sh
+index 922c886..9c3098a 100755
+--- a/scripts/ci_install_dependency.sh
++++ b/scripts/ci_install_dependency.sh
+@@ -22,8 +22,8 @@ pip install -e "python[dev]"
+ # Show current packages
+ pip list
+ 
+-# Install additional dependencies
+-pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
++# Install additional dependencies (bump mooncake for NVLink custom mem pool)
++pip install mooncake-transfer-engine==0.3.3.post2 nvidia-cuda-nvrtc-cu12
+ 
+ # For lmms_evals evaluating MMMU
+ git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

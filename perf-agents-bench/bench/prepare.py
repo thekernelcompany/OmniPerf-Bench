@@ -119,9 +119,12 @@ class PrepareExecutor:
 
         # Determine agent type early to control prompt construction
         default_agent_early = str(self.cfg["agents"].get("default", "openhands"))
-        # Fair evaluation: suppress human optimization details (diff, stats, hints)
-        # but keep commit message as a hint for all agents
+        # Fair evaluation: suppress ALL human optimization details to prevent data leakage
+        # This includes: diff content, commit messages, file statistics, and derived optimization hints
+        # CRITICAL: Do not leak ANY information about the human solution
         suppress_human_data = True
+        # Also suppress derived hints (e.g., "torch.zeros -> torch.empty") that could leak strategy
+        suppress_optimization_hints = True
         # Detach worktree from git history to prevent agent from accessing human commit
         detach_from_history = True
 
@@ -147,6 +150,8 @@ class PrepareExecutor:
             wt_dir = rm.create_worktree(pre, item_id, detach_from_history=detach_from_history)
 
             # Determine target files: if none provided, derive from pre..human diff
+            # NOTE: Knowing WHICH files were modified is acceptable (also shown in diff_stat)
+            # What's NOT acceptable is showing the actual code changes (diff_text)
             provided_targets = task_cfg["optimization_contract"].get("target_files", [])
             derived_targets = []
             if not provided_targets:
@@ -177,127 +182,32 @@ class PrepareExecutor:
 
             # Create a headless task file (text) from the prompt for -f usage
             # Add richer context to guide the agent
-            # NOTE: For claude_code, we suppress human data to prevent reward hacking
+            #
+            # IMPORTANT: Data leakage prevention policy:
+            # - commit_msg (PR title): ALWAYS include - tells WHAT was optimized, not HOW
+            # - diff_stat (file stats): ALWAYS include - tells WHICH files changed, not the actual changes
+            # - diff_text (actual diff): NEVER include - this IS the solution and would be cheating
+            #
             commit_msg = ""
             diff_stat = ""
-            if not suppress_human_data:
-                try:
-                    import subprocess as _sp
-                    commit_msg = _sp.check_output(["git", "show", "--no-patch", "--pretty=%B", human], cwd=rm.base_dir).decode().strip()
-                except Exception:
-                    commit_msg = ""
-                try:
-                    diff_stat = _sp.check_output(["git", "diff", "--stat", pre, human], cwd=rm.base_dir).decode().strip()
-                except Exception:
-                    diff_stat = ""
+            # ALWAYS fetch commit message and diff stats - these are acceptable hints
+            try:
+                import subprocess as _sp
+                commit_msg = _sp.check_output(["git", "show", "--no-patch", "--pretty=%B", human], cwd=rm.base_dir).decode().strip()
+            except Exception:
+                commit_msg = ""
+            try:
+                import subprocess as _sp
+                diff_stat = _sp.check_output(["git", "diff", "--stat", pre, human], cwd=rm.base_dir).decode().strip()
+            except Exception:
+                diff_stat = ""
 
-            # Read the actual commit data (diff/apis/perf_command)
-            # NOTE: For claude_code, we suppress human data to prevent reward hacking
+            # NEVER fetch the actual diff text - this would leak the solution
+            # The diff_text variable is intentionally left empty to prevent data leakage
             commit_data: Dict[str, Any] | None = None
-            diff_text = ""
-            if not suppress_human_data:
-                # Candidate paths: new configurable dir first, then legacy workspace path (if present)
-                candidate_paths: list[Path] = []
-                if metadata_dir:
-                    candidate_paths.append(Path(metadata_dir) / f"{human}.json")
-                candidate_paths.append(Path(f"/workspace/OmniPerf-Bench/tmp_single_commit/{human}.json"))
-                for cand in candidate_paths:
-                    try:
-                        if cand.exists():
-                            with open(cand, "r") as f:
-                                commit_data = json.load(f)
-                            diff_text = commit_data.get("diff_text", "") or diff_text
-                            break
-                    except Exception:
-                        commit_data = None
-
-                # If no diff from JSON, get it from git
-                if not diff_text:
-                    try:
-                        diff_text = subprocess.check_output(
-                            ["git", "diff", pre, human],
-                            cwd=rm.base_dir,
-                            text=True
-                        ).strip()
-                    except Exception:
-                        diff_text = ""
+            diff_text = ""  # INTENTIONALLY EMPTY - do not populate with human diff
             
-            # Create a concrete test script that demonstrates what we're optimizing
-            # This follows the GSO format more closely
-            if target_files and any('moe' in f.lower() for f in target_files):
-                test_script_content = """import torch
-import time
-from vllm.model_executor.layers.fused_moe import moe_align_block_size
-
-# Benchmark the MoE align block size operation
-num_tokens = 4096
-num_experts = 64
-topk = 2
-block_size = 128
-
-# Create input data
-topk_ids = torch.randint(0, num_experts, (num_tokens * topk,), dtype=torch.int32, device='cuda')
-
-# Time the operation
-torch.cuda.synchronize()
-start = time.time()
-
-sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
-    topk_ids, num_experts, block_size, topk
-)
-
-torch.cuda.synchronize()
-duration = time.time() - start
-
-print(f"Duration: {duration:.4f} seconds")
-"""
-            elif target_files and any('prefix' in f.lower() or 'block' in f.lower() for f in target_files):
-                test_script_content = """import torch
-import time
-from vllm.core.block.prefix_caching_block import PrefixCachingBlockAllocator
-
-# Benchmark prefix caching block allocation with common prefixes
-block_size = 16
-num_blocks = 256
-num_sequences = 8
-common_prefix_blocks = 4
-
-# Create allocator
-allocator = PrefixCachingBlockAllocator(num_blocks=num_blocks, block_size=block_size)
-
-# Common token IDs for shared prefix
-common_token_ids = list(range(block_size * common_prefix_blocks))
-
-# Time the allocation and marking operation
-start = time.time()
-
-# Allocate blocks for multiple sequences with common prefixes
-for seq_idx in range(num_sequences):
-    prev_block = None
-    for block_idx in range(common_prefix_blocks):
-        start_idx = block_idx * block_size
-        end_idx = start_idx + block_size
-        token_ids = common_token_ids[start_idx:end_idx]
-        
-        block = allocator.allocate_immutable_block(
-            prev_block=prev_block,
-            token_ids=token_ids
-        )
-        prev_block = block
-
-# Mark blocks as computed (this is the optimized operation)
-allocator.mark_blocks_as_computed([])
-
-duration = time.time() - start
-print(f"Duration: {duration:.4f} seconds")
-print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
-"""
-            else:
-                # Generic performance test
-                test_script_content = """# This is a performance optimization task
-# The specific operations to optimize are in the files listed below
-# Focus on performance improvements in the target functions
-"""
+            # No test_script - agent should explore the repo and create their own benchmarks
             
             # Determine the path the agent should use when referring to the workspace.
             # For local runtime (bench_test.yaml), use the absolute worktree path.
@@ -306,82 +216,21 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
             scratch_rel_dir = ".bench_scratch"
             scratch_abs_dir = str(Path(agent_workspace_root) / scratch_rel_dir)
 
-            # Build the official GSO prompt with the human's diff
+            # Build the task prompt (without human diff to prevent data leakage)
             task_lines = [
                 f"I've uploaded a python code repository in the directory {agent_workspace_root}.",
-                "Consider the following test script showing an example usage of the repository:",
                 "",
-                "<test_script>",
-                test_script_content if test_script_content else "# Test script will be created based on the optimization target",
-                "</test_script>",
-                "",
-                "Can you help me implement the necessary changes to the repository so that the runtime of the <test_script> is optimized?",
+                "Can you help me implement performance optimizations to the target files listed below?",
                 "",
                 "Basic guidelines:",
-                f"1. Your task is to make changes to non-test files in the {agent_workspace_root} directory to improve the performance of the <test_script>.",
-                "2. Make changes while ensuring the repository is functionally equivalent to the original.",
-                "3. Do not overoptimize for just the specific inputs in <test_script>. Make general performance improvements for the usage scenario shown.",
-                "4. You may need to rebuild the repo for your changes to take effect before testing. Some rebuilds may take time to run, so be patient with running them.",
+                f"1. Make changes to the target files in {agent_workspace_root} to improve performance.",
+                "2. Ensure the repository remains functionally equivalent to the original.",
+                "3. Make general performance improvements, not micro-optimizations for specific inputs.",
                 "",
-                "Follow these steps to improve performance:",
-                "1. As a first step, explore the repository structure.",
-                f"2. Create a script ONLY inside {scratch_abs_dir} (e.g., {scratch_abs_dir}/test_opt.py) to reproduce and time the example, then execute it with python <filename.py> from the repo root.",
-                "3. Edit the source code of the repository to improve performance.",
-                "4. Rebuild and rerun your script to confirm that performance has improved.",
-                "",
-                "Here is an example of the kind of optimizations that have been shown to improve performance in this codebase:",
-                "",
-                "<example_optimization_diff>",
             ]
             
-            # Add the diff showing the human's optimization as an example
-            if diff_text:
-                # Show a portion of the diff to guide the agent
-                diff_lines = diff_text.split('\n')
-                # Focus on the key optimization patterns
-                key_patterns = []
-                for i, line in enumerate(diff_lines):
-                    if any(pattern in line for pattern in ['-    sorted_ids.fill_', '-    expert_ids = torch.zeros', '+    expert_ids = torch.empty', '- fill_', '+ torch.empty']):
-                        # Get context around the change
-                        start = max(0, i - 2)
-                        end = min(len(diff_lines), i + 3)
-                        key_patterns.extend(diff_lines[start:end])
-                        key_patterns.append("...")
-                
-                if key_patterns:
-                    task_lines.extend(key_patterns[:50])  # Limit to avoid too much text
-                else:
-                    # Show first part of diff if no specific patterns found
-                    task_lines.extend(diff_lines[:30])
-            else:
-                task_lines.append("# Optimization patterns: torch.zeros -> torch.empty, remove fill_ operations, optimize memory allocations")
-            
             task_lines.extend([
-                "</example_optimization_diff>",
-                "",
-                "IMPORTANT: The above diff is an EXAMPLE of optimizations that were successful in a different context.",
-                "These changes have NOT been applied to your codebase yet.",
-                "Your task is to:",
-                "1. Understand the optimization pattern shown (e.g., torch.zeros → torch.empty)",
-                "2. Look at the CURRENT code in the target files",
-                "3. Find places where you can apply SIMILAR optimizations",
-                "4. MAKE THE CHANGES yourself using str_replace_editor",
-                "",
-                "The codebase you're working with is at the BASE commit - it does NOT have these optimizations yet.",
-                "You need to IMPLEMENT similar optimizations yourself.",
-                "",
-                "HERE'S WHAT YOU NEED TO DO:",
-                "1. The files CURRENTLY contain torch.zeros() calls that need optimization",
-                "2. You need to CHANGE torch.zeros to torch.empty where appropriate",
-                "3. You need to REMOVE .fill_() operations that are unnecessary",
-                "4. These are NEW changes you're making - not already in the code",
-                "",
-                "START WITH THIS COMMAND to see what needs changing:",
-                "```bash",
-                "grep -n 'torch.zeros\\|fill_' vllm/model_executor/layers/fused_moe/moe_align_block_size.py benchmarks/kernels/benchmark_moe_align_block_size.py",
-                "```",
-                "",
-                "CRITICAL: You MUST make actual code changes. Look for patterns like:",
+                "CRITICAL: You MUST make actual code changes to improve performance.",
             ])
 
             # Optional: Inject symbolic hints from commit metadata
@@ -417,49 +266,17 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     task_lines.append(str(perf_cmd))
                     task_lines.append("```")
             
-            # Analyze the actual commit diff to understand what needs to be optimized
-            # NOTE: For claude_code, we skip this to prevent reward hacking
-            optimization_hints = []
+            # REMOVED: Optimization hints derived from analyzing human diff (data leakage)
+            # Previously this code analyzed the human diff for patterns like:
+            # - torch.zeros -> torch.empty
+            # - fill_() operations
+            # - BlockScan/cub patterns
+            # This leaked the exact optimization strategy used by humans.
 
-            if not suppress_human_data:
-                # Get the actual diff to analyze what was changed
-                try:
-                    diff_output = subprocess.check_output(
-                        ["git", "diff", pre, human],
-                        cwd=rm.base_dir,
-                        text=True
-                    ).strip()
-
-                    # Analyze the diff for specific patterns
-                    if "torch.zeros" in diff_output and "torch.empty" in diff_output:
-                        optimization_hints.append("- Replace torch.zeros with torch.empty where initialization is not needed")
-                        optimization_hints.append("- Avoid unnecessary memory initialization overhead")
-
-                    if "fill_" in diff_output:
-                        optimization_hints.append("- Remove unnecessary tensor filling operations")
-
-                    if "BlockScan" in diff_output or "cub::" in diff_output:
-                        optimization_hints.append("- Use efficient parallel algorithms for prefix sum computation")
-
-                    if any(x in diff_output for x in ["cumsum", "prefix sum"]):
-                        optimization_hints.append("- Optimize cumulative sum calculations")
-
-                except Exception:
-                    # Fallback to commit message analysis
-                    if commit_msg:
-                        if "speed up" in commit_msg.lower():
-                            optimization_hints.append("- Focus on performance bottlenecks in the identified files")
-                        if "align" in commit_msg.lower() and "kernel" in commit_msg.lower():
-                            optimization_hints.append("- Optimize alignment and memory access patterns in CUDA kernels")
-            
-            # If we have specific optimization hints, add them
-            if optimization_hints:
-                task_lines.extend(optimization_hints)
-            else:
-                # Provide generic but actionable guidance
-                task_lines.append("- Analyze the target files for performance bottlenecks")
-                task_lines.append("- Look for unnecessary memory allocations or initializations")
-                task_lines.append("- Consider more efficient algorithms or data structures")
+            # Now provide only generic guidance that doesn't reveal the solution
+            task_lines.append("- Analyze the target files for performance bottlenecks")
+            task_lines.append("- Look for opportunities to reduce computational overhead")
+            task_lines.append("- Consider memory access patterns and cache efficiency")
             
             # Add target files if available
             if target_files:
@@ -485,37 +302,33 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 task_lines.append("## Target Files (ONLY modify these)")
                 task_lines += [f"- `{t}`" for t in prompt["target_files"]]
             
-            # Add specific optimization guidance based on commit analysis
+            # Show commit message and diff stats - these are acceptable hints (not leakage)
+            # They tell WHAT was optimized and WHICH files, but not HOW (the actual code changes)
             if commit_msg or diff_stat:
                 task_lines.append("")
-                task_lines.append("## SPECIFIC OPTIMIZATION TARGETS:")
-                task_lines.append("Based on the human commit analysis, focus on these areas:")
-                task_lines.append("- Memory allocation patterns (torch.zeros vs torch.empty)")
-                task_lines.append("- Tensor initialization strategies") 
-                task_lines.append("- Kernel parameter optimization")
-                task_lines.append("- Buffer reuse and caching")
-                
+                task_lines.append("## Optimization Context")
+                task_lines.append("The following information describes what optimization was made by a human developer.")
+                task_lines.append("Use this as guidance for the type of optimization expected, but implement your own solution.")
+
             if commit_msg:
                 task_lines.append("")
-                task_lines.append("### Human Developer's Approach:")
+                task_lines.append("### PR Title / Commit Message:")
                 task_lines.append("```")
                 task_lines += commit_msg.splitlines()
                 task_lines.append("```")
-                
+
             if diff_stat:
                 task_lines.append("")
-                task_lines.append("### Files Modified (statistics):")
+                task_lines.append("### Files Modified (statistics only, not the actual changes):")
                 task_lines.append("```")
                 task_lines += diff_stat.splitlines()
                 task_lines.append("```")
             
             task_lines.append("")
             task_lines.append("## IMMEDIATE ACTION REQUIREMENTS:")
-            task_lines.append("1. Start editing files by iteration 3")
-            task_lines.append(f"2. Create and run {scratch_abs_dir}/test_opt.py before and after edits (do not create timing scripts outside {scratch_abs_dir})")
-            task_lines.append("3. Make at least 3 concrete optimizations")
-            task_lines.append("4. Commit changes by iteration 8")
-            task_lines.append("5. Use finish command by iteration 10")
+            task_lines.append("1. Start editing target files immediately")
+            task_lines.append("2. Make concrete optimizations to improve performance")
+            task_lines.append("3. Commit your changes when done")
             task_lines.append("")
             task_lines.append("## TASK COMPLETION COMMAND:")
             task_lines.append("When you have made optimizations:")
@@ -679,10 +492,14 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                     except Exception:
                         prompt_text = ""
                     profile = args_cfg.get("profile") or os.environ.get("CODEX_PROFILE")
+                    model = args_cfg.get("model") or os.environ.get("CODEX_MODEL", "gpt-5")
                     cmd = [
                         cli, "exec",
-                        "--cd", str(wt_dir),
-                        "--sandbox", "danger-full-access",
+                        "-C", str(wt_dir),  # Working directory
+                        "-m", str(model),  # Explicit model (gpt-5)
+                        "--disable", "web_search_request",  # CRITICAL: No web search
+                        "-c", "sandbox_workspace_write.network_access=false",  # CRITICAL: No network
+                        "-s", "danger-full-access",  # Full filesystem access
                     ]
                     if profile:
                         cmd += ["-p", str(profile)]
@@ -816,8 +633,8 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                         forced_target = ""
                     headless_msg = (
                         "Do not ask for user input. Proceed immediately to implement the next step: "
-                        f"1) create {scratch_abs_dir}/test_opt.py to time the critical path (do not create timing scripts outside {scratch_abs_dir}); 2) edit the performance-critical file "
-                        f"{forced_target if forced_target else 'one of the target files'} now; 3) run the timing script; 4) commit; then finish."
+                        f"1) edit the performance-critical file {forced_target if forced_target else 'one of the target files'} now; "
+                        "2) commit your changes; then finish."
                     )
                     env["OPENHANDS_HEADLESS_USER_MESSAGE"] = headless_msg
                 

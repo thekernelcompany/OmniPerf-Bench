@@ -1,0 +1,258 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..afdc482 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -189,28 +189,48 @@ class LoRAManager:
+                     ] = lora.scaling
+             batch_info = self.cuda_graph_batch_info
+         else:
+-            seg_lens = (
+-                forward_batch.extend_seq_lens
+-                if forward_batch.forward_mode.is_extend()
+-                else torch.ones(bs, device=self.device)
++            is_extend = forward_batch.forward_mode.is_extend()
++            if is_extend:
++                # Ensure integer lens to avoid dtype casts in cumsum/indexing
++                seg_lens = forward_batch.extend_seq_lens.to(dtype=torch.int32)
++                seg_indptr = torch.zeros(
++                    (bs + 1,), dtype=torch.int32, device=self.device
++                )
++                seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
++                # Computing max_len only when needed; avoid redundant GPU work.
++                max_len = int(seg_lens.max().item())
++            else:
++                # Common path: all segments are length 1.
++                seg_lens = torch.ones(
++                    bs, dtype=torch.int32, device=self.device
++                )
++                # For all-ones, seg_indptr is a simple arange; cheaper than cumsum.
++                seg_indptr = torch.arange(
++                    0, bs + 1, dtype=torch.int32, device=self.device
++                )
++                max_len = 1
++
++            # Vectorize buffer id fetch to reduce Python/device traffic
++            get_buf_id = self.memory_pool.get_buffer_id
++            weight_indices_list = [get_buf_id(p) for p in forward_batch.lora_paths]
++            weight_indices = torch.as_tensor(
++                weight_indices_list, dtype=torch.int32, device=self.device
+             )
+-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+-            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+-            max_len = int(torch.max(seg_lens))
+-            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+ 
++            # Initialize per-adapter metadata only once per unique adapter
+             lora_ranks = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
++                (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
+             )
+             scalings = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
++                (self.max_loras_per_batch,), dtype=torch.float32, device=self.device
+             )
+-            for i, lora_path in enumerate(forward_batch.lora_paths):
+-                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+-                if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+-                    scalings[weight_indices[i]] = lora.scaling
++            # Deduplicate to avoid redundant writes
++            unique_paths = {p for p in forward_batch.lora_paths if p is not None}
++            for lora_path in unique_paths:
++                buf_id = get_buf_id(lora_path)
++                lora = self.loras[lora_path]
++                lora_ranks[buf_id] = lora.config.hf_config["r"]
++                scalings[buf_id] = lora.scaling
+             batch_info = LoRABatchInfo(
+                 bs=bs,
+                 seg_lens=seg_lens,
+@@ -238,8 +258,13 @@ class LoRAManager:
+                         ),
+                     )
+                 else:
+-                    weight_name = get_weight_name(
+-                        module_name, self.lora_weight_names, LoRAType.LORA_A
++                    # Avoid repeated string matching by caching weight name on module
++                    weight_name = getattr(
++                        module,
++                        "_lora_cached_weight_name",
++                        get_weight_name(
++                            module_name, self.lora_weight_names, LoRAType.LORA_A
++                        ),
+                     )
+                     module.set_lora_info(
+                         self.memory_pool.get_tensor(
+@@ -281,6 +306,21 @@ class LoRAManager:
+             # The module should be converted if it is included in target_names
+             if module_name.split(".")[-1] in customized_target_names:
+                 layer_id = get_layer_id(module_name)
+-                self.lora_modules[layer_id].append(
+-                    (module_name, self.set_lora_module(module_name, module))
+-                )
++                lora_module = self.set_lora_module(module_name, module)
++                # Precompute and cache weight-name mapping to avoid repeated
++                # regex/string checks during every batch setup.
++                if "qkv_proj" not in module_name:
++                    try:
++                        setattr(
++                            lora_module,
++                            "_lora_cached_weight_name",
++                            get_weight_name(
++                                module_name,
++                                self.lora_weight_names,
++                                LoRAType.LORA_A,
++                            ),
++                        )
++                    except Exception:
++                        # Fallback: let runtime resolve if mapping fails for any reason
++                        pass
++                self.lora_modules[layer_id].append((module_name, lora_module))
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..0756af9 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -54,6 +54,39 @@ class LoRAMemoryPool:
+         # Here we don't initialize to None since None is a valid uid
+         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
+ 
++        # Micro-caches to avoid repeated string parsing/computation in hot paths
++        # 1) cache get_stacked_multiply(name) for known names
++        self._stacked_multiply_cache: Dict[str, int] = {}
++        # 2) cache mapping from weight tensor name -> normalized lora weight name
++        #    keyed by (original_name, lora_type)
++        self._weight_name_cache: Dict[Tuple[str, LoRAType], str] = {}
++        # 3) cache module_name -> normalized weight name per layer to avoid
++        #    repeated lookups during tensor-parallel slicing
++        self._module_weight_name_cache_per_layer: Dict[int, Dict[str, str]] = {
++            i: {} for i in range(self.num_layer)
++        }
++        # Pre-fill caches using known names and modules where possible
++        all_names: Set[str] = set()
++        for n in lora_modules.values():
++            for module_name, _ in n:
++                # For non-stacked special names, pre-resolve mapping once
++                if "qkv_proj" not in module_name:
++                    try:
++                        self._module_weight_name_cache_per_layer[
++                            get_layer_id(module_name)
++                        ][module_name] = get_weight_name(
++                            module_name, getattr(self, "lora_weight_names", (set(), set())), LoRAType.LORA_A
++                        )
++                    except Exception:
++                        pass
++                all_names.add(module_name.split(".")[-1])
++        for name in all_names:
++            try:
++                self._stacked_multiply_cache[name] = get_stacked_multiply(name)
++            except Exception:
++                # Name might not be a stacked-multiply candidate
++                pass
++
+     def get_lora_A_shape(
+         self, module_name: str, base_model: torch.nn.Module
+     ) -> Tuple[int]:
+@@ -162,10 +195,15 @@ class LoRAMemoryPool:
+                 buffer_view.shape == weight.shape
+             ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+ 
++        # Fast helpers with local variables to reduce attribute lookups
++        get_mul = self._stacked_multiply_cache.get
++        resolve_weight_name = self._resolve_weight_name
++
+         if uid is None:
+             for i in range(self.num_layer):
+                 for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++                    # Zero the target slot in-place to avoid temporary scalars
++                    self.A_buffer[k][i][buffer_id].zero_()
+             return
+ 
+         assert lora_adapter is not None
+@@ -176,14 +214,10 @@ class LoRAMemoryPool:
+             temp_B_buffer: Dict[str, torch.Tensor] = {}
+             for name, weights in layer_weights.items():
+                 if "lora_A" in name:
+-                    lora_weight_name = get_weight_name(
+-                        name, self.lora_weight_names, LoRAType.LORA_A
+-                    )
++                    lora_weight_name = resolve_weight_name(name, LoRAType.LORA_A)
+                     temp_A_buffer[lora_weight_name] = weights
+                 else:
+-                    lora_weight_name = get_weight_name(
+-                        name, self.lora_weight_names, LoRAType.LORA_B
+-                    )
++                    lora_weight_name = resolve_weight_name(name, LoRAType.LORA_B)
+                     temp_B_buffer[lora_weight_name] = weights
+ 
+             if self.tp_size > 1:
+@@ -200,8 +234,13 @@ class LoRAMemoryPool:
+                             )
+                         )
+                     else:
+-                        weight_name = get_weight_name(
+-                            module_name, self.lora_weight_names, LoRAType.LORA_A
++                        weight_name = self._module_weight_name_cache_per_layer[
++                            layer_id
++                        ].get(
++                            module_name,
++                            get_weight_name(
++                                module_name, self.lora_weight_names, LoRAType.LORA_A
++                            ),
+                         )
+                         temp_A_buffer[weight_name] = module.slice_lora_a_weights(
+                             temp_A_buffer[weight_name], self.tp_rank
+@@ -211,28 +250,34 @@ class LoRAMemoryPool:
+                         )
+ 
+             for name, weights in temp_A_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = get_mul(name)
++                if c is None:
++                    c = get_stacked_multiply(name)
++                    self._stacked_multiply_cache[name] = c
+                 buffer_view = self.A_buffer[name][layer_id][buffer_id][
+                     : lora_rank * c, :
+                 ]
+                 check_lora_weight_shape(buffer_view, weights)
+-                buffer_view.copy_(weights)
++                buffer_view.copy_(weights, non_blocking=True)
+ 
+             for name, weights in temp_B_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = get_mul(name)
++                if c is None:
++                    c = get_stacked_multiply(name)
++                    self._stacked_multiply_cache[name] = c
+                 if c > 1:
+                     for stacked_id in range(c):
+                         buffer_view = self.B_buffer[name][layer_id][stacked_id][
+                             buffer_id
+                         ][:, :lora_rank]
+                         check_lora_weight_shape(buffer_view, weights[stacked_id])
+-                        buffer_view.copy_(weights[stacked_id])
++                        buffer_view.copy_(weights[stacked_id], non_blocking=True)
+                 else:
+                     buffer_view = self.B_buffer[name][layer_id][0][buffer_id][
+                         :, :lora_rank
+                     ]
+                     check_lora_weight_shape(buffer_view, weights)
+-                    buffer_view.copy_(weights)
++                    buffer_view.copy_(weights, non_blocking=True)
+ 
+     def get_tensor(
+         self, weight_name: str, layer_id: int, lora_type: LoRAType
+@@ -245,3 +290,13 @@ class LoRAMemoryPool:
+ 
+     def get_buffer_id(self, lora_uid: str):
+         return self.uid_to_buffer_id[lora_uid]
++
++    # Internal: resolve normalized lora weight name with caching
++    def _resolve_weight_name(self, name: str, lora_type: LoRAType) -> str:
++        key = (name, lora_type)
++        cached = self._weight_name_cache.get(key)
++        if cached is not None:
++            return cached
++        resolved = get_weight_name(name, self.lora_weight_names, lora_type)
++        self._weight_name_cache[key] = resolved
++        return resolved

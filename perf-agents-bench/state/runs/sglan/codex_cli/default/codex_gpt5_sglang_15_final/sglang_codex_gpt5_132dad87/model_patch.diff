@@ -1,0 +1,54 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 824f767..5bd268d 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -326,10 +326,34 @@ class MooncakeKVManager(BaseKVManager):
+                     if kv_chunk.room in self.transfer_infos
+                     else []
+                 )
++
++                # Fast-path: if there are no real transfers (all dummy ranks),
++                # avoid per-request iteration and bookkeeping. Only the last
++                # chunk needs to mark the room as success.
++                if reqs_to_be_processed:
++                    has_real = any(not r.is_dummy for r in reqs_to_be_processed)
++                else:
++                    has_real = False
++
++                if not has_real:
++                    if kv_chunk.is_last and kv_chunk.room in self.request_status:
++                        self.update_status(kv_chunk.room, KVPoll.Success)
++                    # Since there is no real transfer target, we can safely
++                    # drop cached transfer infos for this room to reduce
++                    # memory and lookups.
++                    if kv_chunk.room in self.transfer_infos:
++                        self.transfer_infos.pop(kv_chunk.room, None)
++                    # Nothing else to do for dummy-only rooms.
++                    continue
++
+                 polls = []
+                 dst_ranks_infos = []
+                 for req in reqs_to_be_processed:
+-                    if not req.is_dummy:
++                    # Skip dummy ranks when real targets exist; their status
++                    # will be concluded by the real transfers' results.
++                    if req.is_dummy:
++                        continue
++                    else:
+                         # Early exit if the request has failed
+                         with self.session_lock:
+                             if req.mooncake_session_id in self.failed_sessions:
+@@ -411,11 +435,8 @@ class MooncakeKVManager(BaseKVManager):
+                                     self.sync_status_to_decode_endpoint(
+                                         endpoint, dst_port, room, status
+                                     )
+-                    else:
+-                        # Dummy request means the decode instance is not used, so its status can be marked as success directly
+-                        # Dummy request does not need to sync status to decode endpoint
+-                        if kv_chunk.is_last and req.room in self.request_status:
+-                            self.update_status(req.room, KVPoll.Success)
++                    # Note: dummy requests are intentionally ignored above. If a
++                    # room has only dummy requests, the fast-path handles it.
+ 
+                 if (
+                     kv_chunk.room not in self.request_status

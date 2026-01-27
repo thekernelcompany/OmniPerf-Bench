@@ -1,0 +1,129 @@
+diff --git a/model_patch.diff b/model_patch.diff
+index 88189fa..e69de29 100644
+--- a/model_patch.diff
++++ b/model_patch.diff
+@@ -1,106 +0,0 @@
+-diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+-index 9dbc270..9390f6e 100644
+---- a/docs/backend/pd_disaggregation.md
+-+++ b/docs/backend/pd_disaggregation.md
+-@@ -15,7 +15,9 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
+- 
+- For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
+- 
+--Currently, we support Mooncake and NIXL as the transfer engine.
+-+Currently, we support Mooncake and NIXL as the transfer engine. For
+-+best stability under load, avoid extremely small heartbeat intervals
+-+and prefer the default values unless you have measured bottlenecks.
+- 
+- 
+- ## Mooncake
+-@@ -61,7 +63,7 @@ PD Disaggregation with Mooncake supports the following environment variables for
+- #### Decode Server Configuration
+- | Variable | Description | Default |
+- |:--------:|:-----------:|:--------:
+--| **`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`** | Interval (seconds) between health checks to prefill bootstrap servers | `5.0` |
+-+| **`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`** | Interval (seconds) between health checks to prefill bootstrap servers (min 2.0s to prevent flapping and CPU spikes) | `5.0` |
+- | **`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`** | Consecutive heartbeat failures before marking prefill server offline | `2` |
+- 
+- 
+-diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+-index 940a25d..8cc64bc 100644
+---- a/python/sglang/srt/disaggregation/mooncake/conn.py
+-+++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+-@@ -12,7 +12,7 @@ import threading
+- import time
+- from collections import defaultdict
+- from functools import cache
+--from typing import Dict, List, Optional, Tuple, Union
+-+from typing import Dict, List, Optional, Tuple, Union, Set
+- 
+- import numpy as np
+- import numpy.typing as npt
+-@@ -191,7 +191,13 @@ class MooncakeKVManager(BaseKVManager):
+-             self.heartbeat_failures = {}
+-             self.session_pool = defaultdict(requests.Session)
+-             self.session_pool_lock = threading.Lock()
+--            self.addr_to_rooms_tracker = defaultdict(list)
+-+            # Use sets to track active rooms per prefill address for O(1) add/remove.
+-+            # This avoids periodic full scans that can cause latency spikes.
+-+            self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
+-+            # Reverse mapping to find the prefill address for a room quickly.
+-+            self.room_to_addr: Dict[int, str] = {}
+-+            # Dedicated lock for tracker structures accessed across threads.
+-+            self.tracker_lock = threading.Lock()
+-             self.connection_lock = threading.Lock()
+-             # Heartbeat interval should be at least 2 seconds
+-             self.heartbeat_interval = max(
+-@@ -503,15 +509,8 @@ class MooncakeKVManager(BaseKVManager):
+-                         )
+-                         if response.status_code == 200:
+-                             self.heartbeat_failures[bootstrap_addr] = 0
+--
+--                            for bootstrap_room in self.addr_to_rooms_tracker[
+--                                bootstrap_addr
+--                            ]:
+--                                # Remove KVPoll.Success requests from the map
+--                                if bootstrap_room not in self.request_status:
+--                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+--                                        bootstrap_room
+--                                    )
+-+                            # Tracker cleanup is handled immediately on update_status,
+-+                            # avoiding per-heartbeat scans of large room lists.
+-                         else:
+-                             logger.info(
+-                                 f"Attempting to reconnect to {bootstrap_addr}..."
+-@@ -593,6 +592,19 @@ class MooncakeKVManager(BaseKVManager):
+-                     self.request_status[bootstrap_room], status
+-                 )
+- 
+-+        # Fast GC: once a room reaches terminal state, remove it from trackers.
+-+        if (
+-+            self.disaggregation_mode == DisaggregationMode.DECODE
+-+            and status in (KVPoll.Success, KVPoll.Failed)
+-+        ):
+-+            # Avoid attribute error in PREFILL mode or early init.
+-+            tracker_lock = getattr(self, "tracker_lock", None)
+-+            if tracker_lock is not None:
+-+                with tracker_lock:
+-+                    addr = self.room_to_addr.pop(bootstrap_room, None)
+-+                    if addr is not None and addr in self.addr_to_rooms_tracker:
+-+                        self.addr_to_rooms_tracker[addr].discard(bootstrap_room)
+-+
+-     def record_failure(self, bootstrap_room: int, failure_reason: str):
+-         with self.failure_lock:
+-             self.failure_records[bootstrap_room] = failure_reason
+-@@ -879,9 +891,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
+-             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+- 
+-         assert len(self.bootstrap_infos) > 0
+--        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
+--            self.bootstrap_room
+--        )
+-+        # Record room->addr and addr->rooms for fast, contention-free tracker ops.
+-+        with self.kv_mgr.tracker_lock:
+-+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
+-+                self.bootstrap_room
+-+            )
+-+            self.kv_mgr.room_to_addr[self.bootstrap_room] = self.bootstrap_addr
+-         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+- 
+-     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 30b6001..0e7e972 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -744,6 +744,13 @@ class MooncakeKVSender(BaseKVSender):
+     def clear(self) -> None:
+         if self.bootstrap_room in self.kv_mgr.request_status:
+             self.kv_mgr.request_status.pop(self.bootstrap_room)
++        # Mirror cleanup to keep trackers consistent when receiver clears.
++        tracker_lock = getattr(self.kv_mgr, "tracker_lock", None)
++        if tracker_lock is not None:
++            with tracker_lock:
++                addr = self.kv_mgr.room_to_addr.pop(self.bootstrap_room, None)
++                if addr is not None and addr in self.kv_mgr.addr_to_rooms_tracker:
++                    self.kv_mgr.addr_to_rooms_tracker[addr].discard(self.bootstrap_room)
+         # Ensure tracker structures are cleaned even if callers clear directly.
+         tracker_lock = getattr(self.kv_mgr, "tracker_lock", None)
+         if tracker_lock is not None:
