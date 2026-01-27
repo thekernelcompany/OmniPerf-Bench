@@ -1,0 +1,43 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 0e1640f..ef1e4fb 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -375,21 +375,27 @@ def block_quant_dequant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
++    # Convert to float32 first for accurate computation
++    x_q_block_fp32 = x_q_block.to(torch.float32)
++    x_dq_block = torch.empty((n, k), dtype=torch.float32)
++
++    # Precompute all slice boundaries to avoid repeated min() calls
++    n_slices = [min((j + 1) * block_n, n) for j in range(n_tiles + 1)]
++    k_slices = [min((i + 1) * block_k, k) for i in range(k_tiles + 1)]
+ 
+     for j in range(n_tiles):
++        n_start = j * block_n
++        n_end = n_slices[j + 1]
+         for i in range(k_tiles):
+-            x_q_block_tile = x_q_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile = x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
++            k_start = i * block_k
++            k_end = k_slices[i + 1]
++            
++            # Direct computation with precomputed boundaries
++            x_dq_block[n_start:n_end, k_start:k_end] = (
++                x_q_block_fp32[n_start:n_end, k_start:k_end] * x_s[j][i]
++            )
+ 
+-    return x_dq_block
++    return x_dq_block.to(dtype)
+ 
+ 
+ def channel_quant_to_tensor_quant(

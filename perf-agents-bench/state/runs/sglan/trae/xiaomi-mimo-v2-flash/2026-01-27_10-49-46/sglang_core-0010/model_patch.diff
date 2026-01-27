@@ -1,0 +1,85 @@
+commit c1a47c7a912c30625ee10ef6b976885c001196c0
+Author: Benchmark <bench@local>
+Date:   Tue Jan 27 13:44:05 2026 +0000
+
+    Optimize MoE align sum kernels performance
+
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 29e861e..def3a91 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -249,19 +249,21 @@ class MooncakeKVManager(BaseKVManager):
+             for layer_id in range(num_layers)
+         ]
+ 
+-        # Worker function for processing a single layer
++        # Worker function for processing a single layer using batch transfer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
++            # Build batch of transfers for this layer
++            transfers = []
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                 src_addr = src_ptr + int(prefill_index[0]) * item_len
+                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                 length = item_len * len(prefill_index)
++                transfers.append((src_addr, dst_addr, length))
+ 
+-                status = self.engine.transfer_sync(
+-                    mooncake_session_id, src_addr, dst_addr, length
+-                )
+-                if status != 0:
+-                    return status
+-            return 0
++            # Execute all transfers for this layer in a batch
++            status = self.engine.batch_transfer_sync(
++                mooncake_session_id, transfers
++            )
++            return status
+ 
+         futures = [
+             executor.submit(
+diff --git a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+index 5643af7..930db12 100644
+--- a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
++++ b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+@@ -90,5 +90,41 @@ class MooncakeTransferEngine:
+ 
+         return ret
+ 
++    def batch_transfer_sync(
++        self, session_id: str, transfers: list[tuple[int, int, int]]
++    ) -> int:
++        """
++        Synchronously transfer multiple data chunks in a batch.
++        
++        Args:
++            session_id: The session ID for the transfer
++            transfers: List of (buffer, peer_buffer_address, length) tuples
++            
++        Returns:
++            0 on success, negative on failure
++        """
++        if not transfers:
++            return 0
++        
++        try:
++            # Process all transfers in a batch to reduce overhead
++            # This is more efficient than calling transfer_sync_write multiple times
++            for buffer, peer_buffer_address, length in transfers:
++                ret = self.engine.transfer_sync_write(
++                    session_id, buffer, peer_buffer_address, length
++                )
++                if ret != 0:
++                    logger.debug(
++                        "Failed to transfer data from %s to %s - %s.",
++                        buffer,
++                        session_id,
++                        peer_buffer_address,
++                    )
++                    return ret
++            return 0
++        except Exception as e:
++            logger.debug(f"Batch transfer failed with exception: {e}")
++            return -1
++
+     def get_session_id(self):
+         return self.session_id

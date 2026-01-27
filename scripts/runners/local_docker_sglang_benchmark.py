@@ -38,6 +38,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
+# Repository root for portable paths
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 # Configuration - Docker image repositories
 SGLANG_DOCKER_REPOS = [
     "shikhar481/sglang-images",       # Newer repo with -src, -v2, -v3 suffixes
@@ -48,24 +51,25 @@ SGLANG_DOCKER_REPOS = [
 OFFICIAL_SGLANG_IMAGE = "lmsysorg/sglang:v0.4.6.post5-cu124"
 
 # Results directory
-RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_sglang")
+RESULTS_DIR = REPO_ROOT / "omniperf_results_3way_sglang"
 OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
 BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 
 # Commit mapping file
-COMMIT_MAPPING_FILE = Path("/root/OmniPerf-Bench/src/benchmark/fixes/sglang_commit_mapping.json")
+COMMIT_MAPPING_FILE = REPO_ROOT / "src/benchmark/fixes/sglang_commit_mapping.json"
 
 # Agent patches configuration - support multiple agents
 AGENT_RUNS_DIRS = {
-    "claude_code": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/claude_code"),
-    "codex": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/codex"),
-    "trae_gpt5": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/trae/gpt-5"),
-    "trae_sonnet45": Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/sglang/trae/claude-sonnet-45"),
+    "claude_code": REPO_ROOT / "perf-agents-bench/state/runs/sglang/claude_code",
+    "codex": REPO_ROOT / "perf-agents-bench/state/runs/sglang/codex",
+    "trae_gpt5": REPO_ROOT / "perf-agents-bench/state/runs/sglang/trae/gpt-5",
+    "trae_sonnet45": REPO_ROOT / "perf-agents-bench/state/runs/sglang/trae/claude-sonnet-45",
+    "mimo": REPO_ROOT / "perf-agents-bench/state/runs/sglan/trae/xiaomi-mimo-v2-flash/2026-01-27_10-49-46",
 }
 
 # HuggingFace cache mount path
-HF_CACHE_PATH = Path("/root/.cache/huggingface")
+HF_CACHE_PATH = Path.home() / ".cache/huggingface"
 
 # Legacy compatibility
 CLAUDE_CODE_RUNS_DIR = AGENT_RUNS_DIRS["claude_code"]
@@ -161,18 +165,24 @@ def get_sglang_image(commit: str, phase: str = "human") -> Optional[str]:
     full = commit[:40] if len(commit) >= 40 else commit
 
     if phase == "baseline":
-        # Look for baseline-tagged images
+        # Look for baseline-tagged images and full commit hashes
         candidates = [
             f"shikhar481/sglang-images:baseline-{short12}",
             f"ayushnangia16/nvidia-sglang-docker:baseline-{short12}",
+            # Also check full commit hash (ayushnangia16 uses full hashes for commits)
+            f"ayushnangia16/nvidia-sglang-docker:{full}",
+            # Simple 8-char hash patterns
+            f"shikhar481/sglang-images:{short8}",
         ]
     else:
         # Human/agent phase - look for commit images
-        # Priority: simple hash (known to work) > v04x-fixed > v04x-triton > v05 > src > ayushnangia16
+        # Priority: simple hash > ayushnangia16 (tested working) > v04x variants > v05 > src
         candidates = [
             # Simple 8-char hash (like c087ddd6 which works on H100)
             f"shikhar481/sglang-images:{short8}",
-            # v04x-fixed pattern (12-char hash) - fixed dependency versions
+            # ayushnangia16 repo (full hashes) - tested working on H100
+            f"ayushnangia16/nvidia-sglang-docker:{full}",
+            # v04x-fixed pattern (12-char hash) - may have Triton issues
             f"shikhar481/sglang-images:v04x-fixed-{short12}",
             # v04x-triton pattern (12-char hash)
             f"shikhar481/sglang-images:v04x-triton-{short12}",
@@ -183,8 +193,6 @@ def get_sglang_image(commit: str, phase: str = "human") -> Optional[str]:
             f"shikhar481/sglang-images:fixed-{short8}",
             # -src suffix pattern
             f"shikhar481/sglang-images:{short8}-src",
-            # ayushnangia16 repo (full hashes) - often has ABI issues
-            f"ayushnangia16/nvidia-sglang-docker:{full}",
         ]
 
     for image_tag in candidates:
@@ -285,6 +293,12 @@ def load_agent_patches(agent_type: str = "claude_code") -> Dict[str, Dict[str, A
         # The runs_dir already points to trae/gpt-5 or trae/claude-sonnet-45
         search_patterns = [
             runs_dir.glob("*/sglang_*"),
+        ]
+    elif agent_type == "mimo":
+        # Pattern: xiaomi-mimo-v2-flash/2026-01-27_10-49-46/sglang_core-*
+        # The runs_dir already points to the timestamp directory
+        search_patterns = [
+            runs_dir.glob("sglang_core-*"),
         ]
     else:
         search_patterns = [runs_dir.glob("*/*/sglang_*")]

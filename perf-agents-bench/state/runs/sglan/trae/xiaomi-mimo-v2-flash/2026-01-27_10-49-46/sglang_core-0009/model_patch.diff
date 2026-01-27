@@ -1,0 +1,164 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..c0cfd36 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -71,6 +71,13 @@ class LoRAManager:
+ 
+         self.init_loras()
+         self.init_lora_memory_pool()
++        
++        # Pre-compute and cache lora ranks and scalings for each adapter
++        self._lora_ranks_cache: Dict[str, int] = {}
++        self._lora_scalings_cache: Dict[str, float] = {}
++        for name, lora in self.loras.items():
++            self._lora_ranks_cache[name] = lora.config.hf_config["r"]
++            self._lora_scalings_cache[name] = lora.scaling
+ 
+     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+@@ -180,13 +187,13 @@ class LoRAManager:
+                     self.memory_pool.get_buffer_id(lora_path)
+                 )
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
++                    # Use cached values instead of accessing lora.config.hf_config["r"] and lora.scaling
+                     self.cuda_graph_batch_info.lora_ranks[
+                         self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.config.hf_config["r"]
++                    ] = self._lora_ranks_cache[lora_path]
+                     self.cuda_graph_batch_info.scalings[
+                         self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.scaling
++                    ] = self._lora_scalings_cache[lora_path]
+             batch_info = self.cuda_graph_batch_info
+         else:
+             seg_lens = (
+@@ -208,9 +215,9 @@ class LoRAManager:
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+-                    scalings[weight_indices[i]] = lora.scaling
++                    # Use cached values instead of accessing lora.config.hf_config["r"] and lora.scaling
++                    lora_ranks[weight_indices[i]] = self._lora_ranks_cache[lora_path]
++                    scalings[weight_indices[i]] = self._lora_scalings_cache[lora_path]
+             batch_info = LoRABatchInfo(
+                 bs=bs,
+                 seg_lens=seg_lens,
+@@ -223,6 +230,7 @@ class LoRAManager:
+         self.lora_backend.set_batch_info(batch_info)
+ 
+         # call set_lora_info for each lora modules
++        # Cache weight name lookups to avoid repeated computations
+         for layer_id, modules in self.lora_modules.items():
+             for module_name, module in modules:
+                 if "qkv_proj" in module_name:
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..f3685b1 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -53,6 +53,9 @@ class LoRAMemoryPool:
+         # All uids are initialized as empty strings for empty buffer slots
+         # Here we don't initialize to None since None is a valid uid
+         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
++        
++        # Cache for stacked_multiply values to avoid repeated lookups
++        self._stacked_multiply_cache: Dict[str, int] = {}
+ 
+     def get_lora_A_shape(
+         self, module_name: str, base_model: torch.nn.Module
+@@ -61,7 +64,12 @@ class LoRAMemoryPool:
+         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
+         """
+         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
+-        c = get_stacked_multiply(module_name)
++        # Use cached value if available
++        if module_name in self._stacked_multiply_cache:
++            c = self._stacked_multiply_cache[module_name]
++        else:
++            c = get_stacked_multiply(module_name)
++            self._stacked_multiply_cache[module_name] = c
+         if self.tp_size > 1:
+             if module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                 input_dim = divide(input_dim, self.tp_size)
+@@ -78,7 +86,12 @@ class LoRAMemoryPool:
+         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
+         """
+         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
+-        c = get_stacked_multiply(module_name)
++        # Use cached value if available
++        if module_name in self._stacked_multiply_cache:
++            c = self._stacked_multiply_cache[module_name]
++        else:
++            c = get_stacked_multiply(module_name)
++            self._stacked_multiply_cache[module_name] = c
+         if self.tp_size > 1:
+             if module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                 output_dim = divide(output_dim, self.tp_size)
+@@ -99,6 +112,12 @@ class LoRAMemoryPool:
+         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
+         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
+         device = next(base_model.parameters()).device
++        
++        # Pre-compute and cache stacked_multiply values for all weight names
++        all_weight_names = lora_weight_names[0].union(lora_weight_names[1])
++        for name in all_weight_names:
++            self._stacked_multiply_cache[name] = get_stacked_multiply(name)
++        
+         # Init A tensor, column_major=False
+         for module_A in lora_weight_names[0]:
+             lora_A_shape = self.get_lora_A_shape(module_A, base_model)
+@@ -163,17 +182,27 @@ class LoRAMemoryPool:
+             ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+ 
+         if uid is None:
+-            for i in range(self.num_layer):
+-                for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++            # Zero out all buffers for this slot - use in-place operations
++            for k in self.A_buffer.keys():
++                for i in range(self.num_layer):
++                    self.A_buffer[k][i][buffer_id].zero_()
+             return
+ 
+         assert lora_adapter is not None
+         lora_rank = lora_adapter.config.hf_config["r"]
++        
++        # Pre-allocate temporary buffers once per method call instead of per layer
++        temp_A_buffer: Dict[str, torch.Tensor] = {}
++        temp_B_buffer: Dict[str, torch.Tensor] = {}
++        
+         for layer_id in range(self.num_layer):
+             layer_weights = lora_adapter.layers[layer_id].weights
+-            temp_A_buffer: Dict[str, torch.Tensor] = {}
+-            temp_B_buffer: Dict[str, torch.Tensor] = {}
++            
++            # Clear and reuse temporary buffers
++            temp_A_buffer.clear()
++            temp_B_buffer.clear()
++            
++            # Batch the weight name lookups
+             for name, weights in layer_weights.items():
+                 if "lora_A" in name:
+                     lora_weight_name = get_weight_name(
+@@ -210,8 +239,9 @@ class LoRAMemoryPool:
+                             temp_B_buffer[weight_name], self.tp_rank
+                         )
+ 
++            # Use cached stacked_multiply values
+             for name, weights in temp_A_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = self._stacked_multiply_cache[name]
+                 buffer_view = self.A_buffer[name][layer_id][buffer_id][
+                     : lora_rank * c, :
+                 ]
+@@ -219,7 +249,7 @@ class LoRAMemoryPool:
+                 buffer_view.copy_(weights)
+ 
+             for name, weights in temp_B_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = self._stacked_multiply_cache[name]
+                 if c > 1:
+                     for stacked_id in range(c):
+                         buffer_view = self.B_buffer[name][layer_id][stacked_id][

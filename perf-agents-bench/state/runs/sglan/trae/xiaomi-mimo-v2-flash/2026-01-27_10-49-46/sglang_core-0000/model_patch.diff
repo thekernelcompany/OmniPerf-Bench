@@ -1,0 +1,160 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..5bee361 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -42,14 +42,23 @@ def deepep_permute_triton_kernel(
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+ 
++    # Pre-load dst indices to avoid redundant memory accesses
++    dst_idxs = tl.zeros([topk], dtype=tl.int32)
++    valid_dsts = tl.zeros([topk], dtype=tl.int1)
++    
++    for idx in range(topk):
++        dst_idx = tl.load(src2dst_ptr + idx)
++        dst_idxs[idx] = dst_idx
++        valid_dsts[idx] = dst_idx >= 0
++
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+         offset = start_offset + tl.arange(0, BLOCK_SIZE)
+         mask = offset < hidden_size
+         in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+ 
+         for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            if dst_idx >= 0:
++            if valid_dsts[idx]:
++                dst_idx = dst_idxs[idx]
+                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 tl.store(dst_ptr + offset, in_data, mask=mask)
+ 
+@@ -73,14 +82,27 @@ def deepep_post_reorder_triton_kernel(
+     topk_weights_ptr = topk_weights_ptr + src_idx * topk
+ 
+     store_ptr = output_ptr + src_idx * hidden_size
++    
++    # Pre-load expert info to avoid redundant memory accesses
++    dst_idxs = tl.zeros([topk], dtype=tl.int32)
++    weigh_scales = tl.zeros([topk], dtype=InDtype)
++    valid_dsts = tl.zeros([topk], dtype=tl.int1)
++    
++    for idx in range(topk):
++        dst_idx = tl.load(src2dst_ptr + idx)
++        dst_idxs[idx] = dst_idx
++        valid_dsts[idx] = dst_idx >= 0
++        if dst_idx >= 0:
++            weigh_scales[idx] = tl.load(topk_weights_ptr + idx).to(InDtype)
++    
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+         offset = start_offset + tl.arange(0, BLOCK_SIZE)
+         mask = offset < hidden_size
+         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+         for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            if dst_idx >= 0:
+-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
++            if valid_dsts[idx]:
++                dst_idx = dst_idxs[idx]
++                weigh_scale = weigh_scales[idx]
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+                 in_data = tl.load(load_ptr + offset, mask=mask)
+                 sum_vec += in_data * weigh_scale
+@@ -186,20 +208,24 @@ def pre_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+-    for idx in range(topk):
+-        expert_id = tl.load(topk_ids_ptr + idx)
+-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-            if a1_scales_ptr is not None:
+-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+-            else:
+-                scale = 1.0
+-
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-                mask = offset < hidden_size
+-                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++    
++    # Pre-load input data once to avoid redundant memory accesses
++    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++        offset = start_offset + tl.arange(0, BLOCK_SIZE)
++        mask = offset < hidden_size
++        in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++        
++        # Process each expert for this block
++        for idx in range(topk):
++            expert_id = tl.load(topk_ids_ptr + idx)
++            if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                if a1_scales_ptr is not None:
++                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
++                else:
++                    scale = 1.0
++
++                dst_idx = tl.load(src2dst_ptr + idx)
++                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 out_data = (in_data * scale).to(OutDtype)
+                 tl.store(dst_ptr + offset, out_data, mask=mask)
+ 
+@@ -479,31 +505,44 @@ def post_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+     topk_weights_ptr = topk_weights_ptr + src_idx * topk
+ 
+-    computed = False
+     store_ptr = output_ptr + src_idx * hidden_size
++    
++    # Pre-load expert info to avoid redundant memory accesses
++    expert_ids = tl.zeros([topk], dtype=tl.int32)
++    dst_idxs = tl.zeros([topk], dtype=tl.int32)
++    weigh_scales = tl.zeros([topk], dtype=InDtype)
++    valid_experts = tl.zeros([topk], dtype=tl.int1)
++    
++    for idx in range(topk):
++        expert_id = tl.load(topk_ids_ptr + idx)
++        is_valid = (expert_id >= start_expert_id) & (expert_id <= end_expert_id)
++        expert_ids[idx] = expert_id
++        valid_experts[idx] = is_valid
++        if is_valid:
++            dst_idxs[idx] = tl.load(src2dst_ptr + idx)
++            weigh_scales[idx] = tl.load(topk_weights_ptr + idx).to(InDtype)
++    
++    # Process blocks
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+         offset = start_offset + tl.arange(0, BLOCK_SIZE)
+         mask = offset < hidden_size
+ 
+         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
++        has_computed = False
++        
+         for idx in range(topk):
+-            expert_id = tl.load(topk_ids_ptr + idx)
+-            if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-                computed = True
+-                dst_idx = tl.load(src2dst_ptr + idx)
+-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
++            if valid_experts[idx]:
++                has_computed = True
++                dst_idx = dst_idxs[idx]
++                weigh_scale = weigh_scales[idx]
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+                 in_data = tl.load(load_ptr + offset, mask=mask)
+                 sum_vec += in_data * weigh_scale
+-        tl.store(store_ptr + offset, sum_vec, mask=mask)
+-
+-    if computed == False:
+-        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-            mask = offset < hidden_size
+-            tl.store(
+-                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+-            )
++        
++        if has_computed:
++            tl.store(store_ptr + offset, sum_vec, mask=mask)
++        else:
++            tl.store(store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask)
+ 
+ 
+ @triton.jit

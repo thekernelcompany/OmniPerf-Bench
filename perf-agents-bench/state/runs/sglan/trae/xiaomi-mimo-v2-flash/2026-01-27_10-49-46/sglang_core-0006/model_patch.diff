@@ -1,0 +1,84 @@
+diff --git a/python/sglang/srt/configs/utils.py b/python/sglang/srt/configs/utils.py
+index 8403d95..5df9350 100644
+--- a/python/sglang/srt/configs/utils.py
++++ b/python/sglang/srt/configs/utils.py
+@@ -15,7 +15,7 @@ def register_image_processor(
+     """
+     register customized hf image processor while removing hf impl
+     """
+-    AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)
++    AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)
+ 
+ 
+ def register_processor(config: Type[PretrainedConfig], processor: Type[ProcessorMixin]):
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..b4d5718 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -40,13 +40,21 @@ def compute_split_seq_index(
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+     overall_sum = sum(arr)
+-    accumulator, split_index = 0, 0
+-    for value in arr[:-1]:
+-        accumulator += value
+-        split_index += 1
+-        if accumulator >= overall_sum // 2:
+-            break
+-    return split_index
++    half_sum = overall_sum // 2
++    
++    # Edge case: single element or empty
++    if len(arr) <= 1:
++        return 0
++    
++    accumulator = 0
++    # Iterate through all but the last element without creating a slice
++    for i in range(len(arr) - 1):
++        accumulator += arr[i]
++        if accumulator >= half_sum:
++            return i + 1
++    
++    # If we never reached half sum, return the last valid index
++    return len(arr) - 1
+ 
+ 
+ def compute_split_token_index(
+diff --git a/test/srt/test_two_batch_overlap.py b/test/srt/test_two_batch_overlap.py
+index 89e793c..402ad21 100644
+--- a/test/srt/test_two_batch_overlap.py
++++ b/test/srt/test_two_batch_overlap.py
+@@ -4,6 +4,7 @@ from types import SimpleNamespace
+ 
+ import requests
+ 
++from sglang.srt.two_batch_overlap import _split_array_by_half_sum
+ from sglang.srt.utils import kill_process_tree
+ from sglang.test.run_eval import run_eval
+ from sglang.test.test_utils import (
+@@ -15,6 +16,25 @@ from sglang.test.test_utils import (
+ 
+ 
+ class TestTwoBatchOverlap(unittest.TestCase):
++    def test_split_array_by_half_sum(self):
++        """Test the _split_array_by_half_sum function with various inputs."""
++        # Balanced arrays
++        self.assertEqual(_split_array_by_half_sum([10, 10, 10, 10]), 2)
++        self.assertEqual(_split_array_by_half_sum([100] * 20), 10)
++        self.assertEqual(_split_array_by_half_sum([50] * 100), 50)
++        
++        # Imbalanced arrays
++        self.assertEqual(_split_array_by_half_sum([1, 1, 1, 100]), 3)
++        self.assertEqual(_split_array_by_half_sum([1, 1, 1, 1, 1000]), 4)
++        self.assertEqual(_split_array_by_half_sum([1] * 50 + [1000]), 50)
++        self.assertEqual(_split_array_by_half_sum([1] * 100 + [10000]), 100)
++        
++        # Edge cases
++        self.assertEqual(_split_array_by_half_sum([1]), 0)
++        self.assertEqual(_split_array_by_half_sum([10, 20]), 1)
++        self.assertEqual(_split_array_by_half_sum([1, 2, 3, 4, 5]), 4)
++        self.assertEqual(_split_array_by_half_sum([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 7)
++
+     @classmethod
+     def setUpClass(cls):
+         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST

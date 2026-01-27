@@ -1,0 +1,124 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 8ab5066..1dd1708 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -5,7 +5,6 @@ import concurrent.futures
+ import dataclasses
+ import logging
+ import os
+-import queue
+ import socket
+ import struct
+ import threading
+@@ -31,6 +30,8 @@ from sglang.srt.disaggregation.base.conn import (
+ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+ from sglang.srt.disaggregation.utils import (
+     DisaggregationMode,
++    FastQueue,
++    FastQueueEmpty,
+     group_concurrent_contiguous,
+ )
+ from sglang.srt.server_args import ServerArgs
+@@ -151,7 +152,7 @@ class MooncakeKVManager(BaseKVManager):
+         self.server_socket = zmq.Context().socket(zmq.PULL)
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-            self.transfer_queue = queue.Queue()
++            self.transfer_queue = FastQueue()
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+             self.start_prefill_thread()
+@@ -453,7 +454,7 @@ class MooncakeKVManager(BaseKVManager):
+                         if kv_chunk.room in self.transfer_infos:
+                             self.transfer_infos.pop(kv_chunk.room)
+ 
+-                except queue.Empty:
++                except FastQueueEmpty:
+                     continue
+                 except Exception as e:
+                     # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index 8841d5f..e3c6844 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -3,10 +3,12 @@ from __future__ import annotations
+ import dataclasses
+ import os
+ import random
++import threading
++import time
+ import warnings
+ from collections import deque
+ from enum import Enum
+-from typing import TYPE_CHECKING, List, Optional
++from typing import TYPE_CHECKING, Any, List, Optional
+ 
+ import numpy as np
+ import requests
+@@ -24,6 +26,66 @@ FakeBootstrapHost = "2.2.2.2"
+ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
+ 
+ 
++class FastQueueEmpty(Exception):
++    """Exception raised when FastQueue is empty."""
++    pass
++
++
++class FastQueue:
++    """
++    A fast, lock-based queue implementation optimized for performance.
++    
++    This queue uses collections.deque internally which is more efficient
++    than queue.Queue for simple producer-consumer patterns, especially
++    when used with small timeouts.
++    """
++
++    def __init__(self):
++        self._queue = deque()
++        self._lock = threading.Lock()
++        self._not_empty = threading.Condition(self._lock)
++
++    def put(self, item: Any, block: bool = True, timeout: Optional[float] = None) -> None:
++        """Put an item into the queue."""
++        with self._lock:
++            self._queue.append(item)
++            self._not_empty.notify()
++
++    def get(self, block: bool = True, timeout: Optional[float] = None) -> Any:
++        """
++        Remove and return an item from the queue.
++        
++        Args:
++            block: Whether to block if queue is empty
++            timeout: Timeout in seconds (only used when block=True)
++            
++        Raises:
++            FastQueueEmpty: If queue is empty and block=False or timeout expires
++        """
++        if timeout is None:
++            timeout = float('inf')
++        
++        deadline = time.time() + timeout
++        
++        with self._not_empty:
++            while not self._queue:
++                remaining = deadline - time.time()
++                if remaining <= 0:
++                    raise FastQueueEmpty()
++                self._not_empty.wait(remaining)
++            return self._queue.popleft()
++
++    def qsize(self) -> int:
++        """Return the approximate size of the queue."""
++        with self._lock:
++            return len(self._queue)
++
++    def empty(self) -> bool:
++        """Return True if the queue is empty."""
++        with self._lock:
++            return len(self._queue) == 0
++
++
+ class DisaggregationMode(Enum):
+     NULL = "null"
+     PREFILL = "prefill"
