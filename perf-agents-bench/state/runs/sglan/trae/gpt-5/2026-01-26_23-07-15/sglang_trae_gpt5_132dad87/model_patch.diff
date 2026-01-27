@@ -1,0 +1,29 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 824f767..791a02f 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -565,8 +565,22 @@ class MooncakeKVManager(BaseKVManager):
+         # NOTE(shangming): sharding according to the dst_infos to make sure
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
+-        dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
++        infos = self.transfer_infos.get(bootstrap_room, {})
++        # Fast path: if all destinations are dummy, avoid queueing work
++        if infos and all(info.is_dummy for info in infos.values()):
++            if is_last:
++                self.update_status(bootstrap_room, KVPoll.Success)
++            else:
++                self.update_status(bootstrap_room, KVPoll.WaitingForInput)
++            return
++
++        # Compute shard index using non-dummy destinations' ports for stability
++        non_dummy_infos = [info for info in infos.values() if not info.is_dummy]
++        # Fallback to bootstrap_room for sharding when info is missing (should be rare)
++        if non_dummy_infos:
++            session_port_sum = sum(info.dst_port for info in non_dummy_infos)
++        else:
++            session_port_sum = bootstrap_room
+         shard_idx = session_port_sum % len(self.transfer_queues)
+ 
+         self.transfer_queues[shard_idx].put(

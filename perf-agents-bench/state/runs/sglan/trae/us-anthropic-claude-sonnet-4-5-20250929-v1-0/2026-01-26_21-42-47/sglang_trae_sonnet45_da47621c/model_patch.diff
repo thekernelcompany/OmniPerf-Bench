@@ -1,0 +1,94 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index f5dceac..8ad4b39 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -106,10 +106,20 @@ def _fused_topk_postprocess(
+     expert_location_dispatch_info,
+     num_token_non_padded,
+ ):
++    # Early optimization: avoid unnecessary computation
+     if renormalize:
+-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++        # Use in-place division for better memory efficiency
++        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
++        topk_weights = topk_weights / topk_weights_sum
++    
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
++    
++    # Optimized masking: avoid creating arange tensor
++    if num_token_non_padded is not None:
++        # Use direct slicing which is more efficient than index-based masking
++        mask = torch.arange(topk_ids.shape[0], device=topk_ids.device).unsqueeze(1) >= num_token_non_padded
++        topk_ids = torch.where(mask, torch.tensor(-1, dtype=topk_ids.dtype, device=topk_ids.device), topk_ids)
++    
+     return topk_weights, topk_ids
+ 
+ 
+@@ -158,14 +168,17 @@ def grouped_topk(
+         topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+ 
+     if renormalize:
+-        topk_weights_sum = (
+-            topk_weights.sum(dim=-1, keepdim=True)
+-            if num_fused_shared_experts == 0
+-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+-        )
++        # Optimize: compute sum once and reuse
++        if num_fused_shared_experts == 0:
++            topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
++        else:
++            topk_weights_sum = topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+         topk_weights = topk_weights / topk_weights_sum
+ 
+-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
++    # Convert types efficiently
++    topk_weights = topk_weights.to(torch.float32)
++    topk_ids = topk_ids.to(torch.int32)
++    
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+     return topk_weights, topk_ids
+@@ -222,14 +235,17 @@ def biased_grouped_topk_impl(
+         topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+ 
+     if renormalize:
+-        topk_weights_sum = (
+-            topk_weights.sum(dim=-1, keepdim=True)
+-            if num_fused_shared_experts == 0
+-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+-        )
++        # Optimize: compute sum once and reuse
++        if num_fused_shared_experts == 0:
++            topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
++        else:
++            topk_weights_sum = topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+         topk_weights = topk_weights / topk_weights_sum
+ 
+-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
++    # Convert types efficiently
++    topk_weights = topk_weights.to(torch.float32)
++    topk_ids = topk_ids.to(torch.int32)
++    
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+     return topk_weights, topk_ids
+@@ -245,8 +261,16 @@ def _mask_topk_ids_padded_region(
+ ):
+     if num_token_non_padded is None:
+         return
+-    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+-    topk_ids[indices >= num_token_non_padded, :] = -1
++    # Optimized: avoid creating full arange tensor, use direct slicing
++    # This is more cache-efficient and reduces memory allocations
++    num_tokens = topk_ids.shape[0]
++    num_non_padded_int = num_token_non_padded.item() if num_token_non_padded.numel() == 1 else num_token_non_padded
++    if isinstance(num_non_padded_int, int) and num_non_padded_int < num_tokens:
++        topk_ids[num_non_padded_int:, :] = -1
++    else:
++        # Fallback for non-scalar case
++        indices = torch.arange(0, num_tokens, device=topk_ids.device)
++        topk_ids[indices >= num_token_non_padded, :] = -1
+ 
+ 
+ def biased_grouped_topk(

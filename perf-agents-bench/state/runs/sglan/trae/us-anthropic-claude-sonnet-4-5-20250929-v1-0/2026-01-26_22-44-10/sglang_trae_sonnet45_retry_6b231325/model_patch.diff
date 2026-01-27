@@ -1,0 +1,92 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 8ab5066..5475d4f 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -5,7 +5,6 @@ import concurrent.futures
+ import dataclasses
+ import logging
+ import os
+-import queue
+ import socket
+ import struct
+ import threading
+@@ -31,6 +30,7 @@ from sglang.srt.disaggregation.base.conn import (
+ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+ from sglang.srt.disaggregation.utils import (
+     DisaggregationMode,
++    FastQueue,
+     group_concurrent_contiguous,
+ )
+ from sglang.srt.server_args import ServerArgs
+@@ -151,7 +151,7 @@ class MooncakeKVManager(BaseKVManager):
+         self.server_socket = zmq.Context().socket(zmq.PULL)
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-            self.transfer_queue = queue.Queue()
++            self.transfer_queue = FastQueue()
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+             self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+             self.start_prefill_thread()
+@@ -453,7 +453,7 @@ class MooncakeKVManager(BaseKVManager):
+                         if kv_chunk.room in self.transfer_infos:
+                             self.transfer_infos.pop(kv_chunk.room)
+ 
+-                except queue.Empty:
++                except TimeoutError:
+                     continue
+                 except Exception as e:
+                     # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index 8841d5f..33e8526 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import dataclasses
+ import os
+ import random
++import threading
+ import warnings
+ from collections import deque
+ from enum import Enum
+@@ -24,6 +25,41 @@ FakeBootstrapHost = "2.2.2.2"
+ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
+ 
+ 
++class FastQueue:
++    """A faster queue implementation using deque with minimal locking overhead."""
++
++    def __init__(self):
++        self._queue = deque()
++        self._lock = threading.Lock()
++        self._not_empty = threading.Condition(self._lock)
++
++    def put(self, item):
++        with self._not_empty:
++            self._queue.append(item)
++            self._not_empty.notify()
++
++    def get(self, timeout=None):
++        with self._not_empty:
++            if timeout is None:
++                while not self._queue:
++                    self._not_empty.wait()
++                return self._queue.popleft()
++            else:
++                if not self._queue:
++                    self._not_empty.wait(timeout)
++                if not self._queue:
++                    raise TimeoutError()
++                return self._queue.popleft()
++
++    def empty(self):
++        with self._lock:
++            return len(self._queue) == 0
++
++    def qsize(self):
++        with self._lock:
++            return len(self._queue)
++
++
+ class DisaggregationMode(Enum):
+     NULL = "null"
+     PREFILL = "prefill"

@@ -1,0 +1,128 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index 9dbc270..f771bb8 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -15,7 +15,7 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
+ 
+ For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
+ 
+-Currently, we support Mooncake and NIXL as the transfer engine.
++Currently, we support Mooncake and NIXL as the transfer engines.
+ 
+ 
+ ## Mooncake
+@@ -65,6 +65,9 @@ PD Disaggregation with Mooncake supports the following environment variables for
+ | **`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`** | Consecutive heartbeat failures before marking prefill server offline | `2` |
+ 
+ 
++Note: The decode server performs incremental cleanup of connection trackers to avoid spikes during heartbeat GC. If you observe frequent reconnections under heavy loads, consider tuning `SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL` and `SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE` to balance responsiveness and overhead.
++
++
+ ## NIXL
+ ### Requirements
+ 
+@@ -97,11 +100,11 @@ $ python -m sglang.srt.disaggregation.mini_lb --prefill http://127.0.0.1:30000 -
+ 
+ ```bash
+ # prefill 0
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
+ # prefill 1
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
+ # decode 0
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ # decode 1
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ ```
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 940a25d..e7c0919 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -149,7 +149,7 @@ class MooncakeKVManager(BaseKVManager):
+             )
+         self.request_status: Dict[int, KVPoll] = {}
+         self.rank_port = None
+-        self.server_socket = zmq.Context().socket(zmq.PULL)
++        self.server_socket = zmq.Context.instance().socket(zmq.PULL)
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+@@ -226,9 +226,9 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     @cache
+     def _connect(self, endpoint: str):
+-        socket = zmq.Context().socket(zmq.PUSH)
+-        socket.connect(endpoint)
+-        return socket
++        sock = zmq.Context.instance().socket(zmq.PUSH)
++        sock.connect(endpoint)
++        return sock
+ 
+     def send_kvcache(
+         self,
+@@ -504,14 +504,12 @@ class MooncakeKVManager(BaseKVManager):
+                         if response.status_code == 200:
+                             self.heartbeat_failures[bootstrap_addr] = 0
+ 
+-                            for bootstrap_room in self.addr_to_rooms_tracker[
+-                                bootstrap_addr
+-                            ]:
+-                                # Remove KVPoll.Success requests from the map
+-                                if bootstrap_room not in self.request_status:
+-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+-                                        bootstrap_room
+-                                    )
++                            rooms = self.addr_to_rooms_tracker.get(bootstrap_addr)
++                            if rooms:
++                                # Prune completed rooms in a single pass to avoid quadratic removals
++                                self.addr_to_rooms_tracker[bootstrap_addr] = [
++                                    r for r in rooms if r in self.request_status
++                                ]
+                         else:
+                             logger.info(
+                                 f"Attempting to reconnect to {bootstrap_addr}..."
+@@ -748,7 +746,7 @@ class MooncakeKVSender(BaseKVSender):
+ 
+ 
+ class MooncakeKVReceiver(BaseKVReceiver):
+-    _ctx = zmq.Context()
++    _ctx = zmq.Context.instance()
+     _socket_cache = {}
+     _socket_locks = {}
+     _global_lock = threading.Lock()
+@@ -905,7 +903,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
+         """Fetch the prefill parallel info from the bootstrap server."""
+         try:
+             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
+-            response = requests.get(url)
++            response = requests.get(url, timeout=5)
+             if response.status_code == 200:
+                 prefill_parallel_info = response.json()
+                 return int(prefill_parallel_info["prefill_tp_size"]), int(
+@@ -921,16 +919,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return None, None
+ 
+     def _register_kv_args(self):
++        # Pre-pack static pointer arrays once to avoid repeated work per bootstrap_info
++        packed_kv_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
++        )
++        packed_aux_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
++        )
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
+ 
+             sock, lock = self._connect("tcp://" + self.prefill_server_url)
+             with lock:

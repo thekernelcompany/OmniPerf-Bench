@@ -1,0 +1,231 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 2f974ea..da44d2c 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -263,6 +263,142 @@ def make_local_attention_virtual_batches(
+     return seqlens_q_local, cu_seqlens_q_local, seqlens_k_local, block_table_local
+ 
+ 
++
++
++def make_local_attention_virtual_batches_torch(
++    attn_chunk_size: int,
++    cu_seqlens_q: torch.Tensor,
++    seq_lens: torch.Tensor,
++    block_table: torch.Tensor,
++    page_size: int = 0,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """
++    Torch implementation of make_local_attention_virtual_batches to avoid
++    host<->device transfers and reduce intermediate allocations.
++
++    Args:
++        attn_chunk_size: Size of local attention chunks (must be divisible by page_size)
++        cu_seqlens_q: 1D cumulative sum of query lengths (int32 tensor)
++        seq_lens: 1D sequence lengths (int32 tensor)
++        block_table: [B, pages] page-table tensor used to resolve page indices
++        page_size: size of a page
++
++    Returns:
++        seqlens_q_local: 1D int32 tensor of query lengths for local attention
++        cu_seqlens_q_local: 1D int32 cumulative lengths for local attention queries
++        seqlens_k_local: 1D int32 tensor of key lengths per local block
++        block_table_local: [local_batches, pages_per_local_batch] int32 tensor
++    """
++    assert page_size > 0, "page_size must be > 0"
++
++    # Ensure tensor dtypes/devices
++    device = block_table.device
++    itype = torch.int32
++    ltype = torch.long
++    cu_seqlens_q = cu_seqlens_q.to(device=device, dtype=itype)
++    seq_lens = seq_lens.to(device=device, dtype=itype)
++
++    # Adjust chunk size to be valid and page-size aligned
++    max_seq_len = torch.clamp(seq_lens.max(), min=1).item()
++    effective_chunk_size = min(attn_chunk_size, max_seq_len)
++    effective_chunk_size = (effective_chunk_size // page_size) * page_size
++    if effective_chunk_size < page_size:
++        effective_chunk_size = page_size
++    attn_chunk_size = int(effective_chunk_size)
++
++    # Basic per-request quantities
++    q_seqlens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]  # [B]
++    # q tokens in the first local block for each request
++    # min(attn_chunk - ((seq_lens - q_seqlens) % attn_chunk), q_seqlens)
++    modulo = (seq_lens - q_seqlens) % attn_chunk_size
++    q_tokens_in_first_block = torch.minimum(
++        torch.as_tensor(attn_chunk_size, dtype=itype, device=device) - modulo,
++        q_seqlens,
++    )
++    # size of the last k-block for each request
++    tokens_in_last_block = ((seq_lens - 1) % attn_chunk_size) + 1
++
++    # number of local blocks for each request
++    remaining = q_seqlens - q_tokens_in_first_block
++    local_blocks = 1 + (remaining + (attn_chunk_size - 1)) // attn_chunk_size
++
++    cu_num_blocks = torch.cumsum(local_blocks, dim=0)
++    virtual_batches = int(cu_num_blocks[-1].item())
++
++    # Build arange per-local-batch and helpers
++    block_offsets = torch.repeat_interleave(
++        (cu_num_blocks - local_blocks).to(itype), local_blocks.to(ltype)
++    ).to(itype)
++    arange = torch.arange(virtual_batches, device=device, dtype=itype) - block_offsets
++    rarange = torch.repeat_interleave(local_blocks.to(itype), local_blocks.to(ltype)) - arange - 1
++
++    # seqlens_q_local construction
++    seqlens_q_local = torch.repeat_interleave(
++        (q_seqlens - q_tokens_in_first_block).to(itype), local_blocks.to(ltype)
++    )
++    # set first blocks
++    first_mask = arange == 0
++    seqlens_q_local[first_mask] = q_tokens_in_first_block.repeat_interleave(
++        local_blocks.to(ltype)
++    )[first_mask]
++    # set remaining blocks: min(seqlens_q_local - attn_chunk*(arange-1), attn_chunk)
++    pos_mask = arange > 0
++    if pos_mask.any():
++        tmp = seqlens_q_local - attn_chunk_size * (arange - 1)
++        seqlens_q_local[pos_mask] = torch.minimum(
++            tmp[pos_mask], torch.as_tensor(attn_chunk_size, dtype=itype, device=device)
++        )
++
++    # cu of q local
++    cu_seqlens_q_local = torch.nn.functional.pad(
++        torch.cumsum(seqlens_q_local, dim=0, dtype=itype), (1, 0)
++    )
++
++    # k seqlens local: full blocks except the last block per request
++    seqlens_k_local = torch.full(
++        (virtual_batches,), attn_chunk_size, dtype=itype, device=device
++    )
++    last_block_indices = (cu_num_blocks - 1).to(ltype)
++    seqlens_k_local[last_block_indices] = tokens_in_last_block.to(itype)
++
++    # block starts for each local batch
++    base = (
++        torch.repeat_interleave(seq_lens.to(itype), local_blocks.to(ltype))
++        - (rarange * attn_chunk_size + torch.repeat_interleave(tokens_in_last_block.to(itype), local_blocks.to(ltype)))
++    )
++    block_starts = (base // page_size).to(itype)
++
++    assert attn_chunk_size % page_size == 0, (
++        f"attn_chunk_size {attn_chunk_size} is not divisible by page_size {page_size}"
++    )
++    pages_per_local_batch = attn_chunk_size // page_size
++
++    # Build block indices [local_batches, pages_per_local_batch]
++    per_page = torch.arange(pages_per_local_batch, device=device, dtype=itype)
++    block_indices_2d = block_starts[:, None] + per_page[None, :]
++    # clamp to avoid OOB
++    max_col = block_table.shape[1] - 1
++    if max_col >= 0:
++        block_indices_2d = torch.clamp(block_indices_2d, max=max_col)
++
++    # Build batch indices aligned with flattened block indices
++    b = seq_lens.shape[0]
++    batch_ids_per_local = torch.repeat_interleave(
++        torch.arange(b, device=device, dtype=ltype), local_blocks.to(ltype)
++    )  # [virtual_batches]
++    batch_indices = batch_ids_per_local.repeat_interleave(pages_per_local_batch)
++
++    block_table_local = block_table[
++        batch_indices, block_indices_2d.reshape(-1).to(dtype=ltype)
++    ].view(virtual_batches, pages_per_local_batch)
++
++    return (
++        seqlens_q_local.to(itype),
++        cu_seqlens_q_local.to(itype),
++        seqlens_k_local.to(itype),
++        block_table_local.to(torch.int32),
++    )
++
+ def cdiv(a: int, b: int) -> int:
+     """Ceiling division."""
+     return -(a // -b)
+@@ -1783,27 +1919,26 @@ class FlashAttentionBackend(AttentionBackend):
+             metadata.local_attn_metadata = None
+             return
+ 
+-        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+-        seq_lens_np = cache_seqlens_int32.cpu().numpy()
++        # Compute local attention batching on device to avoid host-device transfers
+         (
+-            seqlens_q_local_np,
+-            cu_seqlens_q_local_np,
+-            seqlens_k_local_np,
++            seqlens_q_local,
++            cu_seqlens_q_local,
++            seqlens_k_local,
+             block_table_local,
+-        ) = make_local_attention_virtual_batches(
++        ) = make_local_attention_virtual_batches_torch(
+             self.attention_chunk_size,
+-            cu_seqlens_q_np,
+-            seq_lens_np,
++            cu_seqlens_q,
++            cache_seqlens_int32,
+             page_table,
+             self.page_size,
+         )
+ 
+         local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+-            local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
+-            local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
+-            local_block_table=block_table_local.to(device),
+-            local_max_query_len=int(seqlens_q_local_np.max()),
+-            local_max_seq_len=int(seqlens_k_local_np.max()),
++            local_query_start_loc=cu_seqlens_q_local,
++            local_seqused_k=seqlens_k_local,
++            local_block_table=block_table_local,
++            local_max_query_len=int(seqlens_q_local.max().item()),
++            local_max_seq_len=int(seqlens_k_local.max().item()),
+         )
+         metadata.local_attn_metadata = local_metadata
+ 
+@@ -1841,26 +1976,19 @@ class FlashAttentionBackend(AttentionBackend):
+         max_seq_len = int(seqlens.max().item())
+         sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+ 
+-        cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+-        seqlens_np = seqlens.cpu().numpy()
+         (
+-            seqlens_q_local_np,
+-            cu_seqlens_q_local_np,
+-            seqlens_k_local_np,
++            seqlens_q_local,
++            cu_seqlens_q_local,
++            seqlens_k_local,
+             block_table_local,
+-        ) = make_local_attention_virtual_batches(
++        ) = make_local_attention_virtual_batches_torch(
+             self.attention_chunk_size,
+-            cu_seqlens_q_np,
+-            seqlens_np,
++            cu_seqlens_q,
++            seqlens,
+             sliced_page_table,
+             self.page_size,
+         )
+ 
+-        # Convert back to tensors
+-        device = local_q_buf.device
+-        cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device)
+-        seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device)
+-        block_table_local = block_table_local.to(device)
+         # Get sizes
+         q_len = cu_seqlens_q_local.shape[0]
+         k_len = seqlens_k_local.shape[0]
+@@ -1877,8 +2005,8 @@ class FlashAttentionBackend(AttentionBackend):
+ 
+         if metadata.local_attn_metadata is not None:
+             lam = metadata.local_attn_metadata
+-            lam.local_max_query_len = int(seqlens_q_local_np.max())
+-            lam.local_max_seq_len = int(seqlens_k_local_np.max())
++            lam.local_max_query_len = int(seqlens_q_local.max().item())
++            lam.local_max_seq_len = int(seqlens_k_local.max().item())
+ 
+ 
+ class FlashAttentionMultiStepBackend:

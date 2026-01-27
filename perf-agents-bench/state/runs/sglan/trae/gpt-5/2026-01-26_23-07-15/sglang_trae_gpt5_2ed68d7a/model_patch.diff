@@ -1,0 +1,89 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 29e861e..5983ba5 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -251,17 +251,22 @@ class MooncakeKVManager(BaseKVManager):
+ 
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
++            # Precompute batched segments to reduce per-call overhead
++            src_addrs = []
++            dst_addrs = []
++            lengths = []
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+-                src_addr = src_ptr + int(prefill_index[0]) * item_len
+-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+-                length = item_len * len(prefill_index)
++                src_addrs.append(src_ptr + int(prefill_index[0]) * item_len)
++                dst_addrs.append(dst_ptr + int(decode_index[0]) * item_len)
++                lengths.append(item_len * len(prefill_index))
+ 
+-                status = self.engine.transfer_sync(
+-                    mooncake_session_id, src_addr, dst_addr, length
+-                )
+-                if status != 0:
+-                    return status
+-            return 0
++            if not src_addrs:
++                return 0
++
++            status = self.engine.transfer_batch_sync(
++                mooncake_session_id, src_addrs, dst_addrs, lengths
++            )
++            return status
+ 
+         futures = [
+             executor.submit(
+diff --git a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+index 5643af7..7e9eb8d 100644
+--- a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
++++ b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+@@ -1,7 +1,7 @@
+ import json
+ import logging
+ from dataclasses import dataclass
+-from typing import Optional
++from typing import Optional, List, Sequence
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -90,5 +90,39 @@ class MooncakeTransferEngine:
+ 
+         return ret
+ 
++    def transfer_batch_sync(
++        self,
++        session_id: str,
++        buffers: Sequence[int],
++        peer_buffer_addresses: Sequence[int],
++        lengths: Sequence[int],
++    ) -> int:
++        """Batch transfer multiple segments.
++
++        Uses a native batch API if available in mooncake; otherwise falls back to
++        issuing multiple transfer_sync calls sequentially.
++        Returns 0 on success, or the first non-zero/negative status encountered.
++        """
++        # Fast path: use engine's batch write if available
++        engine = self.engine
++        try:
++            batch_fn = getattr(engine, "transfer_batch_sync_write", None)
++        except Exception:
++            batch_fn = None
++
++        if batch_fn is not None:
++            try:
++                ret = batch_fn(session_id, list(buffers), list(peer_buffer_addresses), list(lengths))
++            except Exception:
++                ret = -1
++            return ret
++
++        # Fallback path
++        for b, p, l in zip(buffers, peer_buffer_addresses, lengths):
++            r = self.transfer_sync(session_id, b, p, l)
++            if r != 0:
++                return r
++        return 0
++
+     def get_session_id(self):
+         return self.session_id

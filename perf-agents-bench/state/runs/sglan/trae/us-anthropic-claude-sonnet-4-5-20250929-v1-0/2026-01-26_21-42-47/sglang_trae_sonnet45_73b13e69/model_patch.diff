@@ -1,0 +1,58 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..06740e0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1403,23 +1403,20 @@ class Scheduler(
+         """Coordinate the DP attention batch."""
+ 
+         local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
++            new_batch is not None,
+             dtype=torch.int64,
+         )
+         global_info = torch.empty(
+-            (self.server_args.dp_size, self.attn_tp_size, 1),
++            self.server_args.dp_size * self.attn_tp_size,
+             dtype=torch.int64,
+         )
+         torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
++            global_info,
+             local_info,
+             group=self.tp_cpu_group,
+         )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
++        # Check if any DP worker has a forward batch (avoid .tolist() conversion)
++        any_new_batch = global_info[::self.attn_tp_size].any().item()
+         return any_new_batch
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+@@ -1456,15 +1453,17 @@ class Scheduler(
+ 
+         new_batch = self.get_new_batch_prefill()
+ 
+-        # TODO(ch-wan): minor refactor is needed here to improve readability
+-        any_new_batch = (
+-            self.server_args.enable_dp_attention
+-            and not self.spec_algorithm.is_none()
+-            and self.coordinate_spec_dp_attn_batch(new_batch)
+-        )
+-        if new_batch is not None or any_new_batch:
++        # Optimize DP attention coordination for speculative decoding
++        if new_batch is not None:
+             # Run prefill first if possible
+             ret = new_batch
++        elif (
++            self.server_args.enable_dp_attention
++            and not self.spec_algorithm.is_none()
++            and self.coordinate_spec_dp_attn_batch(None)
++        ):
++            # Coordinate with other DP workers when no local batch
++            ret = None
+         else:
+             # Run decode
+             if not self.running_batch.is_empty():

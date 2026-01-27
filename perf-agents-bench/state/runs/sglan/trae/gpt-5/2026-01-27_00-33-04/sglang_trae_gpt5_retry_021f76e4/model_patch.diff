@@ -1,0 +1,236 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..739b8bd 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -72,6 +72,10 @@ class LoRAManager:
+         self.init_loras()
+         self.init_lora_memory_pool()
+ 
++
++        # Cache for frequently used seg_lens/seg_indptr tensors by batch size (decode mode)
++        self._seg_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
++
+     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+         with torch.device("cuda"):
+@@ -189,28 +193,36 @@ class LoRAManager:
+                     ] = lora.scaling
+             batch_info = self.cuda_graph_batch_info
+         else:
+-            seg_lens = (
+-                forward_batch.extend_seq_lens
+-                if forward_batch.forward_mode.is_extend()
+-                else torch.ones(bs, device=self.device)
+-            )
+-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+-            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+-            max_len = int(torch.max(seg_lens))
+-            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
++            is_extend = forward_batch.forward_mode.is_extend()
++            if is_extend:
++                # Build seg_lens from extend_seq_lens on device as int32
++                if torch.is_tensor(forward_batch.extend_seq_lens):
++                    seg_lens = forward_batch.extend_seq_lens.to(device=self.device, dtype=torch.int32)
++                else:
++                    seg_lens = torch.tensor(
++                        forward_batch.extend_seq_lens, device=self.device, dtype=torch.int32
++                    )
++                seg_indptr = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
++                seg_indptr[0] = 0
++                torch.cumsum(seg_lens, dim=0, out=seg_indptr[1:])
++                max_len = int(seg_lens.max().item())
++            else:
++                # Decode step: one token per sequence
++                cached = self._seg_cache.get(bs)
++                if cached is None or cached[0].device != self.device:
++                    ones = torch.ones((bs,), dtype=torch.int32, device=self.device)
++                    indptr = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
++                    self._seg_cache[bs] = (ones, indptr)
++                seg_lens, seg_indptr = self._seg_cache[bs]
++                max_len = 1
+ 
+-            lora_ranks = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+-            )
+-            scalings = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+-            )
++            weight_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+-                if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+-                    scalings[weight_indices[i]] = lora.scaling
++
++            # Reuse per-buffer metadata from memory pool to avoid allocations and CPU<->GPU syncs
++            lora_ranks = self.memory_pool.lora_ranks_tensor
++            scalings = self.memory_pool.lora_scalings_tensor
+             batch_info = LoRABatchInfo(
+                 bs=bs,
+                 seg_lens=seg_lens,
+@@ -225,7 +237,7 @@ class LoRAManager:
+         # call set_lora_info for each lora modules
+         for layer_id, modules in self.lora_modules.items():
+             for module_name, module in modules:
+-                if "qkv_proj" in module_name:
++                if getattr(module, "_is_qkv_proj", False):
+                     module.set_lora_info(
+                         self.memory_pool.get_tensor(
+                             "qkv_proj", layer_id, LoRAType.LORA_A
+@@ -238,9 +250,12 @@ class LoRAManager:
+                         ),
+                     )
+                 else:
+-                    weight_name = get_weight_name(
+-                        module_name, self.lora_weight_names, LoRAType.LORA_A
+-                    )
++                    weight_name = getattr(module, "_lora_weight_name", None)
++                    if weight_name is None:
++                        weight_name = get_weight_name(
++                            module_name, self.lora_weight_names, LoRAType.LORA_A
++                        )
++                        setattr(module, "_lora_weight_name", weight_name)
+                     module.set_lora_info(
+                         self.memory_pool.get_tensor(
+                             weight_name, layer_id, LoRAType.LORA_A
+@@ -281,6 +296,14 @@ class LoRAManager:
+             # The module should be converted if it is included in target_names
+             if module_name.split(".")[-1] in customized_target_names:
+                 layer_id = get_layer_id(module_name)
+-                self.lora_modules[layer_id].append(
+-                    (module_name, self.set_lora_module(module_name, module))
+-                )
++                lora_module = self.set_lora_module(module_name, module)
++                if "qkv_proj" in module_name:
++                    setattr(lora_module, "_is_qkv_proj", True)
++                else:
++                    setattr(lora_module, "_is_qkv_proj", False)
++                    setattr(
++                        lora_module,
++                        "_lora_weight_name",
++                        get_weight_name(module_name, self.lora_weight_names, LoRAType.LORA_A),
++                    )
++                self.lora_modules[layer_id].append((module_name, lora_module))
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..00f667b 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -54,6 +54,14 @@ class LoRAMemoryPool:
+         # Here we don't initialize to None since None is a valid uid
+         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
+ 
++        # Track free buffer slots for O(1) allocation and eviction
++        self.free_buffer_ids: List[int] = list(range(self.max_loras_per_batch))
++
++        # Per-buffer LoRA metadata tensors, allocated in init_buffers()
++        self.lora_ranks_tensor: Optional[torch.Tensor] = None
++        self.lora_scalings_tensor: Optional[torch.Tensor] = None
++
++
+     def get_lora_A_shape(
+         self, module_name: str, base_model: torch.nn.Module
+     ) -> Tuple[int]:
+@@ -122,32 +130,45 @@ class LoRAMemoryPool:
+                 for _ in range(self.num_layer)
+             ]
+ 
++        # Initialize per-buffer LoRA metadata tensors
++        self.lora_ranks_tensor = torch.zeros(
++            (self.max_loras_per_batch,), dtype=torch.int32, device=device
++        )
++        self.lora_scalings_tensor = torch.zeros(
++            (self.max_loras_per_batch,), dtype=torch.float, device=device
++        )
++
++
+     def prepare_lora_batch(
+         self,
+         cur_uids: Set[Optional[str]],
+         lora_adapters: Dict[str, LoRAAdapter],
+     ):
+ 
+-        def get_available_buffer_slot():
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Prioritize empty slots
+-                if self.buffer_id_to_uid[buffer_id] == "":
+-                    return buffer_id, ""
+-
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Evict unneeded lora
+-                if self.buffer_id_to_uid[buffer_id] not in cur_uids:
+-                    return buffer_id, self.buffer_id_to_uid[buffer_id]
+-
+-            raise ValueError(
+-                "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+-            )
+-
+-        for uid in cur_uids:
+-            if uid not in self.uid_to_buffer_id:
+-                buffer_id, evicted_lora_uid = get_available_buffer_slot()
+-                if evicted_lora_uid != "":
+-                    self.uid_to_buffer_id.pop(evicted_lora_uid)
++        # Determine adapters to load and adapters to evict
++        active_uids: Set[Optional[str]] = set(self.uid_to_buffer_id.keys())
++        missing = cur_uids - active_uids
++        if missing:
++            # Free slots by evicting any adapters not needed by the current batch
++            evictable = [uid for uid in active_uids if uid not in cur_uids]
++            for uid in evictable:
++                buffer_id = self.uid_to_buffer_id.pop(uid)
++                self.buffer_id_to_uid[buffer_id] = ""
++                # Mark slot as free
++                self.free_buffer_ids.append(buffer_id)
++                # Clear metadata for evicted slot to avoid stale reads
++                if self.lora_ranks_tensor is not None:
++                    self.lora_ranks_tensor[buffer_id] = 0
++                if self.lora_scalings_tensor is not None:
++                    self.lora_scalings_tensor[buffer_id] = 0
++
++            # Allocate and load all missing adapters
++            for uid in missing:
++                if not self.free_buffer_ids:
++                    raise ValueError(
++                        "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
++                    )
++                buffer_id = self.free_buffer_ids.pop()
+                 self.load_lora_weight_to_buffer(
+                     uid, buffer_id, lora_adapters.get(uid, None)
+                 )
+@@ -163,14 +184,25 @@ class LoRAMemoryPool:
+             ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+ 
+         if uid is None:
++            # Clear A buffers for the slot and reset metadata; rank/scaling 0 means disabled
+             for i in range(self.num_layer):
+-                for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++                for k, per_layer_list in self.A_buffer.items():
++                    per_layer_list[i][buffer_id].zero_()
++            if self.lora_ranks_tensor is not None:
++                self.lora_ranks_tensor[buffer_id] = 0
++            if self.lora_scalings_tensor is not None:
++                self.lora_scalings_tensor[buffer_id] = 0
+             return
+ 
+         assert lora_adapter is not None
+         lora_rank = lora_adapter.config.hf_config["r"]
++        # Update per-buffer metadata for this adapter
++        if self.lora_ranks_tensor is not None:
++            self.lora_ranks_tensor[buffer_id] = int(lora_rank)
++        if self.lora_scalings_tensor is not None:
++            self.lora_scalings_tensor[buffer_id] = float(lora_adapter.scaling)
+         for layer_id in range(self.num_layer):
++
+             layer_weights = lora_adapter.layers[layer_id].weights
+             temp_A_buffer: Dict[str, torch.Tensor] = {}
+             temp_B_buffer: Dict[str, torch.Tensor] = {}
+@@ -227,6 +259,8 @@ class LoRAMemoryPool:
+                         ][:, :lora_rank]
+                         check_lora_weight_shape(buffer_view, weights[stacked_id])
+                         buffer_view.copy_(weights[stacked_id])
++
++
+                 else:
+                     buffer_view = self.B_buffer[name][layer_id][0][buffer_id][
+                         :, :lora_rank

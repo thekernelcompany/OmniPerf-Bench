@@ -1,0 +1,98 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a4..f4844cf 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -120,6 +120,7 @@ class ExpertLocationMetadata:
+             ep_size=common["ep_size"],
+             physical_to_logical_map=physical_to_logical_map,
+             logical_to_all_physical_map=logical_to_all_physical_map,
++            ep_dispatch_algorithm=server_args.ep_dispatch_algorithm,
+         )
+ 
+     @staticmethod
+@@ -159,6 +160,7 @@ class ExpertLocationMetadata:
+             logical_to_all_physical_map=logical_to_all_physical_map.to(
+                 server_args.device
+             ),
++            ep_dispatch_algorithm=server_args.ep_dispatch_algorithm,
+         )
+ 
+     @staticmethod
+@@ -187,6 +189,7 @@ class ExpertLocationMetadata:
+         ep_size: int,
+         physical_to_logical_map: torch.Tensor,
+         logical_to_all_physical_map: torch.Tensor,
++        ep_dispatch_algorithm: Optional[str] = None,
+     ):
+         _, num_physical_experts = physical_to_logical_map.shape
+ 
+@@ -200,17 +203,31 @@ class ExpertLocationMetadata:
+             logical_to_all_physical_map != -1, dim=-1
+         )
+ 
+-        return ExpertLocationMetadata(
+-            physical_to_logical_map=physical_to_logical_map,
+-            logical_to_all_physical_map=logical_to_all_physical_map_padded,
+-            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+-            logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
++        # Compute the per-rank dispatch map only when using static dispatch.
++        # For dynamic/fake dispatch algorithms, this map is not used in routing, so skip the
++        # expensive construction to speed up rebalancing. Provide a lightweight placeholder
++        # tensor to keep the API shape compatible.
++        if ep_dispatch_algorithm == "static":
++            logical_to_rank_dispatch_physical_map = compute_logical_to_rank_dispatch_physical_map(
+                 logical_to_all_physical_map=logical_to_all_physical_map,
+                 num_gpus=ep_size,
+                 num_physical_experts=num_physical_experts,
+                 # TODO improve when we have real EP rank
+                 ep_rank=torch.distributed.get_rank() % ep_size,
+-            ),
++            )
++        else:
++            num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
++            logical_to_rank_dispatch_physical_map = torch.zeros(
++                (num_layers, num_logical_experts),
++                dtype=logical_to_all_physical_map.dtype,
++                device=logical_to_all_physical_map.device,
++            )
++
++        return ExpertLocationMetadata(
++            physical_to_logical_map=physical_to_logical_map,
++            logical_to_all_physical_map=logical_to_all_physical_map_padded,
++            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
++            logical_to_rank_dispatch_physical_map=logical_to_rank_dispatch_physical_map,
+         )
+ 
+     # -------------------------------- mutation ------------------------------------
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01..aecd6f4 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -40,11 +40,24 @@ class ExpertLocationDispatchInfo:
+         if ep_dispatch_algorithm is None:
+             return None
+ 
++        # Only slice the (potentially large) rank-dispatch map when using static dispatch.
++        # For dynamic/fake dispatch, this map is not used, so avoid touching it to save work.
++        if ep_dispatch_algorithm == "static":
++            partial_rank_map = expert_location_metadata.logical_to_rank_dispatch_physical_map[
++                layer_id, :
++            ]
++        else:
++            # Lightweight placeholder to keep the structure consistent; it will never be used
++            # under non-static dispatch paths.
++            partial_rank_map = torch.zeros(
++                expert_location_metadata.num_logical_experts,
++                dtype=expert_location_metadata.logical_to_all_physical_map.dtype,
++                device=expert_location_metadata.logical_to_all_physical_map.device,
++            )
++
+         return cls(
+             ep_dispatch_algorithm=ep_dispatch_algorithm,
+-            partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
+-                layer_id, :
+-            ],
++            partial_logical_to_rank_dispatch_physical_map=partial_rank_map,
+             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
+                 layer_id, :
+             ],

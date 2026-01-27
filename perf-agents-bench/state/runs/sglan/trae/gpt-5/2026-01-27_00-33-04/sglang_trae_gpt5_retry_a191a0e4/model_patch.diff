@@ -1,0 +1,108 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..f0eb844 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -1,5 +1,5 @@
+ import dataclasses
+-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
++from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
+ 
+ import torch
+ 
+@@ -39,6 +39,37 @@ def compute_split_seq_index(
+ 
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
++    """Find the smallest split index i (0 <= i < len(arr)) s.t. sum(arr[:i+1]) >= sum(arr)//2.
++
++    Optimized to avoid Python loops for tensor inputs by using vectorized ops and
++    torch.searchsorted, which reduces Python overhead and CPU-GPU sync in common paths.
++    """
++    # Fast path for torch tensors (supports CPU/GPU tensors)
++    if isinstance(arr, torch.Tensor):
++        if arr.numel() == 0:
++            return 0
++        x = arr.reshape(-1)
++        # Ensure integer type for stable floor division semantics
++        if x.dtype.is_floating_point:
++            x = x.to(torch.int64)
++        total = x.sum()
++        # Compute half using floor division while keeping computation on-device
++        if total.dtype.is_floating_point:
++            half = total // 2
++        else:
++            # div with rounding_mode avoids dtype issues across torch versions
++            half = total.div(2, rounding_mode="floor") if hasattr(total, "div") else total // 2
++        csum = x.cumsum(0)
++        # To be consistent with original logic (iterate arr[:-1]), we avoid selecting the
++        # last index by searching within csum[:-1] when length > 1
++        search_space = csum[:-1] if csum.numel() > 1 else csum
++        idx = torch.searchsorted(search_space, half, right=False)
++        # searchsorted may return a 0-dim tensor
++        idx_val = int(idx.item())
++        # Clamp to [0, len(arr)-1]
++        return max(0, min(idx_val, x.numel() - 1))
++
++    # Generic path for sequences of ints
+     overall_sum = sum(arr)
+     accumulator, split_index = 0, 0
+     for value in arr[:-1]:
+@@ -114,8 +145,10 @@ class TboDPAttentionPreparer:
+         return local_can_run_tbo, local_forward_mode
+ 
+     def compute_output(self, partial_global_info):
+-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
+-        forward_modes = partial_global_info[:, 0, 1].tolist()
++        # Avoid converting the whole tensor to a Python list; reduce sync and overhead
++        # partial_global_info layout: [:, 0, 0] -> local_can_run_tbo flags, [:, 0, 1] -> forward modes
++        local_can_run_tbo_aggregated = bool(partial_global_info[:, 0, 0].min().item())
++        forward_modes = partial_global_info[:, 0, 1]
+ 
+         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
+             forward_modes
+@@ -138,7 +171,33 @@ class TboDPAttentionPreparer:
+         ).value
+ 
+     @staticmethod
+-    def _compute_global_forward_mode(forward_modes):
++    def _compute_global_forward_mode(forward_modes: Union[Sequence[int], torch.Tensor]):
++        """Determine the global forward mode.
++
++        Optimized for torch tensors to avoid Python materialization; supports both list-like
++        and tensor inputs for backward compatibility.
++        """
++        if isinstance(forward_modes, torch.Tensor):
++            fm = forward_modes.reshape(-1)
++            # Cast to integer for stable comparisons even if coming from float tensors
++            if fm.dtype.is_floating_point:
++                fm = fm.to(torch.int64)
++            decode_v = int(ForwardMode.DECODE.value)
++            idle_v = int(ForwardMode.IDLE.value)
++            # Replace IDLE with DECODE for agreement check
++            fm_conv = torch.where(
++                fm == idle_v,
++                torch.as_tensor(decode_v, device=fm.device, dtype=fm.dtype),
++                fm,
++            )
++            if fm_conv.numel() == 0:
++                return None, False
++            first = fm_conv[0]
++            agree = bool(torch.all(fm_conv == first).item())
++            global_forward_mode = ForwardMode(int(first.item())) if agree else None
++            return global_forward_mode, agree
++
++        # Fallback for Python sequences
+         converted_forward_modes = [
+             ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+             for x in forward_modes
+@@ -153,6 +212,10 @@ class TboDPAttentionPreparer:
+ 
+     @staticmethod
+     def _is_all_same(x):
++        if isinstance(x, torch.Tensor):
++            if x.numel() == 0:
++                return True
++            return bool(torch.all(x == x.reshape(-1)[0]).item())
+         return all(value == x[0] for value in x)
+ 
+ 

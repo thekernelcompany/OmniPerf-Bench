@@ -1,0 +1,74 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..4543adb 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -186,20 +186,21 @@ def pre_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+-    for idx in range(topk):
+-        expert_id = tl.load(topk_ids_ptr + idx)
+-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-            if a1_scales_ptr is not None:
+-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+-            else:
+-                scale = 1.0
++    offs = tl.arange(0, BLOCK_SIZE)
++    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++        offset = start_offset + offs
++        mask = offset < hidden_size
++        in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++        for idx in range(topk):
++            expert_id = tl.load(topk_ids_ptr + idx)
++            if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                if a1_scales_ptr is not None:
++                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
++                else:
++                    scale = 1.0
+ 
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-                mask = offset < hidden_size
+-                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++                dst_idx = tl.load(src2dst_ptr + idx)
++                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 out_data = (in_data * scale).to(OutDtype)
+                 tl.store(dst_ptr + offset, out_data, mask=mask)
+ 
+@@ -479,17 +480,16 @@ def post_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+     topk_weights_ptr = topk_weights_ptr + src_idx * topk
+ 
+-    computed = False
+     store_ptr = output_ptr + src_idx * hidden_size
++    offs = tl.arange(0, BLOCK_SIZE)
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
++        offset = start_offset + offs
+         mask = offset < hidden_size
+ 
+         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+         for idx in range(topk):
+             expert_id = tl.load(topk_ids_ptr + idx)
+             if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-                computed = True
+                 dst_idx = tl.load(src2dst_ptr + idx)
+                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+@@ -497,14 +497,6 @@ def post_reorder_triton_kernel(
+                 sum_vec += in_data * weigh_scale
+         tl.store(store_ptr + offset, sum_vec, mask=mask)
+ 
+-    if computed == False:
+-        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-            mask = offset < hidden_size
+-            tl.store(
+-                store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
+-            )
+-
+ 
+ @triton.jit
+ def compute_m_range(

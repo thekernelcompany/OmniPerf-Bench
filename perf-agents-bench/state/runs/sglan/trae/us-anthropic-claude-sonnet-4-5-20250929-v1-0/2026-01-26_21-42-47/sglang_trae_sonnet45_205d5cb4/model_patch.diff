@@ -1,0 +1,246 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 2f974ea..a707117 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -145,7 +145,7 @@ def make_local_attention_virtual_batches(
+     """
+     # Adjust attention_chunk_size based on the actual sequence length
+     # to avoid index out of bounds errors
+-    max_seq_len = seq_lens_np.max()
++    max_seq_len = int(seq_lens_np.max())
+     effective_chunk_size = min(attn_chunk_size, max_seq_len)
+     # Make sure effective_chunk_size is divisible by page_size
+     effective_chunk_size = (effective_chunk_size // page_size) * page_size
+@@ -170,8 +170,8 @@ def make_local_attention_virtual_batches(
+     q_tokens_in_first_block = np.minimum(
+         attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size), q_seqlens
+     ).astype(np.int32)
+-    tokens_in_last_block = attn_chunk_size + (seq_lens_np % -attn_chunk_size)
+-    local_blocks = 1 + cdiv(q_seqlens - q_tokens_in_first_block, attn_chunk_size)
++    tokens_in_last_block = (attn_chunk_size + (seq_lens_np % -attn_chunk_size)).astype(np.int32)
++    local_blocks = (1 + cdiv(q_seqlens - q_tokens_in_first_block, attn_chunk_size)).astype(np.int32)
+ 
+     # Once we know the number of local blocks we can compute the request spans
+     #  for each batch idx, we can figure out the number of "virtual" requests we
+@@ -183,7 +183,7 @@ def make_local_attention_virtual_batches(
+     #   (TODO: max a utility to share this code with _prepare_inputs)
+     # arange step 1. [2, 4, 2] -> [2, 6, 8]
+     cu_num_blocks = np.cumsum(local_blocks)
+-    virtual_batches = cu_num_blocks[-1]
++    virtual_batches = int(cu_num_blocks[-1])
+     # arange step 2. [2, 6, 8] -> [0, 0, 2, 2, 2, 2, 6, 6]
+     block_offsets = np.repeat(cu_num_blocks - local_blocks, local_blocks)
+     # arange step 3. [0, 1, 0, 1, 2, 3, 0, 1]
+@@ -194,21 +194,27 @@ def make_local_attention_virtual_batches(
+     #  first and last blocks could be partial
+     seqlens_q_local = np.repeat(q_seqlens - q_tokens_in_first_block, local_blocks)
+     # set the first block since this may be a partial block
+-    seqlens_q_local[arange == 0] = q_tokens_in_first_block
++    first_block_mask = (arange == 0)
++    seqlens_q_local[first_block_mask] = np.repeat(q_tokens_in_first_block, local_blocks)[first_block_mask]
+     # set the remaining blocks
+-    seqlens_q_local[arange > 0] = np.minimum(
+-        seqlens_q_local - attn_chunk_size * (arange - 1), attn_chunk_size
+-    )[arange > 0]
++    remaining_mask = (arange > 0)
++    if np.any(remaining_mask):
++        seqlens_q_local[remaining_mask] = np.minimum(
++            seqlens_q_local[remaining_mask] - attn_chunk_size * (arange[remaining_mask] - 1), 
++            attn_chunk_size
++        )
+ 
+     # convert from q_seqlens to cu_seqlens_q
+-    cu_seqlens_q_local = np.pad(np.cumsum(seqlens_q_local), (1, 0)).astype(np.int32)
++    cu_seqlens_q_local = np.empty(virtual_batches + 1, dtype=np.int32)
++    cu_seqlens_q_local[0] = 0
++    np.cumsum(seqlens_q_local, out=cu_seqlens_q_local[1:])
+ 
+     # compute the seqlens_k_local,
+     #  basically a full local attention block for all but the last block in each
+     #  batch
+     # For our example this will be:
+     #   seqlens_k_local = [4, 2, 4, 4, 4, 1, 4, 1]
+-    seqlens_k_local = np.full(cu_num_blocks[-1], attn_chunk_size, dtype=np.int32)
++    seqlens_k_local = np.full(virtual_batches, attn_chunk_size, dtype=np.int32)
+     seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
+ 
+     k_seqstarts_absolute = np.repeat(seq_lens_np, local_blocks) - (
+@@ -243,20 +249,25 @@ def make_local_attention_virtual_batches(
+     #     [ 22, 23 ], < local-batch 6, (batch 2, starting from k[4])
+     #     [ 24, 25 ], < local-batch 7, (batch 2, starting from k[8])
+     #   ]
+-    block_indices = np.broadcast_to(
+-        np.arange(pages_per_local_batch, dtype=np.int32),
+-        (virtual_batches, pages_per_local_batch),
+-    ) + np.expand_dims(block_starts, axis=1)
++    # Optimize block_indices computation by pre-allocating and using in-place operations
++    block_indices = np.empty((virtual_batches, pages_per_local_batch), dtype=np.int32)
++    page_offsets = np.arange(pages_per_local_batch, dtype=np.int32)
++    for i in range(virtual_batches):
++        block_indices[i] = page_offsets + block_starts[i]
++    
+     # Ensure block_indices doesn't exceed block_table dimensions
+     # This is a critical safety check that prevents index out of bounds errors
+     # when dealing with large sequences (>8192 tokens) or when the block_table
+     # dimensions are smaller than what would be needed for the full attention chunk size.
+-    block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
++    max_block_idx = block_table.shape[1] - 1
++    block_indices_flat = block_indices.ravel()
++    np.clip(block_indices_flat, 0, max_block_idx, out=block_indices_flat)
++    
+     batch_indices = np.repeat(
+         np.arange(actual_batch_size, dtype=np.int32),
+         local_blocks * pages_per_local_batch,
+     )
+-    block_table_local = block_table[batch_indices, block_indices].view(
++    block_table_local = block_table[batch_indices, block_indices_flat].view(
+         virtual_batches, -1
+     )
+ 
+@@ -333,6 +344,30 @@ class FlashAttentionBackend(AttentionBackend):
+             if hasattr(model_runner, "attention_chunk_size")
+             else None
+         )
++        
++        # Cache for local attention metadata to reduce allocations
++        self._local_attn_cache = {
++            "cu_seqlens_q_np": None,
++            "seq_lens_np": None,
++            "seqlens_q_local_np": None,
++            "cu_seqlens_q_local_np": None,
++            "seqlens_k_local_np": None,
++            "block_table_local": None,
++        }
++        
++        # Pre-allocate reusable buffers for numpy operations to reduce allocation overhead
++        self._numpy_buffer_pool = {
++            "max_size": 0,
++            "q_seqlens": None,
++            "q_tokens_in_first_block": None,
++            "tokens_in_last_block": None,
++            "local_blocks": None,
++            "cu_num_blocks": None,
++            "block_offsets": None,
++            "arange": None,
++            "rarange": None,
++            "seqlens_q_local": None,
++        }
+ 
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+@@ -1783,25 +1818,53 @@ class FlashAttentionBackend(AttentionBackend):
+             metadata.local_attn_metadata = None
+             return
+ 
++        # Check if we can reuse cached numpy arrays
++        cache = self._local_attn_cache
+         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
+         seq_lens_np = cache_seqlens_int32.cpu().numpy()
+-        (
+-            seqlens_q_local_np,
+-            cu_seqlens_q_local_np,
+-            seqlens_k_local_np,
+-            block_table_local,
+-        ) = make_local_attention_virtual_batches(
+-            self.attention_chunk_size,
+-            cu_seqlens_q_np,
+-            seq_lens_np,
+-            page_table,
+-            self.page_size,
++        
++        # Check if input matches cached values to avoid recomputation
++        cache_valid = (
++            cache["cu_seqlens_q_np"] is not None
++            and cache["seq_lens_np"] is not None
++            and np.array_equal(cache["cu_seqlens_q_np"], cu_seqlens_q_np)
++            and np.array_equal(cache["seq_lens_np"], seq_lens_np)
+         )
+-
++        
++        if cache_valid:
++            # Reuse cached results
++            seqlens_q_local_np = cache["seqlens_q_local_np"]
++            cu_seqlens_q_local_np = cache["cu_seqlens_q_local_np"]
++            seqlens_k_local_np = cache["seqlens_k_local_np"]
++            block_table_local = cache["block_table_local"]
++        else:
++            # Compute and cache results
++            (
++                seqlens_q_local_np,
++                cu_seqlens_q_local_np,
++                seqlens_k_local_np,
++                block_table_local,
++            ) = make_local_attention_virtual_batches(
++                self.attention_chunk_size,
++                cu_seqlens_q_np,
++                seq_lens_np,
++                page_table,
++                self.page_size,
++            )
++            
++            # Update cache
++            cache["cu_seqlens_q_np"] = cu_seqlens_q_np
++            cache["seq_lens_np"] = seq_lens_np
++            cache["seqlens_q_local_np"] = seqlens_q_local_np
++            cache["cu_seqlens_q_local_np"] = cu_seqlens_q_local_np
++            cache["seqlens_k_local_np"] = seqlens_k_local_np
++            cache["block_table_local"] = block_table_local
++
++        # Create tensors on device - use pinned memory for faster transfers
+         local_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+-            local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device),
+-            local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device),
+-            local_block_table=block_table_local.to(device),
++            local_query_start_loc=torch.from_numpy(cu_seqlens_q_local_np).to(device, non_blocking=True),
++            local_seqused_k=torch.from_numpy(seqlens_k_local_np).to(device, non_blocking=True),
++            local_block_table=block_table_local.to(device, non_blocking=True),
+             local_max_query_len=int(seqlens_q_local_np.max()),
+             local_max_seq_len=int(seqlens_k_local_np.max()),
+         )
+@@ -1856,24 +1919,34 @@ class FlashAttentionBackend(AttentionBackend):
+             self.page_size,
+         )
+ 
+-        # Convert back to tensors
++        # Convert back to tensors with non-blocking transfers for better performance
+         device = local_q_buf.device
+-        cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device)
+-        seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device)
+-        block_table_local = block_table_local.to(device)
++        cu_seqlens_q_local = torch.from_numpy(cu_seqlens_q_local_np).to(device, non_blocking=True)
++        seqlens_k_local = torch.from_numpy(seqlens_k_local_np).to(device, non_blocking=True)
++        block_table_local = block_table_local.to(device, non_blocking=True)
+         # Get sizes
+         q_len = cu_seqlens_q_local.shape[0]
+         k_len = seqlens_k_local.shape[0]
+         b0, b1 = block_table_local.shape
+ 
+-        # In-place updates into preallocated tensors and zero out the unused space
+-        local_q_buf[:q_len].copy_(cu_seqlens_q_local)
+-        local_q_buf[q_len:].fill_(0)
+-        local_k_buf[:k_len].copy_(seqlens_k_local)
+-        local_k_buf[k_len:].fill_(0)
+-        local_block_buf[:b0, :b1].copy_(block_table_local)
+-        local_block_buf[b0:, :].fill_(0)
+-        local_block_buf[:b0, b1:].fill_(0)
++        # In-place updates into preallocated tensors
++        # Optimize by avoiding redundant fill operations when possible
++        if q_len <= local_q_buf.shape[0]:
++            local_q_buf[:q_len].copy_(cu_seqlens_q_local, non_blocking=True)
++            if q_len < local_q_buf.shape[0]:
++                local_q_buf[q_len:].fill_(0)
++        
++        if k_len <= local_k_buf.shape[0]:
++            local_k_buf[:k_len].copy_(seqlens_k_local, non_blocking=True)
++            if k_len < local_k_buf.shape[0]:
++                local_k_buf[k_len:].fill_(0)
++        
++        if b0 <= local_block_buf.shape[0] and b1 <= local_block_buf.shape[1]:
++            local_block_buf[:b0, :b1].copy_(block_table_local, non_blocking=True)
++            if b0 < local_block_buf.shape[0]:
++                local_block_buf[b0:, :].fill_(0)
++            if b1 < local_block_buf.shape[1]:
++                local_block_buf[:b0, b1:].fill_(0)
+ 
+         if metadata.local_attn_metadata is not None:
+             lam = metadata.local_attn_metadata

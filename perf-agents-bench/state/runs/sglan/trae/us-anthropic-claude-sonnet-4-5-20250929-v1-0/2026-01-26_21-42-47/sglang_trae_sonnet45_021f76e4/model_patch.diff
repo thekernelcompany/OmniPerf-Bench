@@ -1,0 +1,142 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..8a550cc 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -88,6 +88,24 @@ class LoRAManager:
+                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+             )
++    
++    def _preallocate_batch_tensors(self):
++        """Pre-allocate reusable tensors to avoid repeated allocations."""
++        # Cache for lora config values to avoid repeated dictionary lookups
++        self._lora_rank_cache = {}
++        self._lora_scaling_cache = {}
++        for name, lora in self.loras.items():
++            self._lora_rank_cache[name] = lora.config.hf_config["r"]
++            self._lora_scaling_cache[name] = lora.scaling
++        
++        # Pre-allocate reusable tensors for non-CUDA-graph batches
++        # These will be resized as needed but avoid repeated allocations
++        self._reusable_lora_ranks = torch.zeros(
++            self.max_loras_per_batch, dtype=torch.int64, device=self.device
++        )
++        self._reusable_scalings = torch.zeros(
++            self.max_loras_per_batch, dtype=torch.float, device=self.device
++        )
+ 
+     def init_loras(self):
+         # Config of each LoRA adapter
+@@ -149,6 +167,9 @@ class LoRAManager:
+ 
+         # Initialize target lora modules in memory pool
+         self.memory_pool.init_buffers(self.lora_weight_names, self.base_model)
++        
++        # Pre-allocate reusable tensors for batch preparation
++        self._preallocate_batch_tensors()
+ 
+     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+         # load active loras into lora memory pool
+@@ -175,18 +196,17 @@ class LoRAManager:
+             )
+             self.cuda_graph_batch_info.max_len = 1
+ 
++            # Optimized loop: use cached values to avoid repeated dictionary lookups
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+-                self.cuda_graph_batch_info.weight_indices[i] = (
+-                    self.memory_pool.get_buffer_id(lora_path)
+-                )
++                buffer_id = self.memory_pool.get_buffer_id(lora_path)
++                self.cuda_graph_batch_info.weight_indices[i] = buffer_id
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    self.cuda_graph_batch_info.lora_ranks[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.config.hf_config["r"]
+-                    self.cuda_graph_batch_info.scalings[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.scaling
++                    self.cuda_graph_batch_info.lora_ranks[buffer_id] = (
++                        self._lora_rank_cache[lora_path]
++                    )
++                    self.cuda_graph_batch_info.scalings[buffer_id] = (
++                        self._lora_scaling_cache[lora_path]
++                    )
+             batch_info = self.cuda_graph_batch_info
+         else:
+             seg_lens = (
+@@ -199,26 +219,26 @@ class LoRAManager:
+             max_len = int(torch.max(seg_lens))
+             weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+ 
+-            lora_ranks = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+-            )
+-            scalings = torch.zeros(
+-                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+-            )
++            # Reuse pre-allocated tensors and zero them out
++            self._reusable_lora_ranks.zero_()
++            self._reusable_scalings.zero_()
++            
++            # Optimized loop: use cached values and avoid redundant lookups
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+-                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
++                buffer_id = self.memory_pool.get_buffer_id(lora_path)
++                weight_indices[i] = buffer_id
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+-                    scalings[weight_indices[i]] = lora.scaling
++                    self._reusable_lora_ranks[buffer_id] = self._lora_rank_cache[lora_path]
++                    self._reusable_scalings[buffer_id] = self._lora_scaling_cache[lora_path]
++            
+             batch_info = LoRABatchInfo(
+                 bs=bs,
+                 seg_lens=seg_lens,
+                 seg_indptr=seg_indptr,
+                 max_len=max_len,
+                 weight_indices=weight_indices,
+-                lora_ranks=lora_ranks,
+-                scalings=scalings,
++                lora_ranks=self._reusable_lora_ranks,
++                scalings=self._reusable_scalings,
+             )
+         self.lora_backend.set_batch_info(batch_info)
+ 
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..47a11a2 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -210,13 +210,14 @@ class LoRAMemoryPool:
+                             temp_B_buffer[weight_name], self.tp_rank
+                         )
+ 
++            # Use non-blocking copies to avoid stream synchronization
+             for name, weights in temp_A_buffer.items():
+                 c = get_stacked_multiply(name)
+                 buffer_view = self.A_buffer[name][layer_id][buffer_id][
+                     : lora_rank * c, :
+                 ]
+                 check_lora_weight_shape(buffer_view, weights)
+-                buffer_view.copy_(weights)
++                buffer_view.copy_(weights, non_blocking=True)
+ 
+             for name, weights in temp_B_buffer.items():
+                 c = get_stacked_multiply(name)
+@@ -226,13 +227,13 @@ class LoRAMemoryPool:
+                             buffer_id
+                         ][:, :lora_rank]
+                         check_lora_weight_shape(buffer_view, weights[stacked_id])
+-                        buffer_view.copy_(weights[stacked_id])
++                        buffer_view.copy_(weights[stacked_id], non_blocking=True)
+                 else:
+                     buffer_view = self.B_buffer[name][layer_id][0][buffer_id][
+                         :, :lora_rank
+                     ]
+                     check_lora_weight_shape(buffer_view, weights)
+-                    buffer_view.copy_(weights)
++                    buffer_view.copy_(weights, non_blocking=True)
+ 
+     def get_tensor(
+         self, weight_name: str, layer_id: int, lora_type: LoRAType

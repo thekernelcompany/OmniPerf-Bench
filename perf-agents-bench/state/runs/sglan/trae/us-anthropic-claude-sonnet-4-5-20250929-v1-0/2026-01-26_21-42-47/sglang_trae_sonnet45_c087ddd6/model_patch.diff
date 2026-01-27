@@ -1,0 +1,164 @@
+diff --git a/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+new file mode 100644
+index 0000000..31b668c
+--- /dev/null
++++ b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+@@ -0,0 +1,119 @@
++"""
++Benchmark for EP MoE pre_reorder_triton_kernel performance.
++"""
++
++import argparse
++import torch
++import triton
++
++from sglang.srt.layers.moe.ep_moe.kernels import pre_reorder_triton_kernel
++
++
++def benchmark_pre_reorder_kernel(
++    num_tokens: int,
++    hidden_size: int,
++    topk: int,
++    num_experts: int,
++    dtype: torch.dtype = torch.float16,
++    use_scales: bool = False,
++):
++    """Benchmark the pre_reorder_triton_kernel."""
++    device = torch.device("cuda")
++    
++    # Create input tensors
++    input_tensor = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
++    gateup_input = torch.empty(num_tokens * topk, hidden_size, dtype=dtype, device=device)
++    
++    # Create src2dst mapping
++    src2dst = torch.randint(0, num_tokens * topk, (num_tokens, topk), dtype=torch.int32, device=device)
++    
++    # Create topk_ids
++    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
++    
++    # Create scales if needed
++    a1_scales = None
++    if use_scales:
++        a1_scales = torch.rand(num_experts, dtype=torch.float32, device=device) + 0.5
++    
++    start_expert_id = 0
++    end_expert_id = num_experts - 1
++    BLOCK_SIZE = 128
++    
++    # Warmup
++    grid = (num_tokens,)
++    for _ in range(10):
++        pre_reorder_triton_kernel[grid](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            a1_scales,
++            start_expert_id,
++            end_expert_id,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++    
++    torch.cuda.synchronize()
++    
++    # Benchmark
++    ms = triton.testing.do_bench(
++        lambda: pre_reorder_triton_kernel[grid](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            a1_scales,
++            start_expert_id,
++            end_expert_id,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++    )
++    
++    # Calculate throughput
++    total_bytes = num_tokens * hidden_size * input_tensor.element_size()  # input read
++    total_bytes += num_tokens * topk * hidden_size * gateup_input.element_size()  # output write (worst case)
++    bandwidth_gb_s = total_bytes / (ms * 1e-3) / 1e9
++    
++    return ms, bandwidth_gb_s
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Benchmark pre_reorder_triton_kernel")
++    parser.add_argument("--num-tokens", type=int, default=4096, help="Number of tokens")
++    parser.add_argument("--hidden-size", type=int, default=4096, help="Hidden size")
++    parser.add_argument("--topk", type=int, default=2, help="Top-k experts")
++    parser.add_argument("--num-experts", type=int, default=8, help="Number of experts")
++    parser.add_argument("--use-scales", action="store_true", help="Use FP8 scales")
++    args = parser.parse_args()
++    
++    print("=" * 80)
++    print("Benchmarking pre_reorder_triton_kernel")
++    print("=" * 80)
++    print(f"Configuration:")
++    print(f"  num_tokens: {args.num_tokens}")
++    print(f"  hidden_size: {args.hidden_size}")
++    print(f"  topk: {args.topk}")
++    print(f"  num_experts: {args.num_experts}")
++    print(f"  use_scales: {args.use_scales}")
++    print("-" * 80)
++    
++    ms, bandwidth = benchmark_pre_reorder_kernel(
++        args.num_tokens,
++        args.hidden_size,
++        args.topk,
++        args.num_experts,
++        use_scales=args.use_scales,
++    )
++    
++    print(f"Results:")
++    print(f"  Time: {ms:.3f} ms")
++    print(f"  Bandwidth: {bandwidth:.2f} GB/s")
++    print("=" * 80)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..23b75a3 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -186,20 +186,21 @@ def pre_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+-    for idx in range(topk):
+-        expert_id = tl.load(topk_ids_ptr + idx)
+-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-            if a1_scales_ptr is not None:
+-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+-            else:
+-                scale = 1.0
++    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++        offset = start_offset + tl.arange(0, BLOCK_SIZE)
++        mask = offset < hidden_size
++        in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++        
++        for idx in range(topk):
++            expert_id = tl.load(topk_ids_ptr + idx)
++            if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                if a1_scales_ptr is not None:
++                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
++                else:
++                    scale = 1.0
+ 
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-                mask = offset < hidden_size
+-                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++                dst_idx = tl.load(src2dst_ptr + idx)
++                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 out_data = (in_data * scale).to(OutDtype)
+                 tl.store(dst_ptr + offset, out_data, mask=mask)
+ 

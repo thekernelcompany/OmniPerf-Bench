@@ -1,0 +1,81 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..20ed21e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1399,28 +1399,6 @@ class Scheduler(
+             self.metrics_collector.log_stats(self.stats)
+         self._publish_kv_events()
+ 
+-    def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+-        """Coordinate the DP attention batch."""
+-
+-        local_info = torch.tensor(
+-            [
+-                (new_batch is not None),
+-            ],
+-            dtype=torch.int64,
+-        )
+-        global_info = torch.empty(
+-            (self.server_args.dp_size, self.attn_tp_size, 1),
+-            dtype=torch.int64,
+-        )
+-        torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=self.tp_cpu_group,
+-        )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
+-        return any_new_batch
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         # Merge the prefill batch into the running batch
+@@ -1456,13 +1434,8 @@ class Scheduler(
+ 
+         new_batch = self.get_new_batch_prefill()
+ 
+-        # TODO(ch-wan): minor refactor is needed here to improve readability
+-        any_new_batch = (
+-            self.server_args.enable_dp_attention
+-            and not self.spec_algorithm.is_none()
+-            and self.coordinate_spec_dp_attn_batch(new_batch)
+-        )
+-        if new_batch is not None or any_new_batch:
++        # Prefer prefill when available locally; avoid extra cross-DP sync here.
++        if new_batch is not None:
+             # Run prefill first if possible
+             ret = new_batch
+         else:
+@@ -1534,12 +1507,14 @@ class Scheduler(
+         for req in self.waiting_queue:
+             if (
+                 self.lora_paths
+-                and len(
+-                    lora_set
+-                    | set([req.lora_path for req in adder.can_run_list])
+-                    | set([req.lora_path])
++                and (
++                    len(
++                        lora_set
++                        | set([r.lora_path for r in adder.can_run_list])
++                        | {req.lora_path}
++                    )
++                    > self.max_loras_per_batch
+                 )
+-                > self.max_loras_per_batch
+             ):
+                 self.running_batch.batch_is_full = True
+                 break
+@@ -1579,9 +1554,8 @@ class Scheduler(
+             for req in can_run_list:
+                 req.queue_time_end = time.perf_counter()
+ 
+-        self.waiting_queue = [
+-            x for x in self.waiting_queue if x not in set(can_run_list)
+-        ]
++        can_run_set = set(can_run_list)
++        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+ 
+         if adder.new_chunked_req is not None:
+             assert self.chunked_req is None

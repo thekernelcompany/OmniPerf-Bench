@@ -1,0 +1,63 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 0e1640f..2f4eded 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -332,22 +332,12 @@ def block_quant_to_tensor_quant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = x_q_block.to(torch.float32)
+-
+-    x_dq_block_tiles = [
+-        [
+-            x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            for i in range(k_tiles)
+-        ]
+-        for j in range(n_tiles)
+-    ]
+-
+-    for i in range(k_tiles):
+-        for j in range(n_tiles):
+-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
++    # Vectorized dequantization: expand scales to full matrix and multiply once
++    dev = x_q_block.device
++    rows = torch.arange(n, device=dev) // block_n
++    cols = torch.arange(k, device=dev) // block_k
++    scale = x_s[rows[:, None], cols[None, :]].to(device=dev, dtype=torch.float32)
++    x_dq_block = x_q_block.to(torch.float32) * scale
+ 
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_block)
+@@ -375,21 +365,14 @@ def block_quant_dequant(
+     assert n_tiles == x_s.shape[0]
+     assert k_tiles == x_s.shape[1]
+ 
+-    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+-
+-    for j in range(n_tiles):
+-        for i in range(k_tiles):
+-            x_q_block_tile = x_q_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile = x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+-
+-    return x_dq_block
++    # Vectorized dequantization: expand scales to full matrix and multiply
++    dev = x_q_block.device
++    rows = torch.arange(n, device=dev) // block_n
++    cols = torch.arange(k, device=dev) // block_k
++    scale = x_s[rows[:, None], cols[None, :]].to(device=dev, dtype=torch.float32)
++
++    x_dq = x_q_block.to(torch.float32) * scale
++    return x_dq.to(dtype)
+ 
+ 
+ def channel_quant_to_tensor_quant(

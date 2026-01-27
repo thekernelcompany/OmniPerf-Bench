@@ -1,0 +1,121 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..46d98bd 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -40,12 +40,21 @@ def compute_split_seq_index(
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+     overall_sum = sum(arr)
+-    accumulator, split_index = 0, 0
+-    for value in arr[:-1]:
++    half_sum = overall_sum / 2
++    accumulator = 0
++    split_index = 0
++    
++    for i, value in enumerate(arr[:-1]):
++        prev_accumulator = accumulator
+         accumulator += value
+-        split_index += 1
+-        if accumulator >= overall_sum // 2:
++        split_index = i + 1
++        
++        if accumulator >= half_sum:
++            # Check if previous split was closer to half
++            if abs(prev_accumulator - half_sum) < abs(accumulator - half_sum):
++                split_index = i
+             break
++    
+     return split_index
+ 
+ 
+diff --git a/test/srt/test_two_batch_overlap.py b/test/srt/test_two_batch_overlap.py
+index 89e793c..6f3dfc2 100644
+--- a/test/srt/test_two_batch_overlap.py
++++ b/test/srt/test_two_batch_overlap.py
+@@ -4,6 +4,7 @@ from types import SimpleNamespace
+ 
+ import requests
+ 
++from sglang.srt.two_batch_overlap import _split_array_by_half_sum
+ from sglang.srt.utils import kill_process_tree
+ from sglang.test.run_eval import run_eval
+ from sglang.test.test_utils import (
+@@ -68,5 +69,78 @@ class TestTwoBatchOverlap(unittest.TestCase):
+         self.assertGreater(metrics["score"], 0.5)
+ 
+ 
++class TestSplitArrayByHalfSum(unittest.TestCase):
++    """Test the _split_array_by_half_sum function for balanced splitting."""
++
++    def test_balanced_array(self):
++        """Test with a balanced array."""
++        arr = [10, 10, 10, 10]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        self.assertEqual(split_index, 2)
++        self.assertEqual(sum_first, 20)
++        self.assertEqual(sum_second, 20)
++
++    def test_imbalanced_array_large_element(self):
++        """Test with imbalanced array where one element is much larger."""
++        arr = [40, 30, 30]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        # Should split at index 1: [40] vs [30, 30] = 40 vs 60
++        # This is better than [40, 30] vs [30] = 70 vs 30
++        self.assertEqual(split_index, 1)
++        self.assertLess(abs(sum_first - sum_second), 30)
++
++    def test_imbalanced_array_very_large_last_element(self):
++        """Test with very large last element."""
++        arr = [10, 10, 10, 70]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        # Should split at index 3: [10, 10, 10] vs [70] = 30 vs 70
++        self.assertEqual(split_index, 3)
++
++    def test_imbalanced_array_large_middle_element(self):
++        """Test with large middle element."""
++        arr = [10, 60, 30]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        # Should split at index 2: [10, 60] vs [30] = 70 vs 30
++        # This is better than [10] vs [60, 30] = 10 vs 90
++        self.assertEqual(split_index, 2)
++
++    def test_two_element_array(self):
++        """Test with two elements."""
++        arr = [30, 70]
++        split_index = _split_array_by_half_sum(arr)
++        self.assertEqual(split_index, 1)
++
++    def test_small_first_large_rest(self):
++        """Test with small first element and large rest."""
++        arr = [5, 45, 50]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        # Should prefer the split that's closer to 50
++        # [5] vs [45, 50] = 5 vs 95 (distance = 90)
++        # [5, 45] vs [50] = 50 vs 50 (distance = 0)
++        self.assertEqual(split_index, 2)
++        self.assertEqual(sum_first, 50)
++        self.assertEqual(sum_second, 50)
++
++    def test_multiple_small_one_large(self):
++        """Test with multiple small elements and one large."""
++        arr = [5, 5, 5, 5, 80]
++        split_index = _split_array_by_half_sum(arr)
++        sum_first = sum(arr[:split_index])
++        sum_second = sum(arr[split_index:])
++        # Total = 100, half = 50
++        # Should split at index 4: [5, 5, 5, 5] vs [80] = 20 vs 80
++        self.assertEqual(split_index, 4)
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,136 @@
+diff --git a/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+new file mode 100644
+index 0000000..7866540
+--- /dev/null
++++ b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+@@ -0,0 +1,91 @@
++"""
++Benchmark for EP MoE pre_reorder_triton_kernel performance.
++"""
++
++import torch
++import triton
++
++from sglang.srt.layers.moe.ep_moe.kernels import pre_reorder_triton_kernel
++
++
++def benchmark_pre_reorder_kernel(
++    batch_size: int = 1024,
++    hidden_size: int = 4096,
++    topk: int = 2,
++    num_experts: int = 8,
++    dtype: torch.dtype = torch.float16,
++    device: str = "cuda",
++):
++    """Benchmark the pre_reorder_triton_kernel."""
++    
++    # Create input tensors
++    input_tensor = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
++    gateup_input = torch.empty(batch_size * topk, hidden_size, dtype=dtype, device=device)
++    src2dst = torch.randint(0, batch_size * topk, (batch_size, topk), dtype=torch.int32, device=device)
++    topk_ids = torch.randint(0, num_experts, (batch_size, topk), dtype=torch.int32, device=device)
++    a1_scales = torch.ones(num_experts, dtype=torch.float32, device=device)
++    
++    start_expert_id = 0
++    end_expert_id = num_experts - 1
++    BLOCK_SIZE = 128
++    
++    # Warmup
++    grid = (batch_size,)
++    for _ in range(10):
++        pre_reorder_triton_kernel[grid](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            a1_scales,
++            start_expert_id,
++            end_expert_id,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++    
++    # Benchmark
++    ms = triton.testing.do_bench(
++        lambda: pre_reorder_triton_kernel[grid](
++            input_tensor,
++            gateup_input,
++            src2dst,
++            topk_ids,
++            a1_scales,
++            start_expert_id,
++            end_expert_id,
++            topk,
++            hidden_size,
++            BLOCK_SIZE,
++        )
++    )
++    
++    # Calculate throughput
++    total_elements = batch_size * hidden_size * topk
++    throughput_gb_s = (total_elements * input_tensor.element_size() * 2) / (ms * 1e-3) / 1e9
++    
++    print(f"Batch size: {batch_size}, Hidden size: {hidden_size}, TopK: {topk}")
++    print(f"Time: {ms:.3f} ms")
++    print(f"Throughput: {throughput_gb_s:.2f} GB/s")
++    
++    return ms
++
++
++if __name__ == "__main__":
++    print("=" * 80)
++    print("Benchmarking pre_reorder_triton_kernel")
++    print("=" * 80)
++    
++    # Test different configurations
++    configs = [
++        (1024, 4096, 2, 8),
++        (2048, 4096, 2, 8),
++        (4096, 4096, 2, 8),
++        (1024, 8192, 2, 8),
++        (2048, 8192, 2, 8),
++    ]
++    
++    for batch_size, hidden_size, topk, num_experts in configs:
++        benchmark_pre_reorder_kernel(batch_size, hidden_size, topk, num_experts)
++        print()
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..23b75a3 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -186,20 +186,21 @@ def pre_reorder_triton_kernel(
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+-    for idx in range(topk):
+-        expert_id = tl.load(topk_ids_ptr + idx)
+-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-            if a1_scales_ptr is not None:
+-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+-            else:
+-                scale = 1.0
++    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++        offset = start_offset + tl.arange(0, BLOCK_SIZE)
++        mask = offset < hidden_size
++        in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++        
++        for idx in range(topk):
++            expert_id = tl.load(topk_ids_ptr + idx)
++            if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                if a1_scales_ptr is not None:
++                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
++                else:
++                    scale = 1.0
+ 
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-                mask = offset < hidden_size
+-                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++                dst_idx = tl.load(src2dst_ptr + idx)
++                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 out_data = (in_data * scale).to(OutDtype)
+                 tl.store(dst_ptr + offset, out_data, mask=mask)
+ 

@@ -1,0 +1,52 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 29f18f0..b4fc4d7 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -454,6 +454,7 @@ class DeepseekV2MoE(nn.Module):
+                 num_expert_group=self.num_expert_group,
+                 correction_bias=self.correction_bias,
+                 routed_scaling_factor=self.routed_scaling_factor,
++                num_token_non_padded=state.forward_batch.num_token_non_padded,
+                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                     layer_id=self.layer_id,
+                 ),
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f..a3fc574 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -332,6 +332,26 @@ class TboForwardBatchPreparer:
+         else:
+             gathered_buffer = None
+ 
++        # Compute num_token_non_padded for the child batch
++        num_token_non_padded = None
++        if batch.num_token_non_padded is not None:
++            parent_non_padded = batch.num_token_non_padded.item()
++            # For child batch, compute how many non-padded tokens fall in this range
++            if start_token_index < parent_non_padded:
++                child_non_padded = min(end_token_index, parent_non_padded) - start_token_index
++                num_token_non_padded = torch.tensor(
++                    child_non_padded,
++                    dtype=batch.num_token_non_padded.dtype,
++                    device=batch.num_token_non_padded.device,
++                )
++            else:
++                # All tokens in this child batch are padding
++                num_token_non_padded = torch.tensor(
++                    0,
++                    dtype=batch.num_token_non_padded.dtype,
++                    device=batch.num_token_non_padded.device,
++                )
++
+         output_dict.update(
+             dict(
+                 batch_size=end_seq_index - start_seq_index,
+@@ -357,7 +377,7 @@ class TboForwardBatchPreparer:
+                 top_p_normalized_logprobs=False,
+                 top_p=None,
+                 mm_inputs=None,
+-                num_token_non_padded=None,
++                num_token_non_padded=num_token_non_padded,
+             )
+         )
+ 
