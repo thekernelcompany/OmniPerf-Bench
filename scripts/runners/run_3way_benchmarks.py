@@ -20,7 +20,8 @@ from typing import Optional, Dict, Any
 # Configuration
 HUMAN_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
-PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/exports/full_results.jsonl")
+# PERF_DATA_FILE will be set after REPO_ROOT
+_PERF_DATA_FILE_RELATIVE = "omniperf_results_3way_claude_code/exports/full_results.jsonl"
 
 # Agent configurations - paths to agent patch directories
 AGENT_CONFIGS = {
@@ -32,18 +33,7 @@ AGENT_CONFIGS = {
     # TRAE specific run paths:
     "trae_gpt5_0123": "perf-agents-bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
     "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
-}
-
-# Output directories per agent type
-AGENT_OUTPUT_DIRS = {
-    "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
-    "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
-    "codex_cli": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex_cli"),  # Codex CLI results
-    "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
-    "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
-    # TRAE specific run output dirs:
-    "trae_gpt5_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5_0123"),
-    "trae_sonnet45_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45_0123"),
+    "mimo": "perf-agents-bench/state/runs/vllm/trae/xiaomi-mimo-v2-flash/2026-01-27_00-01-51",
 }
 
 # Model overrides for compatibility issues (e.g., RoPE scaling)
@@ -55,11 +45,29 @@ MODEL_OVERRIDES = {
     "ibm-ai-platform/Bamba-9B": "meta-llama/Meta-Llama-3-8B-Instruct",  # Bamba not well supported
 }
 
+# Get repository root (parent of scripts/runners/)
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Set PERF_DATA_FILE using REPO_ROOT
+PERF_DATA_FILE = REPO_ROOT / _PERF_DATA_FILE_RELATIVE
+
+# Output directories per agent type
+AGENT_OUTPUT_DIRS = {
+    "claude_code": REPO_ROOT / "omniperf_results_3way_claude_code",
+    "codex_gpt5": REPO_ROOT / "omniperf_results_3way_codex",
+    "codex_cli": REPO_ROOT / "omniperf_results_3way_codex_cli",
+    "trae_gpt5": REPO_ROOT / "omniperf_results_3way_trae_gpt5",
+    "trae_sonnet45": REPO_ROOT / "omniperf_results_3way_trae_sonnet45",
+    "trae_gpt5_0123": REPO_ROOT / "omniperf_results_3way_trae_gpt5_0123",
+    "trae_sonnet45_0123": REPO_ROOT / "omniperf_results_3way_trae_sonnet45_0123",
+    "mimo": REPO_ROOT / "omniperf_results_3way_mimo",
+}
+
 # Default (for backward compatibility)
-RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code")
+RESULTS_DIR = REPO_ROOT / "omniperf_results_3way_claude_code"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
-BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping_complete.json")
-AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+BASELINE_MAPPING_FILE = REPO_ROOT / "complete_benchmark_mapping.json"
+AGENT_PATCHES_DIR = REPO_ROOT / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 
 
 def get_hf_token() -> str:
@@ -70,7 +78,7 @@ def get_hf_token() -> str:
     return ""
 
 
-BENCHMARK_MODE_MAPPING_FILE = Path("/root/OmniPerf-Bench/data/mappings/benchmark_mode_mapping.json")
+BENCHMARK_MODE_MAPPING_FILE = REPO_ROOT / "data/mappings/benchmark_mode_mapping.json"
 
 
 def load_benchmark_mode_mapping() -> Dict[str, dict]:
@@ -1439,7 +1447,7 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
 
     # Mount ShareGPT dataset if perf_command uses it
     sharegpt_mount = []
-    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    sharegpt_path = REPO_ROOT / 'data/sharegpt_dataset.json'
     if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
         sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
 
@@ -1678,7 +1686,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
 
     # Mount ShareGPT dataset if needed
     sharegpt_mount = []
-    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    sharegpt_path = REPO_ROOT / 'data/sharegpt_dataset.json'
     if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
         sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
 
@@ -2007,13 +2015,25 @@ PATCH
     cd /opt/vllm_baseline
 
     echo "Running benchmark_serving.py for serving metrics..."
+
+    # Check if this vLLM version supports --dataset-name random
+    if $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py --help 2>&1 | grep -q "random"; then
+        DATASET_ARGS="--dataset-name random --random-input-len 256 --random-output-len 64"
+    else
+        echo "Note: This vLLM version doesn't support random dataset, using sonnet..."
+        # Download sonnet dataset if not present
+        if [ ! -f /tmp/sonnet.txt ]; then
+            echo "Downloading sonnet dataset..."
+            $VLLM_PYTHON -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/sonnet.txt', '/tmp/sonnet.txt')"
+        fi
+        DATASET_ARGS="--dataset-name sonnet --dataset-path /tmp/sonnet.txt"
+    fi
+
     PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py \
         --model $MODEL \
         --backend vllm \
         --port 8000 \
-        --dataset-name random \
-        --random-input-len 256 \
-        --random-output-len 64 \
+        $DATASET_ARGS \
         --num-prompts 100 \
         --request-rate inf \
         2>&1 | tee /tmp/benchmark_output.txt
@@ -2150,7 +2170,7 @@ def main():
 
     # Set agent-specific paths
     agent_type = args.agent_type
-    AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench") / AGENT_CONFIGS[agent_type]
+    AGENT_PATCHES_DIR = REPO_ROOT / AGENT_CONFIGS[agent_type]
     AGENT_OUTPUT_DIR = AGENT_OUTPUT_DIRS[agent_type] / "results"
 
     print(f"=== Agent Type: {agent_type} ===")
