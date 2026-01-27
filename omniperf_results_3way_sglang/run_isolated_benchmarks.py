@@ -175,30 +175,35 @@ SINGLE_GPU_MODELS = {
 # Fallback model for large models that need tp>1
 FALLBACK_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-# All 17 Target commits (8-char short hashes)
-# Focusing on PR#6500-7500 range (May-June 2025 era) - best compatibility
-TARGET_COMMITS = [
-    # Successfully benchmarked (6):
-    "c087ddd6",  # PR#6627 - Refine pre_reorder_triton_kernel  [SUCCESS]
-    "6b231325",  # PR#6649 - [PD Perf] replace Queue to FastQueue [SUCCESS]
-    "dd1012fc",  # PR#6764 - [PD] Fix potential perf spike [SUCCESS]
-    "df7f61ee",  # PR#6812 - Speed up rebalancing [SUCCESS]
-    "e3ec6bf4",  # PR#6814 - Minor speed up block_quant_dequant [SUCCESS]
-    "da47621c",  # PR#7058 - Minor speedup topk postprocessing [SUCCESS]
-    # New candidates from same range (11 more to reach 17):
-    "a191a0e4",  # PR#6593 - Improve performance of two batch overlap
-    "31589e17",  # PR#6668 - Speed up when having padding tokens
-    "6cb00c63",  # PR#6761 - [PD] Optimize time out logic
-    "132dad87",  # PR#6922 - [PD] Optimize transfer queue forward logic
-    "b1e5a33a",  # PR#6960 - Eliminate stream sync to speed up LoRA
-    "021f76e4",  # PR#6994 - [Perf] Refactor LoRAManager
-    "2ed68d7a",  # PR#7236 - [PD] replace transfer with batch transfer
-    "73b13e69",  # PR#7285 - Optimize DP attn scheduling
-    "187b85b7",  # PR#7393 - [PD] Optimize custom mem pool usage
-    # Additional from similar era:
-    "205d5cb4",  # PR#6356 - Optimize local attention memory allocation
-    "1acca3a2",  # PR#5969 - FA3 speed up: skip len operation
+# Commits that require multi-GPU (DeepSeek-V3, Llama-4-Maverick) - SKIP these
+MULTI_GPU_COMMITS = {
+    "c087ddd6",  # DeepSeek-V3 (671B) - needs H100-TP8
+    "2ed68d7a",  # DeepSeek-V3 (671B) - needs H100-TP8
+    "31589e17",  # DeepSeek-V3-0324 (671B) - needs H100-TP16-DP16
+    "205d5cb4",  # Llama-4-Maverick-17B-128E-FP8 - needs H100-TP8
+}
+
+# Single-GPU compatible commits (use actual perf_command from dataset)
+SINGLE_GPU_COMMITS = [
+    "021f76e4",  # PR#6994 - bench_serving --num-prompt 480 --request-rate 8 --lora-name lora
+    "132dad87",  # PR#6922 - bench_serving --num-prompts 100
+    "187b85b7",  # PR#7393 - bench_serving --num-prompts 100
+    "1acca3a2",  # PR#5969 - bench_serving --num-prompts 100
+    "6b231325",  # PR#6649 - bench_serving --num-prompts 100
+    "6cb00c63",  # PR#6761 - bench_serving --num-prompts 100
+    "73b13e69",  # PR#7285 - bench_serving --num-prompts 100
+    "a191a0e4",  # PR#6593 - bench_serving --num-prompts 100
+    "b1e5a33a",  # PR#6960 - bench_serving --num-prompts 100
+    "da47621c",  # PR#7058 - bench_serving --num-prompts 100
+    "dd1012fc",  # PR#6764 - bench_serving --num-prompts 100
+    "df7f61ee",  # PR#6812 - bench_serving --num-prompts 100
+    "e3ec6bf4",  # PR#6814 - bench_serving --num-prompts 100
 ]
+
+# All 17 Target commits (8-char short hashes)
+# Updated: Now using SINGLE_GPU_COMMITS as default (13 commits compatible with single H100)
+# Multi-GPU commits (c087ddd6, 2ed68d7a, 31589e17, 205d5cb4) moved to MULTI_GPU_COMMITS
+TARGET_COMMITS = SINGLE_GPU_COMMITS.copy()
 
 # Actually completed commits (benchmarked successfully)
 COMPLETED_COMMITS = [
@@ -1229,20 +1234,32 @@ SERVER_TIMEOUT = 300  # Wait up to 5 minutes for server to start (increased from
 
 
 def get_benchmark_config(commit_short: str) -> dict:
-    """Get benchmark configuration for a commit from PERF_COMMAND_CONFIG."""
+    """Get benchmark configuration for a commit from PERF_COMMAND_CONFIG.
+
+    For single-GPU commits: use the actual perf_command from dataset
+    For multi-GPU commits: mark as 'skip' (requires DeepSeek-V3 or Llama-4-Maverick with TP>1)
+    """
+    # Check if this commit requires multi-GPU hardware (skip it)
+    if commit_short in MULTI_GPU_COMMITS:
+        config = PERF_COMMAND_CONFIG.get(commit_short, {}).copy()
+        config["skip"] = True
+        config["skip_reason"] = f"Requires multi-GPU (model: {config.get('model', 'unknown')})"
+        return config
+
     if commit_short in PERF_COMMAND_CONFIG:
         config = PERF_COMMAND_CONFIG[commit_short].copy()
-        # Check if model needs fallback
+        # Verify single-GPU compatibility (safety check)
         if config["model"] not in SINGLE_GPU_MODELS:
-            print(f"  Model {config['model']} needs multi-GPU, using fallback: {FALLBACK_MODEL}")
-            config["model"] = FALLBACK_MODEL
-            config["needs_fallback"] = True
+            print(f"  WARNING: Model {config['model']} not in SINGLE_GPU_MODELS, marking as skip")
+            config["skip"] = True
+            config["skip_reason"] = f"Model {config['model']} requires multi-GPU"
         return config
-    # Default config for unknown commits
+
+    # Default config for unknown commits (use safe defaults)
     return {
-        "bench_type": "one_batch",
-        "model": MODEL_PATH,
-        "full_command": "",
+        "bench_type": "serving",
+        "model": FALLBACK_MODEL,
+        "full_command": f"python -m sglang.bench_serving --backend sglang --model {FALLBACK_MODEL} --num-prompts 100",
     }
 
 
@@ -1376,10 +1393,15 @@ def run_serving_benchmark(venv_path: Path, commit_short: str, model: str, num_pr
     else:
         truncated_output = output
 
+    # Get the perf_command from config for recording
+    config = get_benchmark_config(commit_short)
+
     result = {
         "returncode": returncode,
         "raw_output": truncated_output,
         "bench_type": "serving",
+        "perf_command": config.get("full_command", ""),
+        "model": model,
     }
 
     if returncode != 0:
@@ -1447,10 +1469,23 @@ def run_one_batch_benchmark(venv_path: Path, commit_short: str, model: str) -> d
 def run_benchmark(venv_path: Path, commit_short: str, use_dataset_config: bool = True) -> dict:
     """Run the appropriate benchmark based on commit config."""
     config = get_benchmark_config(commit_short)
+
+    # Check if commit should be skipped (multi-GPU requirement)
+    if config.get("skip"):
+        print(f"  SKIPPING: {config.get('skip_reason', 'Unknown reason')}")
+        return {
+            "status": "skipped",
+            "skip_reason": config.get("skip_reason"),
+            "bench_type": config.get("bench_type", "unknown"),
+            "model": config.get("model", "unknown"),
+        }
+
     bench_type = config["bench_type"]
     model = config["model"]
+    full_command = config.get("full_command", "")
 
     print(f"  Benchmark type: {bench_type}, Model: {model}")
+    print(f"  Dataset perf_command: {full_command[:80]}...")
 
     if bench_type == "serving":
         # Start server, run benchmark, stop server
