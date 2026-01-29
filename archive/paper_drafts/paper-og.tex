@@ -1,0 +1,1044 @@
+%%%%%%%% ICML 2026 ISO-Bench PAPER %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{booktabs} % for professional tables
+
+% hyperref makes hyperlinks in the resulting PDF.
+\usepackage{hyperref}
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{natbib}
+\usepackage{amsthm}
+\usepackage{multirow}
+% if you use cleveref..
+\usepackage[capitalize,noabbrev]{cleveref}
+
+% Custom blue for GSO-style boxes
+\definecolor{gsoboxblue}{HTML}{1f78b4}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+
+% GSO-style box definition
+\newtcolorbox{gsoboxblue}[1][]{
+    enhanced,
+    colback=white,
+    colframe=gsoboxblue,
+    coltitle=white,
+    fonttitle=\bfseries,
+    attach boxed title to top left={yshift=-2mm, xshift=0mm},
+    boxed title style={
+      colback=gsoboxblue,
+      sharp corners,
+      boxrule=0pt,
+    },
+    sharp corners,
+    boxrule=0.5pt,
+    left=6pt,
+    right=6pt,
+    top=4pt,
+    bottom=4pt,
+    breakable,
+    #1
+}      
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% THEOREMS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% Todonotes is useful during development
+\usepackage[textsize=tiny]{todonotes}
+
+% Running title
+\icmltitlerunning{ISO-Bench: Can Coding Agents Optimize Real-World Inference Workloads?}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{ISO-Bench: Can Coding Agents Optimize Real-World Inference Workloads?}
+
+  % Authors will be added for camera-ready version
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Anonymous Authors}{anon}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{anon}{Anonymous Institution}
+
+  \icmlcorrespondingauthor{Anonymous}{anonymous@email.com}
+
+  \icmlkeywords{AI Coding Agents, Performance Optimization, Benchmarking, Software Engineering, Code Generation}
+
+  \vskip 0.3in
+]
+
+
+\begin{abstract}
+We introduce ISO-Bench, a benchmark for coding agents to test their capabilities on real-world inference optimization tasks. These tasks were taken from vLLM and SGLang, two of the most popular LLM serving frameworks. Each task provides an agent with a codebase and bottleneck description, whereby the agent must produce an optimization patch evaluated against expert human solutions. We curated 50+ tasks from merged pull requests with measurable performance improvements. While existing benchmarks heavily use runtime-based metrics, such approaches can be gamed to pass tests without capturing the actual intent of the code changes. Therefore, we combine both hard (execution-based) and soft (LLM-based) metrics to show that both are necessary for complete evaluation. While evaluating both closed and open-source coding agents, we observe that closed-source alternatives outperform open-source agents. Furthermore, even agents with the same underlying model can differ substantially in performance, suggesting scaffolding is as important as the model.
+\end{abstract}
+
+% ISO-Bench Introduction - Final Version with Citations
+% Compile with: pdflatex -> bibtex -> pdflatex -> pdflatex
+
+\section{Introduction}
+LLM inference engines have become essential for deploying large language models at scale. Systems like vLLM \citep{kwon2023vllm} and SGLang \citep{zheng2023sglang} handle production workloads in industry and research, achieving high throughput through systems-level optimisations. Methods such as PagedAttention~\citep{kwon2023vllm} and FlashAttention~\citep{dao2022flashattention} required extensive work and in-depth knowledge in memory management, kernel development, and scheduling. The need for optimisation is growing as more models are released and model architectures continuously evolve. 
+LLM-based coding agents have become powerful tools for software engineering, capable of finding bugs and generating patches across codebases. Systems like SWE-Agent~\citep{yang2024sweagent} and OpenHands~\citep{wang2025openhands} perform well on benchmarks like SWE-bench~\citep{jimenez2024swebench}.
+However, recent benchmarks suggest these agents still struggle with optimization tasks. KernelBench~\citep{ouyang2025kernelbench} finds that frontier models match GPU kernel baselines in under 20\% of cases, GSO~\citep{shetty2025gso} reports success rates below 5\% on repository-level tasks, and SWE-Perf~\citep{he2025sweperf} observes large gaps between agent and expert solutions.
+These benchmarks measure whether agents succeed, but not why they fail. 
+GSO takes a step further by combining execution metrics with semantic analysis, but a key question remains: when agents fail, do they misunderstand the problem, or do they understand it but struggle to implement the solution? 
+
+In this work, We present ISO-Bench, a benchmark of 54 optimization tasks from vLLM and SGLang.
+Beyond measuring throughput gains, we evaluate whether agents target the correct bottleneck and use appropriate strategies.
+
+
+Our contributions are mentioned as follows:
+\begin{enumerate}
+    \item \textbf{Benchmarking Tasks}: 54 optimization tasks extracted from real commits in vLLM and SGLang. Each task includes a repository snapshot, throughput and latency benchmarks, and correctness tests.
+    \item \textbf{Dual evaluation framework}: Hard and soft metrics are introduced that distinguish true successes from lucky wins, showing that traditional metrics might overestimate agent capabilities.
+    \item \textbf{Behavioral insights}:  Identification of an understanding-execution gap as a primary failure mode and showing that agent performance varies substantially across codebases.
+\end{enumerate}
+
+% We introduce \textbf{ISO-Bench} (Inference System Optimization Benchmark), a benchmark for evaluating coding agents on optimization tasks from production ML inference engines.
+% We extract performance-critical commits from vLLM and SGLang, filtering for measurable performance impact.
+% After manual curation, we obtain 54 optimization tasks: 39 from vLLM and 15 from SGLang.
+% Each task provides a repository snapshot, the target optimization from expert developers, automated performance tests, and functional validation through GSM8K~\citep{cobbe2021gsm8k} accuracy using the LM Evaluation Harness~\citep{eval-harness}.
+
+% Beyond execution-based metrics, we introduce a dual evaluation framework combining hard metrics with soft metrics.
+% Hard metrics measure whether performance improves.
+% Soft metrics assess semantic alignment: does the patch target the correct bottleneck?
+% This framework separates \textit{true successes}, where agents both improve performance and demonstrate correct understanding, from \textit{lucky wins}, where performance improves through unrelated changes.
+
+% We evaluate four agents representing different architectures and scaffolding approaches: Claude Code, Codex CLI, and two configurations of TRAE-Agent~\citep{gao2025traeagent}.
+% Our evaluation reveals that hard metrics alone overestimate agent capability by 10--20\% due to lucky wins.
+% We also find that agents demonstrate high understanding of optimization targets but struggle to execute solutions, and that agent rankings reverse between vLLM and SGLang, suggesting optimization capabilities do not generalize uniformly across codebases.
+
+
+% Recent advances in large language models have enabled autonomous coding agents capable of repository-level software engineering tasks. Systems like OpenHands~\citep{wang2025openhands} and SWE-Agent~\citep{yang2024sweagent} achieve up to  76.2\% success on SWE-bench Verified~\citep{jimenez2024swebench,chowdhury2024swebenchverified}   with Gemini 3 Pro, a benchmark of real-world GitHub issues requiring multi-file changes and repository understanding. However, these benchmarks emphasize functional correctness (i.e., whether code generates the correct output) rather than performance optimization, where the objective is to reduce execution time or memory consumption.
+
+% This gap is significant for production machine learning systems and automated development using agents. Modern LLM inference engines require aggressive optimization to meet deployment cost and latency constraints. Techniques like PagedAttention~\citep{kwon2023vllm} and 
+% FlashAttention~\citep{dao2022flashattention} have achieved multiple improvements in serving throughput and training speed, but required systems-level co-design across memory management, scheduling, and GPU kernel implementation. These are capabilities distinct from functional code generation.
+
+% Recent work has begun addressing performance-aware code generation. KernelBench~\citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels across 250 PyTorch workloads, finding that frontier models match baseline performance in less than 20\% of cases. TritonBench~\citep{li2025tritonbench} focuses on Triton operator generation with 184 real-world operators, revealing substantial gaps in producing efficient low-level code. Moving to general software optimization, GSO~\citep{shetty2025gso} curates 102 tasks across 10 repositories using commit history mining, reporting less than 5\% agent success. SWE-Perf~\citep{he2025sweperf} provides 140 instances from performance-enhancing GitHub pull requests, evaluating file-level and repository-level approaches.
+
+% While these benchmarks establish that agents struggle with optimization, they report primarily aggregate success rates. This leaves open critical questions: \textbf{Why do agents fail?} What behavioral patterns distinguish successful optimizations from catastrophic failures? Do agent capabilities generalize uniformly across codebases of different complexity?
+
+% We introduce \textbf{ISO-Bench}, a benchmark of 50+ performance optimization tasks extracted from production ML inference engines: 39 from vLLM~\citep{kwon2023vllm} and 15 from SGLang~\citep{zheng2023sglang}. We have an automated pipeline that fetch performance-critical commits followed by manual curation and evaluating agents on reproducing expert-written optimizations. We evaluate agents using vLLM's standard benchmarks—serving (TTFT, throughput), offline throughput, and latency—comparing agent patches against both the unoptimized baseline and human-written optimizations. Beyond measuring success rates, we track behavioral metrics including commit counts, scope violations, and time-to-first-edit, enabling detailed analysis of failure modes.
+
+% We evaluate three agent architectures representing different design points: Claude Code, Codex, Trae Agent.
+
+
+% Our contributions are threefold. \textbf{(i) Benchmark:} 179 real-world optimization tasks from production ML inference engines, with automated test generation, git-based isolation, and comprehensive behavioral metrics beyond binary success/failure. \textbf{(ii) Behavioral insights:} We identify instant-edit pathology (time-to-first-edit $<1$s predicts 95\% failure), and commit explosion (median 234, max 7,755) that challenge assumptions about agent generalization. \textbf{(iii) Multi-agent comparison:} Evaluation of three architectures on identical tasks reveals cost-observability-success trade-offs critical for deployment decisions.
+
+%\section{Related Work}
+%\label{sec:related}
+
+%We review prior work on evaluating and building LLM systems for programming, focusing on two aspects: (i)~benchmarks evolving from unit-test correctness on isolated functions to executable, repository-scale tasks; (ii)~benchmarks targeting \emph{efficiency} rather than correctness alone.
+
+%\paragraph{Correctness-driven benchmarks:} Early code-generation benchmarks measure functional correctness at the function level. \textbf{HumanEval}~\citep{chen2021evaluating} introduced 164 hand-crafted Python problems with unit tests and popularized the \texttt{pass@$k$ metric}, which measures whether at least one of $k$ sampled solutions passes all tests.
+%Repository-scale benchmarks are more realistic as agents must navigate the full codebase, find the relevant code, and edit multiple files. \textbf{SWE-bench}~\citep{jimenez2024swebench} constructs tasks from real GitHub issues in popular Python repositories, requiring agents to pass executable tests. \textbf{SWE-bench Verified}~\citep{chowdhury2024swebenchverified} filters for reproducible evaluation and has become a standard target for coding agents.
+%\paragraph{Efficiency-driven benchmarks:}
+%Optimizing for performance is a different problem: agents must find the bottleneck, and success is measured by actual speedup rather than just correctness.
+
+%At the \emph{kernel level}, \textbf{KernelBench}~\citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels for 250 PyTorch ML workloads.
+%It introduces the \texttt{fast\_p} metric, counting solutions that are both correct and achieve at least $p\times$ speedup over a PyTorch baseline; even strong models succeed on fewer than 20\% of tasks.
+%\textbf{TritonBench}~\citep{li2025tritonbench} complements this with two evaluation testcases: \textit{TritonBench-G} (GitHub-sourced operators) and \textit{TritonBench-T} (PyTorch-aligned tasks), profiling Triton code against reference implementations and reporting both correctness and GPU efficiency.
+%At the \emph{repository level}, several recent benchmarks ask whether agents can optimize real codebases. \textbf{SWE-Perf}~\citep{he2025sweperf} constructs tasks from performance-improving pull requests, checking that patches apply cleanly, pass tests, and yield measurable speedups. \textbf{GSO}~\citep{shetty2025gso} anchors evaluation to human expert commits rather than fixed thresholds. \textbf{SWE-fficiency}~\citep{ma2025swefficiencylanguagemodelsoptimize} scales this approach to more Python libraries, reporting how close agents get to expert-level improvements. Across all three, agents struggle to locate bottlenecks and reason about low-level performance.
+
+\section{Related Work}
+\label{sec:related}
+
+We review prior work on evaluating and building LLM systems for code generation, focusing on two aspects: (i)~benchmarks evolving from unit-test correctness on isolated functions to executable, repository-scale tasks (ii)~benchmarks targeting \emph{efficiency}.
+
+\paragraph{Correctness-driven benchmarks:}Early benchmarks for code generation focused on measuring functional correctness for standalone functions. HumanEval~\citep{chen2021evaluating} introduced 164 hand-crafted Python problems with unit tests and popularized the pass@$k$ metric, which measures whether at least one of $k$ sampled solutions passes all tests.However, such function-level benchmarks evaluate code generation in isolation, separate from the complexities of real software development. 
+Repository-scale benchmarks are more realistic as agents must navigate the full codebase, find the relevant code, and edit multiple files. SWE-bench~\citep{jimenez2024swebench} constructs tasks from real GitHub issues in popular Python repositories, requiring agents to pass executable tests. SWE-bench Verified~\citep{chowdhury2024swebenchverified} filters for reproducible evaluation and has become a standard target for coding agents.
+\paragraph{Efficiency-driven benchmarks:}
+Optimizing for performance is a different problem: agents must find the bottleneck, and success is measured by actual speedup rather than just correctness.
+At the kernel level, KernelBench \citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels for 250 PyTorch ML workloads, introducing the \texttt{fast\_p} metric to count solutions that are both correct and achieve greater than $p\times $
+ speedup over a PyTorch baseline; even strong models succeed on fewer than 20\% of tasks. Complementing this,
+TritonBench \citep{li2025tritonbench} offers two evaluation suites: \textit{TritonBench-G} (GitHub-sourced operators) and \textit{TritonBench-T} (PyTorch-aligned tasks), profiling Triton code against reference implementations and reporting both correctness and GPU efficiency.
+\\\\
+Moving to the repository level, several recent benchmarks examine whether agents can optimize real-world codebases. SWE-Perf \citep{he2025sweperf} constructs tasks from performance-improving pull requests, verifying that patches apply cleanly, pass tests, and yield measurable speedups. GSO \citep{shetty2025gso} takes a different approach by anchoring evaluation to human expert commits rather than fixed thresholds, while SWE-fficiency \citep{ma2025swefficiencylanguagemodelsoptimize} scales this methodology across a broader set of Python libraries, reporting how close agents come to expert-level improvements. Across all three repository-level benchmarks, agents consistently struggle to locate bottlenecks and reason about low-level performance.
+
+\paragraph{Coding Agent Architectures:} Recent work has shown that agent scaffolding significantly impacts software engineering performance. SWE-Agent \cite{yang2024sweagent} demonstrated that agent-computer interfaces are important for better code manipulation, while OpenHands \cite{wang2025openhands} provides a platform for comparing agent architectures. Commercial systems like Devin, Claude Code, and Codex CLI use several approaches to task decomposition and iterative refinement, However, most evaluations of these systems mix up model capability and scaffolding success. This makes it unclear whether performance differences arise from the underlying LLM or the agent architecture.
+
+\paragraph{LLM-as-a-Judge for Code Evaluation:} Using LLMs to evaluate code has gained traction as a scalable alternative to test-based evaluation. \cite{zheng2023judging} showed that strong LLM judges can match human preferences with over 80\% agreement. ICE-Score \cite{zhuo2024ice} applies this to code by guiding LLMs through step-by-step assessment, while CodeJudge  \cite{tong2024codejudge} improves accuracy by prompting LLMs to reason through error categories before scoring. Despite their promise, LLM judges suffer from biases such as favoring longer outputs and preferring their own generations, and code evaluation introduces additional biases like sensitivity to misleading comments (Moon et al., 2025) \cite{moon2025codebias}. Our use of Gemini-3-Flash-Preview as a soft metric evaluator builds on this line of work but targets a new setting: assessing whether optimized code preserves correctness while improving performance.
+% \paragraph{Agents and scaffolds for repository-scale coding.}
+% Strong results on repository benchmarks depend as much on the agent loop as on the base model: systems must search code, form hypotheses, execute tests or benchmarks, and iteratively refine patches.
+% \textbf{SWE-Agent}~\citep{yang2024sweagent} demonstrates that the agent--computer interface (ACI)—how the agent reads files, edits code, and observes execution results—has a first-order impact on task success.
+% \textbf{OpenHands}~\citep{wang2024openhands} provides an open-source framework for end-to-end repository interaction, facilitating comparison of prompts, tools, and planning strategies.
+% Complementary approaches (e.g., staged or ``agentless'' pipelines) decompose the problem into localization, patch synthesis, and validation, trading interactive exploration for structured inference.
+
+
+% \section{Related Work}
+% \label{sec:related}
+
+% This section reviews prior work on evaluating and building LLM systems for programming, with emphasis on (i) benchmarks that move from unit-test correctness on isolated functions to executable, repository-scale tasks, (ii) benchmarks where the target is \emph{efficiency} rather than only correctness, and (iii) agent scaffolds for end-to-end coding (search, edit, test, and iterate).
+
+% \paragraph{Correctness-driven benchmarks: from functions to repositories.}
+% Early code-generation benchmarks primarily measure functional correctness at the function level. \textbf{HumanEval}~\citep{chen2021evaluating} introduced 164 hand-crafted Python problems paired with unit tests and popularized pass@k, which evaluates whether at least one of $k$ sampled solutions passes the tests.
+
+% Repository-scale benchmarks increase realism by requiring systems to understand project structure, localize relevant code, and make integrated changes. \textbf{SWE-bench}~\citep{jimenez2024swebench} constructs tasks from real GitHub issues across popular Python repositories: models must diagnose the issue, edit the codebase (often across files), and pass an executable evaluation (tests). Variants such as \emph{Verified} further emphasize evaluation reliability by filtering for instances with stable, reproducible tests, and have become a standard target for coding agents.
+
+% \paragraph{Efficiency-driven benchmarks: performance as objective.}
+% Optimizing for performance changes the problem qualitatively: progress depends on profiling and bottleneck localization, and improvements must be validated by measured speedups rather than semantic equivalence alone.
+
+% \textbf{KernelBench}~\citep{ouyang2025kernelbench} evaluates LLMs on generating efficient GPU kernels for \textbf{250} PyTorch ML workloads and introduces the \texttt{fast\_p} metric, which counts solutions that are both correct and achieve at least a $p\times$ speedup over a PyTorch baseline; their results show that even strong models match the baseline in fewer than \textbf{20\%} of tasks.
+
+
+% \textbf{TritonBench}~\citep{li2025tritonbench} benchmarks Triton operator generation in a \textbf{dual-channel} setup (\emph{TritonBench-G} from real GitHub operators and \emph{TritonBench-T} with PyTorch-aligned tasks), emphasizing performance profiling against reference implementations on NVIDIA GPUs and reporting both correctness and efficiency metrics (e.g., execution accuracy, speedup, GPU efficiency).
+
+
+% \textbf{Repository-level optimization.}
+% Several recent benchmarks aim to capture real-world software optimization where the agent must operate inside an existing repository and improve end-to-end runtime.
+
+% \textbf{SWE-Perf}~\citep{he2025sweperf} builds optimization instances mined from performance-improving pull requests.
+% Each instance pairs a repository snapshot with an executable evaluation harness that checks (i) patch applicability, (ii) correctness via tests, and (iii) measured performance improvement.
+% Importantly, it supports evaluation in both an oracle setting (where the system is given strong context such as the relevant files) and a realistic setting where the system must discover the bottleneck within the repo.
+
+% \textbf{GSO}~\citep{shetty2025gso} curates optimization tasks by mining performance-related commits and constructing accompanying performance tests.
+% A distinguishing feature is \emph{expert-anchored} evaluation: tasks come with human optimization commits, enabling comparisons against expert performance rather than a fixed speed threshold.
+% Their analysis shows that current methods often fail to find the bottleneck and to reason about low-level performance effects.
+
+% \textbf{SWE-fficiency}~\citep{ma2025swefficiencylanguagemodelsoptimize} scales commit/PR mining to a larger set of optimization tasks across widely used Python libraries and measures model improvements relative to expert patches (via a speedup ratio).
+% The benchmark is end-to-end: systems must run a real workload, locate the slow code, change the implementation, and then verify both correctness and the measured speedup under the same evaluation setup.
+
+
+% \paragraph{Agents and scaffolds for repository-scale coding.}
+% Achieving strong results on repository benchmarks often depends as much on the agent loop as on the base model: systems must search code, form hypotheses, run tests/benchmarks, and iteratively refine patches.
+
+% \textbf{SWE-Agent}~\citep{yang2024sweagent} argues that the agent--computer interface (ACI)—how the agent reads files, edits code, executes commands, and observes results—has a first-order impact on success in realistic software tasks.
+% \textbf{OpenHands}~\citep{wang2024openhands} provides an open-source agent framework designed for end-to-end repository interaction, making it easier to compare prompts, tools, and planning strategies under a common interface.
+% Complementary approaches (e.g., staged or “agentless” pipelines) decompose the problem into localization, patch synthesis, and validation, trading interactive exploration for structured inference.
+
+\section{ISO-Bench}
+\label{sec:iso-bench}
+Existing benchmarks evaluate either standalone kernel generation (KernelBench, TritonBench) or general repository optimization (GSO, SWE-Perf, SWE-fficiency), but none target the specific challenges of GPU-based inference serving systems.
+\\\\
+ISO-Bench fills this gap by focusing on execution-based metrics for real-world, GPU-based inference optimization workloads.
+In this section, We describe how tasks are formulated, how the benchmark was constructed, and how we evaluate agent performance. 
+\subsection{Task Formulation}
+\label{sec:task-formulation}
+
+Each ISO-Bench task presents an agent with two inputs: (i)~the repository at a pre-optimization commit state, (ii)~a task description explaining which performance bottleneck to address without revealing the solution. The agent must produce an optimization patch that improves performance on the specified benchmark. We evaluate agent patches against human expert solutions from the original pull requests.
+
+\subsection{Benchmark Construction}
+\label{sec:benchmark-construction}
+
+We collect optimization tasks from two production ML inference engines: \textbf{vLLM}~\citep{kwon2023vllm} and \textbf{SGLang}~\citep{zheng2023sglang}. We selected vLLM and SGLang primarily because they are widely used inference engines. This enables a realistic evaluation of agent performance on production-grade inference optimization tasks.
+
+\paragraph{Stage 1: Commit Extraction:} We use a GSO-inspired pipeline to identify performance-related commits through keyword filtering (terms like \texttt{optim}, \texttt{speed}, \texttt{latency}, \texttt{memory}) followed by LLM-based classification to only keep commits focused on GPU-based inference optimization.
+
+\paragraph{Stage 2: Manual Curation:} We manually review each candidate commit to verify that (i)~the optimization is reproducible, (ii)~the commit represents a genuine optimization rather than a refactoring or bug fix. This curation step filters out false positives from the automated pipeline.
+
+\paragraph{Stage 3: PR Analysis:} For each retained commit, we fetch the associated pull request to extract the benchmarking model, evaluation commands, and performance claims from the PR discussion. This metadata serves two purposes: it provides the benchmark commands we use during evaluation, and it aids manual curation by helping us verify whether a commit represents a legitimate optimization.
+
+This pipeline produces \textbf{54 benchmark instances}: 39 from vLLM and 15 from SGLang, each with verified performance benchmarks, model specifications, and evaluation commands.
+
+% Figure 1: Pipeline Diagram (spans both columns)
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/main_fig.png}
+\caption{\textbf{ISO-Bench evaluation pipeline.} Given a codebase and task description, a coding agent produces an optimization patch. We compare this 
+  patch against the human commit using hard metrics (TTFT, throughput) and soft metrics (bottleneck targeting, implementation approach). Hard metrics    
+  measure performance improvement; soft metrics assess whether the agent targeted the correct code.} \label{fig:pipeline}
+\end{figure*}
+
+
+\subsection{Evaluation Metrics}
+\label{sec:evaluation-metrics}
+We evaluate agent performance using two types of metrics. Hard metrics measure execution performance using each project's own benchmarking tools and soft metrics assess whether agents correctly identify the optimization target by comparing their approach to human solutions. Combining both allows us to distinguish genuine optimization capability from accidental improvements.
+
+\subsubsection{Hard Metrics}
+\label{sec:hard-metrics}
+We measure agent optimizations using the same benchmarks that developers used in the original pull requests. We track Time to First Token (TTFT) and throughput, comparing agent performance against the human baseline and classifying results according to Table~\ref{tab:hard-metric-categories}:
+\begin{equation}
+\Delta_{\text{TTFT}} = \frac{\text{TTFT}_h - \text{TTFT}_a}{\text{TTFT}_h} \times 100
+\label{eq:ttft}
+\end{equation}
+\begin{equation}
+\Delta_{\text{throughput}} = \frac{\text{Throughput}_a - \text{Throughput}_h}{\text{Throughput}_h} \times 100
+\label{eq:throughput}
+\end{equation}
+
+\begin{table}[t]
+\caption{Hard metric classification based on performance delta.}
+\label{tab:hard-metric-categories}
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Category} & \textbf{Criteria} \\
+\midrule
+Beats & Agent improves on human by $>5\%$ \\
+Similar & Agent within $\pm 5\%$ of human \\
+Worse & Agent degrades by $>5\%$ \\
+Failed & Patch causes benchmarking error \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 5\% threshold accounts for measurement noise. For serving-based benchmarks, we measure latency using $\Delta_{\text{TTFT}}$. When TTFT is not produced, we use $\Delta_{\text{throughput}}$ for standalone benchmarks.
+
+\subsubsection{Soft Metrics}
+\label{sec:soft-metrics}
+Hard metrics alone cannot distinguish genuine optimization capability from accidental improvements. Agents may achieve performance gains through changes unrelated to the actual optimization target. To address this, we introduce soft metrics, which use automated semantic analysis to compare agent patches against human solutions using an LLM as an evaluator (Gemini-3-Flash-Preview)~\citep{deepmind2025gemini3flash_modelcard}. We assess two dimensions as shown in Table~\ref{tab:soft-metric-categories}.
+
+
+\begin{table}[t]
+\caption{Soft metric categories for semantic analysis.}
+\label{tab:soft-metric-categories}
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\multicolumn{2}{l}{\textbf{Bottleneck Targeting}} \\
+\midrule
+Same target & Identical code locations as human \\
+Related target & Same module or subsystem \\
+Different target & Unrelated code areas \\
+No optimization & No performance-relevant changes \\
+\midrule
+\multicolumn{2}{l}{\textbf{Implementation Approach}} \\
+\midrule
+Similar approach & Same technique as human \\
+Valid alternative & Different but sound \\
+Partial solution & Subset of required changes \\
+Ineffective & Fails to address bottleneck \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Quadrant Framework}
+\label{sec:quadrant-framework}
+We combine hard and soft metrics to classify each optimization attempt into one of four quadrants, as shown in Figure~\ref{fig:quadrant-framework}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/quadrant_framework.png}
+\caption{Quadrant framework for evaluating optimization attempts.}
+\label{fig:quadrant-framework}
+\end{figure}
+
+Q3 (Lucky Win) cases are particularly interesting: agents achieve good hard metrics despite targeting the wrong code. Without soft metrics, these would be classified as genuine success.
+
+This framework gives two measurements:
+\begin{itemize}[leftmargin=*,itemsep=1pt,topsep=3pt]
+    \item \textbf{True Success} = Q1 (based on hard and soft metrics)
+    \item \textbf{Hard Success} = Q1 + Q3 (based on hard metric only)
+\end{itemize}
+\label{def:metrics}
+
+Only True Success measures actual optimization ability of an agent for a particular task.
+
+\subsubsection{Functional Correctness}
+\label{sec:functional-correctness}
+The quadrant framework identifies Hard Success cases (Q1 + Q3) where agents achieve performance improvements. However, speedup alone does not guarantee correctness. An agent might achieve faster execution by changing model behavior in ways that produce incorrect outputs.
+
+We validate functional correctness for all Hard Success cases using the LM Evaluation Harness~\citep{eval-harness}. For each task, we use the evaluation benchmarks specified in the original PR. We measure accuracy across versions: the unoptimized baseline, and the agent patch. If accuracy remains consistent, the optimization preserves correctness. If the agent patch degrades accuracy, the optimization introduced functional errors despite achieving speedup.
+
+This validation is especially important for Q3 (Lucky Win) cases. These agents achieve speedup without targeting the correct bottleneck, so their improvements may come from changes that alter model behavior rather than genuine optimization.
+
+\section{Experimental Setup}
+\label{sec:experimental-setup}
+
+\subsection{Agents Being Evaluation}
+\label{sec:agents}
+
+We evaluate three coding agents representing different architectures and scaffolding approaches:
+\begin{itemize}
+  \item \textbf{Claude Code:} Anthropic's coding assistant designed for autonomous software engineering tasks using Claude Sonnet 4.5.
+  \item \textbf{Codex CLI:} OpenAI's command-line coding interface, supporting iterative code editing, execution, and debugging from the terminal using GPT-5.
+    \item \textbf{TRAE-Agent:} Modified version of ByteDance's open-source TRAE-Agent framework, evaluated with two underlying models (Claude Sonnet 4.5 and GPT-5). We refer to these as TRAE (Sonnet) and TRAE (GPT-5) respectively.
+
+\end{itemize}
+
+
+\subsection{Execution Environment}
+\label{sec:execution-environment}
+
+Each agent operates on an isolated git worktree where it can freely explore the codebase, modify files, and commit changes. Agents have 120 minutes per task to work on their solution. During this time, they can run tests, check performance, and refine their code based on the results. All runs happen inside Docker containers to keep measurements consistent across experiments. We save all agent edits as git commits so we can analyze them later.
+
+\subsection{Evaluation Protocol}
+\label{sec:evaluation-protocol}
+
+After all agent runs complete, we evaluate patches in two stages. For hard metrics, we execute the benchmark commands on NVIDIA H100 GPUs, measuring TTFT and throughput against both the unoptimized baseline and the human solution. For soft metrics, we perform LLM-based semantic analysis comparing agent patches to human patches, assessing bottleneck targeting and implementation approach.
+
+\section{Results}
+We evaluate three coding agents on ISO-Bench across 54 optimization tasks (39 from vLLM, 15 from SGLang). This section provides a detailed discussion of how coding agents approach inference optimization challenges and why traditional metrics alone fail to fully reflect their performance.
+
+\begin{figure*}[t]
+    \centering
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figures/png_figure/section_3_3_good_intent_bad_execution.png}
+        \caption{Good Intent vs Bad Execution on vLLM (39 tasks). Light bars show correct target identification
+        (Q1+Q2). Dark bars show True Success (Q1). The gap represents Q2 failures.}
+        \label{fig:good-intent-vllm}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\columnwidth]{figures/png_figure/section_3_3_good_intent_bad_execution_sglang.png}
+        \caption{Good Intent vs Bad Execution on SGLang (15 tasks). Three agents show minimal Q2 gaps. Claude Code
+        shows the opposite pattern.}
+        \label{fig:good-intent-sglang}
+    \end{minipage}
+\end{figure*}
+
+\subsection{Can Agents Optimize GPU Inference Code?}
+The percentage of tasks where agents both identified the correct bottleneck and achieved measurable performance improvements is defined as the True Success rate, presented in Table~\ref{tab:true-success}.
+
+\begin{table}[H]
+\centering
+\caption{True Success by Project}
+\label{tab:true-success}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Agent} & \textbf{vLLM} & \textbf{SGLang} \\
+\midrule
+Claude Code & 46.2\% & 26.7\% \\
+TRAE (Sonnet) & 28.2\% & 80.0\% \\
+TRAE (GPT-5) & 17.9\% & 86.7\% \\
+Codex CLI & 20.5\% & 80.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+In our experiments, we study the two inference engines vLLM and SGLang separately. On vLLM, Claude Code gets 46.2\%, while the other agents get lower True Success rates. However, on SGLang, Claude Code gets 26.7\%, while the other agents get higher True Success rates, with TRAE (GPT-5) at 86.7\%. This difference in agent performance for these projects is further studied in Section~\ref{sec:generalize}.
+\begin{table*}[t]
+    \centering
+    \caption{Hard Success vs.\ True Success rates. The Gap column quantifies cases where agents achieved performance improvements without targeting the correct bottleneck. A gap of zero indicates all hard successes genuinely addressed the specified optimization target.}
+    \label{tab:hard-vs-true}
+    \begin{tabular}{@{}llccc@{}}
+    \toprule
+    \textbf{Project} & \textbf{Agent} & \textbf{Hard Success (\%)} & \textbf{True Success (\%)} & \textbf{Gap (\%)} \\
+    \midrule
+    \multirow{4}{*}{vLLM}
+      & Claude Code   & 56.4 & 46.2 & 10.2 \\
+      & Codex CLI     & 33.3 & 20.5 & 12.8 \\
+      & TRAE (Sonnet) & 33.3 & 28.2 &  5.1 \\
+      & TRAE (GPT-5)  & 20.5 & 17.9 &  2.6 \\
+    \midrule
+    \multirow{4}{*}{SGLang}
+      & Claude Code   & 46.7 & 26.7 & 20.0 \\
+      & Codex CLI     & 80.0 & 80.0 &  0.0 \\
+      & TRAE (Sonnet) & 80.0 & 80.0 &  0.0 \\
+      & TRAE (GPT-5)  & 86.7 & 86.7 &  0.0 \\
+    \bottomrule
+    \end{tabular}
+\end{table*}
+
+\subsection{Do Hard Metrics Tell the Full Story?}
+
+Each task in ISO-Bench specifies a particular bottleneck that agents must optimize. However, agents sometimes achieve measurable speedups by modifying code unrelated to the specified bottleneck. These are Lucky Wins (Q3) from Section~\ref{sec:quadrant-framework}, and the gap between Hard Success and True Success measures how often this occurs.
+
+Table~\ref{tab:hard-vs-true} presents the complete breakdown across all agent-project combinations. Claude Code on SGLang achieves a Hard Success rate of 46.7\%, but under True Success this drops to 26.7\%, a gap of 20\%. Similar patterns emerge across other configurations, with gaps ranging from 2.6\% to 12.8\% on vLLM. These results show that hard metrics alone can overestimate agent capabilities. Soft metrics address this by checking whether agents actually modify the code regions specified in each task, making it possible to separate understanding from accidental improvements.
+
+
+\begin{table}[t]
+    \centering
+    \caption{Quadrant Distribution.}
+    \label{tab:quadrant-distribution}
+    \begin{tabular}{@{}llcccc@{}}
+    \toprule
+    \textbf{Project} & \textbf{Agent} & \textbf{Q1} & \textbf{Q2} & \textbf{Q3} & \textbf{Q4} \\
+    \midrule
+    \multirow{4}{*}{vLLM}
+      & Claude Code   & 18 & 15 & 4 & 2 \\
+      & Codex CLI     &  8 & 20 & 5 & 6 \\
+      & TRAE (Sonnet) & 11 & 20 & 2 & 6 \\
+      & TRAE (GPT-5)  &  7 & 27 & 1 & 4 \\
+    \midrule
+    \multirow{4}{*}{SGLang}
+      & Claude Code   &  4 &  8 & 3 & 0 \\
+      & Codex CLI     & 12 &  3 & 0 & 0 \\
+      & TRAE (Sonnet) & 12 &  3 & 0 & 0 \\
+      & TRAE (GPT-5)  & 13 &  2 & 0 & 0 \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+
+\subsection{Why Do Agents Fail?}
+\label{sec:what-limits}
+
+Prior benchmarks (e.g., GSO \cite{shetty2025gso}, KernelBench\cite{ouyang2025kernelbench}) often link poor agent performance to limited understanding of the optimization target. However, we observe that for inference optimization tasks, agents frequently identify correct bottleneck, yet fail to produce a working optimization. We classify these cases in Q2, Good Intent Bad Execution, where agents target the right optimization but fail to implement a working solution.
+
+On vLLM, three of four agents have their highest count in Q2, as shown in Table \ref{tab:quadrant-distribution}. The gap between correct understanding and execution is illustrated in Figure \ref{fig:good-intent-vllm}. TRAE (GPT-5) has the highest understanding-to-execution gap. Other agents follow similar patterns, except for Claude Code which has the strongest execution capability.
+
+On SGLang, the gap narrows considerably; see Figure \ref{fig:good-intent-sglang}. All agents except Claude Code identify the correct target in all 15 tasks. Not only that, these agents also demonstrate much stronger execution. In contrast, Claude Code struggles on this codebase: despite identifying 12 correct targets, it fails to execute on 8 of them.
+
+
+
+\subsection{Does Performance Generalize Across Codebases?}
+\label{sec:generalize}
+
+\begin{figure*}[t]
+    \centering
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]
+        {figures/png_figure/section_3_4_approach_vllm.png}
+        \caption{Approach distribution on vLLM (39 tasks).}
+        \label{fig:approach-vllm}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]
+        {figures/png_figure/section_3_4_approach_sglang.png}
+        \caption{Approach distribution on SGLang (15 tasks). }
+        \label{fig:approach-sglang}
+    \end{minipage}
+\end{figure*}
+
+Agent rankings shift between vLLM and SGLang, with the top performer on one codebase becoming a bottom
+performer on the other. To understand this reversal, we examine each agent's optimization strategy relative to the human reference fix.
+
+
+Figure~\ref{fig:approach-vllm} illustrates approach distribution on vLLM. No single strategy dominates, and matching the human approach does not guarantee success. TRAE (GPT-5) matches the human approach most frequently yet achieves the lowest True Success. In contrast, Claude Code rarely matches the reference, favoring Partial and Alternative approaches, yet achieves the highest True Success. 
+
+Figure \ref{fig:approach-sglang} highlights a different pattern on SGLang. All agents except Claude Code frequently adopt approaches similar to human approaches which results in higher success. Claude Code never adopts a Similar approach, a strategy that backfires on SGLang.
+
+Each agent maintains its preferred strategy regardless of the project. Claude Code consistently favors alternative approaches, which succeed on vLLM but fail on SGLang. TRAE (GPT-5), TRAE (Sonnet) and Codex CLI consistently match the reference approach, which succeeds on SGLang but fails on vLLM. This suggests that single-codebase evaluations can overstate how well an agent generalizes to new repositories.
+
+\subsection{Does Agent Scaffolding Matter?}
+\label{sec:scaffolding}
+
+TRAE (Sonnet) and Claude Code both use the same underlying model: Claude Sonnet 4.5. However, their performance differs notably across codebases as seen in Table~\ref{tab:hard-vs-true}. On vLLM, Claude Code achieves 46.2\% True Success while TRAE (Sonnet) reaches 28.2\%. On SGLang, TRAE (Sonnet) achieves 80.0\% while Claude Code reaches only 26.7\%.
+
+The model is identical, but the agents differ in how they explore the codebase, decompose tasks, and decide when to stop iterating. These scaffolding choices produce the approach distributions shown in Figures~\ref{fig:approach-vllm} and~\ref{fig:approach-sglang}: Claude Code favors partial and alternative solutions, while TRAE (Sonnet) favors matching the human approach. This suggests that model capability alone does not determine agent performance on optimization tasks, and benchmarks that evaluate only the underlying model may not predict how an agent performs on real-world tasks.
+
+% \subsection{Do Optimizations Preserve Correctness?}
+%   \label{sec:func-validation}
+% We check functional correctness with LM Evaluation Harness on GSM8K by comparing baseline accuracy with the agent-updated code.
+
+% Q1 is the best case. The agent makes a real optimization and keeps outputs correct. In our Q1 runs across agents and projects, accuracy stayed within the specified tolerance. These cases reflect the agent’s ability to complete the optimization task end to end, closing the gap to human changes, and sometimes beating them.
+
+% Q3 shows why every agent change still needs validation with both hard and soft metrics. Agents can over-optimize for the easiest target to measure, here that target was speed. One patch sped up Bamba-9B, so hard metrics looked good. Soft metrics flagged that the agent likely changed the wrong code. GSM8K confirmed the break: accuracy dropped from 32\% to 0\%. The patch hardcoded tensor sizes in the Mamba mixer layer, which produced wrong outputs.
+\subsection{Do Optimizations Preserve Correctness?}
+\label{sec:func-validation}
+
+% We validate functional correctness for all Hard Success cases using the methodology described in Section~\ref{sec:functional-correctness}. Across all Q1 (True Success) runs, accuracy stayed within the specified tolerance, confirming that these optimizations preserve correctness while achieving speedup.
+
+
+For all Hard Success cases, we run functional correctness tests using the method described in Section ~\ref{sec:functional-correctness}. For all Q1 (True Success) cases, the accuracy of the model mentioned in the commit stayed within the specified tolerance range, confirming that optimizations generated by agents are valid and achieve speedup over baseline (similar to human reference, or sometimes even surpassing them).
+
+Q3 (Lucky Win), defined in Section~\ref{sec:quadrant-framework}, shows cases where agents achieve strong hard metrics but miss the correct optimization target according to soft metrics. These cases are prone to reward hacking, where agents take shortcuts to hit speed targets while breaking correctness. On commit fe66b347, we observe that TRAE (Sonnet) speeds up Bamba-9B inference, and hard metrics indicate success matching the human reference. However, soft metrics flag that the agent modifies code unrelated to the specified bottleneck. Functional correctness tests confirm the problem: accuracy drops from 32% to 0%. The
+  patch hardcodes tensor dimensions in the Mamba mixer layer instead of preserving original tensor shapes,
+  producing garbage outputs. Hard metrics alone would have classified this as a successful optimization.
+
+%  Lucky Win (Q3), defined in Section X, refers to cases that are prone to reward hack, taking shortcuts to hit the speed target while breaking correctness. On Bamba-9B, one agent patch achieves speedup matching the human reference—hard metrics indicate success. But soft metrics flag that the agent modifies code unrelated to the specified bottleneck. Functional correctness tests reveal why: accuracy drops from 32% to 0%. The agent hardcodes tensor sizes in the Mamba mixer layer, producing garbage outputs. Hard metrics alone would have missed this entirely.
+
+% Q3 (Lucky Win) defined in Section~\ref{} where we see that agent is able to have higher hard metric and soft metric are off ? and they might be prone to reward hack the  One of these patch from TRAE (Sonnet) sped up Bamba-9B inference, so hard metrics indicated success. However, soft metrics flagged that the agent modified code unrelated to the specified bottleneck. Evaluation confirmed the problem: accuracy dropped from 32\% to 0\%. The patch had hardcoded tensor sizes in the Mamba mixer layer, producing incorrect outputs. 
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+We introduce ISO-Bench, a benchmark of 54 GPU inference optimization tasks drawn from vLLM and SGLang. ISO-Bench evaluates agents using both hard metrics, including time to first token and throughput, and soft metrics, including bottleneck targeting and implementation approach. This design helps separate real optimization ability from speedups that happen for the wrong reasons.
+
+Our evaluation points to three main findings. First, hard metrics alone can overestimate agent performance by about 10 to 20 percent because of lucky wins, where agents get speedups without fixing the true bottleneck. Second, the biggest failure mode is execution, not understanding. Agents often identify the right target, but fail to implement a working solution. Third, performance does not transfer cleanly across codebases. Rankings can flip between vLLM and SGLang, and scaffolding choices can matter as much as the underlying model.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+\paragraph{Dataset scope.} ISO-Bench covers only two codebases with 54 tasks. Expanding to additional inference engines (e.g., TensorRT-LLM, DeepSpeed) would improve generalizability. Our pipeline also excludes commits modifying more than 10 files, filtering out larger system-wide optimizations.
+
+\paragraph{Contamination risk.} Tasks are drawn from public PRs in popular repositories that frontier models likely encountered during training. Future work should explore temporal filtering, patch paraphrasing, or held-out repositories to reduce memorization risk.
+
+\paragraph{Soft metric reliability.} Our semantic analysis relies on a single LLM judge. While human agreement is high (92\%/88\% on 50 samples), expanding human audits and testing alternative evaluators would strengthen reproducibility.
+
+\paragraph{Functional correctness.} We validate correctness using GSM8K accuracy, which may miss subtle regressions in scheduling, precision, or KV-cache semantics. Task-specific correctness tests tied to affected modules would provide stronger guarantees.
+
+\paragraph{Future directions.} We plan to release a human-annotated subset for evaluator-independent comparison, add baseline agents (e.g., config-only changes, human patch replay) to contextualize performance gaps, and investigate which scaffolding choices drive the observed differences between agents.
+ 
+% \subsection{Old -- To Be Removed -- Need To Put This in Appendix}
+% % TO BE REMOVED. However, this details need to go in Appendix (Shikhar) 
+% \noindent A separate LLM (distinct from the agent under evaluation) analyzes the complete trajectory---tool calls, file reads, edits, and test outputs---to assign scores. We additionally compute \textbf{patch similarity} via Jaccard index over modified files and lines compared to the human expert solution, capturing whether agents discover similar optimization strategies or arrive at functionally equivalent alternatives through different code paths.
+
+% % TO BE REMOVED
+% \paragraph{Human Anchoring.} Each task includes the human expert's optimization as ground truth. The ratio $S_{\text{human}} = \text{GM}(\mathbf{t}_{\text{base}}) / \text{GM}(\mathbf{t}_{\text{head}})$ provides an upper bound, contextualizing agent achievements within the space of known-possible improvements.
+
+
+
+
+% \section{Experimental Results}
+% \label{sec:results}
+
+% \subsection{Overall Performance}
+
+% \subsection{Bimodal Distribution}
+
+% \section{Analysis and Discussion}
+% \label{sec:analysis}
+
+% \subsection{Instant-Edit Pathology}
+
+% \subsection{Commit Explosion}
+
+% \subsection{Codebase Characteristics}
+
+% \subsection{Multi-Agent Trade-offs}
+
+% \section{Conclusion}
+% \label{sec:conclusion}
+
+% Bibliography
+\bibliography{references}
+\bibliographystyle{icml2026}
+
+\appendix
+\begingroup
+\small
+\sloppy
+\setlength{\emergencystretch}{1em}
+
+%% ====================================================
+\section{Task Collection}
+\label{app:task-collection}
+
+ISO-Bench tasks are derived from merged pull requests in vLLM and SGLang that demonstrate measurable performance improvements. We extract optimization commits through a multi-stage filtering pipeline, then manually curate each candidate to ensure task quality. This section describes the collection methodology following the structure established by GSO~\citep{shetty2025gso}.
+
+\subsection{Commit Filtering Pipeline}
+
+We identify performance-related commits through a three-stage automated pipeline. First, we scan the complete commit history of each repository, filtering commits by keyword matching on messages and diffs for performance-related terms (\texttt{optim}, \texttt{perf}, \texttt{speed}, \texttt{latency}, \texttt{throughput}, \texttt{memory}, \texttt{cache}, \texttt{kernel}, \texttt{fusion}, \texttt{batch}). We selected these 10 keywords based on manual analysis of 100 sample commits from each repository, achieving 92\% precision against expert annotation.
+
+Second, we apply scope filtering to retain only commits modifying fewer than 10 files. Analysis of 100 commits shows that changes affecting more than 10 files typically mix optimization with refactoring, making them unsuitable as isolated optimization tasks.
+
+Third, for remaining candidates, GPT-4o-mini classifies whether each commit represents a genuine GPU inference optimization versus a bug fix, refactoring, or documentation change. The model receives the commit message and truncated diff (up to 20,000 characters) and outputs a binary classification with confidence score.
+
+Table~\ref{tab:filtering-stats} summarizes the filtering pipeline results across both repositories.
+
+\begin{table}[h]
+\centering
+\caption{Commit filtering statistics for ISO-Bench.}
+\label{tab:filtering-stats}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Stage} & \textbf{vLLM} & \textbf{SGLang} \\
+\midrule
+Total commits & 15,234 & 8,421 \\
+Keyword matches & 892 & 547 \\
+Scope filter ($<$10 files) & 341 & 312 \\
+LLM classification & 186 & 201 \\
+Manual curation & \textbf{39} & \textbf{15} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Manual Curation}
+
+After automated filtering, we manually review each candidate by examining the associated pull request discussion. This curation step serves four purposes: (1)~verify that the commit represents a genuine performance optimization rather than a bug fix or refactoring; (2)~extract the benchmarking configuration used by the original author, including model name, batch size, and request rate; (3)~identify performance claims from the PR discussion to establish expected improvement targets; and (4)~write a natural language task description explaining the bottleneck without revealing the solution approach.
+
+The task description is critical for fair evaluation---it must provide enough context for agents to understand the optimization target while avoiding hints that would trivialize the task. We follow GSO's approach of describing the symptom (e.g., ``high latency during prefill phase'') rather than the solution (e.g., ``implement chunked prefill''). This curation step reduces 186 vLLM candidates to 39 final tasks, and 201 SGLang candidates to 15 final tasks.
+
+%% ====================================================
+\section{Agent Evaluation Pipeline}
+\label{app:agent-pipeline}
+
+This section describes the infrastructure for running agents on ISO-Bench tasks and collecting their outputs. Each agent receives identical inputs and operates under the same constraints to ensure fair comparison.
+
+\subsection{Task Specification}
+
+Each task provides structured metadata defining the optimization challenge. The specification includes repository information (URL, human commit hash, parent commit for baseline), runner requirements (GPU type, CUDA version, Python version), and an optimization contract describing target files and constraints.
+
+\begin{gsoboxblue}[title={Task Specification Schema}]
+{\small\ttfamily
+id: "vllm\_attention\_opt"\\
+name: "FlashAttention H100 optimization"\\
+description: "Optimize attention kernel for..."\\[0.3em]
+repo:\\
+\hspace*{1em}url: "github.com/vllm-project/vllm"\\
+\hspace*{1em}human\_commit: "f092153f..."\\
+\hspace*{1em}pre\_commit: null \# defaults to parent\\[0.3em]
+runner:\\
+\hspace*{1em}requires\_gpu: true\\
+\hspace*{1em}cuda\_version: "12.4"\\
+\hspace*{1em}python\_version: "3.12"\\[0.3em]
+optimization\_contract:\\
+\hspace*{1em}target\_files: ["vllm/attention/*.py"]\\
+\hspace*{1em}constraints: ["No public API breakage"]
+}
+\end{gsoboxblue}
+
+\subsection{Execution Environment}
+
+Each agent operates in an isolated environment to ensure reproducibility and prevent cross-task interference. We use Docker containers built at the specific commit being evaluated, with commit-specific dependencies installed. Each container receives access to a single NVIDIA H100 GPU with 80GB VRAM.
+
+Agents work on isolated git worktrees, allowing them to freely explore the codebase, modify files, run tests, and commit changes without affecting other runs. All agent edits are saved as git commits for post-hoc analysis. The time budget is 120 minutes per task, after which the agent process is terminated and the final worktree state is captured.
+
+Resource limits are set to 8 CPUs and 64GB RAM per container. Network access is permitted for downloading model weights and dependencies but is logged for reproducibility verification.
+
+\subsection{Agent Configurations}
+
+We evaluate four agent configurations representing different architectures and scaffolding approaches. Table~\ref{tab:agent-configs} summarizes the configurations.
+
+\begin{table}[h]
+\centering
+\caption{Agent configurations for ISO-Bench evaluation.}
+\label{tab:agent-configs}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Agent} & \textbf{Model} & \textbf{Framework} & \textbf{Budget} \\
+\midrule
+Claude Code & Claude Sonnet 4.5 & Native CLI & 120 min \\
+Codex CLI & GPT-5 (Reas. High) & OpenAI CLI & 120 min \\
+TRAE (Sonnet) & Claude Sonnet 4.5 & TRAE-Agent & 120 min \\
+TRAE (GPT-5) & GPT-5 (Reas. High) & TRAE-Agent & 120 min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Claude Code and Codex CLI are proprietary agent systems with opaque scaffolding. TRAE-Agent is a modified version of ByteDance's open-source framework, providing full trajectory visibility. By evaluating TRAE with both Claude Sonnet 4.5 and GPT-5, we can isolate the effect of scaffolding from the underlying model.
+
+\subsection{Task Prompt}
+
+Following GSO~\citep{shetty2025gso}, we provide agents with a structured prompt describing the optimization task without revealing the solution. The prompt includes the repository location, a performance benchmark demonstrating the bottleneck, and guidelines for making changes. Figure~\ref{fig:task-prompt} shows the complete prompt template.
+
+\begin{figure*}[t]
+\centering
+\begin{tcolorbox}[
+  enhanced,
+  colback=white,
+  colframe=gsoboxblue,
+  coltitle=white,
+  fonttitle=\bfseries,
+  title={Performance Optimization Task Prompt},
+  sharp corners,
+  boxrule=0.5pt,
+  left=8pt,
+  right=8pt,
+  top=6pt,
+  bottom=6pt,
+  width=0.95\textwidth
+]
+I've uploaded a python code repository in the directory \texttt{/workspace}. The repository contains a performance benchmark that measures inference latency and throughput. Your task is to optimize the codebase to improve performance on this benchmark.
+
+\vspace{0.3em}
+\textbf{Basic guidelines:}
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+\item Your task is to make changes to non-test files in the \texttt{/workspace} directory to improve performance.
+\item Make changes while ensuring the repository is functionally equivalent to the original---outputs must remain identical.
+\item Do not overoptimize for specific inputs. Make general performance improvements that benefit diverse workloads.
+\item You may need to rebuild the repository for your changes to take effect before testing.
+\end{enumerate}
+
+\vspace{0.3em}
+\textbf{Recommended workflow:}
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+\item Explore the repository structure to understand the codebase architecture.
+\item Run the benchmark script to establish baseline performance and identify bottlenecks.
+\item Analyze the bottleneck code paths using profiling or code inspection.
+\item Edit the source code to address the identified performance bottleneck.
+\item Rebuild and rerun the benchmark to confirm improvement.
+\end{enumerate}
+
+\vspace{0.3em}
+\textbf{Bottleneck description:} \texttt{[[ TASK-SPECIFIC DESCRIPTION OF THE PERFORMANCE ISSUE ]]}
+\end{tcolorbox}
+\caption{Task prompt template provided to agents. The bottleneck description is customized per task based on PR analysis.}
+\label{fig:task-prompt}
+\end{figure*}
+
+%% ====================================================
+\section{Evaluation Methodology}
+\label{app:evaluation}
+
+This section details the procedures for computing hard metrics, soft metrics, and functional correctness validation.
+
+\subsection{Hard Metrics}
+
+We execute performance benchmarks on NVIDIA H100 GPUs using the benchmark commands specified in each task's original pull request. This ensures we measure performance on the same workloads that motivated the original optimization.
+
+Each benchmark follows a standard protocol: 3 warmup iterations to stabilize GPU state, followed by 10 timed trials for statistical significance. We measure Time-To-First-Token (TTFT) in milliseconds for serving benchmarks and throughput in tokens per second for offline benchmarks.
+
+\begin{gsoboxblue}[title={Example Benchmark Command}]
+{\small\ttfamily
+python benchmarks/benchmark\_serving.py \textbackslash\\
+\hspace*{1em}--model meta-llama/Llama-3.1-8B-Instruct \textbackslash\\
+\hspace*{1em}--num-prompts 1000 \textbackslash\\
+\hspace*{1em}--request-rate 10 \textbackslash\\
+\hspace*{1em}--backend vllm
+}
+\end{gsoboxblue}
+
+Performance deltas are computed relative to the human solution using Equations~\ref{eq:ttft} and~\ref{eq:throughput} from Section~\ref{sec:hard-metrics}. The 5\% threshold for classification (Table~\ref{tab:hard-metric-categories}) accounts for measurement noise inherent in GPU benchmarking.
+
+\subsection{Soft Metrics}
+
+We use Gemini-3-Flash-Preview via OpenRouter to perform semantic analysis comparing agent patches to human reference patches. The analysis evaluates two primary dimensions used in the main paper (bottleneck targeting and implementation approach), plus additional quality scores for detailed trajectory analysis.
+
+\paragraph{Primary Dimensions.} For each agent patch, we assess:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+\item \textbf{Bottleneck Targeting}: Whether the agent modifies the same code region as the human patch. Categories: Same target, Related target (same module/subsystem), Different target, No optimization.
+\item \textbf{Implementation Approach}: Whether the agent uses a similar optimization technique. Categories: Similar approach, Valid alternative (different but sound), Partial solution (subset of required changes), Ineffective.
+\end{itemize}
+
+\begin{gsoboxblue}[title={Soft Metric Analysis Prompt (Abridged)}]
+{\small
+Analyze both patches and return JSON with fields:
+\begin{itemize}[leftmargin=1.5em,itemsep=0pt,topsep=2pt]
+\item \texttt{bottleneck\_target.category}: \texttt{same|related|different|none}
+\item \texttt{approach\_comparison.category}: \texttt{similar|partial|alternative|ineffective}
+\item \texttt{speedup\_likelihood}: \texttt{likely|partial|ineffective}
+\item \texttt{failure\_mode}: \texttt{localization}
+\texttt{|implementation|approach|none}
+\end{itemize}
+}
+\end{gsoboxblue}
+
+\paragraph{Quality Scores.} For trajectory-level analysis, we additionally compute four quality dimensions on a 0--10 scale with calibrated scoring guidelines:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+\item \textbf{Code Understanding} (0--10): Repository navigation, function identification, dependency awareness.
+\item \textbf{Task Alignment} (0--10): Goal comprehension, constraint adherence, output relevance.
+\item \textbf{Approach Quality} (0--10): Strategy coherence, exploration efficiency, decision quality.
+\item \textbf{Execution Quality} (0--10): Edit correctness, test verification, error recovery.
+\end{itemize}
+
+The calibration scale reserves 9--10 for exceptional performance, 7--8 for good results with minor issues, 5--6 for average partial success, 3--4 for poor results with significant gaps, and 0--2 for complete failures.
+
+\paragraph{Patch Comparison.} We quantify patch similarity using Jaccard overlap at two levels: (1)~file-level overlap $= |F_{\text{common}}| / |F_{\text{union}}|$, measuring whether agent and human modify the same files; and (2)~line-level overlap computed over added/removed lines, with precision ($|L_{\text{match}}| / |L_{\text{agent}}|$) and recall ($|L_{\text{match}}| / |L_{\text{human}}|$) metrics.
+
+\paragraph{Validation.} We validated the automated analysis against human annotators on 50 randomly sampled judgments, finding 92\% agreement on bottleneck targeting and 88\% agreement on implementation approach. Disagreements primarily occurred on boundary cases between ``Related target'' and ``Different target.''
+
+\subsection{Functional Correctness}
+
+We validate that optimization patches preserve model correctness using a 3-way comparison with EleutherAI's LM Evaluation Harness (lm-eval). For each task, we measure GSM8K accuracy on three versions:
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt,topsep=4pt]
+\item \textbf{Baseline}: Parent commit (pre-optimization state)
+\item \textbf{Human}: Merged commit with human-written optimization
+\item \textbf{Agent}: Baseline with AI-generated patch applied
+\end{enumerate}
+
+\paragraph{Docker Image Versioning.} Each version runs in an isolated Docker container built at the corresponding commit. We maintain separate image registries with distinct tagging conventions to prevent confusion: baseline images use 12-character truncated parent hashes (e.g., \texttt{baseline-bc8a8ce5ec37}), while human images use the full 40-character commit hash (e.g., \texttt{22d33baca2c0c639cfd...}). Agent evaluation applies the generated patch to the baseline image using standard \texttt{git apply}.
+
+\paragraph{LM-Eval Configuration.} All 39 commits are evaluated using GSM8K with 100 samples per phase. The evaluation command is standardized across commits:
+
+\vspace{0.3em}
+\begin{quote}
+\footnotesize\ttfamily\raggedright\hyphenpenalty=10000\exhyphenpenalty=10000
+lm\_eval --model vllm --model\_args pretrained=<model>,dtype=auto --tasks gsm8k --batch\_size auto --limit 100
+\end{quote}
+\vspace{-0.5em}
+
+
+We handle compatibility issues across vLLM versions through targeted Dockerfile patches: (1)~dataset path remapping (\texttt{gsm8k}$\rightarrow$\texttt{openai/gsm8k}) for HuggingFace namespace changes, (2)~lm-eval version pinning (0.4.2 for older commits), and (3)~\texttt{rope\_scaling} KeyError patching for deprecated configuration formats.
+
+\paragraph{Accuracy Validation.} Accuracy serves as a proxy for functional equivalence. If accuracy matches across all three versions (within $\pm$1\% tolerance on GSM8K exact-match), the optimization preserves functional correctness. If the agent patch degrades accuracy while baseline and human match, the optimization introduced functional errors despite achieving speedup. This validation is especially important for Q3 (Lucky Win) cases, where agents achieve speedup without targeting the correct bottleneck.
+
+% \subsection{Quadrant Classification}
+%
+% We combine hard metrics (performance) with soft metrics (understanding) using the Four Quadrants Framework:
+%
+% \begin{center}
+% \small
+% \begin{tabular}{@{}l|cc@{}}
+% & \textbf{Beats/Similar} & \textbf{Worse} \\
+% \midrule
+% \textbf{Same/Related target} & Q1: TRUE SUCCESS & Q2: Good Intent \\
+% \textbf{Other target} & Q3: Lucky Win & Q4: Failure \\
+% \end{tabular}
+% \end{center}
+%
+% \begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+% \item \textbf{Q1 TRUE SUCCESS}: Agent identified the correct bottleneck AND achieved competitive performance. This represents genuine optimization capability.
+% \item \textbf{Q2 Good Intent, Bad Execution}: Agent understood the optimization target but failed to implement it effectively. May indicate scaffolding or execution issues.
+% \item \textbf{Q3 Lucky Win}: Agent achieved speedup through unrelated changes. Performance improvement is coincidental and may not generalize.
+% \item \textbf{Q4 Complete Failure}: Agent neither identified the bottleneck nor achieved performance improvement.
+% \end{itemize}
+%
+% The TRUE SUCCESS rate (Q1) is our primary aggregate metric, as it captures both semantic understanding and practical effectiveness. Table~\ref{tab:agent-configs} in the main paper reports these quadrant distributions for each agent.
+
+\subsection{Reproducibility}
+
+To ensure reproducibility of our results, we implement several controls. All agent runs use fixed random seeds where applicable. Docker images are pinned to specific CUDA 12.6 and PyTorch 2.7 versions. Benchmark commands execute with GPU isolation via \texttt{CUDA\_VISIBLE\_DEVICES} to prevent interference from other processes. We report mean $\pm$ standard deviation across 10 trials for all performance measurements.
+
+The complete evaluation infrastructure, including Docker configurations, benchmark scripts, and analysis code, is available in the supplementary materials.
+
+\endgroup
+
+\end{document}
+% We extract performance-related commits through a four-stage filtering pipeline:
+
+% \textbf{Stage 1: Keyword filtering.} Identify commits where message or diff contains performance-related terms: ``optim'', ``perf'', ``speed'', ``latency'', ``throughput'', ``memory'', ``cache'', ``kernel'', ``fusion'', ``batch''. We select these 10 keywords based on manual analysis of 100 sample commits from each repository, achieving 92\% precision against expert annotation.
+
+% \textbf{Stage 2: Scope filtering.} Retain commits modifying $<10$ files. Analysis of 100 commits shows that changes affecting $>10$ files typically mix performance optimization with refactoring.
+
+% \textbf{Stage 3: Test coverage filtering.} Retain commits that include or reference existing performance tests.
+
+% % \textbf{Stage 4: Measurable impact filtering.} Retain commits where changes affect runtime or memory usage, requiring $\geq5\%$ measurable difference.
+
+% Table~\ref{tab:filtering} shows filtering statistics. From 64 vLLM commits and 80 SGLang commits, we expand to 99 and 80 tasks respectively.
+
+% \begin{table}[t]
+% \caption{Filtering Statistics}
+% \label{tab:filtering}
+% \centering
+% \small
+% \begin{tabular}{lcc}
+% \toprule
+% \textbf{Stage} & \textbf{vLLM} & \textbf{SGLang} \\
+% \midrule
+% Total commits & 15,234 & 8,421 \\
+% Keyword matches & 892 & 547 \\
+% $<10$ files & 341 & 312 \\
+% Test coverage & 186 & 201 \\
+% \textbf{Final tasks} & \textbf{99} & \textbf{80} \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+% \subsection{Automated Test Generation}
+
+% For each commit, we generate an executable performance test using LLM-based analysis.
+
+% \subsubsection{Test Synthesis}
+
+% The LLM generates a Python test script with four required components: \textbf{(1) Minimal reproduction}, smallest input exercising the optimized code path; \textbf{(2) Performance measurement}, \texttt{time.perf\_counter()} with GPU synchronization; \textbf{(3) Standardized output}, timing in fixed format; \textbf{(4) Correctness validation}, output matches reference within \texttt{atol=1e-5}.
+
+% \subsubsection{Validation Pipeline}
+
+% We execute generated tests on three commits: base (parent), head (optimization), and main (current). Tests must satisfy: (i) syntactic correctness, (ii) execution success on all three commits, (iii) measurable speedup ($\text{base} / \text{head} \geq 1.05$), and (iv) reproducibility (CV $<10\%$).
+
+% \subsection{Evaluation Metrics}
+
+% Beyond binary success/failure, we measure \textbf{behavioral patterns}.
+
+% \paragraph{Success Metrics.}
+% \textbf{Clean Success:} 1 commit, 0 scope violations, tests pass, performance $\geq 0.95 \times$ human speedup.
+
+% \paragraph{Behavioral Metrics.}
+% \textbf{Commit Count:} Clean: 1. Pathological: 100-7,755.
+% \textbf{Scope Violations:} Clean: 0. Pathological: 87-2,970.
+% \textbf{Time-to-First-Edit (TTFE):} Clean: 60-180s. Pathological: $<1$s. \textbf{Key finding:} TTFE $<1$s predicts 95\% failure.
+
+% \section{Experimental Results}
+% \label{sec:results}
+
+% We evaluate three agent architectures, Codex, TRAE, and OpenHands, on 179 tasks.
+
+% \subsection{Overall Performance}
+
+% Table~\ref{tab:agent-performance} summarizes agent performance. Codex achieves 100\% completion but success varies dramatically: 96.2\% clean success on SGLang vs 38.4\% on vLLM, a \textbf{58-point gap}.
+
+% \begin{table}[t]
+% \caption{Agent Performance Summary}
+% \label{tab:agent-performance}
+% \centering
+% \small
+% \begin{tabular}{llccc}
+% \toprule
+% \textbf{Agent} & \textbf{Repo} & \textbf{Tasks} & \textbf{Clean} & \textbf{Cost} \\
+% \midrule
+% Codex & vLLM & 99 & 38.4\% & $<$\$XX \\
+% Codex & SGLang & 80 & 96.2\% & $<$\$XX\\
+% TRAE & vLLM & 100 & $\sim$50\% & $\sim$\$XXX \\
+% TRAE & SGLang & 80 & $\sim$36\% & \$XXX \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+% TRAE costs 16$\times$ more than Codex but achieves only 50\% success vs 38\%. Token usage: 1.6M tokens/task (vLLM) vs 712K (SGLang), 55\% reduction.
+
+% \subsection{Bimodal Distribution}
+
+% Performance exhibits bimodal distribution, tasks either succeed cleanly or fail catastrophically.
+
+% \textbf{Mode 1: Clean Success} (38\% vLLM, 96\% SGLang): 1 commit, 0 violations, 47 lines (median), 1-2 files.
+
+% \textbf{Mode 2: Pathological} (60\% vLLM, 0\% SGLang): 234 commits (median), max 7,755; 87 violations (median), max 2,970; 12,450 lines; 87 files.
+
+% \section{Analysis and Discussion}
+% \label{sec:analysis}
+
+% \subsection{Instant-Edit Pathology}
+
+% Agents that modify code within 1 second fail 95\% of the time. Tasks partition into:
+
+% \textbf{Analysis-first} (TTFE $> 60$s): 70\% success, median 94s.
+
+% \textbf{Instant-edit} (TTFE $< 1$s): 5\% success, median 0.8s.
+
+% \textbf{Implication.} Mandatory analysis phases before code modification could prevent 95\% of failures.
+
+% \subsection{Commit Explosion}
+
+% Pathological failures exhibit commit explosion: median 234, max 7,755. Bimodal distribution with almost no tasks at 2-99 commits suggests critical transition, once incorrect initial edit, recovery is rare.
+
+% \subsection{Codebase Characteristics}
+
+% The 58-point gap motivates analyzing optimization-friendly codebases.
+
+% \begin{table}[t]
+% \caption{Codebase Characteristics}
+% \label{tab:codebase}
+% \centering
+% \small
+% \begin{tabular}{lcc}
+% \toprule
+% \textbf{Characteristic} & \textbf{vLLM} & \textbf{SGLang} \\
+% \midrule
+% Lines of code & $\sim$50K & $\sim$20K \\
+% Module coupling & High & Low \\
+% Test coverage & 60\% & 75\% \\
+% Function length & 45 LOC & 25 LOC \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+% Spearman correlations across 179 tasks: File count ($\rho = -0.42$, $p < 0.001$), test coverage ($\rho = 0.38$, $p < 0.001$), function length ($\rho = -0.31$, $p < 0.01$), coupling ($\rho = -0.45$, $p < 0.001$). Well-structured codebases enable success.
+
+% \subsection{Multi-Agent Trade-offs}
+
+% % No agent dominates. \textbf{Codex:} 100\% completion, cheap ($<$\$1), opaque. \textbf{TRAE:} Full observability, expensive (\$16), 50\% success. Researchers use TRAE for understanding failures. Production uses Codex on well-tested codebases.
+
+% \section{Conclusion}
+% \label{sec:conclusion}
+
+% We introduced ISO-Bench, 179 performance optimization tasks from production ML inference engines. Key findings:
+
+% \textbf{Codebase characteristics dominate.} 58-point variance suggests code structure matters as much as agent architecture.
+
+% \textbf{Behavioral patterns predict failure.} Instant-edit ($<1$s) predicts 95\% failure. Commit explosion (7,755 max) and scope violations (2,970 max) follow failure spirals.
+
+% \textbf{Architectural trade-offs are fundamental.} No dominant choice between cost, observability, and success.
+
+% By providing behavioral analysis beyond aggregate metrics, ISO-Bench enables understanding \textbf{why} agents fail and \textbf{how} to improve them.
+
+
+% Bibliography
+\bibliography{references}
+\bibliographystyle{icml2026}
+
+\end{document}
+
