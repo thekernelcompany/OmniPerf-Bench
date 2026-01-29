@@ -141,7 +141,7 @@ This is a **17.6 percentage point improvement** in success rate!
 
 ### Run Directory
 ```
-/home/ubuntu/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2025-12-23_22-06-06/
+/home/ubuntu/OmniPerf-Bench/ISO-Bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2025-12-23_22-06-06/
 ```
 
 ### Log Files
@@ -231,7 +231,7 @@ The remaining 45 failures are primarily environmental issues that require test e
 
 ### View run report
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source ../bench-env/bin/activate
 python -m bench.cli report state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2025-12-23_22-06-06
 ```

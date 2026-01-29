@@ -7,7 +7,7 @@
 
 ## Overview
 
-This document summarizes the setup for rerunning unsuccessful TRAE + GPT-5 commits from the evaluation analysis in `perf-agents-bench/eval_results_v2/`.
+This document summarizes the setup for rerunning unsuccessful TRAE + GPT-5 commits from the evaluation analysis in `ISO-Bench/eval_results_v2/`.
 
 ## Background
 
@@ -60,13 +60,13 @@ With this fix, **we expect many previously failed commits to now succeed**.
 ### Files Created
 
 1. **Commit Lists**
-   - `perf-agents-bench/TRAE_GPT5_VLLM_FAILED.txt` (53 commits)
-   - `perf-agents-bench/TRAE_GPT5_SGLANG_FAILED.txt` (51 commits)
-   - `perf-agents-bench/TRAE_GPT5_ALL_FAILED.txt` (104 commits)
+   - `ISO-Bench/TRAE_GPT5_VLLM_FAILED.txt` (53 commits)
+   - `ISO-Bench/TRAE_GPT5_SGLANG_FAILED.txt` (51 commits)
+   - `ISO-Bench/TRAE_GPT5_ALL_FAILED.txt` (104 commits)
 
 2. **Rerun Plans** (JSON format for bench.cli)
-   - `perf-agents-bench/state/plan_trae_gpt5_vllm_rerun.json` (53 commits)
-   - `perf-agents-bench/state/plan_trae_gpt5_sglang_rerun.json` (51 commits)
+   - `ISO-Bench/state/plan_trae_gpt5_vllm_rerun.json` (53 commits)
+   - `ISO-Bench/state/plan_trae_gpt5_sglang_rerun.json` (51 commits)
 
 3. **Execution Scripts**
    - `scripts/reruns/rerun_trae_gpt5_vllm.sh` - Run vLLM rerun only
@@ -146,7 +146,7 @@ export OPENAI_API_KEY="your_key"
 If you prefer to run manually:
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # vLLM rerun
 ../bench-env/bin/python -m bench.cli prepare tasks/vllm.yaml \
@@ -196,7 +196,7 @@ These require addressing API credentials and quota, not the agent.
 ### View Results
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Check success/error counts
 grep -c "status determined as: success" pipeline_run_*.log
@@ -216,7 +216,7 @@ python3 scripts/reruns/analyze_gpt5_rerun_results.py
 ### Check Individual Run
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Find latest run
 LATEST_VLLM=$(ls -t state/runs/vllm/trae/gpt-5* | head -n1)
@@ -297,17 +297,17 @@ Based on GPT-5 pricing:
 ## Files Reference
 
 ### Analysis Files
-- `perf-agents-bench/eval_results_v2/AGENT_FAILURE_ROOT_CAUSES.md`
-- `perf-agents-bench/eval_results_v2/DEEP_ANALYSIS.md`
-- `perf-agents-bench/eval_results_v2/evaluation_report.json`
+- `ISO-Bench/eval_results_v2/AGENT_FAILURE_ROOT_CAUSES.md`
+- `ISO-Bench/eval_results_v2/DEEP_ANALYSIS.md`
+- `ISO-Bench/eval_results_v2/evaluation_report.json`
 
 ### Generated Files
 - `scripts/reruns/create_gpt5_rerun_plans.py` - Plan creation script
 - `scripts/reruns/rerun_trae_gpt5_vllm.sh` - vLLM execution script
 - `scripts/reruns/rerun_trae_gpt5_sglang.sh` - SGLang execution script
 - `scripts/reruns/analyze_gpt5_rerun_results.py` - Results analysis
-- `perf-agents-bench/TRAE_GPT5_*.txt` - Commit lists
-- `perf-agents-bench/state/plan_trae_gpt5_*.json` - Rerun plans
+- `ISO-Bench/TRAE_GPT5_*.txt` - Commit lists
+- `ISO-Bench/state/plan_trae_gpt5_*.json` - Rerun plans
 
 ---
 
@@ -335,5 +335,5 @@ Edit the plan JSON file and remove the entries you want to skip, then restart th
 For questions or issues, refer to:
 - Main README: `/home/ubuntu/OmniPerf-Bench/README.md`
 - TRAE documentation: `third-party/trae-agent/`
-- Benchmark documentation: `perf-agents-bench/README.md`
+- Benchmark documentation: `ISO-Bench/README.md`
 - Claude Sonnet 4.5 rerun summary: `docs/reruns/TRAE_SONNET45_RERUN_SUMMARY.md`

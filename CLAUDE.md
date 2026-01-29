@@ -35,7 +35,7 @@ This repository has **two separate virtual environments**:
 |-------------|----------|---------|
 | `.venv/` | Root directory | Main OmniPerf-Bench, collection framework, harness |
 | `bench-env/` | Root directory | Agent benchmarking (TRAE, Codex), Modal runners |
-| `perf-agents-bench/.venv/` | Subdirectory | perf-agents-bench CLI (OpenHands) |
+| `ISO-Bench/.venv/` | Subdirectory | ISO-Bench CLI (OpenHands) |
 
 ```bash
 # Main environment
@@ -79,17 +79,17 @@ PYTHONPATH=src python src/collect/analysis/apis.py <exp_id>
 PYTHONPATH=src python src/collect/generate/generate.py configs/experiments.yaml
 ```
 
-**4. Agent Benchmarking** (perf-agents-bench):
+**4. Agent Benchmarking** (ISO-Bench):
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 .venv/bin/python -m bench.cli plan tasks/vllm.yaml --commits .work/vllm_commits.txt --out ./state/plan.json
 .venv/bin/python -m bench.cli prepare tasks/vllm.yaml --from-plan ./state/plan.json --bench-cfg bench.yaml --max-workers 1 --resume
 .venv/bin/python -m bench.cli report state/runs/<run_id>
 ```
 
-**5. Soft Metrics Analysis** (perf-agents-bench):
+**5. Soft Metrics Analysis** (ISO-Bench):
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 source .venv/bin/activate
 export OPENROUTER_API_KEY="sk-or-v1-..."
 
@@ -112,7 +112,7 @@ OmniPerf-Bench/
 │   ├── harness/                   # Docker-based evaluation system
 │   └── test_scripts/              # Test generation and analysis
 │
-├── perf-agents-bench/             # Agent benchmarking harness
+├── ISO-Bench/                     # Agent benchmarking harness
 │   ├── bench/                     # CLI: plan → prepare → report
 │   ├── tasks/                     # Task configs (vllm.yaml)
 │   ├── state/runs/                # Agent run outputs
@@ -145,12 +145,12 @@ OmniPerf-Bench/
    - `opt_at_k.py`: Main evaluation runner with Opt@K metrics
    - Docker-based isolated test execution
 
-3. **Agent Benchmarking** (`perf-agents-bench/`):
+3. **Agent Benchmarking** (`ISO-Bench/`):
    - `bench/cli.py`: Main CLI entry point
    - `bench/pipeline.py`: Agent execution pipeline
    - `bench/analysis/`: Soft metrics analyzer (LLM-as-a-Judge)
    - Supports OpenHands, TRAE, Codex, Claude Code agents
-   - See `perf-agents-bench/SOFT_METRICS_ANALYSIS.md` for detailed results
+   - See `ISO-Bench/SOFT_METRICS_ANALYSIS.md` for detailed results
 
 ### Soft Metrics Analysis Schema
 

@@ -79,7 +79,7 @@ Run AI agents (OpenHands, TRAE, Codex, Claude Code) on optimization tasks.
 ### Setup
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 
 # Create dedicated virtual environment
 uv venv --python 3.12 .venv
@@ -112,7 +112,7 @@ cp .env.example .env
 
 ### Expected Output
 
-Results are saved to `perf-agents-bench/state/runs/<repo>/<agent>/<model>/<timestamp>/`:
+Results are saved to `ISO-Bench/state/runs/<repo>/<agent>/<model>/<timestamp>/`:
 - `run_summary.json`: Summary metrics
 - `journal.json`: Detailed execution log
 - `<commit>/patch.diff`: Generated patches
@@ -165,7 +165,7 @@ Run these commands to verify your setup:
 python -c "from commit_to_dataset import *; print('Dataset pipeline OK')"
 
 # Check agent CLI
-cd perf-agents-bench && .venv/bin/python -m bench.cli --help
+cd ISO-Bench && .venv/bin/python -m bench.cli --help
 
 # Check evaluation harness
 python -c "import sys; sys.path.insert(0, 'src'); from harness.opt_at_k import *; print('Harness OK')"

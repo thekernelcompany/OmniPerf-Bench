@@ -21,7 +21,7 @@ Increased `max_steps` from 200 to 400 in TRAE configuration
 - Completed: 7/51 commits (021f76e4, 10189d08, 132dad87, 148254d4, 187b85b7, 205d5cb4, 23c764b1)
 - Resuming from: 25e1816e (commit 8 of 51)
 - Remaining: 44 commits
-- Resume plan: `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/state/plan_sglang_resume.json`
+- Resume plan: `/home/ubuntu/OmniPerf-Bench/ISO-Bench/state/plan_sglang_resume.json`
 
 ## Configuration Details
 
@@ -36,7 +36,7 @@ The real issue was in `bench.yaml`, not `trae_config.yaml`. The bench.yaml `args
            max_steps: 400  # Changed from 200
    ```
 
-2. `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/bench.yaml`:
+2. `/home/ubuntu/OmniPerf-Bench/ISO-Bench/bench.yaml`:
    ```yaml
    agents:
      trae:

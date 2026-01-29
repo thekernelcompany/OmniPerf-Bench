@@ -1,0 +1,87 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+index 3ff162170..de612332b 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+@@ -88,12 +88,13 @@ def scaled_mm_kernel(a_ptr, b_ptr, scale_a_ptr, scale_b_ptr, c_ptr, bias_ptr,
+     # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
+     # for scale_b below.
+     scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
+-    accumulator = scale_a * accumulator.to(tl.float32)
++    accumulator = accumulator.to(tl.float32)
++    accumulator = scale_a * accumulator
+ 
+     masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
+     scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
+     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
+-    accumulator = scale_b.T * accumulator.to(tl.float32)
++    accumulator = scale_b.T * accumulator
+ 
+     # Convert to output format.
+     c = accumulator.to(c_ptr.type.element_ty)
+@@ -128,7 +129,7 @@ def triton_scaled_mm(input: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None,
+                      block_size_m: int = 32,
+                      block_size_n: int = 32,
+-                     block_size_k: int = 32) -> torch.Tensor:
++                     block_size_k: int = 32, use_heuristic: bool = True, num_warps: Optional[int] = None, num_stages: Optional[int] = None) -> torch.Tensor:
+     M, K = input.shape
+     N = weight.shape[1]
+ 
+@@ -144,16 +145,34 @@ def triton_scaled_mm(input: torch.Tensor,
+     assert bias is None or bias.is_floating_point()
+     assert is_weak_contiguous(input)
+     assert is_weak_contiguous(weight)
+-
+-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(
+-        N, META['BLOCK_SIZE_N']), )
++    # Heuristic block sizes and kernel launch parameters for better performance
++    if use_heuristic:
++        is_small_N = N < 8192
++        next_power_of_2_M = max(32, triton.next_power_of_2(M))
++        if next_power_of_2_M <= 32:
++            block_size_m, block_size_n, block_size_k = ((64, 64, 256) if is_small_N else (64, 128, 256))
++        elif next_power_of_2_M <= 64:
++            block_size_m, block_size_n, block_size_k = (64, 64, 256)
++        elif next_power_of_2_M <= 128:
++            block_size_m, block_size_n, block_size_k = (64, 128, 128)
++        else:
++            block_size_m, block_size_n, block_size_k = (128, 128, 128)
++
++    if num_warps is None:
++        num_warps = 8 if (block_size_m >= 128 or block_size_n >= 128) else 4
++    if num_stages is None:
++        num_stages = 3
++
++
++    grid = ( ((M + block_size_m - 1) // block_size_m) * ((N + block_size_n - 1) // block_size_n), )
+ 
+     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+ 
+-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
++    is_scalar_a = scale_a.numel() == 1
++    is_scalar_b = scale_b.numel() == 1
+ 
+-    block_size_sa = 1 if has_scalar(scale_a) else block_size_m
+-    block_size_sb = 1 if has_scalar(scale_b) else block_size_n
++    block_size_sa = 1 if is_scalar_a else block_size_m
++    block_size_sb = 1 if is_scalar_b else block_size_n
+ 
+     accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
+ 
+@@ -174,11 +193,11 @@ def triton_scaled_mm(input: torch.Tensor,
+                            weight.stride(1),
+                            result.stride(0),
+                            result.stride(1),
+-                           accumulator_dtype,
++                           accumulator_dtype, num_warps=num_warps, num_stages=num_stages,
+                            BLOCK_SIZE_M=block_size_m,
+                            BLOCK_SIZE_N=block_size_n,
+                            BLOCK_SIZE_K=block_size_k,
+                            BLOCK_SIZE_SCALE_A=block_size_sa,
+                            BLOCK_SIZE_SCALE_B=block_size_sb)
+ 
+-    return result.to(out_dtype)
++    return result

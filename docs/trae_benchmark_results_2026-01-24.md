@@ -104,8 +104,8 @@ Modified `scripts/runners/run_3way_benchmarks.py`:
 
 - **GPT-5 Results**: `omniperf_results_3way_trae_gpt5_0123/results/`
 - **Sonnet 4.5 Results**: `omniperf_results_3way_trae_sonnet45_0123/results/`
-- **Agent Patches (GPT-5)**: `perf-agents-bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19/`
-- **Agent Patches (Sonnet)**: `perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44/`
+- **Agent Patches (GPT-5)**: `ISO-Bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19/`
+- **Agent Patches (Sonnet)**: `ISO-Bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44/`
 - **Benchmark Script**: `scripts/runners/run_3way_benchmarks.py`
 
 ## Duration

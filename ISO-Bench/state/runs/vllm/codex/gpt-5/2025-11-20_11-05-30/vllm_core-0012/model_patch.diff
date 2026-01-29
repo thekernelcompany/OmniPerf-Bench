@@ -1,0 +1,122 @@
+diff --git a/tests/core/block/test_prefix_caching_block.py b/tests/core/block/test_prefix_caching_block.py
+index c2226870c..639aeae04 100644
+--- a/tests/core/block/test_prefix_caching_block.py
++++ b/tests/core/block/test_prefix_caching_block.py
+@@ -732,3 +732,13 @@ class TestPrefixCachingBlockAllocator:
+             blocks.append(prev_block)
+ 
+         return blocks
++
++    @staticmethod
++    def test_mark_blocks_as_computed_noop_empty():
++        """Ensure calling mark_blocks_as_computed with an empty list is a no-op
++        and does not raise exceptions (fast path)."""
++        block_size = 16
++        allocator = PrefixCachingBlockAllocator(num_blocks=8,
++                                                block_size=block_size)
++        # Should not raise
++        allocator.mark_blocks_as_computed([])
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a6651a..ca7083441 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -108,6 +108,14 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         self.metric_data = CacheMetricData()
+ 
++        # Cached mapping from absolute block id to physical index on this
++        # allocator for faster lookups in get_physical_block_id.
++        # Build once since block id set is static for the allocator lifetime.
++        self._abs_to_phys_map = {
++            abs_id: idx
++            for idx, abs_id in enumerate(sorted(self.all_block_ids))
++        }
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -401,7 +409,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        # Use a cached mapping for O(1) lookup instead of sorting each call.
++        return self._abs_to_phys_map[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -507,7 +516,36 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark the given blocks as computed.
++
++        This updates the internal tracker so subsequent scheduling passes can
++        treat these blocks as reusable cached prefixes. Fast-path for the
++        common case where the input is empty.
++
++        Args:
++            block_ids: Physical block ids to mark as computed.
++        """
++        # Fast path: nothing to mark.
++        if not block_ids:
++            return
++
++        tracker = self._block_tracker
++        evictor = self.evictor
++
++        # Mark only active blocks. Blocks already in the evictor are implicitly
++        # considered computed.
++        for block_id in block_ids:
++            state = tracker.get(block_id)
++            if state is None:
++                continue
++            if state.active:
++                state.computed = True
++            elif block_id in evictor:
++                # Already accounted for via evictor metadata.
++                continue
++            else:
++                # Not active and not in evictor: nothing to do.
++                continue
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+diff --git a/vllm/core/block_manager_v2.py b/vllm/core/block_manager_v2.py
+index b7d9451f1..838d398d5 100644
+--- a/vllm/core/block_manager_v2.py
++++ b/vllm/core/block_manager_v2.py
+@@ -287,11 +287,27 @@ class BlockSpaceManagerV2(BlockSpaceManager):
+                 seq.seq_id, now)
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+-        # The only need for mark block as computed is for prefix caching,
+-        # while currently we could determine whether one block is computed
+-        # or not by check whether it has content hash.
+-        # So this function is useless for block_v2.
+-        pass
++        # Mark full prompt blocks as computed for prefix caching so
++        # subsequent scheduling rounds can skip them. Skip the last block to
++        # avoid caching an entire prompt, which can cause incorrect behavior
++        # in some runners.
++        if not self.enable_caching:
++            return
++
++        block_ids_to_mark: List[int] = []
++        for seq in seq_group.get_seqs():
++            if seq.seq_id not in self.block_tables:
++                continue
++            ids = self.block_tables[seq.seq_id].physical_block_ids
++            if not ids:
++                continue
++            # Exclude the last block id per prefix-caching convention.
++            block_ids_to_mark.extend([bid for bid in ids[:-1] if bid is not None])
++
++        if block_ids_to_mark:
++            # Deduplicate to reduce tracker updates.
++            uniq_ids = list(dict.fromkeys(block_ids_to_mark))
++            self.block_allocator.mark_blocks_as_computed(uniq_ids)
+ 
+     def get_common_computed_block_ids(
+             self, seqs: List[Sequence]) -> GenericSequence[int]:

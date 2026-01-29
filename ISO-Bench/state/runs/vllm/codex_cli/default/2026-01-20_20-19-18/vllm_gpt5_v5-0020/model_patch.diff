@@ -1,0 +1,150 @@
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index fda4d00..12b01f3 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -1,4 +1,6 @@
+ from typing import Optional, Union
++import ctypes
++import numpy as np
+ 
+ # ===================== import region =====================
+ import torch
+@@ -73,13 +75,21 @@ class PyNcclCommunicator:
+             self.unique_id = ncclUniqueId()
+ 
+         if not isinstance(group, StatelessProcessGroup):
+-            tensor = torch.ByteTensor(list(self.unique_id.internal))
++            # Broadcast the ncclUniqueId bytes efficiently without
++            # intermediate Python list materialization.
++            uid_size = ctypes.sizeof(ncclUniqueId)
++            tensor = torch.empty(uid_size, dtype=torch.uint8)
+             ranks = dist.get_process_group_ranks(group)
++            if self.rank == 0:
++                src_bytes = bytes(self.unique_id.internal)
++                tensor.copy_(torch.from_numpy(np.frombuffer(src_bytes,
++                                                           dtype=np.uint8)))
+             # arg `src` in `broadcast` is the global rank
+             dist.broadcast(tensor, src=ranks[0], group=group)
+-            byte_list = tensor.tolist()
+-            for i, byte in enumerate(byte_list):
+-                self.unique_id.internal[i] = byte
++            # Copy the received bytes back into the ctypes structure.
++            np_arr = tensor.numpy()
++            ctypes.memmove(ctypes.addressof(self.unique_id), np_arr.ctypes.data,
++                           uid_size)
+         else:
+             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
+         if isinstance(device, int):
+diff --git a/vllm/utils.py b/vllm/utils.py
+index a92b77e..c1b4717 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -792,8 +792,61 @@ def async_tensor_h2d(
+     return t.to(device=target_device, non_blocking=True)
+ 
+ 
++def device_arange(
++    n: int,
++    dtype: torch.dtype,
++    target_device: Union[str, torch.device],
++    *,
++    pin_memory: bool = False,
++) -> torch.Tensor:
++    """Create a 1-D tensor [0, 1, ..., n-1] directly on the target device.
++
++    This is a fast-path alternative to constructing ``list(range(n))`` and
++    passing it through ``async_tensor_h2d``. It avoids intermediate Python
++    list materialization and host-to-device copies by generating the tensor
++    directly on the destination device when possible.
++
++    - If ``target_device`` is a CPU device, this returns a CPU tensor and
++      optionally pins it when ``pin_memory`` is True.
++    - If ``target_device`` is a CUDA/XPU device, this creates the tensor on
++      that device without an intermediate host copy.
++    """
++    # Construct directly on the destination device to avoid H2D copies.
++    t = torch.arange(n, dtype=dtype, device=target_device)
++    # Preserve semantics for callers expecting a pinned CPU tensor.
++    if pin_memory and (isinstance(target_device, str)
++                       and target_device.startswith("cpu")):
++        t = t.pin_memory()
++    if pin_memory and isinstance(target_device, torch.device) and \
++            target_device.type == "cpu":
++        t = t.pin_memory()
++    return t
++
++
++_DTYPE_SIZE_CACHE = {
++    torch.float16: 2,
++    torch.bfloat16: 2,
++    torch.float32: 4,
++    torch.float64: 8,
++    torch.int8: 1,
++    torch.uint8: 1,
++    torch.int16: 2,
++    torch.int32: 4,
++    torch.int64: 8,
++    torch.bool: 1,
++}
++
++
+ def get_dtype_size(dtype: torch.dtype) -> int:
+-    """Get the size of the data type in bytes."""
++    """Get the size of the data type in bytes.
++
++    Uses a small cached lookup for common dtypes to avoid constructing
++    temporary tensors on hot paths. Falls back to ``element_size()`` for
++    uncommon dtypes.
++    """
++    size = _DTYPE_SIZE_CACHE.get(dtype)
++    if size is not None:
++        return size
+     return torch.tensor([], dtype=dtype).element_size()
+ 
+ 
+@@ -1938,7 +1991,13 @@ def _check_multiproc_method():
+         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+ 
+ 
++@lru_cache(maxsize=1)
+ def get_mp_context():
++    """Return the multiprocessing context using configured start method.
++
++    Cached to avoid repeating environment checks and context creation on
++    hot paths where this helper may be queried frequently.
++    """
+     _check_multiproc_method()
+     mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
+     return multiprocessing.get_context(mp_method)
+diff --git a/vllm/worker/multi_step_model_runner.py b/vllm/worker/multi_step_model_runner.py
+index a2c2ceb..733fc1e 100644
+--- a/vllm/worker/multi_step_model_runner.py
++++ b/vllm/worker/multi_step_model_runner.py
+@@ -14,7 +14,7 @@ from vllm.model_executor.layers.sampler import (PromptLogprobs, SampleLogprobs,
+                                                 get_pythonized_sample_results)
+ from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
+                            Logprob, SequenceGroupMetadata, SequenceOutput)
+-from vllm.utils import PyObjectCache, async_tensor_h2d
++from vllm.utils import PyObjectCache, async_tensor_h2d, device_arange
+ from vllm.worker.model_runner import (GPUModelRunnerBase,
+                                       ModelInputForGPUWithSamplingMetadata)
+ from vllm.worker.model_runner_base import (
+@@ -249,11 +249,13 @@ class StatefulModelInput(BroadcastableModelInput):
+ 
+         assert self.frozen_model_input is not None
+         assert self.frozen_model_input.sampling_metadata is not None
+-        self.frozen_model_input.sampling_metadata.selected_token_indices =  \
+-            async_tensor_h2d(list(range(self.num_queries)),
+-                             dtype=torch.long,
+-                             target_device=device,
+-                             pin_memory=pin_memory)
++        # Create indices directly on target device to avoid Python list
++        # materialization and H2D copies.
++        self.frozen_model_input.sampling_metadata.selected_token_indices = \
++            device_arange(self.num_queries,
++                          dtype=torch.long,
++                          target_device=device,
++                          pin_memory=pin_memory)
+ 
+     def maybe_advance_frozen_model_input(self, device: str, pin_memory: bool):
+         """

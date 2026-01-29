@@ -1,0 +1,242 @@
+diff --git a/vllm/core/block/naive_block.py b/vllm/core/block/naive_block.py
+index 50f27ba..7ea59ec 100644
+--- a/vllm/core/block/naive_block.py
++++ b/vllm/core/block/naive_block.py
+@@ -44,6 +44,12 @@ class NaiveBlockAllocator(BlockAllocator):
+         self._create_block = create_block
+         self._block_size = block_size
+ 
++        # Precompute a stable mapping from absolute block id -> physical index.
++        # This avoids repeatedly sorting and searching when translating ids.
++        # Keep it in sync with the allocator's ids.
++        sorted_ids = sorted(self._all_block_indices)
++        self._abs_to_phys = {bid: i for i, bid in enumerate(sorted_ids)}
++
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly(),
+             allocator=self,
+@@ -163,7 +169,8 @@ class NaiveBlockAllocator(BlockAllocator):
+         Returns:
+             int: The zero-offset block id on certain device.
+         """
+-        return sorted(self._all_block_indices).index(absolute_id)
++        # O(1) using the cached mapping (previously O(N log N) + O(N)).
++        return self._abs_to_phys[absolute_id]
+ 
+     @property
+     def refcounter(self):
+@@ -298,6 +305,12 @@ class NaiveBlock(Block):
+             If not provided, it defaults to self.
+     """
+ 
++    # Reduce per-instance memory + speed up attribute access.
++    __slots__ = (
++        "_token_ids", "_block_size", "_prev_block", "_block_id",
++        "_allocator", "_cow_target"
++    )
++
+     def __init__(self,
+                  prev_block: Optional[Block],
+                  token_ids: List[int],
+@@ -305,14 +318,18 @@ class NaiveBlock(Block):
+                  allocator: BlockAllocator,
+                  block_id: Optional[int] = None,
+                  _cow_target: Optional[Block] = None):
+-        self._token_ids: List[int] = []
++        # Avoid an extra list copy on initialization when possible by
++        # taking ownership of the provided list (common in immutable allocs).
++        # Fallback to an empty list when no tokens provided.
++        self._token_ids: List[int] = token_ids if token_ids else []
+         self._block_size = block_size
+         self._prev_block = prev_block
+         self._block_id = block_id
+         self._allocator = allocator
+         self._cow_target = _cow_target if _cow_target is not None else self
+-
+-        self._append_token_ids_no_cow(token_ids)
++        # Ensure capacity constraints; if we took ownership above this is O(1).
++        if token_ids:
++            assert len(token_ids) <= self._block_size
+ 
+     def append_token_ids(self, token_ids: List[int]) -> None:
+         """Appends the given token IDs to the block, instructing the allocator
+@@ -329,7 +346,12 @@ class NaiveBlock(Block):
+ 
+     def _append_token_ids_no_cow(self, token_ids: List[int]) -> None:
+         assert self.num_empty_slots >= len(token_ids)
+-        self._token_ids.extend(token_ids)
++        # Fast-path when the block is empty: adopt the list directly to avoid
++        # a second copy. Otherwise extend.
++        if not self._token_ids and isinstance(token_ids, list):
++            self._token_ids = token_ids
++        else:
++            self._token_ids.extend(token_ids)
+ 
+     @property
+     def computed(self) -> bool:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74..a6f2489 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -48,6 +48,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # A mapping of blockId to Block to track those cached blocks
+         self._blocks: Dict[BlockId, Block] = {}
+ 
++        # Track basic cache statistics for visibility and tests/benchmarks.
++        self._cache_hits: int = 0
++        self._cache_lookups: int = 0
++
+         # An allocator for blocks that do not have prefix hashes.
+         self._hashless_allocator = NaiveBlockAllocator(
+             create_block=self._create_block,  # type: ignore
+@@ -72,6 +76,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             allocator=self,
+         )
+ 
++        # Stats
++        self._cache_hits = 0
++        self._cache_lookups = 0
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -111,25 +119,43 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        block = self._create_block(
+-            prev_block=prev_block,
+-            token_ids=token_ids,
+-            block_size=self._block_size,
+-            allocator=self,
+-        )
+-        assert block.content_hash is not None
++        # Fast-path compute hash based on previous hash and current tokens
++        # without allocating a physical block first.
++        is_first = prev_block is None
++        prev_hash = None if is_first else prev_block.content_hash  # type: ignore
++
++        if not is_first and prev_hash is None:
++            # Parent not yet hashable (not full). Use standard mutable path.
++            blk = self.allocate_mutable(prev_block)
++            blk.append_token_ids(token_ids)
++            assert blk.content_hash is not None
++            return blk
++
++        chash = PrefixCachingBlock.hash_block_tokens(is_first, prev_hash,
++                                                     token_ids)
++        self._cache_lookups += 1
++        cached_block_id = self._cached_blocks.get(chash, None)
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+         if cached_block_id is not None:
++            # Construct a lightweight logical block and bind to cached id.
++            block = self._create_block(
++                prev_block=prev_block,
++                token_ids=token_ids,
++                block_size=self._block_size,
++                allocator=self,
++            )
++            block._cached_content_hash = chash  # type: ignore[attr-defined]
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block, block.block_id)
++            self._cache_hits += 1
+             return block
+ 
+-        block = self.allocate_mutable(prev_block)
+-        block.append_token_ids(token_ids)
+-        assert block.content_hash is not None
+-
+-        return block
++        # Cache miss: allocate mutable and append to trigger promotion and
++        # registration in the cache.
++        blk = self.allocate_mutable(prev_block)
++        blk.append_token_ids(token_ids)
++        assert blk.content_hash is not None
++        return blk
+ 
+     def allocate_mutable(self,
+                          prev_block: Optional[Block],
+@@ -310,7 +336,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        # Avoid repeated sorts: delegate to underlying allocator which now
++        # caches the mapping.
++        return self._hashless_allocator.get_physical_block_id(absolute_id)
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -322,6 +350,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             return True
+         return False
+ 
++    # Lightweight stats for benchmarking prefix cache effectiveness.
++    def get_prefix_cache_hit_rate(self) -> float:
++        if self._cache_lookups == 0:
++            return 0.0
++        return self._cache_hits / float(self._cache_lookups)
++
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+         block. This means that its content can be referenced by future blocks
+@@ -513,6 +547,13 @@ class PrefixCachingBlock(Block):
+             of this block. Defaults to None.
+     """
+ 
++    # Reduce per-instance overhead on critical path of block creation.
++    __slots__ = (
++        "_prev_block", "_cached_content_hash", "_cached_num_tokens_total",
++        "_prefix_caching_allocator", "_last_accessed", "_computed",
++        "_block"
++    )
++
+     def __init__(
+         self,
+         prev_block: Optional[Block],
+@@ -543,6 +584,19 @@ class PrefixCachingBlock(Block):
+             allocator=prefix_caching_allocator,
+             _cow_target=self,
+         )
++        # Eager compute total tokens for O(1) retrieval.
++        prev_total = 0
++        if prev_block is not None:
++            prev_total = prev_block.num_tokens_total  # type: ignore
++        self._cached_num_tokens_total = prev_total + len(token_ids)
++
++        # If already full, precompute content hash when possible.
++        if self.is_full:
++            is_first = prev_block is None
++            prev_hash = None if is_first else prev_block.content_hash  # type: ignore
++            if is_first or prev_hash is not None:
++                self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
++                    is_first, prev_hash, self._block.token_ids)
+ 
+     @property
+     def computed(self) -> bool:
+@@ -574,6 +628,15 @@ class PrefixCachingBlock(Block):
+         # naive block handles CoW.
+         self._block.append_token_ids(token_ids)
+ 
++        # Maintain O(1) running total tokens for the chain.
++        if self._cached_num_tokens_total is None:
++            prev_total = 0
++            if self._prev_block is not None:
++                prev_total = self._prev_block.num_tokens_total  # type: ignore
++            self._cached_num_tokens_total = prev_total + len(self._block.token_ids)
++        else:
++            self._cached_num_tokens_total += len(token_ids)
++
+         # If the content hash is present, then the block can be made immutable.
+         # Register ourselves with the allocator, potentially replacing the
+         # physical block index.
+@@ -685,6 +748,8 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
++        # Use CPython's tuple hash which is implemented in C and fast for
++        # small tuples. This avoids Python-level loops per call.
+         return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
+ 
+ 

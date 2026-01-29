@@ -1,0 +1,104 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..f3a30c4 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -75,18 +75,20 @@ class LoRAManager:
+     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
+         with torch.device("cuda"):
++            seg_indptr = torch.empty(
++                self.max_bs_in_cuda_graph + 1, dtype=torch.int32
++            )
++            seg_indptr[0] = 0
+             self.cuda_graph_batch_info = LoRABatchInfo(
+                 bs=self.max_bs_in_cuda_graph,
+-                seg_lens=torch.zeros(self.max_bs_in_cuda_graph, dtype=torch.int32),
+-                seg_indptr=torch.zeros(
+-                    self.max_bs_in_cuda_graph + 1, dtype=torch.int32
+-                ),
++                seg_lens=torch.empty(self.max_bs_in_cuda_graph, dtype=torch.int32),
++                seg_indptr=seg_indptr,
+                 max_len=0,
+-                weight_indices=torch.zeros(
++                weight_indices=torch.empty(
+                     self.max_bs_in_cuda_graph, dtype=torch.int32
+                 ),
+-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
++                lora_ranks=torch.empty(self.max_loras_per_batch, dtype=torch.int32),
++                scalings=torch.empty(self.max_loras_per_batch, dtype=torch.float),
+             )
+ 
+     def init_loras(self):
+@@ -189,20 +191,21 @@ class LoRAManager:
+                     ] = lora.scaling
+             batch_info = self.cuda_graph_batch_info
+         else:
+-            seg_lens = (
+-                forward_batch.extend_seq_lens
+-                if forward_batch.forward_mode.is_extend()
+-                else torch.ones(bs, device=self.device)
+-            )
+-            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+-            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
++            if forward_batch.forward_mode.is_extend():
++                seg_lens = forward_batch.extend_seq_lens
++            else:
++                seg_lens = torch.empty(bs, device=self.device)
++                seg_lens.fill_(1)
++            seg_indptr = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
++            seg_indptr[0] = 0
++            torch.cumsum(seg_lens, dim=0, out=seg_indptr[1:])
+             max_len = int(torch.max(seg_lens))
+             weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+ 
+-            lora_ranks = torch.zeros(
++            lora_ranks = torch.empty(
+                 (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
+             )
+-            scalings = torch.zeros(
++            scalings = torch.empty(
+                 (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
+             )
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..9f5733f 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -129,15 +129,21 @@ class LoRAMemoryPool:
+     ):
+ 
+         def get_available_buffer_slot():
++            evictable_buffer_id = None
++            evictable_uid = None
++            
+             for buffer_id in range(self.max_loras_per_batch):
++                uid = self.buffer_id_to_uid[buffer_id]
+                 # Prioritize empty slots
+-                if self.buffer_id_to_uid[buffer_id] == "":
++                if uid == "":
+                     return buffer_id, ""
+-
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Evict unneeded lora
+-                if self.buffer_id_to_uid[buffer_id] not in cur_uids:
+-                    return buffer_id, self.buffer_id_to_uid[buffer_id]
++                # Track first evictable slot
++                if evictable_buffer_id is None and uid not in cur_uids:
++                    evictable_buffer_id = buffer_id
++                    evictable_uid = uid
++            
++            if evictable_buffer_id is not None:
++                return evictable_buffer_id, evictable_uid
+ 
+             raise ValueError(
+                 "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
+@@ -165,7 +171,7 @@ class LoRAMemoryPool:
+         if uid is None:
+             for i in range(self.num_layer):
+                 for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++                    self.A_buffer[k][i][buffer_id].zero_()
+             return
+ 
+         assert lora_adapter is not None

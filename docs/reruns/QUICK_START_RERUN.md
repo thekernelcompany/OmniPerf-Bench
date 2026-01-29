@@ -45,7 +45,7 @@ Duration: ~8-10 hours
 ├── rerun_trae_sonnet45_vllm.sh              # vLLM rerun script
 ├── rerun_trae_sonnet45_sglang.sh            # SGLang rerun script
 ├── rerun_trae_sonnet45_all.sh               # Complete rerun script
-└── perf-agents-bench/
+└── ISO-Bench/
     ├── TRAE_SONNET45_VLLM_UNSUCCESSFUL.txt  # 91 vLLM commits
     ├── TRAE_SONNET45_SGLANG_UNSUCCESSFUL.txt # 51 SGLang commits
     ├── TRAE_SONNET45_ALL_UNSUCCESSFUL.txt   # All 142 commits
@@ -69,7 +69,7 @@ Duration: ~8-10 hours
 ## Monitor Progress
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 LATEST=$(ls -t state/runs | head -n1)
 .venv/bin/python -m bench.cli report state/runs/$LATEST
 ```

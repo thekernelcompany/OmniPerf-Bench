@@ -1,0 +1,167 @@
+diff --git a/python/sglang/bench_serving.py b/python/sglang/bench_serving.py
+index 04c2202..0bdee6a 100644
+--- a/python/sglang/bench_serving.py
++++ b/python/sglang/bench_serving.py
+@@ -231,22 +231,25 @@ async def async_request_openai_completions(
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+-                            if data["choices"][0]["text"]:
+-                                timestamp = time.perf_counter()
+-                                # First token
+-                                if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
+-                                    output.ttft = ttft
++                            choices = data.get("choices")
++                            if choices and len(choices) > 0:
++                                text = choices[0].get("text")
++                                if text:
++                                    timestamp = time.perf_counter()
++                                    # First token
++                                    if ttft == 0.0:
++                                        ttft = time.perf_counter() - st
++                                        output.ttft = ttft
+ 
+-                                # Decoding phase
+-                                else:
+-                                    output.itl.append(timestamp - most_recent_timestamp)
++                                    # Decoding phase
++                                    else:
++                                        output.itl.append(timestamp - most_recent_timestamp)
+ 
+-                                most_recent_timestamp = timestamp
+-                                generated_text += data["choices"][0]["text"]
+-                                output_len = (data.get("usage") or {}).get(
+-                                    "completion_tokens", output_len
+-                                )
++                                    most_recent_timestamp = timestamp
++                                    generated_text += text
++                                    usage = data.get("usage")
++                                    if usage:
++                                        output_len = usage.get("completion_tokens", output_len)
+ 
+                     output.generated_text = generated_text
+                     output.success = True
+@@ -444,19 +447,22 @@ async def async_request_truss(
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+-                            if data["choices"][0]["text"]:
+-                                timestamp = time.perf_counter()
+-                                # First token
+-                                if ttft == 0.0:
+-                                    ttft = time.perf_counter() - st
+-                                    output.ttft = ttft
++                            choices = data.get("choices")
++                            if choices and len(choices) > 0:
++                                text = choices[0].get("text")
++                                if text:
++                                    timestamp = time.perf_counter()
++                                    # First token
++                                    if ttft == 0.0:
++                                        ttft = time.perf_counter() - st
++                                        output.ttft = ttft
+ 
+-                                # Decoding phase
+-                                else:
+-                                    output.itl.append(timestamp - most_recent_timestamp)
++                                    # Decoding phase
++                                    else:
++                                        output.itl.append(timestamp - most_recent_timestamp)
+ 
+-                                most_recent_timestamp = timestamp
+-                                generated_text += data["choices"][0]["text"]
++                                    most_recent_timestamp = timestamp
++                                    generated_text += text
+ 
+                     output.generated_text = generated_text
+                     output.success = True
+@@ -531,10 +537,12 @@ async def async_request_sglang_generate(
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+-                            if "text" in data and data["text"]:
++                            text = data.get("text")
++                            if text:
+                                 timestamp = time.perf_counter()
+-                                generated_text = data["text"]
+-                                output_len = data["meta_info"]["completion_tokens"]
++                                generated_text = text
++                                meta_info = data.get("meta_info", {})
++                                output_len = meta_info.get("completion_tokens", output_len)
+ 
+                                 # First token
+                                 if ttft == 0.0:
+@@ -1115,8 +1123,10 @@ def sample_random_requests(
+ 
+ def gen_prompt(tokenizer, token_num):
+     """Generate a random prompt of specified token length using tokenizer vocabulary."""
+-    all_available_tokens = list(tokenizer.get_vocab().values())
+-    selected_tokens = random.choices(all_available_tokens, k=token_num)
++    vocab = tokenizer.get_vocab()
++    vocab_size = len(vocab)
++    # Use random.choices directly on range instead of creating a full list
++    selected_tokens = random.choices(range(vocab_size), k=token_num)
+     return tokenizer.decode(selected_tokens)
+ 
+ 
+diff --git a/python/sglang/srt/entrypoints/http_server_engine.py b/python/sglang/srt/entrypoints/http_server_engine.py
+index b2edf1a..ce379ef 100644
+--- a/python/sglang/srt/entrypoints/http_server_engine.py
++++ b/python/sglang/srt/entrypoints/http_server_engine.py
+@@ -115,20 +115,28 @@ class HttpServerEngineAdapter(EngineBase):
+         lora_path=None,
+         custom_logit_processor=None,
+     ):
+-        payload = {
+-            "text": prompt,
+-            "sampling_params": sampling_params,
+-            "input_ids": input_ids,
+-            "image_data": image_data,
+-            "return_logprob": return_logprob,
+-            "logprob_start_len": logprob_start_len,
+-            "top_logprobs_num": top_logprobs_num,
+-            "token_ids_logprob": token_ids_logprob,
+-            "lora_path": lora_path,
+-            "custom_logit_processor": custom_logit_processor,
+-        }
+-        # Filter out None values
+-        payload = {k: v for k, v in payload.items() if v is not None}
++        # Build payload directly without None values for better performance
++        payload = {}
++        if prompt is not None:
++            payload["text"] = prompt
++        if sampling_params is not None:
++            payload["sampling_params"] = sampling_params
++        if input_ids is not None:
++            payload["input_ids"] = input_ids
++        if image_data is not None:
++            payload["image_data"] = image_data
++        if return_logprob is not None:
++            payload["return_logprob"] = return_logprob
++        if logprob_start_len is not None:
++            payload["logprob_start_len"] = logprob_start_len
++        if top_logprobs_num is not None:
++            payload["top_logprobs_num"] = top_logprobs_num
++        if token_ids_logprob is not None:
++            payload["token_ids_logprob"] = token_ids_logprob
++        if lora_path is not None:
++            payload["lora_path"] = lora_path
++        if custom_logit_processor is not None:
++            payload["custom_logit_processor"] = custom_logit_processor
+ 
+         return self._make_request("generate", payload)
+ 
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 052e732..8635113 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -2354,7 +2354,7 @@ def is_fa3_default_architecture(hf_config):
+ # Can be more general if it is used in multiple places (keep it simple and thus not general now)
+ class BumpAllocator:
+     def __init__(self, buffer_size: int, dtype, device):
+-        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
++        self._buffer = torch.empty((buffer_size,), dtype=dtype, device=device)
+         self._pointer = 0
+ 
+     def allocate(self, size: int):

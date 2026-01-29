@@ -1,0 +1,157 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index ed7e06cab..03c000339 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -1,6 +1,9 @@
+ import enum
++import heapq
++from heapq import heapify, heappush
++
+ from abc import ABC, abstractmethod
+-from typing import OrderedDict, Tuple
++from typing import Dict, Tuple
+ 
+ 
+ class EvictionPolicy(enum.Enum):
+@@ -60,6 +63,8 @@ class BlockMetaData:
+     blocks with the same content hash, but their physical id is unique.
+     """
+ 
++    __slots__ = ("content_hash", "num_hashed_tokens", "last_accessed")
++
+     def __init__(self, content_hash: int, num_hashed_tokens: int,
+                  last_accessed: float):
+         self.content_hash = content_hash
+@@ -75,49 +80,104 @@ class LRUEvictor(Evictor):
+     highest num_hashed_tokens value, then one will be chose arbitrarily
+     """
+ 
++    # Limit how large the priority queue can grow compared to live entries
++    CLEANUP_THRESHOLD = 1
++    # Rebuild heap after too many stale pops to keep eviction fast
++    STALE_POP_THRESHOLD = 32
++    # Absolute slack for heap growth before rebuild
++    CLEANUP_DELTA_ABS = 4096
++
++
++
+     def __init__(self):
+-        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()
++        self.free_table: Dict[int, BlockMetaData] = {}
++        # heap of tuples: (last_accessed, -num_hashed_tokens, block_id)
++        self.priority_queue = []
++        # counter for consecutive stale pops
++        self._stale_pops = 0
++
+ 
+     def __contains__(self, block_id: int) -> bool:
+         return block_id in self.free_table
+ 
++    def _maybe_cleanup(self):
++        # Rebuild the heap if it has grown disproportionately due to lazy updates
++        live = len(self.free_table)
++        if live == 0:
++            self.priority_queue.clear()
++            self._stale_pops = 0
++            return
++        pq_len = len(self.priority_queue)
++        if pq_len <= live:
++            return
++        delta = pq_len - live
++        # Allow up to 25% slack or an absolute slack before rebuilding
++        if delta <= max(live >> 2, self.CLEANUP_DELTA_ABS):
++            return
++        self._rebuild_heap()
++    def _rebuild_heap(self):
++        # Build heap from current live entries
++        self.priority_queue = [
++            (meta.last_accessed, -meta.num_hashed_tokens, bid)
++            for bid, meta in self.free_table.items()
++        ]
++        heapify(self.priority_queue)
++        self._stale_pops = 0
++
+     def evict(self) -> Tuple[int, int]:
+-        if len(self.free_table) == 0:
++        free = self.free_table
++        if not free:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block, evicted_block_id = None, None
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block is None:
+-                evicted_block, evicted_block_id = block, _id
++        heap = self.priority_queue
++        heappop = heapq.heappop
++        maybe_cleanup = self._maybe_cleanup
++        stale_pops = 0
++
++        # Pop until we find a live, up-to-date entry
++        while True:
++            try:
++                last_accessed, neg_tokens, bid = heappop(heap)
++            except IndexError:
++                self._rebuild_heap()
++                heap = self.priority_queue
++                stale_pops = 0
++                last_accessed, neg_tokens, bid = heappop(heap)
++            meta = free.get(bid)
++            if meta is None or meta.last_accessed != last_accessed or meta.num_hashed_tokens != -neg_tokens:
++                stale_pops += 1
++                if stale_pops >= max(64, len(heap) >> 3):
++                    self._rebuild_heap()
++                    heap = self.priority_queue
++                    stale_pops = 0
+                 continue
+-            if evicted_block.last_accessed < block.last_accessed:
+-                break
+-            if evicted_block.num_hashed_tokens < block.num_hashed_tokens:
+-                evicted_block, evicted_block_id = block, _id
+-
+-        assert evicted_block is not None
+-        assert evicted_block_id is not None
+-        self.free_table.pop(evicted_block_id)
+-
+-        return evicted_block_id, evicted_block.content_hash
++            evicted = free.pop(bid)
++            maybe_cleanup()
++            return bid, evicted.content_hash
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+             last_accessed: float):
+-        self.free_table[block_id] = BlockMetaData(content_hash,
+-                                                  num_hashed_tokens,
+-                                                  last_accessed)
++        meta = BlockMetaData(content_hash, num_hashed_tokens, last_accessed)
++        self.free_table[block_id] = meta
++        heappush(self.priority_queue,
++                       (last_accessed, -num_hashed_tokens, block_id))
++        self._maybe_cleanup()
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        meta = self.free_table[block_id]
++        if meta.last_accessed == last_accessed:
++            return
++        meta.last_accessed = last_accessed
++        # push a new entry; stale one will be lazily ignored
++        heappush(self.priority_queue,
++                       (last_accessed, -meta.num_hashed_tokens, block_id))
+ 
+     def remove(self, block_id: int):
+-        if block_id not in self.free_table:
++        # Lazy removal: delete from map; heap entry becomes stale
++        if self.free_table.pop(block_id, None) is None:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
++        self._maybe_cleanup()
+ 
+     @property
+     def num_blocks(self) -> int:

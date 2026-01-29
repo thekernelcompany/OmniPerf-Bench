@@ -33,7 +33,7 @@ def main():
     parser.add_argument(
         "--state-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "perf-agents-bench" / "state" / "runs",
+        default=Path(__file__).resolve().parents[1] / "ISO-Bench" / "state" / "runs",
         help="Path to state/runs directory",
     )
     parser.add_argument(

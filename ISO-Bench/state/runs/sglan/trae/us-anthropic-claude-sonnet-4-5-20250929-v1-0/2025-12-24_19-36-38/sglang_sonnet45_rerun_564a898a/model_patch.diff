@@ -1,0 +1,109 @@
+diff --git a/python/sglang/srt/managers/controller/cuda_graph_runner.py b/python/sglang/srt/managers/controller/cuda_graph_runner.py
+index 2e37e55..0f48176 100644
+--- a/python/sglang/srt/managers/controller/cuda_graph_runner.py
++++ b/python/sglang/srt/managers/controller/cuda_graph_runner.py
+@@ -23,18 +23,18 @@ class CudaGraphRunner:
+ 
+         # Common inputs
+         self.max_bs = max_batch_size_to_capture
+-        self.input_ids = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.input_ids = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.req_pool_indices = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
+         self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.position_ids_offsets = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
+-        self.out_cache_loc = torch.zeros((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.position_ids_offsets = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
++        self.out_cache_loc = torch.empty((self.max_bs,), dtype=torch.int32, device="cuda")
+ 
+         # FlashInfer inputs
+         self.flashinfer_workspace_buffer = self.model_runner.flashinfer_workspace_buffers[0]
+-        self.flashinfer_kv_indptr = torch.zeros(
++        self.flashinfer_kv_indptr = torch.empty(
+             (self.max_bs + 1,), dtype=torch.int32, device="cuda"
+         )
+-        self.flashinfer_kv_indices = torch.zeros(
++        self.flashinfer_kv_indices = torch.empty(
+             (self.max_bs * model_runner.model_config.context_len,), dtype=torch.int32, device="cuda"
+         )
+         self.flashinfer_kv_last_page_len = torch.ones(
+diff --git a/python/sglang/srt/managers/controller/infer_batch.py b/python/sglang/srt/managers/controller/infer_batch.py
+index d89e978..3247bed 100644
+--- a/python/sglang/srt/managers/controller/infer_batch.py
++++ b/python/sglang/srt/managers/controller/infer_batch.py
+@@ -345,7 +345,7 @@ class Batch:
+ 
+             seq_lens.append(prefix_lens[-1] + extend_lens[-1])
+ 
+-        position_ids_offsets = torch.zeros((bs,), dtype=torch.int32, device=device)
++        position_ids_offsets = torch.empty((bs,), dtype=torch.int32, device=device)
+ 
+         # Allocate memory
+         seq_lens, prefix_lens = np.array(seq_lens), np.array(prefix_lens)
+@@ -372,7 +372,7 @@ class Batch:
+         for i in range(bs):
+             if reqs[i].sampling_params.dtype == "int":
+                 if logit_bias is None:
+-                    logit_bias = torch.zeros(
++                    logit_bias = torch.empty(
+                         (bs, vocab_size), dtype=torch.float32, device=device
+                     )
+                 logit_bias[i] = int_token_logit_bias
+@@ -634,11 +634,11 @@ class Batch:
+                 else other.logit_bias.shape[1]
+             )
+             if self.logit_bias is None:
+-                self.logit_bias = torch.zeros(
++                self.logit_bias = torch.empty(
+                     (len(self.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
+             if other.logit_bias is None:
+-                other.logit_bias = torch.zeros(
++                other.logit_bias = torch.empty(
+                     (len(other.reqs), vocab_size), dtype=torch.float32, device="cuda"
+                 )
+             self.logit_bias = torch.concat([self.logit_bias, other.logit_bias])
+@@ -781,7 +781,8 @@ class InputMetadata:
+                 device="cuda",
+             )
+             extend_seq_lens = seq_lens - prefix_lens
+-            extend_start_loc = torch.zeros_like(seq_lens)
++            extend_start_loc = torch.empty_like(seq_lens)
++            extend_start_loc[0] = 0
+             extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+             extend_no_prefix = torch.all(prefix_lens == 0)
+             total_num_tokens = int(torch.sum(seq_lens))
+@@ -827,9 +828,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+     else:
+         paged_kernel_lens = prefix_lens
+ 
+-    kv_indptr = torch.zeros(
++    kv_indptr = torch.empty(
+         (batch_size + 1,), dtype=torch.int32, device="cuda"
+     )
++    kv_indptr[0] = 0
+     kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+     req_pool_indices_cpu = req_pool_indices.cpu().numpy()
+     paged_kernel_lens_cpu = paged_kernel_lens.cpu().numpy()
+@@ -859,9 +861,10 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+         )
+     else:
+         # extend part
+-        qo_indptr = torch.zeros(
++        qo_indptr = torch.empty(
+             (batch_size + 1,), dtype=torch.int32, device="cuda"
+         )
++        qo_indptr[0] = 0
+         qo_indptr[1:] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+ 
+         model_runner.flashinfer_prefill_wrapper_ragged.end_forward()
+@@ -890,7 +893,8 @@ def init_flashinfer_args(forward_mode, model_runner, req_pool_indices, seq_lens,
+ def init_triton_args(forward_mode, seq_lens, prefix_lens):
+     batch_size = len(seq_lens)
+     max_seq_len = int(torch.max(seq_lens))
+-    start_loc = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
++    start_loc[0] = 0
+     start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+ 
+     if forward_mode == ForwardMode.DECODE:

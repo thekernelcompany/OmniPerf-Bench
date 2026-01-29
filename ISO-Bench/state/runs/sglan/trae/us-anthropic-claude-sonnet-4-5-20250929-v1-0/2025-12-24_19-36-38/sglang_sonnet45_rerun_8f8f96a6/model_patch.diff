@@ -1,0 +1,131 @@
+diff --git a/python/sglang/srt/hf_transformers_utils.py b/python/sglang/srt/hf_transformers_utils.py
+index 56d7c8a..c8ee023 100644
+--- a/python/sglang/srt/hf_transformers_utils.py
++++ b/python/sglang/srt/hf_transformers_utils.py
+@@ -91,10 +91,10 @@ def get_context_length(config):
+     """Get the context length of a model from a huggingface model configs."""
+     rope_scaling = getattr(config, "rope_scaling", None)
+     if rope_scaling:
+-        rope_scaling_factor = config.rope_scaling.get("factor", 1)
++        rope_scaling_factor = rope_scaling.get("factor", 1)
+         if "original_max_position_embeddings" in rope_scaling:
+             rope_scaling_factor = 1
+-        if config.rope_scaling.get("rope_type", None) == "llama3":
++        elif rope_scaling.get("rope_type", None) == "llama3":
+             rope_scaling_factor = 1
+     else:
+         rope_scaling_factor = 1
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index 9ae5801..ba96a2e 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -80,7 +80,8 @@ class Sampler(nn.Module):
+ 
+                 if not torch.all(success):
+                     logger.warning("Detected errors during sampling!")
+-                    batch_next_token_ids = torch.zeros_like(batch_next_token_ids)
++                    batch_next_token_ids = torch.empty_like(batch_next_token_ids)
++                    batch_next_token_ids.fill_(0)
+             elif global_server_args_dict["sampling_backend"] == "pytorch":
+                 # A slower fallback implementation with torch native operations.
+                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index fac008d..5094ad2 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -30,6 +30,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
+ """
+ 
+ import dataclasses
++import itertools
+ import logging
+ from typing import List, Optional, Tuple, Union
+ 
+@@ -574,7 +575,7 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Reassign
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
++        self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32).to(
+             self.device, non_blocking=True
+         )
+         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(
+@@ -645,7 +646,7 @@ class ScheduleBatch:
+             pt += req.extend_input_len
+ 
+         # Set fields
+-        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32).to(
++        self.input_ids = torch.tensor(list(itertools.chain.from_iterable(input_ids)), dtype=torch.int32).to(
+             self.device, non_blocking=True
+         )
+         self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32).to(
+diff --git a/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py b/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
+index c9e0f07..3504aee 100644
+--- a/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
++++ b/python/sglang/srt/sampling/penaltylib/penalizers/min_new_tokens.py
+@@ -43,11 +43,13 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
+             batch_first=True,
+             padding_value=self.orchestrator.vocab_size,
+         )
+-        self.stop_token_penalties = torch.zeros(
++        self.stop_token_penalties = torch.empty(
+             size=(self.orchestrator.batch_size(), self.orchestrator.vocab_size + 1),
+             dtype=torch.float32,
+             device=self.orchestrator.device,
+-        ).scatter_add_(
++        )
++        self.stop_token_penalties.fill_(0)
++        self.stop_token_penalties.scatter_add_(
+             dim=1,
+             index=padded_stop_token_ids,
+             src=torch.full_like(
+@@ -56,15 +58,17 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
+                 fill_value=float("-inf"),
+                 device=self.orchestrator.device,
+             ),
+-        )[
++        )
++        self.stop_token_penalties = self.stop_token_penalties[
+             :, : self.orchestrator.vocab_size
+         ]
+ 
+-        self.len_output_tokens = torch.zeros(
++        self.len_output_tokens = torch.empty(
+             size=(self.orchestrator.batch_size(), 1),
+             dtype=torch.int32,
+             device=self.orchestrator.device,
+         )
++        self.len_output_tokens.fill_(0)
+ 
+     def _teardown(self):
+         del self.min_new_tokens
+diff --git a/python/sglang/srt/sampling/sampling_params.py b/python/sglang/srt/sampling/sampling_params.py
+index b0863b5..f0f0982 100644
+--- a/python/sglang/srt/sampling/sampling_params.py
++++ b/python/sglang/srt/sampling/sampling_params.py
+@@ -125,14 +125,17 @@ class SamplingParams:
+             if isinstance(self.stop_strs, str):
+                 self.stop_strs = [self.stop_strs]
+ 
+-            stop_str_max_len = 0
+-            for stop_str in self.stop_strs:
+-                if tokenizer is not None:
+-                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+-                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+-                else:
+-                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
+-            self.stop_str_max_len = stop_str_max_len
++            if tokenizer is not None:
++                self.stop_str_max_len = max(
++                    (len(tokenizer.encode(stop_str, add_special_tokens=False)) 
++                     for stop_str in self.stop_strs),
++                    default=0
++                )
++            else:
++                self.stop_str_max_len = max(
++                    (len(stop_str) for stop_str in self.stop_strs),
++                    default=0
++                )
+ 
+         # Process stop token ids
+         if tokenizer and tokenizer.additional_stop_token_ids:

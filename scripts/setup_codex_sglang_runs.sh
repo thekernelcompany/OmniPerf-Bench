@@ -31,12 +31,12 @@ if ! codex whoami &> /dev/null; then
 fi
 
 # Setup Codex home directory for non-interactive runs
-if [ ! -d "perf-agents-bench/.codex_home" ]; then
+if [ ! -d "ISO-Bench/.codex_home" ]; then
     echo "Setting up Codex home directory..."
-    mkdir -p perf-agents-bench/.codex_home
+    mkdir -p ISO-Bench/.codex_home
     if [ -d "$HOME/.codex" ]; then
-        echo "Copying Codex state from $HOME/.codex to perf-agents-bench/.codex_home"
-        rsync -a "$HOME/.codex/" perf-agents-bench/.codex_home/.codex/ || true
+        echo "Copying Codex state from $HOME/.codex to ISO-Bench/.codex_home"
+        rsync -a "$HOME/.codex/" ISO-Bench/.codex_home/.codex/ || true
     else
         echo "WARNING: $HOME/.codex not found. Codex may prompt for authentication during runs."
     fi
@@ -44,14 +44,14 @@ else
     # Ensure config is synced
     if [ -d "$HOME/.codex" ]; then
         echo "Syncing Codex config..."
-        rsync -a "$HOME/.codex/" perf-agents-bench/.codex_home/.codex/ || true
+        rsync -a "$HOME/.codex/" ISO-Bench/.codex_home/.codex/ || true
     fi
 fi
 
 # Build plan from all commit JSONs
 echo "Building plan from SGLang commit JSONs..."
 COMMIT_DIR="misc/experiments/sglang_commit_extractions_with_apis"
-PLAN_OUT="perf-agents-bench/state/plan_sglang_codex_full.json"
+PLAN_OUT="ISO-Bench/state/plan_sglang_codex_full.json"
 
 if [ ! -d "$COMMIT_DIR" ]; then
     echo "ERROR: Commit directory not found: $COMMIT_DIR"
@@ -94,7 +94,7 @@ plan = {
     "items": items
 }
 
-out = Path("perf-agents-bench/state/plan_sglang_codex_full.json")
+out = Path("ISO-Bench/state/plan_sglang_codex_full.json")
 out.parent.mkdir(parents=True, exist_ok=True)
 out.write_text(json.dumps(plan, indent=2))
 print(f"✓ Created plan with {len(items)} commits: {out}")

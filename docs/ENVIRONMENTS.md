@@ -8,7 +8,7 @@ OmniPerf-Bench uses multiple virtual environments for different purposes. This d
 |-------------|----------|---------|
 | `.venv/` | Root | Main OmniPerf-Bench, dataset generation, evaluation harness |
 | `bench-env/` | Root | Modal deployment, TRAE integration, cloud execution |
-| `perf-agents-bench/.venv/` | Subdirectory | OpenHands agent benchmarking CLI |
+| `ISO-Bench/.venv/` | Subdirectory | OpenHands agent benchmarking CLI |
 
 ## 1. Main Environment (`.venv/`)
 
@@ -78,14 +78,14 @@ modal token new
 - `anthropic` - Anthropic API for TRAE
 - TRAE agent dependencies
 
-## 3. perf-agents-bench Environment (`perf-agents-bench/.venv/`)
+## 3. ISO-Bench Environment (`ISO-Bench/.venv/`)
 
-**Purpose**: Running the perf-agents-bench CLI for agent planning, preparation, and reporting. Includes OpenHands integration.
+**Purpose**: Running the ISO-Bench CLI for agent planning, preparation, and reporting. Includes OpenHands integration.
 
 ### Setup
 
 ```bash
-cd OmniPerf-Bench/perf-agents-bench
+cd OmniPerf-Bench/ISO-Bench
 
 # Create dedicated virtual environment
 uv venv --python 3.12 .venv
@@ -125,7 +125,7 @@ source bench-env/bin/activate
 modal deploy src/eval/modal_benchmark.py
 
 # Agent CLI benchmarking
-cd perf-agents-bench
+cd ISO-Bench
 source .venv/bin/activate
 python -m bench.cli plan tasks/vllm.yaml --out state/plan.json
 

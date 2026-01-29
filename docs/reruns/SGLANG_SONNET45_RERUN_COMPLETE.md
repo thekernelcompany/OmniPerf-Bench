@@ -75,7 +75,7 @@ Note: All errors have returncode 0, indicating TRAE completed but task wasn't su
 ### 2. Increased max_steps Parameter
 **Critical Discovery:** bench.yaml args override trae_config.yaml settings!
 
-**File 1:** `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/bench.yaml`
+**File 1:** `/home/ubuntu/OmniPerf-Bench/ISO-Bench/bench.yaml`
 ```yaml
 trae:
   args:
@@ -100,7 +100,7 @@ agents:
 ## Run Details
 
 **Run directory:** `state/runs/sglan/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2025-12-24_19-36-38`  
-**Plan file:** `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/state/plan_sglang_final.json`  
+**Plan file:** `/home/ubuntu/OmniPerf-Bench/ISO-Bench/state/plan_sglang_final.json`  
 **Log file:** `/home/ubuntu/OmniPerf-Bench/sglang_final_run.log`
 
 ## Documentation Created

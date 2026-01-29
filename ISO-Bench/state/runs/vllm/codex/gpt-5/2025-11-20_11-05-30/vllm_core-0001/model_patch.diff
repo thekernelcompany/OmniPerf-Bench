@@ -1,0 +1,188 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
+index 66f9106bd..4bf775347 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
+@@ -45,8 +45,8 @@
+     },
+     "16": {
+         "BLOCK_SIZE_M": 16,
+-        "BLOCK_SIZE_N": 16,
+-        "BLOCK_SIZE_K": 256,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 64,
+         "GROUP_SIZE_M": 1,
+         "num_warps": 2,
+         "num_stages": 2,
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
+index ed5b655d8..5a3f415d5 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
+@@ -45,8 +45,8 @@
+     },
+     "16": {
+         "BLOCK_SIZE_M": 16,
+-        "BLOCK_SIZE_N": 32,
+-        "BLOCK_SIZE_K": 256,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 1,
+         "num_warps": 2,
+         "num_stages": 2,
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
+index 822f04e33..a799eb4b6 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
+@@ -52,7 +52,7 @@
+         "num_stages": 2,
+         "waves_per_eu": 0,
+         "matrix_instr_nonkdim": 16,
+-        "kpack": 1
++        "kpack": 2
+     },
+     "24": {
+         "BLOCK_SIZE_M": 16,
+diff --git a/vllm/reasoning/qwen3_reasoning_parser.py b/vllm/reasoning/qwen3_reasoning_parser.py
+new file mode 100644
+index 000000000..185d0d34e
+--- /dev/null
++++ b/vllm/reasoning/qwen3_reasoning_parser.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++
++"""Reasoning parser for the Qwen3 model family."""
++from collections.abc import Sequence
++from typing import Optional, Tuple, Union
++
++from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
++                                              DeltaMessage)
++from vllm.entrypoints.openai.reasoning_parsers.abs_reasoning_parsers import (
++    ReasoningParser, ReasoningParserManager)
++
++
++@ReasoningParserManager.register_module("qwen3")
++class Qwen3ReasoningParser(ReasoningParser):
++    """Parser that extracts <think>...</think> reasoning spans."""
++
++    def __init__(self, tokenizer):
++        super().__init__(tokenizer)
++        # Constant markers used to delimit reasoning blocks
++        self.think_start_token = "<think>"
++        self.think_end_token = "</think>"
++        # Cache lengths to avoid repeated len() calls in hot paths
++        self._think_start_len = len(self.think_start_token)
++        self._think_end_len = len(self.think_end_token)
++
++        self.think_start_token_id = self.vocab.get(self.think_start_token)
++        self.think_end_token_id = self.vocab.get(self.think_end_token)
++        if (self.think_start_token_id is None
++                or self.think_end_token_id is None):
++            raise RuntimeError("Missing think tokens in tokenizer vocabulary.")
++
++    def extract_reasoning_content_streaming(
++        self,
++        previous_text: str,
++        current_text: str,
++        delta_text: str,
++        previous_token_ids: Sequence[int],
++        current_token_ids: Sequence[int],
++        delta_token_ids: Sequence[int],
++    ) -> Union[DeltaMessage, None]:
++        """Fast-path streaming handler using minimal searches.
++
++        The logic mirrors the original behavior while reducing unnecessary
++        allocations and regex usage. We only perform substring searches when
++        the relevant start/end tokens appear in the token deltas.
++        """
++
++        if not delta_token_ids:
++            return None
++
++        # We use local variables to avoid repeated attribute lookups
++        end_tok = self.think_end_token
++        start_tok = self.think_start_token
++        end_len = self._think_end_len
++
++        if self.think_start_token_id in previous_token_ids:
++            if self.think_end_token_id in delta_token_ids:
++                end_index = delta_text.find(end_tok)
++                if end_index == -1:
++                    # Fallback: treat the delta as reasoning if malformed
++                    return DeltaMessage(reasoning_content=delta_text)
++                reasoning_content = delta_text[:end_index]
++                content = delta_text[end_index + end_len:]
++                return DeltaMessage(reasoning_content=reasoning_content,
++                                    content=content or None)
++            # Already inside a <think> block; everything is reasoning
++            return DeltaMessage(reasoning_content=delta_text)
++
++        if self.think_start_token_id in delta_token_ids:
++            if self.think_end_token_id in delta_token_ids:
++                start_index = delta_text.find(start_tok)
++                end_index = delta_text.find(end_tok, start_index + 1)
++                if start_index == -1 or end_index == -1:
++                    return DeltaMessage(reasoning_content=delta_text)
++                reasoning_content = delta_text[start_index +
++                                               self._think_start_len:end_index]
++                content = delta_text[end_index + end_len:]
++                return DeltaMessage(reasoning_content=reasoning_content,
++                                    content=content or None)
++            # Start token appeared; rest of delta belongs to reasoning
++            return DeltaMessage(reasoning_content=delta_text)
++
++        if self.think_end_token_id in delta_token_ids:
++            end_index = delta_text.find(end_tok)
++            if end_index == -1:
++                return DeltaMessage(reasoning_content=delta_text)
++            reasoning_content = delta_text[:end_index]
++            content = delta_text[end_index + end_len:]
++            return DeltaMessage(reasoning_content=reasoning_content,
++                                content=content or None)
++
++        return DeltaMessage(content=delta_text)
++
++    def extract_reasoning_content(
++            self, model_output: str, request: ChatCompletionRequest
++    ) -> Tuple[Optional[str], Optional[str]]:
++        """Efficiently extract reasoning content without regex.
++
++        For input like:
++          pre<think>abc</think>post
++        returns ("abc", "prepost").
++
++        If the end token is not present, we treat the whole text as reasoning
++        (consistent with streaming where the start token may have appeared
++        earlier). If the start token is not present but the end token is, we
++        assume the reasoning started earlier and prepend the start token to
++        parse the current chunk correctly.
++        """
++
++        # Fast path: no end token means everything is still within reasoning
++        if self.think_end_token not in model_output:
++            return model_output, None
++
++        # If we have an end token but no start token, assume it started earlier
++        if self.think_start_token not in model_output:
++            model_output = f"{self.think_start_token}{model_output}"
++
++        start_tok = self.think_start_token
++        end_tok = self.think_end_token
++        s_len = self._think_start_len
++        e_len = self._think_end_len
++
++        s_idx = model_output.find(start_tok)
++        if s_idx == -1:
++            # Shouldn't happen due to insertion above, but be robust
++            return None, model_output or None
++        e_idx = model_output.find(end_tok, s_idx + s_len)
++        if e_idx == -1:
++            # End token missing; treat entire text as reasoning
++            return model_output, None
++
++        reasoning_content = model_output[s_idx + s_len:e_idx]
++        # Remove the think block while preserving any prefix/suffix text
++        remaining = model_output[:s_idx] + model_output[e_idx + e_len:]
++
++        return (reasoning_content or None, remaining or None)

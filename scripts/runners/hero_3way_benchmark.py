@@ -200,7 +200,7 @@ def load_existing_benchmarks() -> Dict[str, Dict]:
 
 
 # Claude Code run directory with all 96 patches
-CLAUDE_CODE_RUN_DIR = Path("perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+CLAUDE_CODE_RUN_DIR = Path("ISO-Bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
 
 
 def load_claude_code_patches() -> Dict[str, str]:

@@ -12,8 +12,8 @@ This document provides complete instructions for rerunning all commits that were
 - Config file: `/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml`
 
 ✅ **Existing Plan Files Available**
-- `perf-agents-bench/state/plan_bedrock_sonnet45.json` (vLLM - 99 commits)
-- `perf-agents-bench/state/plan_sglang_claude_sonnet45.json` (SGLang - 80 commits)
+- `ISO-Bench/state/plan_bedrock_sonnet45.json` (vLLM - 99 commits)
+- `ISO-Bench/state/plan_sglang_claude_sonnet45.json` (SGLang - 80 commits)
 
 ---
 
@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 from collections import defaultdict
 
-runs_dir = Path("perf-agents-bench/state/runs")
+runs_dir = Path("ISO-Bench/state/runs")
 commits_by_repo = defaultdict(set)
 commit_to_pre = {}
 commit_to_item = {}
@@ -75,7 +75,7 @@ print(f"\nCommits by repository:", flush=True)
 for repo in sorted(commits_by_repo.keys()):
     print(f"  {repo}: {len(commits_by_repo[repo])} unique commits", flush=True)
 
-output_dir = Path("perf-agents-bench/state")
+output_dir = Path("ISO-Bench/state")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 for repo in sorted(commits_by_repo.keys()):
@@ -119,8 +119,8 @@ EOF
 ```
 
 This will create:
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_vllm.json`
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_sglang.json`
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_vllm.json`
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_sglang.json`
 
 ---
 
@@ -169,7 +169,7 @@ export AWS_REGION=us-east-1
 ### For vLLM Repository
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -188,7 +188,7 @@ python -m bench.cli prepare \
 ### For SGLang Repository
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -221,7 +221,7 @@ LOG_FILE="/home/ubuntu/OmniPerf-Bench/trae_claude_sonnet45_rerun_vllm_${TIMESTAM
 
 cat > /tmp/run_vllm_rerun.sh << 'SCRIPT'
 #!/bin/bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 export TRAE_PYTHON=/home/ubuntu/OmniPerf-Bench/bench-env/bin/python
 export TRAE_CONFIG=/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml
@@ -259,7 +259,7 @@ Same as above, but change:
 ### Check Status
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Count successes and errors from logs
 grep -c "Task status determined as: success" pipeline_run_*.log 2>/dev/null || echo "0"

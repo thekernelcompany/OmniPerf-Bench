@@ -16,7 +16,7 @@ REPO_ID = f"{HF_ORG}/{DATASET_NAME}"
 def collect_trajectory_data():
     """Collect all trajectory data from GPT-5 rerun results."""
 
-    base_path = Path("perf-agents-bench/state/runs")
+    base_path = Path("ISO-Bench/state/runs")
 
     # vLLM GPT-5 results - use specific successful run
     vllm_path = base_path / "vllm/trae/gpt-5-2025-08-07/2025-12-26_15-06-42"
@@ -57,7 +57,7 @@ def collect_trajectory_data():
                                  "run_summary.json", "task.txt", "prediction.jsonl"]:
                     file_path = commit_dir / file_name
                     if file_path.exists():
-                        entry["files"][file_name] = str(file_path.relative_to("perf-agents-bench/state/runs"))
+                        entry["files"][file_name] = str(file_path.relative_to("ISO-Bench/state/runs"))
                         stats["vllm"]["files"] += 1
 
                 data["vllm"].append(entry)
@@ -300,7 +300,7 @@ def main():
 
     # Copy trajectory files
     print("\nCopying trajectory files...")
-    base_runs = Path("perf-agents-bench/state/runs")
+    base_runs = Path("ISO-Bench/state/runs")
 
     if data["vllm"]:
         repo_output = output_dir / "vllm"

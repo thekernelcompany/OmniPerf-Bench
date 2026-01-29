@@ -1,0 +1,44 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index a9ef97391..b6034806f 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -12,12 +12,10 @@ def get_token_bin_counts_and_mask(
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     # Compute the bin counts for the tokens.
+     # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+-                             dtype=torch.long,
+-                             device=tokens.device)
++    bin_counts = tokens.new_zeros((num_seqs, vocab_size + 1))
+     bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+     bin_counts = bin_counts[:, :vocab_size]
+-    mask = bin_counts > 0
++    mask = bin_counts.ne(0)
+ 
+     return bin_counts, mask
+ 
+@@ -45,14 +43,13 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++    mask_any = prompt_mask | output_mask
++    rep = repetition_penalties.unsqueeze(1)
++    penalties = torch.where(mask_any, rep, 1.0)
++    scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
++    logits *= scaling
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
++    logits -= frequency_penalties.unsqueeze(1).to(logits.dtype) * output_bin_counts.to(logits.dtype)
++    logits -= presence_penalties.unsqueeze(1).to(logits.dtype) * output_mask.to(logits.dtype)
+     return logits

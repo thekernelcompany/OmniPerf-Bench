@@ -1,0 +1,167 @@
+diff --git a/tests/v1/sample/test_rejection_sampler.py b/tests/v1/sample/test_rejection_sampler.py
+index 8bc33e841..3e810e525 100644
+--- a/tests/v1/sample/test_rejection_sampler.py
++++ b/tests/v1/sample/test_rejection_sampler.py
+@@ -26,17 +26,13 @@ def create_logits_tensor(token_ids: List[int],
+ def create_sampling_metadata(spec_tokens: List[List[int]]) -> SamplingMetadata:
+     batch_size = len(spec_tokens)
+     return SamplingMetadata(
+-        temperature=0.0,
++        temperature=torch.tensor([]),
+         all_greedy=True,
+         all_random=False,
+-        rejection_sampling=True,
+         spec_token_ids=spec_tokens,
+         top_p=None,
+         top_k=None,
+-        no_top_p=False,
+-        no_top_k=False,
+         min_p=torch.empty(batch_size, ),
+-        no_min_p=True,
+         generators={},
+         max_num_logprobs=0,
+         no_penalties=False,
+@@ -45,8 +41,7 @@ def create_sampling_metadata(spec_tokens: List[List[int]]) -> SamplingMetadata:
+         presence_penalties=torch.tensor([]),
+         repetition_penalties=torch.tensor([]),
+         output_token_ids=[],
+-        min_tokens=[],
+-        stop_token_ids=[],
++        min_tokens={},
+         logit_bias=[None] * batch_size,
+     )
+ 
+diff --git a/tests/v1/sample/test_sampler.py b/tests/v1/sample/test_sampler.py
+index a4bd651f8..6b7d0a2ce 100644
+--- a/tests/v1/sample/test_sampler.py
++++ b/tests/v1/sample/test_sampler.py
+@@ -74,28 +74,23 @@ def _create_default_sampling_metadata(
+                               size=np.random.randint(
+                                   1, MAX_NUM_PROMPT_TOKENS)).tolist())
+     fake_sampling_metadata = SamplingMetadata(
+-        temperature=torch.full((batch_size, ), 0.0),
++        temperature=torch.tensor([]),
+         all_greedy=True,
+         all_random=False,
+-        rejection_sampling=False,
+         top_p=torch.empty(batch_size, ),
+         top_k=torch.empty(batch_size, ),
+-        no_top_p=True,
+-        no_top_k=True,
+         min_p=torch.empty(batch_size, ),
+-        no_min_p=True,
+         generators={},
+         max_num_logprobs=0,
+         prompt_token_ids=_create_prompt_tokens_tensor(prompt_token_ids,
+                                                       vocab_size, device),
+         output_token_ids=output_token_ids,
+         spec_token_ids=[],
+-        frequency_penalties=_create_penalty_tensor(batch_size, 0.0, device),
+-        presence_penalties=_create_penalty_tensor(batch_size, 0.0, device),
+-        repetition_penalties=_create_penalty_tensor(batch_size, 1.0, device),
++        frequency_penalties=torch.tensor([]),
++        presence_penalties=torch.tensor([]),
++        repetition_penalties=torch.tensor([]),
+         no_penalties=True,
+-        min_tokens=[],
+-        stop_token_ids=[],
++        min_tokens={},
+         logit_bias=[None] * batch_size,
+     )
+     return fake_sampling_metadata
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index ea64181c0..2ae6dd594 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -12,15 +12,11 @@ class SamplingMetadata:
+     temperature: torch.Tensor
+     all_greedy: bool
+     all_random: bool
+-    rejection_sampling: bool
+     spec_token_ids: List[List[int]]
+ 
+     top_p: torch.Tensor
+     top_k: torch.Tensor
+-    no_top_p: bool
+-    no_top_k: bool
+     min_p: torch.Tensor
+-    no_min_p: bool
+ 
+     generators: Dict[int, torch.Generator]
+ 
+@@ -34,7 +30,13 @@ class SamplingMetadata:
+     repetition_penalties: torch.Tensor
+ 
+     output_token_ids: List[List[int]]
+-    min_tokens: List[int]
+-    stop_token_ids: List[Set[int]]
++    min_tokens: Dict[int, int]
+ 
+     logit_bias: List[Optional[Dict[int, float]]]
++    
++    # Optional fields with defaults
++    rejection_sampling: bool = False
++    no_top_p: bool = True
++    no_top_k: bool = True
++    no_min_p: bool = True
++    stop_token_ids: Optional[List[Set[int]]] = None
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index cb7411a44..6bfe8d19f 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -171,10 +171,8 @@ class InputBatch:
+                 self.repetition_penalties_cpu_tensor.numpy()
+         self.repetition_penalties_reqs: Set[str] = set()
+ 
+-        self.min_tokens: List[int] = [0] * max_num_reqs
+-        self.stop_token_ids: List[Set[int]] = [
+-            set() for _ in range(max_num_reqs)
+-        ]
++        self.min_tokens: Dict[int, int] = {}
++        self.stop_token_ids: Dict[int, Set[int]] = {}
+         self.prompt_token_ids: Optional[torch.Tensor] = None
+ 
+         # lora related
+@@ -300,6 +298,8 @@ class InputBatch:
+         self.generators.pop(req_index, None)
+         self.num_logprobs.pop(req_id, None)
+         self.num_prompt_logprobs.pop(req_id, None)
++        self.min_tokens.pop(req_index, None)
++        self.stop_token_ids.pop(req_index, None)
+ 
+         # LoRA
+         lora_id = self.request_lora_mapping[req_index]
+@@ -327,6 +327,8 @@ class InputBatch:
+         self.generators.clear()
+         self.num_logprobs.clear()
+         self.num_prompt_logprobs.clear()
++        self.min_tokens.clear()
++        self.stop_token_ids.clear()
+         self.request_lora_mapping.fill(0)
+         self.lora_id_to_lora_request.clear()
+         self.lora_id_to_request_ids.clear()
+@@ -379,9 +381,10 @@ class InputBatch:
+             self.repetition_penalties_cpu[
+                 empty_index] = self.repetition_penalties_cpu[last_req_index]
+             self.min_p_cpu[empty_index] = self.min_p_cpu[last_req_index]
+-            self.min_tokens[empty_index] = self.min_tokens[last_req_index]
+-            self.stop_token_ids[empty_index] = self.stop_token_ids[
+-                last_req_index]
++            if last_req_index in self.min_tokens:
++                self.min_tokens[empty_index] = self.min_tokens.pop(last_req_index)
++            if last_req_index in self.stop_token_ids:
++                self.stop_token_ids[empty_index] = self.stop_token_ids.pop(last_req_index)
+             generator = self.generators.pop(last_req_index, None)
+             if generator is not None:
+                 self.generators[empty_index] = generator
+@@ -469,8 +472,8 @@ class InputBatch:
+             repetition_penalties=self.repetition_penalties[:self.num_reqs],
+             output_token_ids=output_token_ids,
+             spec_token_ids=spec_token_ids,
+-            min_tokens=self.min_tokens[:self.num_reqs],
+-            stop_token_ids=self.stop_token_ids[:self.num_reqs],
++            min_tokens=self.min_tokens,
++            stop_token_ids=self.stop_token_ids,
+             no_penalties=self.no_penalties,
+             logit_bias=self.logit_bias[:self.num_reqs],
+         )

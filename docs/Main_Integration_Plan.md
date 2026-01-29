@@ -1,16 +1,16 @@
 ## OpenHands × Extraction Pipeline Integration Plan
 
 ### Goal
-- **Unify** `perf-agents-bench/` and `commit_to_dataset.py` into one coherent, optional-agent pipeline that: discovers commits, generates/validates efficiency tests, can run OpenHands, tracks cost/outcomes, and emits canonical dataset records.
+- **Unify** `ISO-Bench/` and `commit_to_dataset.py` into one coherent, optional-agent pipeline that: discovers commits, generates/validates efficiency tests, can run OpenHands, tracks cost/outcomes, and emits canonical dataset records.
 
 ### Reality check (current state)
 - **commit_to_dataset.py**: clones repo, computes diff, LLM-generates test, runs timings (local/Docker), builds dataset record.
-- **perf-agents-bench/**: plans commit pairs, runs OpenHands headless (local/container), journals artifacts, summarizes results.
+- **ISO-Bench/**: plans commit pairs, runs OpenHands headless (local/container), journals artifacts, summarizes results.
 - **Gaps**: duplicated config/env handling, separate workspaces, no shared journals, dataset doesn’t call bench as a library.
 
 ### Key integration decisions
 - **Single orchestrator**: `commit_to_dataset.py` remains entrypoint; it can call bench as a library for the optional OpenHands stage.
-- **One config surface**: prefer `perf-agents-bench/config/*.toml` plus project `.env`. Dataset reads these rather than duplicating flags.
+- **One config surface**: prefer `ISO-Bench/config/*.toml` plus project `.env`. Dataset reads these rather than duplicating flags.
 - **One workspace policy**: reuse bench `RepoManager` worktrees for safety; never mutate user clones.
 - **One cost model**: use bench `LLMConfigManager.get_cost_estimate` consistently; store estimate and journal evidence when available.
 - **Modes**: `dry` (no API), `offline` (no OpenHands), `online` (OpenHands with iteration/budget caps).
@@ -36,7 +36,7 @@
   - `agent_branch`, `agent_success`, `agent_error`, `agent_cost_estimate`, `agent_iterations`, `agent_journal_path`.
 
 ### Configuration unification
-- **Env**: single `.env` at `perf-agents-bench/` root (LLM keys, base URLs, tokens).
+- **Env**: single `.env` at `ISO-Bench/` root (LLM keys, base URLs, tokens).
 - **TOML**: `config/main_<provider>.toml` as primary; dataset reads it (don’t duplicate knobs).
 - **CLI flags from dataset**: `--mode=[dry|offline|online]`, `--iterations`, `--budget-usd`, `--timeout-min`, `--container=[on|off]`.
 

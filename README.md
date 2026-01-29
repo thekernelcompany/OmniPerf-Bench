@@ -75,7 +75,7 @@ OmniPerf-Bench/
 │   ├── docker/                  # Docker image management
 │   └── upload/                  # HuggingFace upload scripts
 │
-├── perf-agents-bench/           # Agent benchmarking harness
+├── ISO-Bench/                   # Agent benchmarking harness
 │   ├── bench/                   # CLI: plan → prepare → report
 │   └── tasks/                   # Task configs (vllm.yaml, sglang.yaml)
 │
@@ -123,7 +123,7 @@ uv run src/harness/opt_at_k.py \
 Run AI agents on optimization tasks:
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 source .venv/bin/activate
 
 # Plan benchmarks
@@ -144,7 +144,7 @@ This repository uses multiple virtual environments:
 |-------------|---------|
 | `.venv/` | Main OmniPerf-Bench, dataset generation, evaluation harness |
 | `bench-env/` | Agent benchmarking, Modal cloud execution |
-| `perf-agents-bench/.venv/` | OpenHands CLI |
+| `ISO-Bench/.venv/` | OpenHands CLI |
 
 ## Environment Variables
 

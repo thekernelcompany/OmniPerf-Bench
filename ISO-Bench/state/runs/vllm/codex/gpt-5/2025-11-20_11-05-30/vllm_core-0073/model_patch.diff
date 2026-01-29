@@ -1,0 +1,153 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index 5b19e3f35..3519cbad9 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -467,16 +467,10 @@ class MambaMixer2(CustomOp):
+ 
+             initial_states = None
+ 
+-            if has_initial_states is not None and torch.any(
+-                    has_initial_states):
+-
+-                # vectorized ssm_state zero init
+-                batched_zero_init_func = torch.vmap(
+-                    lambda idx: mamba_cache_params.ssm_state[idx].zero_())
+-                batched_zero_init_func(
+-                    mamba_cache_params.
+-                    state_indices_tensor[~has_initial_states].unsqueeze(
+-                        dim=-1), )
++            if has_initial_states is not None and any(has_initial_states):
++
++                for idx in mamba_cache_params.state_indices_tensor[~has_initial_states]:
++                    mamba_cache_params.ssm_state[idx].zero_()
+                 initial_states = mamba_cache_params.ssm_state[
+                     mamba_cache_params.state_indices_tensor]
+ 
+@@ -505,12 +499,9 @@ class MambaMixer2(CustomOp):
+             # limitation which doesn't allow use of `item()`
+             # Note: the lambda capture can happen where ssm_state is initialized
+             #       instead of here
+-            batched_copy = torch.vmap(
+-                lambda idx, source_state: mamba_cache_params.ssm_state[
+-                    idx].copy_(source_state))
+-            batched_copy(
+-                mamba_cache_params.state_indices_tensor.unsqueeze(dim=-1),
+-                varlen_state)
++            for idx, source_state in zip(
++                mamba_cache_params.state_indices_tensor, varlen_state):
++                mamba_cache_params.ssm_state[idx].copy_(source_state)
+ 
+             # - reshape
+             hidden_states = scan_output.view(seq_len, -1)
+@@ -518,7 +509,7 @@ class MambaMixer2(CustomOp):
+ 
+             n_groups = self.n_groups // self.tp_size
+             A = self.A[:, None, ...][:, :, None].expand(
+-                -1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
++                -1, self.head_dim, self.ssm_state_size)
+             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+             D = self.D[:, None, ...].expand(-1, self.head_dim)
+diff --git a/vllm/transformers_utils/detokenizer.py b/vllm/transformers_utils/detokenizer.py
+index 9d1d4bb92..2665052b9 100644
+--- a/vllm/transformers_utils/detokenizer.py
++++ b/vllm/transformers_utils/detokenizer.py
+@@ -45,12 +45,15 @@ class Detokenizer:
+         all_token_ids = seq.get_token_ids()
+         prompt_token_ids = all_token_ids[:-1]
+         tokenizer = self.get_tokenizer_for_seq(seq)
++        # Initialize offsets and token buffer for incremental decode.
++        # Using empty prev_tokens avoids an extra prompt conversion call in
++        # the first iteration.
+         prefix_offset = 0
+         read_offset = 0
+         next_iter_prefix_offset = 0
+         next_iter_read_offset = 0
+         next_iter_tokens: List[str] = []
+-        prev_tokens = None
++        prev_tokens: List[str] | None = []
+ 
+         for token_position_in_logprob, prompt_logprobs_for_token in enumerate(
+                 prompt_logprobs):
+@@ -64,12 +67,18 @@ class Detokenizer:
+             for token_id, sample_logprob in prompt_logprobs_for_token.items():
+                 if (sample_logprob.decoded_token is None
+                         and token_id != VLLM_INVALID_TOKEN_ID):
+-                    prompt_token_ids_with_token = (
+-                        prompt_token_ids[:token_position] + [token_id])
++                    # Fast-path: avoid expensive decode for special tokens
++                    # when we skip them.
++                    if prms.skip_special_tokens and token_id in tokenizer.all_special_ids:  # type: ignore[attr-defined]
++                        sample_logprob.decoded_token = ""
++                        continue
++
+                     (new_tokens, new_text, new_prefix_offset,
+                      new_read_offset) = detokenize_incrementally(
+                          tokenizer=tokenizer,
+-                         all_input_ids=prompt_token_ids_with_token,
++                         # Only the new token id is needed when prev_tokens
++                         # is provided.
++                         all_input_ids=[token_id],
+                          prev_tokens=prev_tokens,
+                          prefix_offset=prefix_offset,
+                          read_offset=read_offset,
+@@ -125,7 +134,8 @@ class Detokenizer:
+         (new_tokens, new_decoded_token_text, prefix_offset,
+          read_offset) = detokenize_incrementally(
+              tokenizer=tokenizer,
+-             all_input_ids=all_input_ids,
++             # When prev_tokens is provided, we only need the latest id.
++             all_input_ids=[token_id_generated_this_iteration],
+              prev_tokens=seq.tokens,
+              prefix_offset=seq.prefix_offset,
+              read_offset=seq.read_offset,
+@@ -146,10 +156,17 @@ class Detokenizer:
+ 
+                 if (sample_logprob.decoded_token is None
+                         and token_id != VLLM_INVALID_TOKEN_ID):
+-                    all_input_ids_with_logprob = previous_tokens + [token_id]
++                    # Fast-path: avoid decode for special tokens when
++                    # skipping special tokens.
++                    if prms.skip_special_tokens and token_id in tokenizer.all_special_ids:  # type: ignore[attr-defined]
++                        sample_logprob.decoded_token = ""
++                        continue
++
+                     (_, new_text, _, _) = detokenize_incrementally(
+                         tokenizer=tokenizer,
+-                        all_input_ids=all_input_ids_with_logprob,
++                        # Only the candidate id is needed when prev_tokens
++                        # is provided.
++                        all_input_ids=[token_id],
+                         prev_tokens=seq.tokens,
+                         prefix_offset=seq.prefix_offset,
+                         read_offset=seq.read_offset,
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 2c34f2f5d..38143c4ce 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -72,6 +72,11 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+         tokenizer.all_special_tokens_extended)
+     tokenizer_all_special_tokens = set(tokenizer.all_special_tokens)
+     tokenizer_vocab = tokenizer.get_vocab()
++    # Cache added vocab as it may be recomputed on each access otherwise.
++    try:
++        tokenizer_added_vocab = tokenizer.get_added_vocab()
++    except Exception:
++        tokenizer_added_vocab = {}
+     tokenizer_len = len(tokenizer)
+ 
+     max_token_id = max(tokenizer_vocab.values())
+@@ -107,6 +112,10 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+         def __len__(self):
+             return tokenizer_len
+ 
++        # Cache get_added_vocab to avoid repeated reconstruction.
++        def get_added_vocab(self):  # type: ignore[override]
++            return tokenizer_added_vocab
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     tokenizer.__class__ = CachedTokenizer

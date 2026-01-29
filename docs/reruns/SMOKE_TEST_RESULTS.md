@@ -104,7 +104,7 @@ fatal: Invalid revision range 777688b8929c877e4e28c2eac208d776abe4c3af..HEAD
 
 3. **Run full SGLang rerun:**
    ```bash
-   cd perf-agents-bench
+   cd ISO-Bench
    source ../bench-env/bin/activate
    unset AWS_PROFILE
    nohup python -m bench.cli prepare tasks/sglang.yaml \

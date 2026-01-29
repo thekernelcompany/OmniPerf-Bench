@@ -23,7 +23,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_REPO="${VLLM_REPO:-$SCRIPT_DIR/../vllm}"
 SGLANG_REPO="${SGLANG_REPO:-$SCRIPT_DIR/../sglang}"
-STATE_ROOT="${STATE_ROOT:-$SCRIPT_DIR/perf-agents-bench/state}"
+STATE_ROOT="${STATE_ROOT:-$SCRIPT_DIR/ISO-Bench/state}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/omniperf_results}"
 
 # Default options

@@ -1,0 +1,256 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 444bb25f2..174ffd043 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -287,15 +287,15 @@ class BlockTable:
+             extra_hash: Optional[int] = None) -> List[Block]:
+         blocks: List[Block] = []
+ 
+-        block_token_ids = []
+-        tail_token_ids = []
+-        for cur_token_ids in chunk_list(token_ids, self._block_size):
+-            if len(cur_token_ids) == self._block_size:
+-                block_token_ids.append(cur_token_ids)
+-            else:
+-                tail_token_ids.append(cur_token_ids)
+-
+-        if block_token_ids:
++        num_tokens = len(token_ids)
++        bs = self._block_size
++        full_blocks = num_tokens // bs
++        rem = num_tokens - full_blocks * bs
++
++        if full_blocks:
++            block_token_ids = [
++                token_ids[i * bs:(i + 1) * bs] for i in range(full_blocks)
++            ]
+             blocks.extend(
+                 self._allocator.allocate_immutable_blocks(
+                     prev_block,
+@@ -304,9 +304,8 @@ class BlockTable:
+                     extra_hash=extra_hash))
+             prev_block = blocks[-1]
+ 
+-        if tail_token_ids:
+-            assert len(tail_token_ids) == 1
+-            cur_token_ids = tail_token_ids[0]
++        if rem:
++            cur_token_ids = token_ids[-rem:]
+ 
+             block = self._allocator.allocate_mutable_block(
+                 prev_block=prev_block, device=device, extra_hash=extra_hash)
+@@ -318,22 +317,12 @@ class BlockTable:
+ 
+     def _get_all_token_ids(self) -> List[int]:
+         # NOTE: This function is O(seq_len); use sparingly.
+-        token_ids: List[int] = []
+-
+         if not self._is_allocated:
+-            return token_ids
+-
+-        for block in self.blocks:
+-            token_ids.extend(block.token_ids)
+-
+-        return token_ids
++            return []
++        return [tid for block in self.blocks for tid in block.token_ids]
+ 
+     def _get_num_token_ids(self) -> int:
+-        res = 0
+-        for block in self.blocks:
+-            res += len(block.token_ids)
+-
+-        return res
++        return sum(len(block.token_ids) for block in self.blocks)
+ 
+     @property
+     def _is_allocated(self) -> bool:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2913a01bf..e59ac8094 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -117,6 +117,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             block_pool=self._block_pool,  # Share block pool here
+         )
+ 
++        # Cache an absolute->physical id lookup to avoid repeated sorting
++        # and linear searches when mapping to device-local ids.
++        sorted_ids = sorted(self.all_block_ids)
++        self._phys_id_lut = {abs_id: idx for idx, abs_id in enumerate(sorted_ids)}
++
+         # Evitor used to maintain how we want to handle those computed blocks
+         # if we find memory pressure is high.
+         self.eviction_policy = eviction_policy
+@@ -310,18 +315,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         raise BlockAllocator.NoFreeBlocksError()
+ 
+     def _maybe_allocate_hashless_block_id(self) -> Optional[BlockId]:
++        # Fast path: directly get a free physical block id from the
++        # underlying allocator without creating a temporary Block object.
+         try:
+-            # Allocate mutable block and extract its block_id
+-            block = self._hashless_allocator.allocate_mutable_block(
+-                prev_block=None)
+-            block_id = block.block_id
+-            self._block_pool.free_block(block)
+-
+-            self._track_block_id(block_id, computed=False)
+-            return block_id
++            block_id = self._hashless_allocator._allocate_block_id()  # type: ignore[attr-defined]
+         except BlockAllocator.NoFreeBlocksError:
+             return None
+ 
++        self._track_block_id(block_id, computed=False)
++        return block_id
++
+     def _maybe_allocate_evicted_block_id(self) -> Optional[BlockId]:
+         if self.evictor.num_blocks == 0:
+             return None
+@@ -433,7 +436,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        return self._phys_id_lut[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -569,19 +572,25 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         info in evictor's metadata.
+         """
+ 
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
+-            elif block_id in self.evictor:
+-                self.evictor.update(block_id, now)
++            bt = block_tracker[block_id]
++            if bt.active:
++                bt.last_accessed = now
++            elif block_id in evictor:
++                evictor.update(block_id, now)
+             else:
+                 raise ValueError(
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         # Mark all touched blocks as computed.
++        if not self._touched_blocks:
++            return
++        block_tracker = self._block_tracker
+         for block_id in self._touched_blocks:
+-            self._block_tracker[block_id].computed = True
++            block_tracker[block_id].computed = True
+         self._touched_blocks.clear()
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+diff --git a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+index 7016ff34c..bedfc5276 100644
+--- a/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
++++ b/vllm/model_executor/layers/fused_moe/deepep_ht_prepare_finalize.py
+@@ -31,7 +31,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         self.handle = None
+ 
+         # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
+-        self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
++        self.available_rank_configs = (2, 4, 8, 16, 24, 32, 64, 128, 144, 160)
++        # Cache DeepEP configs once per instance to avoid repeated lookups.
++        self._dispatch_config = (deep_ep.Buffer.get_dispatch_config(dp_size)
++                                 if dp_size in self.available_rank_configs else None)
++        self._combine_config = (deep_ep.Buffer.get_combine_config(dp_size)
++                                if dp_size in self.available_rank_configs else None)
+ 
+     def num_dispatchers(self) -> int:
+         return self.num_dispatchers_
+@@ -47,14 +52,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         return torch.int64
+ 
+     def _get_dispatch_config(self) -> Optional[deep_ep.Config]:
+-        if self.dp_size not in self.available_rank_configs:
+-            return None
+-        return deep_ep.Buffer.get_dispatch_config(self.dp_size)
++        return self._dispatch_config
+ 
+     def _get_combine_config(self) -> Optional[deep_ep.Config]:
+-        if self.dp_size not in self.available_rank_configs:
+-            return None
+-        return deep_ep.Buffer.get_combine_config(self.dp_size)
++        return self._combine_config
+ 
+     def _do_dispatch(self, tokens: torch.Tensor,
+                      token_scales: Optional[torch.Tensor],
+@@ -112,10 +113,15 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+         # DeepEP's topk_ids output refers to the local experts directly. Offset
+         # the topk_ids to move it back to the global experts space so it aligns
+         # with existing vLLM interfaces.
+-        expert_topk_ids = torch.where(
+-            expert_topk_ids == -1,
+-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
+-            expert_topk_ids + self.rank_expert_offset)
++        invalid_mask = (expert_topk_ids == -1)
++        # Offset only valid local expert ids to global space.
++        if self.rank_expert_offset != 0:
++            expert_topk_ids[~invalid_mask] += self.rank_expert_offset
++        # Set tokens not in this rank to a valid global expert id so that
++        # expert_map can later remap them to -1 safely.
++        expert_topk_ids[invalid_mask] = (
++            num_experts - 1 if self.rank_expert_offset == 0 else 0
++        )
+ 
+         # Makes a GPU-CPU copy.
+         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
+@@ -142,14 +148,16 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+             # TODO: this only works for topK=1, will need to update for topK>1
+             assert topk == 1, (
+                 "apply_router_weight_on_input is only implemented for topk=1")
+-            a1 = a1 * topk_weights.to(a1.dtype)
++            w = topk_weights if topk_weights.dtype == a1.dtype else topk_weights.to(a1.dtype)
++            a1 = a1 * w
+ 
+-        if quant_config.per_act_token_quant:
++        if quant_config.is_block_quantized:
++            # Quant and Dispatch
+             a1q, a1q_scale = moe_kernel_quantize_input(
+                 a1,
+                 a1_scale,
+                 quant_dtype=quant_config.quant_dtype,
+-                per_act_token_quant=True,
++                per_act_token_quant=quant_config.per_act_token_quant,
+                 block_shape=quant_config.block_shape,
+             )
+             if a1q_scale is not None and a1q_scale.numel() == 1:
+@@ -162,8 +170,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
+                  rank_topk_weights=topk_weights,
+                  num_experts=num_experts)
+         else:
+-            # DeepEP kernels only support dispatching per-token-quant
+-            # quantization. dispatch in bfloat16.
++            # Dispatch and Quant
++            # DeepEP kernels only support dispatching block-quantized
++            # activation scales.
++            # Dispatch in bfloat16
+             (expert_x, _, expert_tokens_meta, expert_topk_ids,
+              expert_topk_weights) = self._do_dispatch(
+                  tokens=a1,
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index fe87b52f9..a67e90acd 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -1288,9 +1288,9 @@ class HiddenStates(msgspec.Struct, array_like=True,
+             # Adding dummy hidden_states to this to maintain same shape
+             self.second_last_token_hidden_states = torch.cat([
+                 self.second_last_token_hidden_states,
+-                torch.zeros_like(hidden_states)
+-                if second_last_token_hidden_states is None else
+-                second_last_token_hidden_states
++                (torch.empty_like(hidden_states)
++                 if second_last_token_hidden_states is None else
++                 second_last_token_hidden_states)
+             ])
+ 
+     def prune(self,

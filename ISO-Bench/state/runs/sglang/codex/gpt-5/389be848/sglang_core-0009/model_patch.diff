@@ -1,0 +1,93 @@
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 2f974ea9a..528797222 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -327,6 +327,13 @@ class FlashAttentionBackend(AttentionBackend):
+         )
+         self.speculative_step_id = speculative_step_id
+ 
++        # Caches for replay-time fast paths to reduce unnecessary work
++        # - Track the last used number of KV pages per batch size to avoid
++        #   repeatedly zero-filling large page_table tails when unchanged or growing.
++        # - Track previous local-attention buffer extents to minimize zeroing.
++        self._last_max_seq_pages_by_bs = {}
++        self._local_attn_prev_sizes_by_bs = {}
++
+         # Local attention settings
+         self.attention_chunk_size = (
+             model_runner.attention_chunk_size
+@@ -1135,8 +1142,12 @@ class FlashAttentionBackend(AttentionBackend):
+             "cu_seqlens_q": torch.arange(
+                 0, max_bs + 1, dtype=torch.int32, device=self.device
+             ),
+-            "cu_seqlens_k": torch.zeros(
+-                max_bs + 1, dtype=torch.int32, device=self.device
++            # This buffer is updated in-place during replay (index 1:). It does not
++            # need an expensive zero-initialization across the whole tensor.
++            # Keep it uninitialized and only enforce the required convention that
++            # the first element is zero.
++            "cu_seqlens_k": (lambda t: (t.zero_(), t)[1])(
++                torch.empty(max_bs + 1, dtype=torch.int32, device=self.device)
+             ),
+             "page_table": torch.zeros(
+                 max_bs,
+@@ -1241,7 +1252,9 @@ class FlashAttentionBackend(AttentionBackend):
+             and self.speculative_num_draft_tokens > 0
+         ):
+             self.target_verify_metadata = {
+-                "cache_seqlens": torch.zeros(
++                # Will be overwritten via copy_() before use during capture/replay.
++                # Avoid redundant zero-initialization here.
++                "cache_seqlens": torch.empty(
+                     max_bs, dtype=torch.int32, device=self.device
+                 ),
+                 "cu_seqlens_q": torch.arange(
+@@ -1639,7 +1652,13 @@ class FlashAttentionBackend(AttentionBackend):
+                 ]
+                 page_indices //= self.page_size
+                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+-                metadata.page_table[:, max_seq_pages:].fill_(0)
++                # Zero-fill only when the new required pages shrink compared to the
++                # previous replay for this batch size. This avoids repeatedly clearing
++                # large tails when max_seq_pages stays the same or increases.
++                prev_pages = self._last_max_seq_pages_by_bs.get(bs)
++                if prev_pages is not None and prev_pages > max_seq_pages:
++                    metadata.page_table[:, max_seq_pages:prev_pages].zero_()
++                self._last_max_seq_pages_by_bs[bs] = max_seq_pages
+ 
+                 self._update_local_attn_metadata_for_replay(metadata, bs)
+         elif forward_mode.is_target_verify():
+@@ -1866,14 +1885,28 @@ class FlashAttentionBackend(AttentionBackend):
+         k_len = seqlens_k_local.shape[0]
+         b0, b1 = block_table_local.shape
+ 
+-        # In-place updates into preallocated tensors and zero out the unused space
++        # In-place updates into preallocated tensors. Only clear regions that were
++        # previously used but are no longer needed in this replay to minimize work.
++        prev_q_len, prev_k_len, prev_b0, prev_b1 = self._local_attn_prev_sizes_by_bs.get(
++            bs, (0, 0, 0, 0)
++        )
++
+         local_q_buf[:q_len].copy_(cu_seqlens_q_local)
+-        local_q_buf[q_len:].fill_(0)
++        if prev_q_len > q_len:
++            local_q_buf[q_len:prev_q_len].zero_()
++
+         local_k_buf[:k_len].copy_(seqlens_k_local)
+-        local_k_buf[k_len:].fill_(0)
++        if prev_k_len > k_len:
++            local_k_buf[k_len:prev_k_len].zero_()
++
+         local_block_buf[:b0, :b1].copy_(block_table_local)
+-        local_block_buf[b0:, :].fill_(0)
+-        local_block_buf[:b0, b1:].fill_(0)
++        if prev_b0 > b0:
++            local_block_buf[b0:prev_b0, :].zero_()
++        if prev_b1 > b1:
++            local_block_buf[:b0, b1:prev_b1].zero_()
++
++        # Record the latest extents for the next replay.
++        self._local_attn_prev_sizes_by_bs[bs] = (q_len, k_len, b0, b1)
+ 
+         if metadata.local_attn_metadata is not None:
+             lam = metadata.local_attn_metadata

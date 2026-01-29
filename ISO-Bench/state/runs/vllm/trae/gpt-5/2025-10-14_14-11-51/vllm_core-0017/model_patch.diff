@@ -1,0 +1,307 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index d2787d696..3353db07a 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -175,23 +175,13 @@ class CopyOnWriteTracker:
+ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
+     """Retrieves all the blocks in a sequence starting from the last block.
+ 
+-    This function recursively traverses the sequence of blocks in reverse order,
+-    starting from the given last block, and returns a list of all the blocks in
+-    the sequence.
+-
+-    Args:
+-        last_block (Block): The last block in the sequence.
+-
+-    Returns:
+-        List[Block]: A list of all the blocks in the sequence, in the order they
+-            appear.
++    Iterative implementation to avoid recursion overhead.
+     """
+ 
+-    def recurse(block: Block, lst: List[Block]) -> None:
+-        if block.prev_block is not None:
+-            recurse(block.prev_block, lst)
+-        lst.append(block)
+-
+-    all_blocks: List[Block] = []
+-    recurse(last_block, all_blocks)
+-    return all_blocks
++    chain: List[Block] = []
++    cur: Optional[Block] = last_block
++    while cur is not None:
++        chain.append(cur)
++        cur = cur.prev_block
++    chain.reverse()
++    return chain
+diff --git a/vllm/core/block/interfaces.py b/vllm/core/block/interfaces.py
+index 4b20856a1..e9c34ea0e 100644
+--- a/vllm/core/block/interfaces.py
++++ b/vllm/core/block/interfaces.py
+@@ -100,6 +100,15 @@ class BlockAllocator(ABC):
+                            token_ids: List[int]) -> Block:
+         pass
+ 
++    # Optional compatibility wrappers
++    def allocate_immutable_block(self, prev_block: Optional[Block],
++                                 token_ids: List[int]) -> Block:
++        return self.allocate_immutable(prev_block=prev_block,
++                                       token_ids=token_ids)
++
++    def allocate_mutable_block(self, prev_block: Optional[Block]) -> Block:
++        return self.allocate_mutable(prev_block=prev_block)
++
+     @abstractmethod
+     def free(self, block: Block) -> None:
+         pass
+diff --git a/vllm/core/block/naive_block.py b/vllm/core/block/naive_block.py
+index 50f27bab3..3efadb064 100644
+--- a/vllm/core/block/naive_block.py
++++ b/vllm/core/block/naive_block.py
+@@ -44,6 +44,12 @@ class NaiveBlockAllocator(BlockAllocator):
+         self._create_block = create_block
+         self._block_size = block_size
+ 
++        # Precompute a stable ordering and O(1) lookup for absolute->physical ids.
++        self._sorted_block_ids: List[int] = sorted(self._all_block_indices)
++        self._abs_to_phys: Dict[int, int] = {
++            bid: i for i, bid in enumerate(self._sorted_block_ids)
++        }
++
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly(),
+             allocator=self,
+@@ -70,6 +76,21 @@ class NaiveBlockAllocator(BlockAllocator):
+         block.append_token_ids(token_ids)
+         return block
+ 
++    def allocate_immutable_block(self,
++                               prev_block: Optional[Block],
++                               token_ids: List[int],
++                               device: Optional[Device] = None) -> Block:
++        """Compatibility wrapper for allocate_immutable."""
++        return self.allocate_immutable(prev_block=prev_block,
++                                       token_ids=token_ids,
++                                       device=device)
++
++    def allocate_mutable_block(self,
++                             prev_block: Optional[Block],
++                             device: Optional[Device] = None) -> Block:
++        """Compatibility wrapper for allocate_mutable."""
++        return self.allocate_mutable(prev_block=prev_block, device=device)
++
+     def allocate_mutable(self,
+                          prev_block: Optional[Block],
+                          device: Optional[Device] = None) -> Block:
+@@ -142,9 +163,8 @@ class NaiveBlockAllocator(BlockAllocator):
+         if not self._free_block_indices:
+             raise BlockAllocator.NoFreeBlocksError()
+ 
+-        block_id = next(iter(self._free_block_indices))
++        block_id = self._free_block_indices.pop()
+         self._refcounter.incr(block_id)
+-        self._free_block_indices.remove(block_id)
+         return block_id
+ 
+     def _free_block_id(self, block_id: BlockId) -> None:
+@@ -163,7 +183,7 @@ class NaiveBlockAllocator(BlockAllocator):
+         Returns:
+             int: The zero-offset block id on certain device.
+         """
+-        return sorted(self._all_block_indices).index(absolute_id)
++        return self._abs_to_phys[absolute_id]
+ 
+     @property
+     def refcounter(self):
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74e4..add9e26ca 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -67,6 +67,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # blocks.
+         self._refcounter = self._hashless_allocator.refcounter
+ 
++        # Precompute absolute->physical id map for O(1) lookup.
++        self._abs_to_phys = {
++            bid: i
++            for i, bid in enumerate(sorted(self._hashless_allocator.all_block_ids))
++        }
++
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly(),
+             allocator=self,
+@@ -94,6 +100,21 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             computed=computed,
+         )
+ 
++    def allocate_immutable_block(self,
++                               prev_block: Optional[Block],
++                               token_ids: List[int],
++                               device: Optional[Device] = None) -> Block:
++        """Compatibility wrapper for allocate_immutable."""
++        return self.allocate_immutable(prev_block=prev_block,
++                                       token_ids=token_ids,
++                                       device=device)
++
++    def allocate_mutable_block(self,
++                             prev_block: Optional[Block],
++                             device: Optional[Device] = None) -> Block:
++        """Compatibility wrapper for allocate_mutable."""
++        return self.allocate_mutable(prev_block=prev_block, device=device)
++
+     def allocate_immutable(self,
+                            prev_block: Optional[Block],
+                            token_ids: List[int],
+@@ -101,34 +122,36 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """Allocates an immutable block with the given token IDs, reusing cached
+         blocks if possible.
+ 
+-        Args:
+-            prev_block (Optional[Block]): The previous block in the sequence.
+-            token_ids (List[int]): The token IDs to be stored in the block.
+-
+-        Returns:
+-            Block: The allocated immutable block.
++        This path avoids unnecessary writes by checking the prefix-cache first.
+         """
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        block = self._create_block(
+-            prev_block=prev_block,
+-            token_ids=token_ids,
+-            block_size=self._block_size,
+-            allocator=self,
+-        )
+-        assert block.content_hash is not None
+-
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+-        if cached_block_id is not None:
+-            block.block_id = cached_block_id
+-            self._incr_refcount_cached_block(block, block.block_id)
+-            return block
+-
++        # Fast path: if we can compute the content hash without materializing
++        # a mutable block, try cache lookup directly.
++        is_first_block = prev_block is None
++        prev_block_hash = None if is_first_block else prev_block.content_hash  # type: ignore
++        if len(token_ids) == self._block_size and (is_first_block
++                                                   or prev_block_hash is not None):
++            content_hash = PrefixCachingBlock.hash_block_tokens(
++                is_first_block, prev_block_hash, token_ids)
++            cached_block_id = self._cached_blocks.get(content_hash, None)
++            if cached_block_id is not None:
++                # Construct a logical block view bound to the cached physical block
++                block = self._create_block(prev_block=prev_block,
++                                           token_ids=token_ids,
++                                           block_size=self._block_size,
++                                           allocator=self)
++                # Prime cached values to avoid recomputation
++                block._cached_content_hash = content_hash  # type: ignore[attr-defined]
++                block.block_id = cached_block_id
++                self._incr_refcount_cached_block(block, cached_block_id)
++                return block
++
++        # Fallback: allocate writable block and append token ids.
+         block = self.allocate_mutable(prev_block)
+         block.append_token_ids(token_ids)
+         assert block.content_hash is not None
+-
+         return block
+ 
+     def allocate_mutable(self,
+@@ -310,7 +333,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        return self._abs_to_phys[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -385,6 +408,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         info in evictor's metadata.
+         """
+ 
++        if not block_ids:
++            return
++
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 self._blocks[block_id].last_accessed = now
+@@ -397,6 +423,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         """Mark blocks as computed, used in prefix caching."""
+ 
++        if not block_ids:
++            return
++
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 # only those full block is valid for prefix caching
+@@ -424,16 +453,32 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         # prompt is cached. This would cause erroneous behavior in model
+         # runner.
+ 
+-        ids_list = [
+-            list(
+-                takewhile(lambda block_id: self.block_is_computed(block_id),
+-                          seq[:-1])) for seq in seq_block_ids
+-        ]
+-        # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
+-            ids for ids in ids_list  # type: ignore
+-            if ids != []
+-        ])
++        # Build per-sequence computed prefixes (excluding the last block).
++        prefixes: List[List[int]] = []
++        for seq in seq_block_ids:
++            if not seq:
++                continue
++            upto: List[int] = []
++            for block_id in seq[:-1]:
++                if not self.block_is_computed(block_id):
++                    break
++                upto.append(block_id)
++            if upto:
++                prefixes.append(upto)
++        if not prefixes:
++            return []
++
++        # Compute common prefix across all sequences without allocating
++        # intermediate tuples or using os.path.commonprefix.
++        min_len = min(len(p) for p in prefixes)
++        common: List[int] = []
++        for i in range(min_len):
++            v = prefixes[0][i]
++            if all(p[i] == v for p in prefixes[1:]):
++                common.append(v)
++            else:
++                break
++        return common
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],
+@@ -574,6 +619,10 @@ class PrefixCachingBlock(Block):
+         # naive block handles CoW.
+         self._block.append_token_ids(token_ids)
+ 
++        # Update cached total token count incrementally to avoid O(N^2) scans.
++        base = 0 if self._prev_block is None else self._prev_block.num_tokens_total
++        self._cached_num_tokens_total = base + len(self._block.token_ids)
++
+         # If the content hash is present, then the block can be made immutable.
+         # Register ourselves with the allocator, potentially replacing the
+         # physical block index.
+@@ -685,7 +734,7 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ def assert_prefix_caching_block_or_none(block: Optional[Block]):

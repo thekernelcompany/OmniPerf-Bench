@@ -1,5 +1,5 @@
 """
-source /workspace/OmniPerf-Bench/bench-env/bin/activate && export PYTHONPATH=/workspace/OmniPerf-Bench/perf-agents-bench:$PYTHONPATH && cd /workspace/OmniPerf-Bench/perf-agents-bench && python -m bench.cli prepare tasks/chunked_local_attn_optimization.yaml --from-plan ./state/chunked_plan.json --bench-cfg bench_test.yaml --max-workers 1 --resume | cat
+source /workspace/OmniPerf-Bench/bench-env/bin/activate && export PYTHONPATH=/workspace/OmniPerf-Bench/ISO-Bench:$PYTHONPATH && cd /workspace/OmniPerf-Bench/ISO-Bench && python -m bench.cli prepare tasks/chunked_local_attn_optimization.yaml --from-plan ./state/chunked_plan.json --bench-cfg bench_test.yaml --max-workers 1 --resume | cat
 """
 
 ### OpenHands Local Runtime Run Report (commit 8aa1485f and related tasks)
@@ -15,17 +15,17 @@ source /workspace/OmniPerf-Bench/bench-env/bin/activate && export PYTHONPATH=/wo
   - Playwright browsers via `python -m playwright install --with-deps`
 - Added Python deps to `requirements.txt`:
   - playwright>=1.45.0, pytest-playwright>=0.4.2, libtmux>=0.23.1
-- CLI wiring: `PYTHONPATH=/workspace/OmniPerf-Bench/perf-agents-bench` for `python -m bench.cli ...`
-- Doctor: `bench.cli doctor --bench-cfg perf-agents-bench/bench_test.yaml` → OK (Docker not present, not required for local runtime)
+- CLI wiring: `PYTHONPATH=/workspace/OmniPerf-Bench/ISO-Bench` for `python -m bench.cli ...`
+- Doctor: `bench.cli doctor --bench-cfg ISO-Bench/bench_test.yaml` → OK (Docker not present, not required for local runtime)
 
 #### Critical Fix: Workspace Path Confusion
 - Problem: Prompts and headless instructions referenced `/workspace` (container path), causing file lookups like `/workspace/vllm/...` under local runtime.
-- Edits in `perf-agents-bench/bench/prepare.py`:
+- Edits in `ISO-Bench/bench/prepare.py`:
   - Use the actual git worktree path (`agent_workspace_root = str(wt_dir)`) inside all user-visible prompts and headless messages.
   - Updated “Immediate action” and completion command sections to use the resolved worktree path.
   - Left container-only flags/mounts intact (they still use `/workspace` when container mode is selected).
 - Result: OpenHands logs now consistently show the correct workspace path:
-  - “Workspace base path is set to /workspace/OmniPerf-Bench/perf-agents-bench/.work/worktrees/..."
+  - “Workspace base path is set to /workspace/OmniPerf-Bench/ISO-Bench/.work/worktrees/..."
 
 #### Runs Executed (bench_test.yaml, no Docker)
 
@@ -51,7 +51,7 @@ source /workspace/OmniPerf-Bench/bench-env/bin/activate && export PYTHONPATH=/wo
   - Files changed: `vllm/config.py`, `vllm/envs.py`, and `test_opt.py`
   - Target enforcement: FAIL (extra `test_opt.py` not in allowed targets)
   - Artifacts written: `prediction.jsonl`, `model_patch.diff`
-  - Run dir example: `perf-agents-bench/state/runs/chunked_local_attn_opt-<run_id>/<item_id>/`
+  - Run dir example: `ISO-Bench/state/runs/chunked_local_attn_opt-<run_id>/<item_id>/`
 
 #### Observations
 - Workspace issue resolved: all runs use the correct worktree path; no erroneous `/workspace/vllm/...` lookups in local runtime.
@@ -66,13 +66,13 @@ source /workspace/OmniPerf-Bench/bench-env/bin/activate && export PYTHONPATH=/wo
 
 #### Artifacts and References
 - Key files touched:
-  - `perf-agents-bench/bench/prepare.py` (prompt/headless path fixes)
+  - `ISO-Bench/bench/prepare.py` (prompt/headless path fixes)
   - `requirements.txt` (added playwright/libtmux deps)
-  - `perf-agents-bench/tasks/chunked_local_attn_optimization.yaml` (new task for 8aa)
+  - `ISO-Bench/tasks/chunked_local_attn_optimization.yaml` (new task for 8aa)
 - Example run directories:
-  - `perf-agents-bench/state/runs/moe_align_opt-.../`
-  - `perf-agents-bench/state/runs/prefix_caching_opt-.../`
-  - `perf-agents-bench/state/runs/chunked_local_attn_opt-.../`
+  - `ISO-Bench/state/runs/moe_align_opt-.../`
+  - `ISO-Bench/state/runs/prefix_caching_opt-.../`
+  - `ISO-Bench/state/runs/chunked_local_attn_opt-.../`
 
 #### Summary
 - Environment verified and prepared (Python 3.12, OpenHands 0.56.0, tmux, Playwright).

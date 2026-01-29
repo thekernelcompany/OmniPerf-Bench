@@ -50,7 +50,7 @@ Human Commits → Dataset Creation → Canonical Records → HF Dataset
 
 ### 1. OpenHands CLI Integration Module
 
-**File:** `perf-agents-bench/bench/agents/openhands_cli.py`
+**File:** `ISO-Bench/bench/agents/openhands_cli.py`
 
 ```python
 from pathlib import Path
@@ -102,11 +102,11 @@ class OpenHandsCLI:
 
 ### 2. Task Format Converter
 
-**File:** `perf-agents-bench/bench/task_converter.py`
+**File:** `ISO-Bench/bench/task_converter.py`
 
 ```python
 class OpenHandsTaskConverter:
-    """Convert perf-agents-bench tasks to OpenHands format."""
+    """Convert ISO-Bench tasks to OpenHands format."""
 
     def convert_task(self, task_cfg: Dict[str, Any], human_commit: str,
                     pre_commit: str, target_files: list) -> str:
@@ -200,7 +200,7 @@ class CanonicalRecord:
 
 ### 4. LLM Configuration Management
 
-**File:** `perf-agents-bench/bench/config/llm_manager.py`
+**File:** `ISO-Bench/bench/config/llm_manager.py`
 
 ```python
 class LLMConfigManager:
@@ -329,7 +329,7 @@ def assemble_llm_optimization(
 ### Enhanced bench.yaml
 
 ```yaml
-# perf-agents-bench/bench.yaml - Enhanced for LLM benchmarking
+# ISO-Bench/bench.yaml - Enhanced for LLM benchmarking
 container:
   engine: "docker"
   cpus: 2
@@ -403,7 +403,7 @@ drop_params = false
 ## File Structure
 
 ```
-perf-agents-bench/
+ISO-Bench/
 ├── bench/
 │   ├── agents/
 │   │   ├── openhands_cli.py          # New: OpenHands CLI integration
@@ -474,9 +474,9 @@ correlation_map = {
 
 1. **Create OpenHands integration files**
    ```bash
-   mkdir -p perf-agents-bench/bench/agents perf-agents-bench/config
-   touch perf-agents-bench/bench/agents/openhands_cli.py
-   touch perf-agents-bench/config/llm_config.toml
+   mkdir -p ISO-Bench/bench/agents ISO-Bench/config
+   touch ISO-Bench/bench/agents/openhands_cli.py
+   touch ISO-Bench/config/llm_config.toml
    ```
 
 2. **Implement basic OpenHands CLI wrapper**

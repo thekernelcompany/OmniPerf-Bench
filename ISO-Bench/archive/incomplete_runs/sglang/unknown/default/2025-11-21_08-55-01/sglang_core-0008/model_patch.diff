@@ -1,0 +1,109 @@
+diff --git a/python/sglang/lang/interpreter.py b/python/sglang/lang/interpreter.py
+index 00691ca50..8e3ab0b04 100644
+--- a/python/sglang/lang/interpreter.py
++++ b/python/sglang/lang/interpreter.py
+@@ -256,9 +256,18 @@ class StreamExecutor:
+         ret = self.meta_info.get(name, None)
+         return ret
+ 
+-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
+-        self.submit(SglCommitLazy())
+-        self.sync()
++    def fork(
++        self,
++        number: int,
++        position_ids_offset: Optional[List[int]] = None,
++        copy: bool = False,
++    ):
++        # Commit and sync only when duplicating state for multiple branches
++        # or explicitly requesting a deep copy. This avoids unnecessary
++        # synchronization overhead for the common fork(1) case.
++        if int(number) > 1 or copy:
++            self.submit(SglCommitLazy())
++            self.sync()
+ 
+         number = int(number)
+ 
+@@ -641,15 +650,23 @@ class ProgramState:
+         yield
+         self.stream_executor.submit(SglVarScopeEnd(name))
+ 
+-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
+-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
++    def fork(
++        self,
++        number: int = 1,
++        position_ids_offset: Optional[List[int]] = None,
++        copy: bool = False,
++    ):
++        stream_executors = self.stream_executor.fork(
++            number, position_ids_offset, copy=copy
++        )
+         states = [ProgramState(x) for x in stream_executors]
+         state_group = ProgramStateGroup(states, self)
+         return state_group
+ 
+     @contextmanager
+     def copy(self, position_ids_offset: Optional[List[int]] = None):
+-        state_group = self.fork(1, position_ids_offset)
++        # Explicit copy requires a commit to ensure child has an isolated snapshot.
++        state_group = self.fork(1, position_ids_offset, copy=True)
+         try:
+             yield state_group[0]
+         finally:
+diff --git a/python/sglang/srt/managers/router/radix_cache.py b/python/sglang/srt/managers/router/radix_cache.py
+index 7bb8a4b2a..367d37789 100644
+--- a/python/sglang/srt/managers/router/radix_cache.py
++++ b/python/sglang/srt/managers/router/radix_cache.py
+@@ -8,8 +8,18 @@ import torch
+ 
+ 
+ class TreeNode:
++    __slots__ = (
++        "children",
++        "parent",
++        "key",
++        "value",
++        "ref_counter",
++        "last_access_time",
++    )
++
+     def __init__(self):
+-        self.children = defaultdict(TreeNode)
++        # Use a regular dict since default creation is not relied upon.
++        self.children = {}
+         self.parent = None
+         self.key = None
+         self.value = None
+@@ -120,7 +130,7 @@ class RadixCache:
+         if len(key) == 0:
+             return
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+             if prefix_len < len(child.key):
+@@ -151,7 +161,7 @@ class RadixCache:
+         if len(key) == 0:
+             return 0
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+ 
+@@ -183,10 +193,9 @@ class RadixCache:
+             self._print_helper(child, indent=indent + 2)
+ 
+     def _delete_leaf(self, node):
+-        for k, v in node.parent.children.items():
+-            if v == node:
+-                break
+-        del node.parent.children[k]
++        # Node keys are guaranteed to be non-empty for leaves created by insert,
++        # and the first element is the edge label from parent to this node.
++        del node.parent.children[node.key[0]]
+         self.evictable_size_ -= len(node.key)
+ 
+     def _total_size_helper(self, node):

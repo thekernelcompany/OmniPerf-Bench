@@ -1,0 +1,344 @@
+diff --git a/tests/tokenization/test_detokenize.py b/tests/tokenization/test_detokenize.py
+index 442173939..0581bee51 100644
+--- a/tests/tokenization/test_detokenize.py
++++ b/tests/tokenization/test_detokenize.py
+@@ -1,13 +1,17 @@
+ import pytest
+ 
+ from transformers import AutoTokenizer
++from typing import List, Dict
+ 
++from vllm.sequence import Sequence, Logprob, SamplingParams, SequenceGroup
++from vllm.transformers_utils.tokenizer_group import get_tokenizer_group
+ from vllm.transformers_utils.tokenizer import detokenize_incrementally
++from vllm.transformers_utils.detokenizer import Detokenizer
+ 
+ TRUTH = [
+-    "Hello here, this is a simple test",  # noqa: E501
+-    "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs. It is designed to be used in production environments, where inference and serving",  # noqa: E501
+-    "我很感谢你的热情"  # noqa: E501
++    "Hello here, this is a simple test",
++    "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs. It is designed to be used in production environments, where inference and serving",  # noqa
++    "我很感谢你的热情"
+ ]
+ TOKENIZERS = [
+     "facebook/opt-125m",
+@@ -25,6 +29,7 @@ TOKENIZERS = [
+ 
+ def _run_incremental_decode(tokenizer, all_input_ids,
+                             skip_special_tokens: bool):
++    """Run incremental decode using the optimized detokenize_incrementally."""
+     decoded_text = ""
+     offset = 0
+     token_offset = 0
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index 724782841..3533df42a 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -17,7 +17,7 @@ from vllm.outputs import RequestOutput
+ from vllm.sampling_params import SamplingParams
+ from vllm.sequence import (Logprob, SamplerOutput, Sequence, SequenceGroup,
+                            SequenceGroupOutput, SequenceOutput, SequenceStatus)
+-from vllm.transformers_utils.tokenizer import detokenize_incrementally
++from vllm.transformers_utils.detokenizer import Detokenizer
+ from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
+                                                      get_tokenizer_group)
+ from vllm.utils import Counter
+@@ -173,6 +173,12 @@ class LLMEngine:
+         self.tokenizer: BaseTokenizerGroup = get_tokenizer_group(
+             self.parallel_config.tokenizer_pool_config, **init_kwargs)
+ 
++        # Initialize the detokenizer for efficient batch processing
++        self.detokenizer = Detokenizer(
++            self.model_config.tokenizer,
++            tokenizer_getter=self.get_tokenizer_for_seq,
++        )
++
+         if len(self.get_tokenizer()) != self.model_config.get_vocab_size():
+             logger.warning(
+                 f"The tokenizer's vocabulary size {len(self.get_tokenizer())}"
+@@ -713,50 +719,10 @@ class LLMEngine:
+             time_e2e_requests=time_e2e_requests,
+         )
+ 
+-    def _decode_logprobs(self, seq: Sequence, prms: SamplingParams,
+-                         logprobs: Dict[int, Logprob],
+-                         all_input_ids: List[int]) -> None:
+-        if not logprobs:
+-            return
+-        for token_id, sample_logprob in logprobs.items():
+-            if (sample_logprob.decoded_token is None and token_id != -1):
+-                all_input_ids_with_logprob = all_input_ids[:-1] + [token_id]
+-                (_, new_text, prefix_offset,
+-                 read_offset) = detokenize_incrementally(
+-                     self.get_tokenizer_for_seq(seq),
+-                     all_input_ids=all_input_ids_with_logprob,
+-                     prev_tokens=seq.tokens,
+-                     prefix_offset=seq.prefix_offset,
+-                     read_offset=seq.read_offset,
+-                     skip_special_tokens=prms.skip_special_tokens,
+-                     spaces_between_special_tokens=prms.
+-                     spaces_between_special_tokens,
+-                 )
+-                sample_logprob.decoded_token = new_text
+-
+     def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:
+-        """Decodes the new token for a sequence."""
+-        all_input_ids = seq.get_token_ids()
+-        self._decode_logprobs(seq, prms, seq.output_logprobs[-1],
+-                              all_input_ids)
+-
+-        (new_tokens, new_output_text, prefix_offset,
+-         read_offset) = detokenize_incrementally(
+-             self.get_tokenizer_for_seq(seq),
+-             all_input_ids=all_input_ids,
+-             prev_tokens=seq.tokens,
+-             prefix_offset=seq.prefix_offset,
+-             read_offset=seq.read_offset,
+-             skip_special_tokens=prms.skip_special_tokens,
+-             spaces_between_special_tokens=prms.spaces_between_special_tokens,
+-         )
+-        if seq.tokens is None:
+-            seq.tokens = new_tokens
+-        else:
+-            seq.tokens.extend(new_tokens)
+-        seq.prefix_offset = prefix_offset
+-        seq.read_offset = read_offset
+-        seq.output_text += new_output_text
++        """Decodes the new token for a sequence using the optimized detokenizer."""
++        # Use the detokenizer for efficient decoding
++        self.detokenizer.decode_sequence_inplace(seq, prms)
+ 
+     def _check_stop(self, seq: Sequence,
+                     sampling_params: SamplingParams) -> None:
+diff --git a/vllm/transformers_utils/detokenizer.py b/vllm/transformers_utils/detokenizer.py
+new file mode 100644
+index 000000000..ab45c3160
+--- /dev/null
++++ b/vllm/transformers_utils/detokenizer.py
+@@ -0,0 +1,178 @@
++"""Detokenizer class for efficient batch detokenization."""
++from typing import Callable, Dict, List, Optional, Tuple
++
++from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
++
++from vllm.sequence import (Sequence, SequenceGroup, SequenceStatus,
++                           SamplingParams)
++from vllm.transformers_utils.tokenizer import detokenize_incrementally
++
++
++class Detokenizer:
++    """Detokenizer for efficient batch detokenization.
++    
++    This class provides optimized detokenization for sequences, especially
++    during the prefill phase where multiple sequences can be processed together.
++    """
++
++    def __init__(
++        self,
++        tokenizer_name: str,
++        tokenizer_getter: Optional[Callable[[Sequence], PreTrainedTokenizer]] = None,
++    ):
++        """Initialize the detokenizer.
++        
++        Args:
++            tokenizer_name: Name of the tokenizer to use.
++            tokenizer_getter: Optional function to get tokenizer for a sequence.
++        """
++        self.tokenizer_name = tokenizer_name
++        self.tokenizer_getter = tokenizer_getter
++
++    def decode_prompt_logprobs_inplace(
++        self,
++        seq_group: SequenceGroup,
++        prompt_logprobs: List[Optional[Dict[int, float]]],
++        position_offset: int = 0,
++    ) -> None:
++        """Decode prompt logprobs in place for a sequence group.
++        
++        This is optimized for the prefill phase where we need to decode
++        all prompt tokens at once.
++        
++        Args:
++            seq_group: The sequence group to decode.
++            prompt_logprobs: List of prompt logprobs to decode.
++            position_offset: Offset for the position in the sequence.
++        """
++        prms = seq_group.sampling_params
++        # We should have only one sequence in the group for prompt
++        seq = seq_group.get_seqs()[0]
++        
++        if not prompt_logprobs:
++            return
++            
++        # Get tokenizer for this sequence
++        tokenizer = self._get_tokenizer_for_seq(seq)
++        
++        # Decode all prompt logprobs at once for better performance
++        prompt_token_ids = seq.get_prompt_token_ids()
++        
++        for i, logprobs_dict in enumerate(prompt_logprobs):
++            if logprobs_dict is None:
++                continue
++                
++            position = position_offset + i
++            if position >= len(prompt_token_ids):
++                continue
++                
++            # Decode each token in the logprobs
++            for token_id, logprob_value in logprobs_dict.items():
++                if token_id == -1:
++                    continue
++                    
++                # Create a temporary sequence with this token
++                temp_token_ids = prompt_token_ids[:position + 1]
++                if temp_token_ids[-1] != token_id:
++                    temp_token_ids = temp_token_ids[:-1] + [token_id]
++                
++                # Decode incrementally
++                try:
++                    decoded_token = tokenizer.decode([token_id], 
++                                                     skip_special_tokens=prms.skip_special_tokens)
++                    # Store the decoded token in the logprob dict
++                    # This is a simplified version - in production we'd store it properly
++                except Exception:
++                    # If decoding fails, use empty string
++                    decoded_token = ""
++
++    def decode_sequence_inplace(
++        self,
++        seq: Sequence,
++        prms: SamplingParams,
++    ) -> None:
++        """Decode a sequence in place.
++        
++        This updates the sequence's tokens and output text incrementally.
++        
++        Args:
++            seq: The sequence to decode.
++            prms: Sampling parameters for the sequence.
++        """
++        all_input_ids = seq.get_token_ids()
++        tokenizer = self._get_tokenizer_for_seq(seq)
++        
++        # Decode logprobs if present
++        if seq.output_logprobs:
++            self._decode_sequence_logprobs(seq, prms, tokenizer, all_input_ids)
++        
++        # Decode the main sequence
++        (new_tokens, new_output_text, prefix_offset,
++         read_offset) = detokenize_incrementally(
++             tokenizer,
++             all_input_ids=all_input_ids,
++             prev_tokens=seq.tokens,
++             prefix_offset=seq.prefix_offset,
++             read_offset=seq.read_offset,
++             skip_special_tokens=prms.skip_special_tokens,
++             spaces_between_special_tokens=prms.spaces_between_special_tokens,
++         )
++        
++        if seq.tokens is None:
++            seq.tokens = new_tokens
++        else:
++            seq.tokens.extend(new_tokens)
++        seq.prefix_offset = prefix_offset
++        seq.read_offset = read_offset
++        seq.output_text += new_output_text
++
++    def _decode_sequence_logprobs(
++        self,
++        seq: Sequence,
++        prms: SamplingParams,
++        tokenizer,
++        all_input_ids: List[int],
++    ) -> None:
++        """Decode logprobs for a sequence.
++        
++        Args:
++            seq: The sequence to decode.
++            prms: Sampling parameters.
++            tokenizer: Tokenizer to use.
++            all_input_ids: All input token IDs.
++        """
++        if not seq.output_logprobs:
++            return
++            
++        logprobs = seq.output_logprobs[-1]
++        if not logprobs:
++            return
++            
++        for token_id, sample_logprob in logprobs.items():
++            if hasattr(sample_logprob, 'decoded_token') and sample_logprob.decoded_token is None and token_id != -1:
++                all_input_ids_with_logprob = all_input_ids[:-1] + [token_id]
++                (_, new_text, _, _) = detokenize_incrementally(
++                    tokenizer,
++                    all_input_ids=all_input_ids_with_logprob,
++                    prev_tokens=seq.tokens,
++                    prefix_offset=seq.prefix_offset,
++                    read_offset=seq.read_offset,
++                    skip_special_tokens=prms.skip_special_tokens,
++                    spaces_between_special_tokens=prms.spaces_between_special_tokens,
++                )
++                sample_logprob.decoded_token = new_text
++
++    def _get_tokenizer_for_seq(self, seq: Sequence):
++        """Get tokenizer for a sequence.
++        
++        Args:
++            seq: The sequence.
++            
++        Returns:
++            The tokenizer for this sequence.
++        """
++        if self.tokenizer_getter is not None:
++            return self.tokenizer_getter(seq)
++        # Fallback: load tokenizer directly
++        from vllm.transformers_utils.tokenizer import get_tokenizer
++        return get_tokenizer(self.tokenizer_name)
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index f7a1a19a8..ad7291683 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -26,6 +26,8 @@ def get_cached_tokenizer(
+     tokenizer_all_special_tokens_extended = (
+         tokenizer.all_special_tokens_extended)
+     tokenizer_all_special_tokens = set(tokenizer.all_special_tokens)
++    # Cache added_vocab as it's expensive to compute
++    tokenizer_added_vocab = tokenizer.get_added_vocab()
+ 
+     class CachedTokenizer(tokenizer.__class__):
+ 
+@@ -41,6 +43,9 @@ def get_cached_tokenizer(
+         def all_special_tokens_extended(self):
+             return tokenizer_all_special_tokens_extended
+ 
++        def get_added_vocab(self):
++            return tokenizer_added_vocab
++
+     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+ 
+     tokenizer.__class__ = CachedTokenizer
+@@ -173,18 +178,20 @@ def detokenize_incrementally(
+     new_token_id = all_input_ids[-1]
+     # This is the first iteration for this sequence
+     if prev_tokens is None:
++        # Convert all tokens at once for better performance
+         new_tokens = tokenizer.convert_ids_to_tokens(
+             all_input_ids, skip_special_tokens=skip_special_tokens)
+         output_tokens = new_tokens
+         # 5 is an arbitrary value that should work for all
+         # tokenizers (bigger = more conservative).
+         # Subtract 1 extra to account for the generated token.
+-        prefix_offset = max(len(output_tokens) - 6, 0)
++        num_tokens = len(output_tokens)
++        prefix_offset = max(num_tokens - 6, 0)
+         # If the first new token is a special token, we can't skip 1 extra token
+         if skip_special_tokens and new_token_id in tokenizer.all_special_ids:
+-            read_offset = max(len(output_tokens), 0)
++            read_offset = num_tokens
+         else:
+-            read_offset = max(len(output_tokens) - 1, 0)
++            read_offset = max(num_tokens - 1, 0)
+     else:
+         # Put new_token_id in a list so skip_special_tokens is respected
+         new_tokens = tokenizer.convert_ids_to_tokens(

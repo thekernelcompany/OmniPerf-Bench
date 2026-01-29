@@ -1,0 +1,157 @@
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index b8ba36f35..c78c17475 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -6,7 +6,6 @@ from collections.abc import AsyncGenerator, Mapping
+ from copy import copy
+ from typing import Any, Optional, Union
+ 
+-import numpy as np
+ 
+ import vllm.envs as envs
+ from vllm.config import ModelConfig, VllmConfig
+@@ -27,7 +26,7 @@ from vllm.transformers_utils.config import (
+ from vllm.transformers_utils.tokenizer import AnyTokenizer
+ from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
+ from vllm.usage.usage_lib import UsageContext
+-from vllm.utils import Device, cdiv
++from vllm.utils import Device
+ from vllm.v1.engine import EngineCoreRequest
+ from vllm.v1.engine.core_client import EngineCoreClient
+ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+@@ -382,28 +381,36 @@ class AsyncLLM(EngineClient):
+ 
+                     # Split outputs into chunks of at most
+                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
+-                    # event loop for too long.
+-                    if num_outputs <= VLLM_V1_OUTPUT_PROC_CHUNK_SIZE:
+-                        slices = (outputs.outputs, )
+-                    else:
+-                        slices = np.array_split(
+-                            outputs.outputs,
+-                            cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE))
+-
+-                    for i, outputs_slice in enumerate(slices):
++                    # event loop for too long. Use pure Python slicing to avoid
++                    # unnecessary NumPy overhead/allocations.
++                    chunk_size = VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
++                    total = num_outputs
++
++                    # Accumulate aborts across chunks to reduce RPCs.
++                    reqs_to_abort_all: list[str] = []
++
++                    i = 0
++                    while i < total:
++                        outputs_slice = outputs.outputs[i:i + chunk_size]
+                         # 2) Process EngineCoreOutputs.
+                         processed_outputs = output_processor.process_outputs(
+                             outputs_slice, outputs.timestamp, iteration_stats)
+                         # NOTE: RequestOutputs are pushed to their queues.
+                         assert not processed_outputs.request_outputs
+ 
+-                        # Allow other asyncio tasks to run between chunks
+-                        if i + 1 < len(slices):
++                        # Accumulate aborts and allow other asyncio tasks to run
++                        if processed_outputs.reqs_to_abort:
++                            reqs_to_abort_all.extend(
++                                processed_outputs.reqs_to_abort)
++                        if i + chunk_size < total:
+                             await asyncio.sleep(0)
++                        i += chunk_size
+ 
+-                        # 3) Abort any reqs that finished due to stop strings.
++                    # 3) Abort any reqs that finished due to stop strings.
++                    if reqs_to_abort_all:
++                        # De-duplicate to minimize redundant aborts.
+                         await engine_core.abort_requests_async(
+-                            processed_outputs.reqs_to_abort)
++                            list(dict.fromkeys(reqs_to_abort_all)))
+ 
+                     # 4) Logging.
+                     # TODO(rob): make into a coroutine and launch it in
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 2bcd61d1f..023390178 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -49,10 +49,13 @@ class RequestOutputCollector:
+ 
+     async def get(self) -> Union[RequestOutput, PoolingRequestOutput]:
+         """Get operation blocks on put event."""
+-        while (output := self.output) is None:
+-            await self.ready.wait()
++        ready = self.ready
++        output = self.output
++        while output is None:
++            await ready.wait()
++            output = self.output
+         self.output = None
+-        self.ready.clear()
++        ready.clear()
+         if isinstance(output, Exception):
+             raise output
+         return output
+@@ -368,12 +371,15 @@ class OutputProcessor:
+         within the loop below.
+         """
+ 
++        request_states = self.request_states
++        parent_requests = self.parent_requests
++
+         request_outputs: Union[list[RequestOutput],
+                                list[PoolingRequestOutput]] = []
+         reqs_to_abort: list[str] = []
+         for engine_core_output in engine_core_outputs:
+             req_id = engine_core_output.request_id
+-            req_state = self.request_states.get(req_id)
++            req_state = request_states.get(req_id)
+             if req_state is None:
+                 # Ignore output for already-aborted request.
+                 continue
+@@ -383,18 +389,16 @@ class OutputProcessor:
+                                            engine_core_timestamp,
+                                            iteration_stats)
+ 
+-            new_token_ids = engine_core_output.new_token_ids
+             pooling_output = engine_core_output.pooling_output
+             finish_reason = engine_core_output.finish_reason
+             stop_reason = engine_core_output.stop_reason
+-            kv_transfer_params = engine_core_output.kv_transfer_params
+-            num_cached_tokens = engine_core_output.num_cached_tokens
+             req_state.is_prefilling = False
+ 
+             if pooling_output is None:
+                 assert req_state.detokenizer is not None
+                 assert req_state.logprobs_processor is not None
+                 # 2) Detokenize the token ids into text and perform stop checks.
++                new_token_ids = engine_core_output.new_token_ids
+                 stop_string = req_state.detokenizer.update(
+                     new_token_ids, finish_reason == FinishReason.STOP)
+                 if stop_string:
+@@ -405,6 +409,13 @@ class OutputProcessor:
+                 # if required.
+                 req_state.logprobs_processor.update_from_output(
+                     engine_core_output)
++                kv_transfer_params = engine_core_output.kv_transfer_params
++                num_cached_tokens = engine_core_output.num_cached_tokens
++            else:
++                # Avoid unnecessary attribute reads when handling pooling.
++                new_token_ids = []
++                kv_transfer_params = None
++                num_cached_tokens = 0
+ 
+             # 4) Create and handle RequestOutput objects.
+             if request_output := req_state.make_request_output(
+@@ -419,11 +430,11 @@ class OutputProcessor:
+ 
+             # Free completed requests.
+             if finish_reason is not None:
+-                self.request_states.pop(req_id)
++                request_states.pop(req_id)
+                 # Remove parent request if applicable.
+                 parent_req = req_state.parent_req
+                 if parent_req and not parent_req.child_requests:
+-                    self.parent_requests.pop(parent_req.request_id, None)
++                    parent_requests.pop(parent_req.request_id, None)
+                 if not engine_core_output.finished:
+                     # If req not finished in EngineCore, but Detokenizer
+                     # detected stop string, abort needed in EngineCore.

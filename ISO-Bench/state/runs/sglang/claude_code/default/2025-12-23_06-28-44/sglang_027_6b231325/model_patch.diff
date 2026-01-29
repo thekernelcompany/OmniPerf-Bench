@@ -1,0 +1,158 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 8ab5066..6ab8d9c 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -227,11 +227,14 @@ class MooncakeKVManager(BaseKVManager):
+         )
+ 
+         num_layers = len(self.kv_args.kv_data_ptrs)
++        # Cache attributes to avoid repeated lookups
++        kv_data_ptrs = self.kv_args.kv_data_ptrs
++        kv_item_lens = self.kv_args.kv_item_lens
+         layers_params = [
+             (
+-                self.kv_args.kv_data_ptrs[layer_id],
++                kv_data_ptrs[layer_id],
+                 dst_kv_ptrs[layer_id],
+-                self.kv_args.kv_item_lens[layer_id],
++                kv_item_lens[layer_id],
+             )
+             for layer_id in range(num_layers)
+         ]
+@@ -239,8 +242,9 @@ class MooncakeKVManager(BaseKVManager):
+         # Worker function for processing a single layer
+         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+-                src_addr = src_ptr + int(prefill_index[0]) * item_len
+-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
++                # Avoid unnecessary int() conversions in hot loop
++                src_addr = src_ptr + prefill_index[0] * item_len
++                dst_addr = dst_ptr + decode_index[0] * item_len
+                 length = item_len * len(prefill_index)
+ 
+                 status = self.engine.transfer_sync(
+@@ -291,7 +295,8 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++        # Use f-string for more efficient string concatenation
++        self._connect(f"tcp://{remote}:{dst_port}").send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -907,25 +912,35 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return None, None
+ 
+     def _register_kv_args(self):
++        # Pre-pack data pointers once to avoid repeated packing
++        kv_data_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++        aux_data_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++        packed_kv_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in kv_data_ptrs
++        )
++        packed_aux_data_ptrs = b"".join(
++            struct.pack("Q", ptr) for ptr in aux_data_ptrs
++        )
++
++        # Cache encoded strings to avoid repeated encoding
++        none_encoded = b"None"
++        local_ip_encoded = get_local_ip_by_remote().encode("ascii")
++        rank_port_encoded = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_encoded = self.session_id.encode("ascii")
++
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
+ 
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        "None".encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
++                        none_encoded,
++                        local_ip_encoded,
++                        rank_port_encoded,
++                        session_id_encoded,
+                         packed_kv_data_ptrs,
+                         packed_aux_data_ptrs,
+                     ]
+@@ -942,23 +957,32 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+ 
+     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
++        # Cache encoded strings outside loop
++        bootstrap_room_encoded = str(self.bootstrap_room).encode("ascii")
++        local_ip_encoded = get_local_ip_by_remote().encode("ascii")
++        rank_port_encoded = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_encoded = self.session_id.encode("ascii")
++        required_dst_info_num_encoded = str(self.required_dst_info_num).encode("ascii")
++        kv_indices_bytes = kv_indices.tobytes()
++        aux_index_encoded = str(aux_index).encode("ascii") if aux_index is not None else b""
++
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+             is_dummy = bootstrap_info["is_dummy"]
+ 
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        str(self.bootstrap_room).encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
+-                        kv_indices.tobytes() if not is_dummy else b"",
+-                        str(aux_index).encode("ascii") if not is_dummy else b"",
+-                        str(self.required_dst_info_num).encode("ascii"),
++                        bootstrap_room_encoded,
++                        local_ip_encoded,
++                        rank_port_encoded,
++                        session_id_encoded,
++                        b"" if is_dummy else kv_indices_bytes,
++                        b"" if is_dummy else aux_index_encoded,
++                        required_dst_info_num_encoded,
+                     ]
+                 )
+ 
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index 8841d5f..112f5cf 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -207,17 +207,17 @@ class MetadataBuffers:
+ 
+         # We transfer the metadata of first output token to decode
+         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+-        self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+-        self.output_token_logprobs_val = torch.zeros(
++        self.output_ids = torch.empty((size, 16), dtype=torch.int32, device="cpu")
++        self.output_token_logprobs_val = torch.empty(
+             (size, 16), dtype=torch.float32, device="cpu"
+         )
+-        self.output_token_logprobs_idx = torch.zeros(
++        self.output_token_logprobs_idx = torch.empty(
+             (size, 16), dtype=torch.int32, device="cpu"
+         )
+-        self.output_top_logprobs_val = torch.zeros(
++        self.output_top_logprobs_val = torch.empty(
+             (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
+         )
+-        self.output_top_logprobs_idx = torch.zeros(
++        self.output_top_logprobs_idx = torch.empty(
+             (size, max_top_logprobs_num), dtype=torch.int32, device="cpu"
+         )
+ 

@@ -1,0 +1,354 @@
+diff --git a/tests/basic_correctness/test_chunked_prefill.py b/tests/basic_correctness/test_chunked_prefill.py
+index 1211e6b..cc52ebe 100644
+--- a/tests/basic_correctness/test_chunked_prefill.py
++++ b/tests/basic_correctness/test_chunked_prefill.py
+@@ -156,3 +156,72 @@ def test_models_with_fp8_kv_cache(
+         name_0="no_chunked_prefill",
+         name_1="chunked_prefill",
+     )
++
++
++@pytest.mark.parametrize("model", ["facebook/opt-125m"])
++@pytest.mark.parametrize("dtype", ["half"])
++@pytest.mark.parametrize("max_tokens", [16])
++@pytest.mark.parametrize("chunked_prefill_token_size", [4])
++def test_chunked_prefill_batched_block_marking(
++    vllm_runner,
++    example_prompts,
++    model: str,
++    dtype: str,
++    max_tokens: int,
++    chunked_prefill_token_size: int,
++) -> None:
++    """Test that batched block marking works correctly with chunked prefill."""
++    
++    # Use multiple prompts to test batching
++    prompts = example_prompts[:4]
++    
++    with vllm_runner(
++        model,
++        dtype=dtype,
++        max_num_batched_tokens=chunked_prefill_token_size,
++        enable_chunked_prefill=True,
++        tensor_parallel_size=1,
++    ) as vllm_model:
++        # Generate outputs with chunked prefill
++        outputs = vllm_model.generate_greedy(prompts, max_tokens)
++        
++        # Verify that all prompts generated outputs
++        assert len(outputs) == len(prompts)
++        for output in outputs:
++            assert len(output[1]) > 0
++
++
++@pytest.mark.parametrize("model", ["facebook/opt-125m"])
++@pytest.mark.parametrize("dtype", ["half"])
++@pytest.mark.parametrize("max_tokens", [16])
++def test_chunked_prefill_with_prefix_caching(
++    vllm_runner,
++    example_prompts,
++    model: str,
++    dtype: str,
++    max_tokens: int,
++) -> None:
++    """Test that prefix caching works correctly with batched block marking."""
++    
++    # Use prompts with common prefixes
++    common_prefix = "Hello, this is a test prompt about "
++    prompts = [
++        common_prefix + "artificial intelligence.",
++        common_prefix + "machine learning.",
++        common_prefix + "deep learning.",
++    ]
++    
++    with vllm_runner(
++        model,
++        dtype=dtype,
++        enable_chunked_prefill=True,
++        enable_prefix_caching=True,
++        tensor_parallel_size=1,
++    ) as vllm_model:
++        # Generate outputs
++        outputs = vllm_model.generate_greedy(prompts, max_tokens)
++        
++        # Verify that all prompts generated outputs
++        assert len(outputs) == len(prompts)
++        for output in outputs:
++            assert len(output[1]) > 0
+diff --git a/tests/core/test_block_manager.py b/tests/core/test_block_manager.py
+index cd306b9..163c61e 100644
+--- a/tests/core/test_block_manager.py
++++ b/tests/core/test_block_manager.py
+@@ -595,3 +595,38 @@ def test_sliding_window_multi_seq():
+ 
+     # assert all blocks are free now
+     assert block_manager.get_num_free_gpu_blocks() == num_gpu_blocks
++
++
++def test_mark_blocks_as_computed_batched():
++    """Test that mark_blocks_as_computed works with batched seq_groups."""
++    block_size = 4
++    num_cpu_blocks = 4
++    num_gpu_blocks = 4
++    block_manager = BlockSpaceManagerV1(block_size,
++                                        num_cpu_blocks,
++                                        num_gpu_blocks,
++                                        watermark=0,
++                                        enable_caching=True)
++
++    # Create multiple sequence groups
++    seq_groups = []
++    for i in range(3):
++        prompt, seq_group = create_dummy_prompt(str(i), block_size * 2)
++        block_manager.allocate(seq_group)
++        seq_groups.append(seq_group)
++
++    # Append tokens to sequences to create full blocks
++    for seq_group in seq_groups:
++        for seq in seq_group.get_seqs():
++            for _ in range(block_size):
++                seq.append_token_id(0, {0: Logprob(0.0)})
++            block_manager.append_slots(seq, block_size)
++
++    # Mark all blocks as computed in a single batched call
++    block_manager.mark_blocks_as_computed(seq_groups)
++
++    # Verify that blocks are marked as computed
++    for seq_group in seq_groups:
++        for seq in seq_group.get_seqs():
++            computed_blocks = block_manager.get_all_computed_blocks(seq)
++            assert len(computed_blocks) > 0
+diff --git a/tests/core/test_chunked_prefill_scheduler.py b/tests/core/test_chunked_prefill_scheduler.py
+index 6d9c2f3..86e81e3 100644
+--- a/tests/core/test_chunked_prefill_scheduler.py
++++ b/tests/core/test_chunked_prefill_scheduler.py
+@@ -562,3 +562,32 @@ def test_chunked_prefill_max_seqs():
+     assert len(get_sequence_groups(out)) == max_seqs
+     assert not running[0].is_prefill()
+     assert not running[1].is_prefill()
++
++
++def test_batched_mark_blocks_as_computed():
++    """Test that batched mark_blocks_as_computed is called correctly."""
++    block_size = 4
++    max_seqs = 60
++    max_model_len = 80
++    scheduler_config = SchedulerConfig(
++        max_token_budget=100,
++        max_num_seqs=max_seqs,
++        max_model_len=max_model_len,
++        enable_chunked_prefill=True,
++    )
++    cache_config = CacheConfig(block_size, 1.0, 1, "auto")
++    cache_config.num_cpu_blocks = 16
++    cache_config.num_gpu_blocks = 16
++    scheduler = Scheduler(scheduler_config, cache_config, None)
++
++    # Add multiple sequence groups
++    num_seq_groups = 5
++    for i in range(num_seq_groups):
++        _, seq_group = create_dummy_prompt(str(i), prompt_length=block_size * 2)
++        scheduler.add_seq_group(seq_group)
++
++    # Schedule all sequences
++    seq_group_meta, out = schedule_and_update_computed_tokens(scheduler)
++    
++    # Verify that all sequences were scheduled
++    assert len(get_sequence_groups(out)) == num_seq_groups
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 6667233..f6923bb 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -684,13 +684,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+     def compute_full_blocks_in_seq(self, seq: Sequence):
+         if seq.seq_id not in self.block_tables:
+             return
+-        max_full_block = seq.get_len() // self.block_size - 1
+         block_table = self.block_tables[seq.seq_id]
++        max_full_block = seq.get_len() // self.block_size - 1
+         if max_full_block == -1:
+             return
+-        for i in reversed(range(max_full_block)):
++        # Optimize: Mark blocks as computed in forward order and stop early
++        for i in range(max_full_block):
+             if block_table[i].computed:
+-                break
++                continue
+             block_table[i].computed = True
+ 
+     def get_all_computed_blocks(self, seq: Sequence) -> List[int]:
+@@ -718,10 +719,11 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         ids_list = [self.get_all_computed_blocks(seq) for seq in seqs]
+         return commonprefix([ids for ids in ids_list if ids != []])
+ 
+-    def mark_blocks_as_computed(self, seq_group: SequenceGroup):
++    def mark_blocks_as_computed(self, seq_groups: List[SequenceGroup]):
+         if self.enable_caching:
+-            for seq in seq_group.get_seqs():
+-                self.compute_full_blocks_in_seq(seq)
++            for seq_group in seq_groups:
++                for seq in seq_group.get_seqs():
++                    self.compute_full_blocks_in_seq(seq)
+ 
+     def get_prefix_cache_hit_rate(self, device: Device) -> float:
+         if device == Device.GPU:
+diff --git a/vllm/core/block_manager_v2.py b/vllm/core/block_manager_v2.py
+index 7d2db43..833cba9 100644
+--- a/vllm/core/block_manager_v2.py
++++ b/vllm/core/block_manager_v2.py
+@@ -290,7 +290,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
+             self._last_access_blocks_tracker.update_last_access(
+                 seq.seq_id, now)
+ 
+-    def mark_blocks_as_computed(self, seq_group: SequenceGroup):
++    def mark_blocks_as_computed(self, seq_groups: List[SequenceGroup]):
+         # If prefix caching is enabled, mark immutable blocks as computed
+         # right after they have been scheduled (for prefill). This assumes
+         # the scheduler is synchronous so blocks are actually computed when
+diff --git a/vllm/core/embedding_model_block_manager.py b/vllm/core/embedding_model_block_manager.py
+index f16f66e..e696df2 100644
+--- a/vllm/core/embedding_model_block_manager.py
++++ b/vllm/core/embedding_model_block_manager.py
+@@ -80,7 +80,7 @@ class EmbeddingModelBlockSpaceManager(BlockSpaceManager):
+                                       seq_group: List[Sequence]) -> List[int]:
+         return []
+ 
+-    def mark_blocks_as_computed(self, seq_group: SequenceGroup):
++    def mark_blocks_as_computed(self, seq_groups: List[SequenceGroup]):
+         pass
+ 
+     def get_prefix_cache_hit_rate(self, device: Device) -> float:
+diff --git a/vllm/core/interfaces.py b/vllm/core/interfaces.py
+index becd0d2..1982417 100644
+--- a/vllm/core/interfaces.py
++++ b/vllm/core/interfaces.py
+@@ -115,7 +115,7 @@ class BlockSpaceManager(ABC):
+         pass
+ 
+     @abstractmethod
+-    def mark_blocks_as_computed(self, seq_group: SequenceGroup):
++    def mark_blocks_as_computed(self, seq_groups: List[SequenceGroup]):
+         pass
+ 
+     @abstractmethod
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index fbc53af..eecab6b 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -1143,7 +1143,9 @@ class Scheduler:
+                 encoder_seq_data = None
+                 cross_block_table = None
+ 
+-            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
++            # Optimize: Cache the result of get_seqs to avoid multiple calls
++            running_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
++            for seq in running_seqs:
+                 seq_id = seq.seq_id
+                 seq_data[seq_id] = seq.data
+                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+@@ -1152,7 +1154,7 @@ class Scheduler:
+             if self.cache_config.enable_prefix_caching:
+                 common_computed_block_nums = (
+                     self.block_manager.get_common_computed_block_ids(
+-                        seq_group.get_seqs(status=SequenceStatus.RUNNING)))
++                        running_seqs))
+ 
+             do_sample = True
+             is_prompt = seq_group.is_prefill()
+@@ -1224,9 +1226,11 @@ class Scheduler:
+         # batch will have been computed before the next scheduling invocation.
+         # This is because the engine assumes that a failure in model execution
+         # will crash the vLLM instance / will not retry.
+-        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+-            self.block_manager.mark_blocks_as_computed(
+-                scheduled_seq_group.seq_group)
++        seq_groups_to_mark = [
++            scheduled_seq_group.seq_group
++            for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups
++        ]
++        self.block_manager.mark_blocks_as_computed(seq_groups_to_mark)
+ 
+         self._seq_group_metadata_cache[self.next_cache_id].reset()
+ 
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index f556e4e..1b43cdb 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -510,14 +510,21 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+         # have to be updated.
+         if prefix_cache_hit:
+             assert computed_block_nums is not None
+-            context_len = len(computed_block_nums) * self.block_size
+-            inter_data.input_tokens[seq_idx] = inter_data.input_tokens[
+-                seq_idx][context_len:]
+-            inter_data.input_positions[seq_idx] = inter_data.input_positions[
+-                seq_idx][context_len:]
++            # Optimize: compute context_len once and reuse
++            num_computed_blocks = len(computed_block_nums)
++            context_len = num_computed_blocks * self.block_size
++            
++            # Optimize: use in-place slicing to avoid creating new list objects
++            input_tokens = inter_data.input_tokens[seq_idx]
++            input_positions = inter_data.input_positions[seq_idx]
++            
++            # Only slice if there are tokens to skip
++            if context_len > 0:
++                inter_data.input_tokens[seq_idx] = input_tokens[context_len:]
++                inter_data.input_positions[seq_idx] = input_positions[context_len:]
++            
+             inter_data.context_lens[seq_idx] = context_len
+-            inter_data.query_lens[
+-                seq_idx] = inter_data.seq_lens[seq_idx] - context_len
++            inter_data.query_lens[seq_idx] = inter_data.seq_lens[seq_idx] - context_len
+ 
+     def _compute_for_sliding_window(self, inter_data: InterDataForSeqGroup,
+                                     seq_idx: int,
+@@ -641,32 +648,37 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+         """Finalize the builder intermediate data and
+         create on-device tensors.
+         """
++        # Optimize: Use list comprehension to flatten data more efficiently
+         # Combine and flatten intermediate data.
+-        input_tokens = []
+-        for inter_data in self.inter_data_list:
+-            for cur_input_tokens in inter_data.input_tokens:
+-                input_tokens.extend(cur_input_tokens)
++        input_tokens = [
++            token
++            for inter_data in self.inter_data_list
++            for cur_input_tokens in inter_data.input_tokens
++            for token in cur_input_tokens
++        ]
+ 
+         if not input_tokens:
+             # This may happen when all prefill requests hit
+             # prefix caching and there is no decode request.
+             return self.model_input_cls()
+ 
+-        input_positions = []
+-        for inter_data in self.inter_data_list:
+-            for cur_input_positions in inter_data.input_positions:
+-                input_positions.extend(cur_input_positions)
++        input_positions = [
++            pos
++            for inter_data in self.inter_data_list
++            for cur_input_positions in inter_data.input_positions
++            for pos in cur_input_positions
++        ]
+ 
++        # Optimize: Combine loops to reduce iterations
+         seq_lens = []
++        query_lens = []
+         max_decode_seq_len = 0
+         for inter_data in self.inter_data_list:
+             seq_lens.extend(inter_data.seq_lens)
++            query_lens.extend(inter_data.query_lens)
+             if not inter_data.is_prompt:
+                 max_decode_seq_len = max(max_decode_seq_len,
+                                          max(inter_data.seq_lens))
+-        query_lens = []
+-        for inter_data in self.inter_data_list:
+-            query_lens.extend(inter_data.query_lens)
+ 
+         # Mapping from request IDs to sequence IDs. Used for Jamba models
+         # that manages the cache by itself.

@@ -1,0 +1,200 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1_reasoning_parser.py b/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1_reasoning_parser.py
+index e5ab6e6b2..38b55623c 100644
+--- a/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1_reasoning_parser.py
++++ b/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1_reasoning_parser.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-import re
+ from typing import Optional, Sequence, Tuple, Union
+ 
+ from transformers import PreTrainedTokenizerBase
+@@ -27,9 +26,9 @@ class DeepSeekR1ReasoningParser(ReasoningParser):
+         super().__init__(tokenizer)
+         self.think_start_token = "<think>"
+         self.think_end_token = "</think>"
+-
+-        self.reasoning_regex = re.compile(
+-            rf"{self.think_start_token}(.*?){self.think_end_token}", re.DOTALL)
++        # Cache token lengths to avoid repeated len() calls in hot paths.
++        self._think_start_len = len(self.think_start_token)
++        self._think_end_len = len(self.think_end_token)
+ 
+         if not self.model_tokenizer:
+             raise ValueError(
+@@ -62,23 +61,28 @@ class DeepSeekR1ReasoningParser(ReasoningParser):
+         - 'xyz' goes to content
+         """
+         # Skip single special tokens
+-        if len(delta_token_ids) == 1 and (delta_token_ids[0] in [
+-                self.think_start_token_id, self.think_end_token_id
+-        ]):
++        if (len(delta_token_ids) == 1 and delta_token_ids[0]
++                in (self.think_start_token_id, self.think_end_token_id)):
+             return None
+ 
++        # Precompute membership flags to avoid repeated O(n) scans.
++        has_start_prev = self.think_start_token_id in previous_token_ids
++        has_end_prev = self.think_end_token_id in previous_token_ids
++        has_start_delta = self.think_start_token_id in delta_token_ids
++        has_end_delta = self.think_end_token_id in delta_token_ids
++
+         # Check if <think> is present in previous or delta.
+         # Keep compatibility with models that don't generate <think> tokens.
+-        if self.think_start_token_id in previous_token_ids:
+-            if self.think_end_token_id in delta_token_ids:
++        if has_start_prev:
++            if has_end_delta:
+                 # <think> in previous, </think> in delta,
+                 # extract reasoning content
+                 end_index = delta_text.find(self.think_end_token)
+                 reasoning_content = delta_text[:end_index]
+-                content = delta_text[end_index + len(self.think_end_token):]
++                content = delta_text[end_index + self._think_end_len:]
+                 return DeltaMessage(reasoning_content=reasoning_content,
+                                     content=content if content else None)
+-            elif self.think_end_token_id in previous_token_ids:
++            elif has_end_prev:
+                 # <think> in previous, </think> in previous,
+                 # reasoning content continues
+                 return DeltaMessage(content=delta_text)
+@@ -86,15 +90,14 @@ class DeepSeekR1ReasoningParser(ReasoningParser):
+                 # <think> in previous, no </think> in previous or delta,
+                 # reasoning content continues
+                 return DeltaMessage(reasoning_content=delta_text)
+-        elif self.think_start_token_id in delta_token_ids:
+-            if self.think_end_token_id in delta_token_ids:
++        elif has_start_delta:
++            if has_end_delta:
+                 # <think> in delta, </think> in delta, extract reasoning content
+                 start_index = delta_text.find(self.think_start_token)
+                 end_index = delta_text.find(self.think_end_token)
+                 reasoning_content = delta_text[start_index +
+-                                               len(self.think_start_token
+-                                                   ):end_index]
+-                content = delta_text[end_index + len(self.think_end_token):]
++                                               self._think_start_len:end_index]
++                content = delta_text[end_index + self._think_end_len:]
+                 return DeltaMessage(reasoning_content=reasoning_content,
+                                     content=content if content else None)
+             else:
+@@ -105,15 +108,15 @@ class DeepSeekR1ReasoningParser(ReasoningParser):
+             # No <think> in previous or delta, also need to check for </think>.
+             # Because the model may have generated </think> without <think>
+             # Ref https://huggingface.co/deepseek-ai/DeepSeek-R1/commit/8a58a132790c9935686eb97f042afa8013451c9f
+-            if self.think_end_token_id in delta_token_ids:
++            if has_end_delta:
+                 # </think> in delta with more tokens,
+                 # extract reasoning content and content
+                 end_index = delta_text.find(self.think_end_token)
+                 reasoning_content = delta_text[:end_index]
+-                content = delta_text[end_index + len(self.think_end_token):]
++                content = delta_text[end_index + self._think_end_len:]
+                 return DeltaMessage(reasoning_content=reasoning_content,
+                                     content=content if content else None)
+-            elif self.think_end_token_id in previous_token_ids:
++            elif has_end_prev:
+                 # </think> in previous, thinking content ends
+                 return DeltaMessage(content=delta_text)
+             else:
+@@ -123,25 +126,35 @@ class DeepSeekR1ReasoningParser(ReasoningParser):
+     def extract_reasoning_content(
+             self, model_output: str, request: ChatCompletionRequest
+     ) -> Tuple[Optional[str], Optional[str]]:
++        """
++        Extract reasoning content from the complete model output.
+ 
++        For text "<think>abc</think>xyz":
++        - reasoning_content = "abc"
++        - content = "xyz"
++
++        If the model omits the opening token but includes the closing token
++        ("abc</think>xyz"), treat the text before </think> as reasoning.
++        If no closing token is present, return the whole output as reasoning.
++        """
+         # DeepSeek R1 doesn't generate <think> now.
+         # Thus we assume the reasoning content is always at the start.
+-        # Ref https://huggingface.co/deepseek-ai/DeepSeek-R1/commit/8a58a132790c9935686eb97f042afa8013451c9f
+-        if self.think_end_token not in model_output:
++        # Fast path: no closing token, everything is reasoning.
++        end_pos = model_output.find(self.think_end_token)
++        if end_pos == -1:
+             return model_output, None
+-        else:
+-            # Add a start token if it's missing to keep compatibility.
+-            if self.think_start_token not in model_output:
+-                model_output = f"{self.think_start_token}{model_output}"
+-            # Use a regex to find the reasoning content
+-            reasoning_content = self.reasoning_regex.findall(model_output)[0]
+-
+-            end_index = len(
+-                f"{self.think_start_token}{reasoning_content}{self.think_end_token}"
+-            )
+-            final_output = model_output[end_index:]
+ 
+-            if len(final_output) == 0:
+-                return reasoning_content, None
+-
+-            return reasoning_content, final_output
++        # Find opening token (if present before the closing token).
++        start_pos = model_output.find(self.think_start_token)
++        if start_pos != -1 and start_pos < end_pos:
++            reasoning_content = model_output[start_pos +
++                                             self._think_start_len:end_pos]
++        else:
++            # Missing opening token or appears after </think>:
++            # consider reasoning from the start of the string.
++            reasoning_content = model_output[:end_pos]
++
++        final_output = model_output[end_pos + self._think_end_len:]
++        if not final_output:
++            return reasoning_content, None
++        return reasoning_content, final_output
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
+index 66f9106bd..4bf775347 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=14336,device_name=AMD_Instinct_MI300X.json
+@@ -45,8 +45,8 @@
+     },
+     "16": {
+         "BLOCK_SIZE_M": 16,
+-        "BLOCK_SIZE_N": 16,
+-        "BLOCK_SIZE_K": 256,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 64,
+         "GROUP_SIZE_M": 1,
+         "num_warps": 2,
+         "num_stages": 2,
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
+index ed5b655d8..5a3f415d5 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=3584,device_name=AMD_Instinct_MI300X.json
+@@ -45,8 +45,8 @@
+     },
+     "16": {
+         "BLOCK_SIZE_M": 16,
+-        "BLOCK_SIZE_N": 32,
+-        "BLOCK_SIZE_K": 256,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 1,
+         "num_warps": 2,
+         "num_stages": 2,
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json b/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
+index 822f04e33..aee43f961 100644
+--- a/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
++++ b/vllm/model_executor/layers/fused_moe/configs/E=8,N=7168,device_name=AMD_Instinct_MI300X.json
+@@ -1,8 +1,8 @@
+ {
+     "1": {
+         "BLOCK_SIZE_M": 16,
+-        "BLOCK_SIZE_N": 32,
+-        "BLOCK_SIZE_K": 256,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
+         "GROUP_SIZE_M": 1,
+         "num_warps": 2,
+         "num_stages": 2,

@@ -11,7 +11,7 @@ This document summarizes the setup for rerunning unsuccessful TRAE + Claude Sonn
 
 ## Background
 
-From the evaluation analysis in `perf-agents-bench/eval_results_v2/`:
+From the evaluation analysis in `ISO-Bench/eval_results_v2/`:
 
 - **Total TRAE + Sonnet 4.5 runs:** 261 commits
 - **Successful runs:** 149 (57%)
@@ -59,13 +59,13 @@ With this fix, **we expect many previously failed commits to now succeed**.
 ### Files Created
 
 1. **Commit Lists**
-   - `perf-agents-bench/TRAE_SONNET45_VLLM_UNSUCCESSFUL.txt` (91 commits)
-   - `perf-agents-bench/TRAE_SONNET45_SGLANG_UNSUCCESSFUL.txt` (51 commits)
-   - `perf-agents-bench/TRAE_SONNET45_ALL_UNSUCCESSFUL.txt` (142 commits)
+   - `ISO-Bench/TRAE_SONNET45_VLLM_UNSUCCESSFUL.txt` (91 commits)
+   - `ISO-Bench/TRAE_SONNET45_SGLANG_UNSUCCESSFUL.txt` (51 commits)
+   - `ISO-Bench/TRAE_SONNET45_ALL_UNSUCCESSFUL.txt` (142 commits)
 
 2. **Rerun Plans** (JSON format for bench.cli)
-   - `perf-agents-bench/state/plan_trae_sonnet45_vllm_rerun.json` (91 commits)
-   - `perf-agents-bench/state/plan_trae_sonnet45_sglang_rerun.json` (51 commits)
+   - `ISO-Bench/state/plan_trae_sonnet45_vllm_rerun.json` (91 commits)
+   - `ISO-Bench/state/plan_trae_sonnet45_sglang_rerun.json` (51 commits)
 
 3. **Execution Scripts**
    - `rerun_trae_sonnet45_vllm.sh` - Run vLLM rerun only
@@ -105,7 +105,7 @@ With this fix, **we expect many previously failed commits to now succeed**.
 If you prefer to run manually:
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 
 # vLLM rerun
 .venv/bin/python -m bench.cli prepare tasks/vllm.yaml \
@@ -154,7 +154,7 @@ These require fixing the test environment, not the agent.
 ### View Results
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 
 # Find latest run
 LATEST=$(ls -t state/runs | head -n1)
@@ -166,7 +166,7 @@ LATEST=$(ls -t state/runs | head -n1)
 ### Check Individual Run
 
 ```bash
-cd perf-agents-bench
+cd ISO-Bench
 
 # View journal for a specific commit
 cat state/runs/<run_id>/<item_id>/journal.json
@@ -223,16 +223,16 @@ Based on previous runs with TRAE + Sonnet 4.5:
 ## Files Reference
 
 ### Analysis Files
-- `perf-agents-bench/eval_results_v2/AGENT_FAILURE_ANALYSIS.md`
-- `perf-agents-bench/eval_results_v2/DEEP_ANALYSIS.md`
-- `perf-agents-bench/eval_results_v2/TRAE_BUG_DEEP_DIVE.md`
-- `perf-agents-bench/eval_results_v2/TOOL_RESULTS_BUG_FIX_VERIFICATION.md`
+- `ISO-Bench/eval_results_v2/AGENT_FAILURE_ANALYSIS.md`
+- `ISO-Bench/eval_results_v2/DEEP_ANALYSIS.md`
+- `ISO-Bench/eval_results_v2/TRAE_BUG_DEEP_DIVE.md`
+- `ISO-Bench/eval_results_v2/TOOL_RESULTS_BUG_FIX_VERIFICATION.md`
 
 ### Generated Files
 - `extract_unsuccessful_sonnet45.py` - Extraction script
 - `create_sonnet45_rerun_plans.py` - Plan creation script
 - `TRAE_SONNET45_*_UNSUCCESSFUL.txt` - Commit lists
-- `perf-agents-bench/state/plan_trae_sonnet45_*.json` - Rerun plans
+- `ISO-Bench/state/plan_trae_sonnet45_*.json` - Rerun plans
 - `rerun_trae_sonnet45_*.sh` - Execution scripts
 
 ---
@@ -261,4 +261,4 @@ Edit the plan JSON file and remove the entries you want to skip, then restart th
 For questions or issues, refer to:
 - Main README: `/home/ubuntu/OmniPerf-Bench/README.md`
 - TRAE documentation: `third-party/trae-agent/`
-- Benchmark documentation: `perf-agents-bench/README.md`
+- Benchmark documentation: `ISO-Bench/README.md`

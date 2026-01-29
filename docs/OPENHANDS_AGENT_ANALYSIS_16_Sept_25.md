@@ -23,7 +23,7 @@ This behavior aligns with findings in the GSO (Global Software Optimization) pap
 
 ## Files Modified During Resolution
 
-### 1. `/workspace/OmniPerf-Bench/perf-agents-bench/bench/prepare.py`
+### 1. `/workspace/OmniPerf-Bench/ISO-Bench/bench/prepare.py`
 
 **Multiple iterations of changes:**
 
@@ -53,7 +53,7 @@ This behavior aligns with findings in the GSO (Global Software Optimization) pap
 - **Solution**: Simplified fake user response to: "Continue implementing the optimization changes you think are appropriate. Make the edits you believe will improve performance."
 - **Result**: Agent worked for 22 minutes, took 94 actions, but still no file modifications
 
-### 2. `/workspace/OmniPerf-Bench/perf-agents-bench/bench_test.yaml`
+### 2. `/workspace/OmniPerf-Bench/ISO-Bench/bench_test.yaml`
 
 **Changes:**
 ```yaml
@@ -66,12 +66,12 @@ iterations: 50  # Maximum iterations for the agent - increased to give more time
 
 ### 3. Task Configuration Files Created
 
-#### `/workspace/OmniPerf-Bench/perf-agents-bench/tasks/prefix_caching_optimization.yaml`
+#### `/workspace/OmniPerf-Bench/ISO-Bench/tasks/prefix_caching_optimization.yaml`
 - Created new task configuration for prefix caching optimization
 - Specified target files: `tests/core/block/test_prefix_caching_block.py`, `vllm/core/block/prefix_caching_block.py`, `vllm/core/block_manager_v2.py`
 - Set commit hash: `2deb029d115dadd012ce5ea70487a207cb025493`
 
-#### `/workspace/OmniPerf-Bench/perf-agents-bench/state/prefix_plan.json`
+#### `/workspace/OmniPerf-Bench/ISO-Bench/state/prefix_plan.json`
 - Created execution plan for the prefix caching task
 - Mapped human commit to task execution
 
@@ -111,7 +111,7 @@ In the final run, we observed:
 
 The agent was looking in wrong directory. Actual working directory:
 ```
-/workspace/OmniPerf-Bench/perf-agents-bench/.work/worktrees/prefix_caching_opt/prefix_caching_opt-0000
+/workspace/OmniPerf-Bench/ISO-Bench/.work/worktrees/prefix_caching_opt/prefix_caching_opt-0000
 ```
 
 ### 3. Infrastructure vs Agent Capability

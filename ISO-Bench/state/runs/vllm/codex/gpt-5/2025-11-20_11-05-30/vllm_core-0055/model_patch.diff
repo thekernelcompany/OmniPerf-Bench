@@ -1,0 +1,365 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 49e63c231..24d00cd3b 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -337,10 +337,19 @@ class BlockTable:
+         This is required for the scheduler to determine whether a sequence can
+         continue generation, or if it must be preempted.
+         """
+-
+-        all_token_ids = token_ids + [-1] * num_lookahead_slots
+-        token_blocks = self._chunk_token_blocks_for_append(all_token_ids)
+-        return len(token_blocks)
++        # Number of slots to account for (new tokens + lookahead slots)
++        total_new_slots = len(token_ids) + num_lookahead_slots
++
++        # The first touched block is always the current (possibly partially
++        # filled) block. Even when total_new_slots is 0, we still count touching
++        # the current block for consistency with previous behavior.
++        first_chunk_capacity = self._block_size - (self._num_full_slots %
++                                                   self._block_size)
++        remaining = total_new_slots - first_chunk_capacity
++        if remaining <= 0:
++            return 1
++        # Additional blocks needed beyond the first touched block.
++        return 1 + cdiv(remaining, self._block_size)
+ 
+     def _chunk_token_blocks_for_append(
+             self, token_ids: List[int]) -> List[List[int]]:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23ee..2987dda4e 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -501,7 +501,24 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark blocks as computed, used in prefix caching.
++
++        This operation is designed to be lightweight and incremental. It only
++        updates internal tracking state for active blocks; blocks that have
++        already been moved to the evictor are considered computed implicitly.
++        """
++        if not block_ids:
++            return
++        for block_id in block_ids:
++            if self._block_tracker[block_id].active:
++                self._block_tracker[block_id].computed = True
++            elif block_id in self.evictor:
++                # Already tracked by evictor as a computed, cached block
++                continue
++            else:
++                # Invalid block_id for this allocator
++                raise ValueError(
++                    "Mark block as computed which is not belonged to GPU")
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+diff --git a/vllm/model_executor/layers/rotary_embedding.py b/vllm/model_executor/layers/rotary_embedding.py
+index 3f9573f55..83d1d0a9f 100644
+--- a/vllm/model_executor/layers/rotary_embedding.py
++++ b/vllm/model_executor/layers/rotary_embedding.py
+@@ -82,6 +82,10 @@ class RotaryEmbedding(CustomOp):
+         if not self.use_native2:
+             cache = cache.to(dtype)
+             self.register_buffer("cos_sin_cache", cache, persistent=False)
++            # Cached converted copy to avoid repeated .to() each forward
++            self._cos_sin_cache_converted: Optional[torch.Tensor] = None
++            self._cos_sin_cache_device: Optional[torch.device] = None
++            self._cos_sin_cache_dtype: Optional[torch.dtype] = None
+         else:
+             cos, sin = cache.chunk(2, dim=-1)
+             freqs_cis = cos + 1j * sin
+@@ -107,12 +111,28 @@ class RotaryEmbedding(CustomOp):
+         inv_freq = self._compute_inv_freq(self.base)
+         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+ 
+-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        # Use outer product instead of einsum for efficiency
++        freqs = torch.outer(t, inv_freq)
+         cos = freqs.cos()
+         sin = freqs.sin()
+         cache = torch.cat((cos, sin), dim=-1)
+         return cache
+ 
++    def _get_converted_cos_sin_cache(self, device: torch.device,
++                                      dtype: torch.dtype) -> torch.Tensor:
++        """Return cos/sin cache on the requested device/dtype, caching it."""
++        cached = getattr(self, "_cos_sin_cache_converted", None)
++        if (cached is not None and self._cos_sin_cache_device == device
++                and self._cos_sin_cache_dtype == dtype
++                and cached.device == device and cached.dtype == dtype
++                and cached.shape == self.cos_sin_cache.shape):
++            return cached
++        converted = self.cos_sin_cache.to(device=device, dtype=dtype)
++        self._cos_sin_cache_converted = converted
++        self._cos_sin_cache_device = device
++        self._cos_sin_cache_dtype = dtype
++        return converted
++
+     def forward_native(
+         self,
+         positions: torch.Tensor,
+@@ -120,46 +140,38 @@ class RotaryEmbedding(CustomOp):
+         key: torch.Tensor,
+         offsets: Optional[torch.Tensor] = None,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        """A PyTorch-native implementation equivalent to forward().
+-
+-        This method mimics the implementation of the custom CUDA kernel
+-        used in `forward_cuda()`.
+-        """
+-        query = query.view(*query.shape[:-1], -1, self.head_size)
+-        key = key.view(*key.shape[:-1], -1, self.head_size)
++        """PyTorch-native implementation using complex multiply fast path."""
++        if positions.dim() == 1:
++            batch_size = 1
++            seq_len = positions.shape[0]
++        else:
++            batch_size, seq_len = positions.shape
+ 
+-        query_rot = query[..., :self.rotary_dim]
+-        key_rot = key[..., :self.rotary_dim]
+-        if self.rotary_dim < self.head_size:
+-            query_pass = query[..., self.rotary_dim:]
+-            key_pass = key[..., self.rotary_dim:]
++        if offsets is not None:
++            positions = positions + offsets
+ 
+-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(
+-            positions.device, dtype=query.dtype)
+-        cos_sin = self.cos_sin_cache[torch.add(positions, offsets)
+-                                     if offsets is not None else positions]
++        # Prepare complex rotation factors from cached cos/sin
++        cos_sin_cache = self._get_converted_cos_sin_cache(positions.device,
++                                                          query.dtype)
++        cos_sin = cos_sin_cache.index_select(0, positions.flatten())
+         cos, sin = cos_sin.chunk(2, dim=-1)
+-        if self.is_neox_style:
+-            # NOTE(woosuk): Here we assume that the positions tensor has the
+-            # shape [batch_size, seq_len].
+-            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
+-            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+-        else:
+-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
++        freqs_cis = (cos + 1j * sin).view(batch_size, 1, seq_len, -1)
+ 
+-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
++        # Apply rotation to rotary dims only, keep the pass-through dims
++        query_shape = query.shape
++        query = query.view(batch_size, seq_len, -1, self.head_size)
++        query_rot = query[..., :self.rotary_dim]
++        query_pass = query[..., self.rotary_dim:]
++        query_rot = _apply_rotary_emb(query_rot, freqs_cis)
++        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
++
++        key_shape = key.shape
++        key = key.view(batch_size, seq_len, -1, self.head_size)
++        key_rot = key[..., :self.rotary_dim]
++        key_pass = key[..., self.rotary_dim:]
++        key_rot = _apply_rotary_emb(key_rot, freqs_cis)
++        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+ 
+-        if self.rotary_dim < self.head_size:
+-            query = torch.cat((query_rot, query_pass), dim=-1)
+-            key = torch.cat((key_rot, key_pass), dim=-1)
+-        else:
+-            query = query_rot
+-            key = key_rot
+-        query = query.flatten(-2)
+-        key = key.flatten(-2)
+         return query, key
+ 
+     def forward_native2(
+@@ -207,18 +219,18 @@ class RotaryEmbedding(CustomOp):
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         from vllm import _custom_ops as ops
+ 
+-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
+-                                                   dtype=query.dtype)
++        cos_sin_cache = self._get_converted_cos_sin_cache(positions.device,
++                                                          query.dtype)
+         # ops.rotary_embedding()/batched_rotary_embedding()
+         # are in-place operations that update the query and key tensors.
+         if offsets is not None:
+             ops.batched_rotary_embedding(positions, query, key, self.head_size,
+-                                         self.cos_sin_cache,
++                                         cos_sin_cache,
+                                          self.is_neox_style, self.rotary_dim,
+                                          offsets)
+         else:
+             ops.rotary_embedding(positions, query, key, self.head_size,
+-                                 self.cos_sin_cache, self.is_neox_style)
++                                 cos_sin_cache, self.is_neox_style)
+         return query, key
+ 
+     def forward_xpu(
+@@ -230,18 +242,18 @@ class RotaryEmbedding(CustomOp):
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         from vllm._ipex_ops import ipex_ops as ops
+ 
+-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
+-                                                   dtype=query.dtype)
++        cos_sin_cache = self._get_converted_cos_sin_cache(positions.device,
++                                                          query.dtype)
+         # ops.rotary_embedding()/batched_rotary_embedding()
+         # are in-place operations that update the query and key tensors.
+         if offsets is not None:
+             ops.batched_rotary_embedding(positions, query, key, self.head_size,
+-                                         self.cos_sin_cache,
++                                         cos_sin_cache,
+                                          self.is_neox_style, self.rotary_dim,
+                                          offsets)
+         else:
+             ops.rotary_embedding(positions, query, key, self.head_size,
+-                                 self.cos_sin_cache, self.is_neox_style)
++                                 cos_sin_cache, self.is_neox_style)
+         return query, key
+ 
+     def forward_tpu(
+@@ -324,7 +336,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
+             t = torch.arange(max_len, dtype=torch.float)
+             t = t / scaling_factor
+ 
+-            freqs = torch.einsum("i,j -> ij", t, inv_freq)
++            freqs = torch.outer(t, inv_freq)
+             cos = freqs.cos()
+             sin = freqs.sin()
+             cache = torch.cat((cos, sin), dim=-1)
+@@ -381,7 +393,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
+         inv_freq = self._compute_inv_freq(base)
+         t = torch.arange(max_len, dtype=torch.float)
+ 
+-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        freqs = torch.outer(t, inv_freq)
+         cos = freqs.cos()
+         sin = freqs.sin()
+         cache = torch.cat((cos, sin), dim=-1)
+@@ -483,7 +495,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
+         inv_freq = self._compute_inv_freq(self.scaling_factor)
+         t = torch.arange(self.max_position_embeddings * self.scaling_factor,
+                          dtype=torch.float32)
+-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        freqs = torch.outer(t, inv_freq)
+         cos = (freqs.cos() * self.mscale)
+         sin = (freqs.sin() * self.mscale)
+         cache = torch.cat((cos, sin), dim=-1)
+@@ -574,7 +586,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+     ) -> torch.Tensor:
+         inv_freq = self._compute_inv_freq(rescale_factors)
+         t = torch.arange(max_position_embeddings, dtype=torch.float)
+-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        freqs = torch.outer(t, inv_freq)
+         cos = freqs.cos() * mscale * self.scaling_factor
+         sin = freqs.sin() * mscale * self.scaling_factor
+         cache = torch.cat((cos, sin), dim=-1)
+@@ -591,14 +603,19 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+         key = key.view(*key.shape[:-1], -1, self.head_size)
+ 
+         k = self.original_max_position_embeddings
+-        long_prompt_offset = (torch.any(positions > k).float() *
+-                              torch.full_like(positions, k)).long()
+-        idx = (torch.add(positions, long_prompt_offset)
+-               if long_prompt_offset is not None else positions)
+-        self.long_short_cos_sin_cache: torch.Tensor = (
+-            self.long_short_cos_sin_cache.to(idx.device))
++        # Compute offset as a scalar (0 or k) to avoid materializing full tensor
++        long_prompt_offset = ((positions > k).any().to(positions.dtype) * k)
++        idx = positions + long_prompt_offset
++        # Cache device-converted long/short cache to avoid repeated .to()
++        if not hasattr(self, "_long_short_cache_device"):
++            self._long_short_cache_device = None  # type: ignore[attr-defined]
++            self._long_short_cache_converted = None  # type: ignore[attr-defined]
++        if self._long_short_cache_device is not idx.device:  # type: ignore[attr-defined]
++            self._long_short_cache_converted = self.long_short_cos_sin_cache.to(idx.device)  # type: ignore[attr-defined]
++            self._long_short_cache_device = idx.device  # type: ignore[attr-defined]
++        cache = self._long_short_cache_converted  # type: ignore[attr-defined]
+         idx = torch.add(idx, offsets) if offsets is not None else idx
+-        cos_sin = torch.index_select(self.long_short_cos_sin_cache, 0, idx)
++        cos_sin = torch.index_select(cache, 0, idx)
+ 
+         cos, sin = cos_sin.chunk(2, dim=-1)
+         cos = cos.repeat(1, 2).unsqueeze(-2)
+@@ -675,7 +692,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
+         t = torch.arange(self.max_position_embeddings * self.scaling_factor,
+                          device="cuda",
+                          dtype=torch.float32)
+-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        freqs = torch.outer(t, inv_freq)
+         cos = (freqs.cos() * self.mscale)
+         sin = (freqs.sin() * self.mscale)
+         cache = torch.cat((cos, sin), dim=-1)
+@@ -696,10 +713,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
+             query_pass = query[..., self.rotary_dim:]
+             key_pass = key[..., self.rotary_dim:]
+ 
+-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(
+-            positions.device)
+-        cos_sin = self.cos_sin_cache[torch.add(positions, offsets)
+-                                     if offsets is not None else positions]
++        cos_sin_cache = self._get_converted_cos_sin_cache(positions.device,
++                                                          query.dtype)
++        cos_sin = cos_sin_cache[torch.add(positions, offsets)
++                                if offsets is not None else positions]
+         cos, sin = cos_sin.chunk(2, dim=-1)
+         if self.is_neox_style:
+             # NOTE(woosuk): Here we assume that the positions tensor has the
+diff --git a/vllm/model_executor/models/__init__.py b/vllm/model_executor/models/__init__.py
+index 87508a116..6be55de19 100644
+--- a/vllm/model_executor/models/__init__.py
++++ b/vllm/model_executor/models/__init__.py
+@@ -7,6 +7,10 @@ from vllm.logger import init_logger
+ from vllm.utils import is_hip
+ 
+ logger = init_logger(__name__)
++# Cache for imported modules and model classes to avoid repeated imports
++_IMPORTED_MODULES: Dict[str, object] = {}
++_MODEL_CLASS_CACHE: Dict[str, Optional[Type[nn.Module]]] = {}
++
+ 
+ # Architecture -> (module, class).
+ _GENERATION_MODELS = {
+@@ -114,10 +118,20 @@ class ModelRegistry:
+                     "Model architecture %s is partially supported by ROCm: %s",
+                     model_arch, _ROCM_PARTIALLY_SUPPORTED_MODELS[model_arch])
+ 
++        # Fast path: return from cache if available
++        if model_arch in _MODEL_CLASS_CACHE:
++            return _MODEL_CLASS_CACHE[model_arch]
++
+         module_name, model_cls_name = _MODELS[model_arch]
+-        module = importlib.import_module(
+-            f"vllm.model_executor.models.{module_name}")
+-        return getattr(module, model_cls_name, None)
++        # Import module with caching
++        module = _IMPORTED_MODULES.get(module_name)
++        if module is None:
++            module = importlib.import_module(
++                f"vllm.model_executor.models.{module_name}")
++            _IMPORTED_MODULES[module_name] = module
++        model_cls = getattr(module, model_cls_name, None)
++        _MODEL_CLASS_CACHE[model_arch] = model_cls
++        return model_cls
+ 
+     @staticmethod
+     def get_supported_archs() -> List[str]:
+diff --git a/vllm/utils.py b/vllm/utils.py
+index f3025a68d..4ecc861ae 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -520,7 +520,7 @@ def create_kv_caches_with_random(
+     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+ 
+     scale = head_size**-0.5
+-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
++    x = 16 // get_dtype_size(torch_dtype)
+     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+     key_caches: List[torch.Tensor] = []
+     for _ in range(num_layers):

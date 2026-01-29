@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/perf-agents-bench"
+cd "$SCRIPT_DIR/ISO-Bench"
 
 echo "=== Running Codex SGLang bench harness ==="
 echo "Working directory: $(pwd)"
@@ -27,7 +27,7 @@ source ../bench-env/bin/activate
 # Set environment variables
 export CODEX_CLI="${CODEX_CLI:-codex}"
 export CODEX_PROFILE="${CODEX_PROFILE:-kernel-bot}"
-export HOME="$SCRIPT_DIR/perf-agents-bench/.codex_home"
+export HOME="$SCRIPT_DIR/ISO-Bench/.codex_home"
 
 echo "Codex CLI: $CODEX_CLI"
 echo "Codex Profile: $CODEX_PROFILE"

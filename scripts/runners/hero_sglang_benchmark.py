@@ -3,7 +3,7 @@
 Hero SGLang 3-Way Benchmark Runner
 
 Runs 3-way benchmarks (baseline vs human vs agent) for SGLang commits
-using Claude Code patches from perf-agents-bench.
+using Claude Code patches from ISO-Bench.
 
 Usage:
     python hero_sglang_benchmark.py [--start-from N] [--dry-run]
@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Paths
-CLAUDE_CODE_RUNS_DIR = Path("perf-agents-bench/state/runs/sglang/claude_code")
+CLAUDE_CODE_RUNS_DIR = Path("ISO-Bench/state/runs/sglang/claude_code")
 RESULTS_DIR = Path("omniperf_results_3way_sglang")
 SGLANG_REPO_URL = "https://github.com/sgl-project/sglang.git"
 

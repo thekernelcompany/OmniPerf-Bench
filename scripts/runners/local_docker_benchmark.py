@@ -37,18 +37,18 @@ BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
 BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping.json"
 
 # Agent patches configuration (legacy - single agent)
-AGENT_PATCHES_DIR = ROOT_DIR / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
+AGENT_PATCHES_DIR = ROOT_DIR / "ISO-Bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 
 # Multi-agent configuration - paths to agent patch directories
 AGENT_CONFIGS = {
-    "claude_code": "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
-    "codex_gpt5": "perf-agents-bench/state/runs/vllm/codex/gpt-5",
-    "trae_gpt5": "perf-agents-bench/state/runs/vllm/trae/gpt-5",
-    "trae_sonnet45": "perf-agents-bench/state/runs/vllm/trae/claude-sonnet-45",
+    "claude_code": "ISO-Bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38",
+    "codex_gpt5": "ISO-Bench/state/runs/vllm/codex/gpt-5",
+    "trae_gpt5": "ISO-Bench/state/runs/vllm/trae/gpt-5",
+    "trae_sonnet45": "ISO-Bench/state/runs/vllm/trae/claude-sonnet-45",
     # TRAE specific run paths:
-    "trae_gpt5_0123": "perf-agents-bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
-    "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
+    "trae_gpt5_0123": "ISO-Bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
+    "trae_sonnet45_0123": "ISO-Bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
 }
 
 # Output directories per agent type (archived results)

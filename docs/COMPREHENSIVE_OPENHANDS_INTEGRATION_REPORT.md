@@ -7,7 +7,7 @@ This document provides a complete summary of the OpenHands integration work done
 ## What Was Accomplished
 
 ### 1. System Analysis and Understanding
-- **Analyzed existing systems**: Both the original commit optimization pipeline and the new perf-agents-bench framework
+- **Analyzed existing systems**: Both the original commit optimization pipeline and the new ISO-Bench framework
 - **Verified UV migration**: Confirmed successful migration from `python -m venv` + `pip` to `uv venv` + `uv pip`
 - **Validated environment**: Confirmed `bench-env` virtual environment with Python 3.12.11 and OpenHands 0.56.0
 
@@ -30,33 +30,33 @@ This document provides a complete summary of the OpenHands integration work done
 ## Files Modified
 
 ### Core Infrastructure Files
-1. **`perf-agents-bench/bench/prepare.py`** (463 lines)
+1. **`ISO-Bench/bench/prepare.py`** (463 lines)
    - Added comprehensive logging system
    - Implemented real-time output streaming
    - Fixed workspace configuration
    - Enhanced error handling and debugging
 
-2. **`perf-agents-bench/config/main_openai.toml`** (21 lines)
+2. **`ISO-Bench/config/main_openai.toml`** (21 lines)
    - Configured local runtime
    - Added workspace base configuration
    - Set up OpenAI GPT-5 integration
 
-3. **`perf-agents-bench/bench_test.yaml`** (33 lines)
+3. **`ISO-Bench/bench_test.yaml`** (33 lines)
    - Disabled Docker containers
    - Set Python CLI execution
    - Configured iteration limits and budget
 
 ### Task Configuration Files
-4. **`perf-agents-bench/tasks/moe_align_optimization.yaml`** (58 lines)
+4. **`ISO-Bench/tasks/moe_align_optimization.yaml`** (58 lines)
    - Created specific task for MoE align sum kernels optimization
    - Configured target files from commit data
    - Set optimization constraints and metrics
 
 ### State and Plan Files
-5. **`perf-agents-bench/.work/moe_commits.txt`**
+5. **`ISO-Bench/.work/moe_commits.txt`**
    - Contains commit hash: `0ec82edda59aaf5cf3b07aadf4ecce1aa1131add parent=1`
 
-6. **`perf-agents-bench/state/moe_plan.json`**
+6. **`ISO-Bench/state/moe_plan.json`**
    - Generated execution plan for the MoE optimization task
 
 ## How to Run the System
@@ -64,7 +64,7 @@ This document provides a complete summary of the OpenHands integration work done
 ### Prerequisites
 ```bash
 # Ensure you're in the correct environment
-cd /workspace/OmniPerf-Bench/perf-agents-bench
+cd /workspace/OmniPerf-Bench/ISO-Bench
 source ../bench-env/bin/activate
 
 # Verify OpenHands installation
@@ -182,7 +182,7 @@ The problem is **NOT** infrastructure-related but agent-behavioral:
 
 ### Alternative Approaches
 1. **Use Original System**: The `run_commit_optimization.py` system works and can be used for evaluation
-2. **Hybrid Approach**: Use perf-agents-bench for planning, original system for execution
+2. **Hybrid Approach**: Use ISO-Bench for planning, original system for execution
 3. **Custom Agent**: Implement direct LLM calls without OpenHands wrapper
 
 ### Evaluation Pipeline
@@ -195,7 +195,7 @@ Once agent issues are resolved:
 ## File Structure Created
 
 ```
-perf-agents-bench/
+ISO-Bench/
 ├── bench/prepare.py                    # Enhanced with real-time logging
 ├── config/main_openai.toml            # OpenAI GPT-5 configuration
 ├── bench_test.yaml                    # Test configuration
@@ -238,7 +238,7 @@ Related files:
 3. **Custom prompting**: Add forced file modification examples in prompts
 
 ### Long-term Architecture
-1. **Hybrid approach**: Use perf-agents-bench for orchestration, custom agents for implementation
+1. **Hybrid approach**: Use ISO-Bench for orchestration, custom agents for implementation
 2. **Direct LLM integration**: Bypass OpenHands wrapper for more control
 3. **Multi-stage pipeline**: Separate analysis and implementation phases
 

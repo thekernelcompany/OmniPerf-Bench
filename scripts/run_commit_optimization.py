@@ -4,7 +4,7 @@ Single-commit optimization pipeline using OpenHands and generated performance te
 
 This script demonstrates the core integration between:
 - Your commit metadata and generated performance tests
-- OpenHands optimization via perf-agents-bench patterns  
+- OpenHands optimization via ISO-Bench patterns  
 - Performance evaluation and comparison
 
 Usage:

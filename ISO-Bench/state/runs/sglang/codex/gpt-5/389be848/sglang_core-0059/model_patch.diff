@@ -1,0 +1,66 @@
+diff --git a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+index 100fa57fb..8762e3847 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
++++ b/python/sglang/srt/layers/moe/ep_moe/token_dispatcher.py
+@@ -156,7 +156,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+         num_experts: int,
+         num_max_dispatch_tokens_per_rank: int,
+     ):
+-        topk_idx = topk_idx.to(torch.int64)
++        # Avoid redundant dtype conversion if already int64
++        if topk_idx.dtype is not torch.int64:
++            topk_idx = topk_idx.to(torch.int64)
+         previous_event = Buffer.capture() if self.async_finish else None
+         return hidden_states, topk_idx, topk_weights, num_experts, previous_event
+ 
+@@ -311,7 +313,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+                 BLOCK_SIZE=512,
+             )
+         else:
+-            output = torch.zeros(
++            # For zero tokens, allocate an empty tensor to avoid memset overhead
++            output = torch.empty(
+                 (0, hidden_states.shape[1]),
+                 device=hidden_states.device,
+                 dtype=hidden_states.dtype,
+@@ -363,7 +366,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+         num_experts: int,
+         num_max_dispatch_tokens_per_rank: int,
+     ):
+-        topk_idx = topk_idx.to(torch.int64)
++        # Avoid redundant dtype conversion if already int64
++        if topk_idx.dtype is not torch.int64:
++            topk_idx = topk_idx.to(torch.int64)
+         expected_m = (
+             hidden_states.shape[0]
+             * self.buffer_low_latency.group_size
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 96a13a999..02618920f 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -280,7 +280,8 @@ class ForwardBatch:
+             ).to(device, non_blocking=True)
+ 
+             sum_len = sum(batch.global_num_tokens)
+-            ret.gathered_buffer = torch.zeros(
++            # Preallocate without zero-initialization; downstream ops fully write this buffer
++            ret.gathered_buffer = torch.empty(
+                 (sum_len, model_runner.model_config.hidden_size),
+                 dtype=model_runner.dtype,
+                 device=device,
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index d973f1b88..38da8169b 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -298,9 +298,8 @@ class DeepseekV2MoE(nn.Module):
+         self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+     ) -> torch.Tensor:
+         shared_output = None
+-        topk_idx = torch.full(
+-            (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+-        )
++        # For empty batches, avoid filling memory with a constant; an empty tensor suffices
++        topk_idx = torch.empty((0, self.top_k), dtype=torch.int, device=hidden_states.device)
+         topk_weights = torch.empty(
+             (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+         )

@@ -1,0 +1,204 @@
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index ef3d28c80..cc4d6de37 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -255,10 +255,12 @@ class Qwen2_5_VisionAttention(nn.Module):
+         return q, k, v
+ 
+     def forward(
+-        self,
+-        x: torch.Tensor,
+-        cu_seqlens: torch.Tensor,
+-        rotary_pos_emb: torch.Tensor,
++            self,
++            x: torch.Tensor,
++            cu_seqlens: torch.Tensor,
++            rotary_pos_emb: torch.Tensor,
++            max_seqlen: Optional[int] = None,  # Only used for Flash Attention
++            seqlens: Optional[list[int]] = None,  # Only used for xFormers
+     ) -> torch.Tensor:
+         # [s, b, c] --> [s, b, head * 3 * head_dim]
+         x, _ = self.qkv(x)
+@@ -285,7 +287,8 @@ class Qwen2_5_VisionAttention(nn.Module):
+ 
+             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+ 
+-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
++            if max_seqlen is None:
++                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+             output = flash_attn_varlen_func(q,
+                                             k,
+                                             v,
+@@ -321,7 +324,8 @@ class Qwen2_5_VisionAttention(nn.Module):
+             from xformers import ops as xops
+             from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+ 
+-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
++            if seqlens is None:
++                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+             attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens,
+                                                        kv_seqlen=None,
+                                                        device=q.device)
+@@ -365,10 +369,14 @@ class Qwen2_5_VisionBlock(nn.Module):
+                                      prefix=f"{prefix}.mlp")
+ 
+     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
+-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
++                rotary_pos_emb: torch.Tensor,
++                max_seqlen: Optional[int] = None,
++                seqlens: Optional[list[int]] = None) -> torch.Tensor:
+         x = x + self.attn(self.norm1(x),
+                           cu_seqlens=cu_seqlens,
+-                          rotary_pos_emb=rotary_pos_emb)
++                          rotary_pos_emb=rotary_pos_emb,
++                          max_seqlen=max_seqlen,
++                          seqlens=seqlens)
+         x = x + self.mlp(self.norm2(x))
+         return x
+ 
+@@ -557,7 +565,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
+             pos_ids.append(
+                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+         pos_ids = torch.cat(pos_ids, dim=0)
+-        max_grid_size = grid_thw[:, 1:].max()
++        max_grid_size = int(grid_thw[:, 1:].max().item())
+         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+         return rotary_pos_emb
+@@ -586,14 +594,14 @@ class Qwen2_5_VisionTransformer(nn.Module):
+             index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
+                 grid_t, num_windows_h * num_windows_w, vit_merger_window_size,
+                 vit_merger_window_size)
+-            seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
++            seqlens = (index_padded != -100).sum((2, 3)).reshape(-1)
+             index_padded = index_padded.reshape(-1)
+             index_new = index_padded[index_padded != -100]
+             window_index.append(index_new + window_index_id)
+             cu_seqlens_tmp = seqlens.cumsum(
+                 0) * self.spatial_merge_unit + cu_window_seqlens[-1]
+             cu_window_seqlens.extend(cu_seqlens_tmp.tolist())
+-            window_index_id += (grid_t * llm_grid_h * llm_grid_w).item()
++            window_index_id += int(grid_t * llm_grid_h * llm_grid_w)
+         window_index = torch.cat(window_index, dim=0)
+         return window_index, cu_window_seqlens
+ 
+@@ -631,16 +639,30 @@ class Qwen2_5_VisionTransformer(nn.Module):
+                                                  dim=0, dtype=torch.int32)
+         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+ 
++        # precompute seqlens information to avoid repeated syncs/computation
++        _lens_full = (cu_seqlens[1:] - cu_seqlens[:-1])
++        _max_seqlen_full = _lens_full.max().item()
++        _seqlens_full = _lens_full.tolist()
++        _lens_win = (cu_window_seqlens[1:] - cu_window_seqlens[:-1])
++        _max_seqlen_win = _lens_win.max().item()
++        _seqlens_win = _lens_win.tolist()
++
+         # transformers
+         hidden_states = hidden_states.unsqueeze(1)
+         for layer_num, blk in enumerate(self.blocks):
+             if layer_num in self.fullatt_block_indexes:
+                 cu_seqlens_now = cu_seqlens
++                _max_s = _max_seqlen_full
++                _seqs = _seqlens_full
+             else:
+                 cu_seqlens_now = cu_window_seqlens
++                _max_s = _max_seqlen_win
++                _seqs = _seqlens_win
+             hidden_states = blk(hidden_states,
+                                 cu_seqlens=cu_seqlens_now,
+-                                rotary_pos_emb=rotary_pos_emb)
++                                rotary_pos_emb=rotary_pos_emb,
++                                max_seqlen=_max_s,
++                                seqlens=_seqs)
+ 
+         # For Qwen2.5-VL-3B, float16 will overflow at last block
+         # for long visual tokens sequences.
+diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
+index ac3d154dd..2dae4e5dd 100644
+--- a/vllm/model_executor/models/qwen2_vl.py
++++ b/vllm/model_executor/models/qwen2_vl.py
+@@ -303,10 +303,12 @@ class Qwen2VisionAttention(nn.Module):
+         return q, k, v
+ 
+     def forward(
+-        self,
+-        x: torch.Tensor,
+-        cu_seqlens: torch.Tensor,
+-        rotary_pos_emb: torch.Tensor,
++            self,
++            x: torch.Tensor,
++            cu_seqlens: torch.Tensor,
++            rotary_pos_emb: torch.Tensor,
++            max_seqlen: Optional[int] = None,  # Only used for Flash Attention
++            seqlens: Optional[list[int]] = None,  # Only used for xFormers
+     ) -> torch.Tensor:
+ 
+         # [s, b, c] --> [s, b, 3 * head * head_dim]
+@@ -329,7 +331,8 @@ class Qwen2VisionAttention(nn.Module):
+ 
+             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+ 
+-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
++            if max_seqlen is None:
++                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+             output = flash_attn_varlen_func(q,
+                                             k,
+                                             v,
+@@ -365,7 +368,8 @@ class Qwen2VisionAttention(nn.Module):
+             from xformers import ops as xops
+             from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+ 
+-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
++            if seqlens is None:
++                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+             attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens,
+                                                        kv_seqlen=None,
+                                                        device=q.device)
+@@ -410,10 +414,14 @@ class Qwen2VisionBlock(nn.Module):
+                                   prefix=f"{prefix}.mlp")
+ 
+     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
+-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
++                rotary_pos_emb: torch.Tensor,
++                max_seqlen: Optional[int] = None,
++                seqlens: Optional[list[int]] = None) -> torch.Tensor:
+         x = x + self.attn(self.norm1(x),
+                           cu_seqlens=cu_seqlens,
+-                          rotary_pos_emb=rotary_pos_emb)
++                          rotary_pos_emb=rotary_pos_emb,
++                          max_seqlen=max_seqlen,
++                          seqlens=seqlens)
+         x = x + self.mlp(self.norm2(x))
+         return x
+ 
+@@ -599,7 +607,7 @@ class Qwen2VisionTransformer(nn.Module):
+             pos_ids.append(
+                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+         pos_ids = torch.cat(pos_ids, dim=0)
+-        max_grid_size = grid_thw[:, 1:].max()
++        max_grid_size = int(grid_thw[:, 1:].max().item())
+         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+         return rotary_pos_emb
+@@ -622,10 +630,19 @@ class Qwen2VisionTransformer(nn.Module):
+                                                  dim=0, dtype=torch.int32)
+         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+ 
++        # precompute seqlens and max_seqlen once per forward to avoid syncs
++        _lens = (cu_seqlens[1:] - cu_seqlens[:-1])
++        _max_seqlen = _lens.max().item()
++        _seqlens_list = _lens.tolist()
++
+         # transformers
+         x = x.unsqueeze(1)
+         for blk in self.blocks:
+-            x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
++            x = blk(x,
++                    cu_seqlens=cu_seqlens,
++                    rotary_pos_emb=rotary_pos_emb,
++                    max_seqlen=_max_seqlen,
++                    seqlens=_seqlens_list)
+ 
+         # adapter
+         x = self.merger(x)

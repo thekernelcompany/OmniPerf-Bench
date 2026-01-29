@@ -1,0 +1,203 @@
+diff --git a/tests/core/block/test_block_manager_v2.py b/tests/core/block/test_block_manager_v2.py
+index d0ca09c..34e6620 100644
+--- a/tests/core/block/test_block_manager_v2.py
++++ b/tests/core/block/test_block_manager_v2.py
+@@ -5,7 +5,7 @@ from vllm.core.block.utils import (STR_NOT_IMPL_ENC_DEC_PREFIX_CACHE,
+ from vllm.core.block_manager_v2 import BlockSpaceManagerV2
+ from vllm.core.interfaces import AllocStatus
+ from vllm.sequence import Logprob, SequenceStatus
+-from vllm.utils import chunk_list
++from vllm.utils import cdiv
+ 
+ from ..utils import (create_dummy_prompt, create_seq_group,
+                      create_seq_group_encoder_decoder)
+@@ -248,11 +248,9 @@ def test_append_slots(block_size, prompt_len, num_slots_to_append,
+                            block_manager.get_num_free_gpu_blocks())
+ 
+     # Expect consumed blocks to be new blocks required to support the new slots.
+-    expected_consumed_blocks = len(
+-        chunk_list(
+-            list(
+-                range(prompt_len + num_slots_to_append + num_lookahead_slots)),
+-            block_size)) - len(chunk_list(list(range(prompt_len)), block_size))
++    # Optimized: use cdiv instead of chunk_list for better performance
++    total_tokens = prompt_len + num_slots_to_append + num_lookahead_slots
++    expected_consumed_blocks = cdiv(total_tokens, block_size) - cdiv(prompt_len, block_size)
+     assert num_consumed_blocks == expected_consumed_blocks
+ 
+ 
+diff --git a/tests/core/block/test_cpu_gpu_block_allocator.py b/tests/core/block/test_cpu_gpu_block_allocator.py
+index 15b76d9..dbf237a 100644
+--- a/tests/core/block/test_cpu_gpu_block_allocator.py
++++ b/tests/core/block/test_cpu_gpu_block_allocator.py
+@@ -1,7 +1,7 @@
+ import pytest
+ 
+ from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
+-from vllm.utils import Device, chunk_list
++from vllm.utils import Device
+ 
+ 
+ @pytest.mark.parametrize("num_cpu_blocks", [0, 512])
+@@ -58,10 +58,13 @@ def test_allocate_immutable_block(num_cpu_blocks: int, num_gpu_blocks: int,
+ 
+     unique_token_ids = list(
+         range((num_cpu_blocks + num_gpu_blocks) * block_size))
+-    gpu_token_ids = chunk_list(unique_token_ids[:num_gpu_blocks * block_size],
+-                               block_size)
+-    cpu_token_ids = chunk_list(unique_token_ids[num_gpu_blocks * block_size:],
+-                               block_size)
++    
++    # Optimized: inline chunking to avoid intermediate list allocations
++    gpu_token_ids = [unique_token_ids[i:i + block_size] 
++                     for i in range(0, num_gpu_blocks * block_size, block_size)]
++    cpu_token_ids = [unique_token_ids[i:i + block_size] 
++                     for i in range(num_gpu_blocks * block_size, 
++                                    len(unique_token_ids), block_size)]
+ 
+     assert allocator.get_num_free_blocks(Device.CPU) == num_cpu_blocks
+     assert allocator.get_num_free_blocks(Device.GPU) == num_gpu_blocks
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 49e63c2..daa8f4f 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -262,8 +262,14 @@ class BlockTable:
+ 
+         block_token_ids = []
+         tail_token_ids = []
+-        for cur_token_ids in chunk_list(token_ids, self._block_size):
+-            if len(cur_token_ids) == self._block_size:
++        
++        # Optimized chunking to avoid intermediate list allocations
++        num_tokens = len(token_ids)
++        block_size = self._block_size
++        for i in range(0, num_tokens, block_size):
++            end_idx = min(i + block_size, num_tokens)
++            cur_token_ids = token_ids[i:end_idx]
++            if len(cur_token_ids) == block_size:
+                 block_token_ids.append(cur_token_ids)
+             else:
+                 tail_token_ids.append(cur_token_ids)
+@@ -351,6 +357,12 @@ class BlockTable:
+         """
+         first_chunk_size = self._block_size - (self._num_full_slots %
+                                                self._block_size)
+-        token_blocks = [token_ids[:first_chunk_size]] + chunk_list(
+-            token_ids[first_chunk_size:], self._block_size)
++        token_blocks = [token_ids[:first_chunk_size]]
++        
++        # Optimized chunking to avoid intermediate list allocations
++        remaining = token_ids[first_chunk_size:]
++        block_size = self._block_size
++        for i in range(0, len(remaining), block_size):
++            token_blocks.append(remaining[i:i + block_size])
++        
+         return token_blocks
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23..2a56210 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -828,7 +828,7 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ class ComputedBlocksTracker:
+diff --git a/vllm/model_executor/models/__init__.py b/vllm/model_executor/models/__init__.py
+index 87508a1..6638eef 100644
+--- a/vllm/model_executor/models/__init__.py
++++ b/vllm/model_executor/models/__init__.py
+@@ -81,6 +81,9 @@ _MODELS = {**_GENERATION_MODELS, **_EMBEDDING_MODELS}
+ # out of tree models
+ _OOT_MODELS: Dict[str, Type[nn.Module]] = {}
+ 
++# Cache for loaded model classes
++_MODEL_CLASSES_CACHE: Dict[str, Type[nn.Module]] = {}
++
+ # Models not supported by ROCm.
+ _ROCM_UNSUPPORTED_MODELS: List[str] = []
+ 
+@@ -100,6 +103,10 @@ class ModelRegistry:
+ 
+     @staticmethod
+     def load_model_cls(model_arch: str) -> Optional[Type[nn.Module]]:
++        # Check cache first
++        if model_arch in _MODEL_CLASSES_CACHE:
++            return _MODEL_CLASSES_CACHE[model_arch]
++            
+         if model_arch in _OOT_MODELS:
+             return _OOT_MODELS[model_arch]
+         if model_arch not in _MODELS:
+@@ -117,7 +124,13 @@ class ModelRegistry:
+         module_name, model_cls_name = _MODELS[model_arch]
+         module = importlib.import_module(
+             f"vllm.model_executor.models.{module_name}")
+-        return getattr(module, model_cls_name, None)
++        model_cls = getattr(module, model_cls_name, None)
++        
++        # Cache the result
++        if model_cls is not None:
++            _MODEL_CLASSES_CACHE[model_arch] = model_cls
++        
++        return model_cls
+ 
+     @staticmethod
+     def get_supported_archs() -> List[str]:
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 1cebf68..b69082e 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -127,6 +127,9 @@ class SequenceData:
+         # The number of tokens that are computed (that run against the model).
+         self._num_computed_tokens = 0
+         self._stage: SequenceStage = SequenceStage.PREFILL
++        
++        # Cache lengths for performance
++        self._cached_len = len(self._prompt_token_ids) + len(self._output_token_ids)
+ 
+         self._update_cached_all_tokens()
+ 
+@@ -142,6 +145,7 @@ class SequenceData:
+     def prompt_token_ids(self, new_prompt_token_ids) -> None:
+         self._prompt_token_ids = list(new_prompt_token_ids)
+         self._prompt_token_ids_tuple = tuple(new_prompt_token_ids)
++        self._cached_len = len(self._prompt_token_ids) + len(self._output_token_ids)
+         self._update_cached_all_tokens()
+ 
+     @property
+@@ -151,15 +155,17 @@ class SequenceData:
+     @output_token_ids.setter
+     def output_token_ids(self, new_output_token_ids) -> None:
+         self._output_token_ids = list(new_output_token_ids)
++        self._cached_len = len(self._prompt_token_ids) + len(self._output_token_ids)
+         self._update_cached_all_tokens()
+ 
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self._output_token_ids.append(token_id)
+         self._cached_all_token_ids.append(token_id)
++        self._cached_len += 1
+         self.cumulative_logprob += logprob
+ 
+     def get_len(self) -> int:
+-        return len(self._output_token_ids) + len(self._prompt_token_ids)
++        return self._cached_len
+ 
+     def get_prompt_len(self) -> int:
+         return len(self._prompt_token_ids)
+diff --git a/vllm/utils.py b/vllm/utils.py
+index f3025a6..28202ea 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -422,7 +422,8 @@ def chunk_list(lst: List[T], chunk_size: int) -> List[List[T]]:
+ 
+ def cdiv(a: int, b: int) -> int:
+     """Ceiling division."""
+-    return -(a // -b)
++    # Optimized ceiling division
++    return (a + b - 1) // b
+ 
+ 
+ def _generate_random_fp8(

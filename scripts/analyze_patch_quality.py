@@ -80,13 +80,13 @@ def find_agent_patch(commit: str, agent: str) -> Optional[Path]:
     # Search patterns by agent
     search_paths = {
         "claude-code": [
-            base_path / "perf-agents-bench/state/runs/vllm/claude_code",
+            base_path / "ISO-Bench/state/runs/vllm/claude_code",
         ],
         "codex": [
-            base_path / "perf-agents-bench/state/runs/vllm/codex",
+            base_path / "ISO-Bench/state/runs/vllm/codex",
         ],
         "trae": [
-            base_path / "perf-agents-bench/state/runs/vllm/trae",
+            base_path / "ISO-Bench/state/runs/vllm/trae",
             base_path / "trae_gpt5_hf_trajectories/vllm" / commit,
         ]
     }

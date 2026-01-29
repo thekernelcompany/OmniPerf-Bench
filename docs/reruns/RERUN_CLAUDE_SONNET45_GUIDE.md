@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from collections import defaultdict
 
-runs_dir = Path("perf-agents-bench/state/runs")
+runs_dir = Path("ISO-Bench/state/runs")
 commits_by_repo = defaultdict(set)
 commit_to_pre = {}
 commit_to_item = {}
@@ -55,7 +55,7 @@ print(f"\nFound commits by repository:")
 for repo, commits in sorted(commits_by_repo.items()):
     print(f"  {repo}: {len(commits)} commits")
 
-output_dir = Path("perf-agents-bench/state")
+output_dir = Path("ISO-Bench/state")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 for repo in sorted(commits_by_repo.keys()):
@@ -93,8 +93,8 @@ EOF
 ```
 
 This will create:
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_vllm.json`
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_sglang.json`
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_vllm.json`
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_sglang.json`
 
 ---
 
@@ -153,7 +153,7 @@ export AWS_REGION=us-east-1
 ### For vLLM Repository
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -167,7 +167,7 @@ python -m bench.cli prepare \
 ### For SGLang Repository
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -190,7 +190,7 @@ cat > /home/ubuntu/OmniPerf-Bench/run_claude_sonnet45_rerun_vllm.sh << 'SCRIPT'
 #!/bin/bash
 set -e
 
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 export TRAE_PYTHON=/home/ubuntu/OmniPerf-Bench/bench-env/bin/python
@@ -226,7 +226,7 @@ echo "Logs: tail -f $LOG_FILE"
 ### Check Status
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Count successes and errors
 grep -c "Task status determined as: success" pipeline_run_*.log 2>/dev/null || echo "0"

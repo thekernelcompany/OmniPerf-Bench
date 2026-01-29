@@ -1,7 +1,7 @@
 # OmniPerf-Bench TRAE Pipeline Status Analysis
 
 **Generated:** November 7, 2025  
-**Analysis Period:** All runs in `perf-agents-bench/state/`
+**Analysis Period:** All runs in `ISO-Bench/state/`
 
 ---
 
@@ -185,7 +185,7 @@ cat third-party/trae-agent/trae_config.yaml | grep parallel_tool_calls
 # Should show: parallel_tool_calls: false
 
 # 2. Create filtered plan for remaining commits
-cd perf-agents-bench
+cd ISO-Bench
 python3 << 'EOF'
 import json
 from pathlib import Path
@@ -284,7 +284,7 @@ With fix (expected):
 
 2. **Create Audit of Completed Work**
    ```bash
-   cd perf-agents-bench
+   cd ISO-Bench
    python3 << 'EOF'
    import json
    from pathlib import Path
@@ -370,6 +370,6 @@ The TRAE pipeline has demonstrated **strong resilience** by achieving 95.8% comp
 ---
 
 **Report Location:** `/home/ubuntu/OmniPerf-Bench/docs/PIPELINE_STATUS_ANALYSIS.md`  
-**Supporting Data:** `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/state/`  
+**Supporting Data:** `/home/ubuntu/OmniPerf-Bench/ISO-Bench/state/`  
 **Configuration:** `/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml`
 

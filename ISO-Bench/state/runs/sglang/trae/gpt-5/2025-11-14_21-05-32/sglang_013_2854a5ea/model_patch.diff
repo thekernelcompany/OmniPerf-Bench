@@ -1,0 +1,98 @@
+diff --git a/python/sglang/bench_latency.py b/python/sglang/bench_latency.py
+index 7a03e162f..ac6b1fb6f 100644
+--- a/python/sglang/bench_latency.py
++++ b/python/sglang/bench_latency.py
+@@ -260,7 +260,7 @@ def correctness_test(
+ 
+     # Decode
+     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
+-    for _ in range(bench_args.output_len[0]):
++    for _ in range(bench_args.output_len[0] - 1):
+         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+         for i in range(len(reqs)):
+             output_ids[i].append(next_token_ids[i])
+@@ -311,7 +311,7 @@ def latency_test_run_once(
+ 
+     # Decode
+     decode_latencies = []
+-    for i in range(output_len):
++    for i in range(output_len - 1):
+         torch.cuda.synchronize()
+         tic = time.time()
+         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 2ab041726..2d36983a3 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -681,7 +681,9 @@ class ScheduleBatch:
+                 for r in self.reqs
+             ]
+         else:
+-            self.sampling_info.penalizer_orchestrator.cumulate_input_tokens(input_ids)
++            orchestrator = self.sampling_info.penalizer_orchestrator
++            if any(p.is_prepared() for p in orchestrator.penalizers.values()):
++                orchestrator.cumulate_input_tokens(input_ids)
+ 
+         self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+         self.seq_lens.add_(1)
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index fe9afc9f3..5e18e7b8a 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -560,9 +560,11 @@ class ModelTpServer:
+                 logits_output = self.model_runner.forward(batch)
+                 next_token_ids = self.model_runner.sample(logits_output, batch)
+ 
+-                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+-                    next_token_ids
+-                )
++                orchestrator = batch.sampling_info.penalizer_orchestrator
++                if any(p.is_prepared() for p in orchestrator.penalizers.values()):
++                    orchestrator.cumulate_output_tokens(
++                        next_token_ids
++                    )
+ 
+                 # Move logprobs to cpu
+                 if logits_output.next_token_logprobs is not None:
+@@ -752,9 +754,11 @@ class ModelTpServer:
+         # Forward and sample the next tokens
+         logits_output = self.model_runner.forward(batch)
+         next_token_ids = self.model_runner.sample(logits_output, batch)
+-        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+-            next_token_ids
+-        )
++        orchestrator = batch.sampling_info.penalizer_orchestrator
++        if any(p.is_prepared() for p in orchestrator.penalizers.values()):
++            orchestrator.cumulate_output_tokens(
++                next_token_ids
++            )
+ 
+         # Move logprobs to cpu
+         if logits_output.next_token_logprobs is not None:
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 4815fbc56..7406964a6 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -140,7 +140,8 @@ class InputMetadata:
+     def compute_extend_infos(self, batch: ScheduleBatch):
+         self.extend_seq_lens = torch.tensor(batch.extend_lens_cpu, device="cuda")
+         self.extend_prefix_lens = torch.tensor(batch.prefix_lens_cpu, device="cuda")
+-        self.extend_start_loc = torch.zeros_like(self.extend_seq_lens)
++        self.extend_start_loc = torch.empty_like(self.extend_seq_lens)
++        self.extend_start_loc[0] = 0
+         self.extend_start_loc[1:] = torch.cumsum(self.extend_seq_lens[:-1], dim=0)
+         self.extend_no_prefix = all(x == 0 for x in batch.prefix_lens_cpu)
+         self.extend_seq_lens_cpu = batch.extend_lens_cpu
+diff --git a/scripts/playground/reference_hf.py b/scripts/playground/reference_hf.py
+index 1eb7b0dd2..9af7cb66c 100644
+--- a/scripts/playground/reference_hf.py
++++ b/scripts/playground/reference_hf.py
+@@ -81,7 +81,7 @@ def synthetic_tokens(args):
+ 
+     for p in prompts:
+         input_ids = p
+-        for i in range(output_len + 1):
++        for i in range(output_len):
+             prefill_logits = m.forward(torch.tensor([input_ids], device="cuda")).logits[
+                 0
+             ][-1]

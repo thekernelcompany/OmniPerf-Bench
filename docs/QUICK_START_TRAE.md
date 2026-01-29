@@ -22,7 +22,7 @@ export OPENAI_API_KEY="your-openai-api-key-here"
 ```bash
 # Activate environment
 source bench-env/bin/activate
-cd perf-agents-bench
+cd ISO-Bench
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 # Run TRAE agent on chunked local attention task

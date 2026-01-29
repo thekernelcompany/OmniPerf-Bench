@@ -16,7 +16,7 @@ REPO_ID = f"{HF_ORG}/{DATASET_NAME}"
 def collect_trajectory_data():
     """Collect all trajectory data from rerun results."""
     
-    base_path = Path("perf-agents-bench/state/runs")
+    base_path = Path("ISO-Bench/state/runs")
     
     # vLLM results
     vllm_path = base_path / "vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0"
@@ -65,7 +65,7 @@ def collect_trajectory_data():
                                      "run_summary.json", "task.txt", "prediction.jsonl"]:
                         file_path = commit_dir / file_name
                         if file_path.exists():
-                            entry["files"][file_name] = str(file_path.relative_to("perf-agents-bench/state/runs"))
+                            entry["files"][file_name] = str(file_path.relative_to("ISO-Bench/state/runs"))
                             stats["vllm"]["files"] += 1
                     
                     data["vllm"].append(entry)
@@ -106,7 +106,7 @@ def collect_trajectory_data():
                                      "run_summary.json", "task.txt", "prediction.jsonl"]:
                         file_path = commit_dir / file_name
                         if file_path.exists():
-                            entry["files"][file_name] = str(file_path.relative_to("perf-agents-bench/state/runs"))
+                            entry["files"][file_name] = str(file_path.relative_to("ISO-Bench/state/runs"))
                             stats["sglang"]["files"] += 1
                     
                     data["sglang"].append(entry)
@@ -329,7 +329,7 @@ def main():
     
     # Copy trajectory files
     print("\nCopying trajectory files...")
-    base_runs = Path("perf-agents-bench/state/runs")
+    base_runs = Path("ISO-Bench/state/runs")
     
     for repo in ["vllm", "sglang"]:
         if data[repo]:  # Only process if we have data

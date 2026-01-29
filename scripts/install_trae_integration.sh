@@ -32,7 +32,7 @@ print_error() {
 }
 
 # Check if we're in the right directory
-if [ ! -f "perf-agents-bench/bench_test.yaml" ]; then
+if [ ! -f "ISO-Bench/bench_test.yaml" ]; then
     print_error "Please run this script from the OmniPerf-Bench root directory"
     exit 1
 fi
@@ -183,7 +183,7 @@ else
 fi
 
 # Check bench config
-BENCH_CONFIG="perf-agents-bench/bench_test.yaml"
+BENCH_CONFIG="ISO-Bench/bench_test.yaml"
 if [ -f "$BENCH_CONFIG" ]; then
     # Check if config file path is correct
     CURRENT_PATH=$(pwd)
@@ -225,7 +225,7 @@ fi
 
 # Run a quick test
 print_status "Running integration test..."
-cd perf-agents-bench
+cd ISO-Bench
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 if python -m bench.cli doctor --bench-cfg bench_test.yaml >/dev/null 2>&1; then
@@ -242,7 +242,7 @@ echo "1. Set your OpenAI API key if not already done:"
 echo "   export OPENAI_API_KEY='your-api-key-here'"
 echo
 echo "2. Test the integration:"
-echo "   cd perf-agents-bench"
+echo "   cd ISO-Bench"
 echo "   source ../bench-env/bin/activate"
 echo "   export PYTHONPATH=\$(pwd):\$PYTHONPATH"
 echo "   python -m bench.cli prepare tasks/your_task.yaml --from-plan ./state/your_plan.json --bench-cfg bench_test.yaml --max-workers 1"

@@ -1,0 +1,161 @@
+diff --git a/python/sglang/bench_serving.py b/python/sglang/bench_serving.py
+index 04c2202..bd579cf 100644
+--- a/python/sglang/bench_serving.py
++++ b/python/sglang/bench_serving.py
+@@ -138,6 +138,7 @@ async def async_request_trt_llm(
+         ttft = 0.0
+         st = time.perf_counter()
+         most_recent_timestamp = st
++        generated_text_parts = []
+         try:
+             async with session.post(url=api_url, json=payload) as response:
+                 if response.status == 200:
+@@ -149,7 +150,7 @@ async def async_request_trt_llm(
+                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data:")
+ 
+                         data = json.loads(chunk)
+-                        output.generated_text += data["text_output"]
++                        generated_text_parts.append(data["text_output"])
+                         timestamp = time.perf_counter()
+                         # First token
+                         if ttft == 0.0:
+@@ -162,6 +163,7 @@ async def async_request_trt_llm(
+ 
+                         most_recent_timestamp = timestamp
+ 
++                    output.generated_text = "".join(generated_text_parts)
+                     output.latency = most_recent_timestamp - st
+                     output.success = True
+                     output.output_len = request_func_input.output_len
+@@ -206,7 +208,7 @@ async def async_request_openai_completions(
+ 
+         output = RequestFuncOutput.init_new(request_func_input)
+ 
+-        generated_text = ""
++        generated_text_parts = []
+         output_len = request_func_input.output_len
+         ttft = 0.0
+         st = time.perf_counter()
+@@ -231,7 +233,9 @@ async def async_request_openai_completions(
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+-                            if data["choices"][0]["text"]:
++                            choice = data["choices"][0]
++                            text = choice["text"]
++                            if text:
+                                 timestamp = time.perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+@@ -243,12 +247,12 @@ async def async_request_openai_completions(
+                                     output.itl.append(timestamp - most_recent_timestamp)
+ 
+                                 most_recent_timestamp = timestamp
+-                                generated_text += data["choices"][0]["text"]
++                                generated_text_parts.append(text)
+                                 output_len = (data.get("usage") or {}).get(
+                                     "completion_tokens", output_len
+                                 )
+ 
+-                    output.generated_text = generated_text
++                    output.generated_text = "".join(generated_text_parts)
+                     output.success = True
+                     output.latency = latency
+                     output.output_len = output_len
+@@ -317,7 +321,7 @@ async def async_request_openai_chat_completions(
+ 
+         output = RequestFuncOutput.init_new(request_func_input)
+ 
+-        generated_text = ""
++        generated_text_parts = []
+         output_len = request_func_input.output_len
+         ttft = 0.0
+         st = time.perf_counter()
+@@ -373,14 +377,14 @@ async def async_request_openai_chat_completions(
+                                         )
+ 
+                                     most_recent_timestamp = timestamp
+-                                    generated_text += content
++                                    generated_text_parts.append(content)
+ 
+                                 # Check for usage info in final chunk
+                                 output_len = (data.get("usage") or {}).get(
+                                     "completion_tokens", output_len
+                                 )
+ 
+-                        output.generated_text = generated_text
++                        output.generated_text = "".join(generated_text_parts)
+                         output.success = True
+                         output.latency = latency
+                         output.output_len = output_len
+@@ -420,7 +424,7 @@ async def async_request_truss(
+ 
+         output = RequestFuncOutput.init_new(request_func_input)
+ 
+-        generated_text = ""
++        generated_text_parts = []
+         ttft = 0.0
+         st = time.perf_counter()
+         most_recent_timestamp = st
+@@ -444,7 +448,9 @@ async def async_request_truss(
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+                             # want to check a token was generated
+-                            if data["choices"][0]["text"]:
++                            choice = data["choices"][0]
++                            text = choice["text"]
++                            if text:
+                                 timestamp = time.perf_counter()
+                                 # First token
+                                 if ttft == 0.0:
+@@ -456,9 +462,9 @@ async def async_request_truss(
+                                     output.itl.append(timestamp - most_recent_timestamp)
+ 
+                                 most_recent_timestamp = timestamp
+-                                generated_text += data["choices"][0]["text"]
++                                generated_text_parts.append(text)
+ 
+-                    output.generated_text = generated_text
++                    output.generated_text = "".join(generated_text_parts)
+                     output.success = True
+                     output.latency = latency
+                     output.output_len = request_func_input.output_len
+diff --git a/python/sglang/srt/entrypoints/http_server_engine.py b/python/sglang/srt/entrypoints/http_server_engine.py
+index b2edf1a..2ea2b59 100644
+--- a/python/sglang/srt/entrypoints/http_server_engine.py
++++ b/python/sglang/srt/entrypoints/http_server_engine.py
+@@ -25,15 +25,16 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+     base_url = server_args.url()
+     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
+     start_time = time.perf_counter()
++    health_url = f"{base_url}/health_generate"
++    headers = {
++        "Content-Type": "application/json; charset=utf-8",
++        "Authorization": f"Bearer {server_args.api_key}",
++    }
+ 
+     with requests.Session() as session:
+         while time.perf_counter() - start_time < timeout:
+             try:
+-                headers = {
+-                    "Content-Type": "application/json; charset=utf-8",
+-                    "Authorization": f"Bearer {server_args.api_key}",
+-                }
+-                response = session.get(f"{base_url}/health_generate", headers=headers)
++                response = session.get(health_url, headers=headers)
+                 if response.status_code == 200:
+                     return p
+             except requests.RequestException:
+diff --git a/python/sglang/srt/utils.py b/python/sglang/srt/utils.py
+index 052e732..8635113 100644
+--- a/python/sglang/srt/utils.py
++++ b/python/sglang/srt/utils.py
+@@ -2354,7 +2354,7 @@ def is_fa3_default_architecture(hf_config):
+ # Can be more general if it is used in multiple places (keep it simple and thus not general now)
+ class BumpAllocator:
+     def __init__(self, buffer_size: int, dtype, device):
+-        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
++        self._buffer = torch.empty((buffer_size,), dtype=dtype, device=device)
+         self._pointer = 0
+ 
+     def allocate(self, size: int):

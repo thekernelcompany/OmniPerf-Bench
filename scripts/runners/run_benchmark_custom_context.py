@@ -20,7 +20,7 @@ BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
 RESULTS_DIR = ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping_complete.json"
-AGENT_PATCHES_DIR = ROOT_DIR / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
+AGENT_PATCHES_DIR = ROOT_DIR / "ISO-Bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 
 
 def get_hf_token() -> str:

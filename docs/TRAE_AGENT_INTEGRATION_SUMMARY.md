@@ -7,7 +7,7 @@ This document summarizes the successful integration of TRAE Agent into the OmniP
 ## What We Started With
 
 ### Initial State
-- **Working OpenHands Integration**: The perf-agents-bench pipeline had a functional OpenHands integration with real-time logging
+- **Working OpenHands Integration**: The ISO-Bench pipeline had a functional OpenHands integration with real-time logging
 - **TRAE Agent Basic Setup**: TRAE agent was partially integrated but had several critical bugs
 - **Test Task**: Chunked local attention optimization task (commit `8aa1485fcff7be3e42300c0615ee0f3f3cbce9a8`)
 
@@ -70,7 +70,7 @@ OpenAI API call failed: Error code: 400 - {'error': {'message': "An assistant me
 
 ## Files We Changed
 
-### 1. `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/bench/prepare.py`
+### 1. `/home/ubuntu/OmniPerf-Bench/ISO-Bench/bench/prepare.py`
 **Major Changes**:
 - **Fixed file change detection** for TRAE agent using `git diff --name-only` instead of patch parsing
 - **Added real-time logging** using `subprocess.Popen` with `select()` streaming (same as OpenHands)
@@ -84,7 +84,7 @@ OpenAI API call failed: Error code: 400 - {'error': {'message': "An assistant me
 - Patch file handling (lines ~935-952)
 - Success/failure determination (lines ~894-901)
 
-### 2. `/home/ubuntu/OmniPerf-Bench/perf-agents-bench/bench_test.yaml`
+### 2. `/home/ubuntu/OmniPerf-Bench/ISO-Bench/bench_test.yaml`
 **Change**: Fixed config file path from `/workspace/OmniPerf-Bench/...` to `/home/ubuntu/OmniPerf-Bench/...`
 
 ## Where We Are Right Now

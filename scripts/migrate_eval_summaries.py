@@ -158,13 +158,13 @@ def main():
     parser.add_argument(
         "--eval-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "perf-agents-bench" / "eval_results_v2",
+        default=Path(__file__).resolve().parents[1] / "ISO-Bench" / "eval_results_v2",
         help="Path to eval_results directory",
     )
     parser.add_argument(
         "--state-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "perf-agents-bench" / "state" / "runs",
+        default=Path(__file__).resolve().parents[1] / "ISO-Bench" / "state" / "runs",
         help="Path to state/runs directory",
     )
     parser.add_argument(

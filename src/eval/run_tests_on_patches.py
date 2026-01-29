@@ -121,7 +121,7 @@ class TestRunner:
 
         Args:
             repo_path: Path to the main repository (vllm)
-            state_root: Path to perf-agents-bench/state directory
+            state_root: Path to ISO-Bench/state directory
             output_dir: Directory to write evaluation results
             test_index: Pre-loaded commit->script index
             timeout: Timeout in seconds for each test execution
@@ -932,7 +932,7 @@ if __name__ == "__main__":
     # Example usage
     runner = TestRunner(
         repo_path=ROOT_DIR / "vllm",
-        state_root=ROOT_DIR / "perf-agents-bench/state",
+        state_root=ROOT_DIR / "ISO-Bench/state",
         output_dir=ROOT_DIR / "eval_results",
     )
 

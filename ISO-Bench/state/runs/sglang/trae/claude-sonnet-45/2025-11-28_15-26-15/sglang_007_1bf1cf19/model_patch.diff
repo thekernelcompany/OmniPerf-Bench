@@ -1,0 +1,83 @@
+diff --git a/python/sglang/lang/interpreter.py b/python/sglang/lang/interpreter.py
+index 00691ca50..8c5c9c5e3 100644
+--- a/python/sglang/lang/interpreter.py
++++ b/python/sglang/lang/interpreter.py
+@@ -256,9 +256,15 @@ class StreamExecutor:
+         ret = self.meta_info.get(name, None)
+         return ret
+ 
+-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
+-        self.submit(SglCommitLazy())
+-        self.sync()
++    def fork(
++        self,
++        number: int,
++        position_ids_offset: Optional[List[int]] = None,
++        copy: bool = False,
++    ):
++        if int(number) > 1 or copy:
++            self.submit(SglCommitLazy())
++            self.sync()
+ 
+         number = int(number)
+ 
+@@ -269,6 +275,7 @@ class StreamExecutor:
+                 self.default_sampling_para,
+                 self.chat_template,
+                 self.stream,
++                use_thread=self.use_thread,
+             )
+             for _ in range(number)
+         ]
+@@ -641,15 +648,15 @@ class ProgramState:
+         yield
+         self.stream_executor.submit(SglVarScopeEnd(name))
+ 
+-    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
+-        stream_executors = self.stream_executor.fork(number, position_ids_offset)
++    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None, copy: bool = False):
++        stream_executors = self.stream_executor.fork(number, position_ids_offset, copy)
+         states = [ProgramState(x) for x in stream_executors]
+         state_group = ProgramStateGroup(states, self)
+         return state_group
+ 
+     @contextmanager
+     def copy(self, position_ids_offset: Optional[List[int]] = None):
+-        state_group = self.fork(1, position_ids_offset)
++        state_group = self.fork(1, position_ids_offset, copy=True)
+         try:
+             yield state_group[0]
+         finally:
+diff --git a/python/sglang/srt/managers/router/radix_cache.py b/python/sglang/srt/managers/router/radix_cache.py
+index 7bb8a4b2a..3f6bbf4b7 100644
+--- a/python/sglang/srt/managers/router/radix_cache.py
++++ b/python/sglang/srt/managers/router/radix_cache.py
+@@ -120,7 +120,7 @@ class RadixCache:
+         if len(key) == 0:
+             return
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+             if prefix_len < len(child.key):
+@@ -151,7 +151,7 @@ class RadixCache:
+         if len(key) == 0:
+             return 0
+ 
+-        if key[0] in node.children.keys():
++        if key[0] in node.children:
+             child = node.children[key[0]]
+             prefix_len = match(child.key, key)
+ 
+@@ -183,9 +183,7 @@ class RadixCache:
+             self._print_helper(child, indent=indent + 2)
+ 
+     def _delete_leaf(self, node):
+-        for k, v in node.parent.children.items():
+-            if v == node:
+-                break
++        k = node.key[0]
+         del node.parent.children[k]
+         self.evictable_size_ -= len(node.key)
+ 

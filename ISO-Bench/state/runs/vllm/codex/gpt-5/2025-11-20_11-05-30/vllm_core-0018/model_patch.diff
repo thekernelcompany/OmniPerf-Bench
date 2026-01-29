@@ -1,0 +1,170 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74e4..b049276f5 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -72,6 +72,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             allocator=self,
+         )
+ 
++        # Stats for cache efficiency (lightweight; helps benchmarking)
++        self._cache_hits: int = 0
++        self._cache_lookups: int = 0
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -111,26 +115,65 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        block = self._create_block(
+-            prev_block=prev_block,
+-            token_ids=token_ids,
+-            block_size=self._block_size,
+-            allocator=self,
+-        )
+-        assert block.content_hash is not None
++        # Fast-path: if we can compute a content hash for this block without
++        # building a temporary Block, check the cache first to avoid extra
++        # allocations. We can compute the hash only when this block is full and
++        # either it's the first block or the previous block already has a hash.
++        cached_block_id: Optional[int] = None
++        content_hash: Optional[int] = None
++        if len(token_ids) == self._block_size:
++            is_first_block = prev_block is None
++            prev_block_hash = (None if is_first_block else
++                               prev_block.content_hash  # type: ignore
++                               )
++            if is_first_block or prev_block_hash is not None:
++                content_hash = PrefixCachingBlock.hash_block_tokens(
++                    is_first_block,
++                    prev_block_hash,
++                    cur_block_token_ids=token_ids,
++                )
++                self._cache_lookups += 1
++                cached_block_id = self._cached_blocks.get(content_hash)
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+         if cached_block_id is not None:
++            # Cache hit: create the logical block once, bind to cached id, and
++            # bump refcount. Avoids a miss-then-recreate path.
++            block = self._create_block(
++                prev_block=prev_block,
++                token_ids=token_ids,
++                block_size=self._block_size,
++                allocator=self,
++            )
+             block.block_id = cached_block_id
++            # Cache the hash locally to avoid recomputing later.
++            if content_hash is not None:
++                assert isinstance(block, PrefixCachingBlock)
++                block._cached_content_hash = content_hash  # type: ignore[attr-defined]
++            self._cache_hits += 1
+             self._incr_refcount_cached_block(block, block.block_id)
+             return block
+ 
++        # Cache miss or hash unavailable: allocate a mutable block once and
++        # append token ids.
+         block = self.allocate_mutable(prev_block)
+         block.append_token_ids(token_ids)
+         assert block.content_hash is not None
+ 
+         return block
+ 
++    def get_prefix_cache_hit_rate(self) -> float:
++        lookups = self._cache_lookups
++        if lookups == 0:
++            return 0.0
++        return self._cache_hits / lookups
++
++    # Backwards-compatible helper for older user code/tests
++    def allocate_immutable_block(self,
++                                 prev_block: Optional[Block],
++                                 token_ids: List[int],
++                                 device: Optional[Device] = None) -> Block:
++        return self.allocate_immutable(prev_block, token_ids, device)
++
+     def allocate_mutable(self,
+                          prev_block: Optional[Block],
+                          device: Optional[Device] = None) -> Block:
+@@ -384,7 +427,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
+-
++        if not block_ids:
++            return
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 self._blocks[block_id].last_accessed = now
+@@ -396,7 +440,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         """Mark blocks as computed, used in prefix caching."""
+-
++        if not block_ids:
++            return
+         for block_id in block_ids:
+             if block_id in self._blocks:
+                 # only those full block is valid for prefix caching
+@@ -416,24 +461,43 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             self, seq_block_ids: List[List[int]]) -> List[int]:
+         """Return the block ids that are common for a given sequence group.
+ 
+-        Only those blocks that are immutable and already be marked
+-        compyted would be taken consideration.
++        Only those blocks that are immutable and already marked computed are
++        considered. The last block for each sequence is excluded to avoid the
++        case where the entire prompt is cached (which would be incorrect in the
++        model runner).
+         """
+-
+-        # NOTE We exclude the last block to avoid the case where the entire
+-        # prompt is cached. This would cause erroneous behavior in model
+-        # runner.
+-
+-        ids_list = [
+-            list(
+-                takewhile(lambda block_id: self.block_is_computed(block_id),
+-                          seq[:-1])) for seq in seq_block_ids
+-        ]
+-        # It returns a list of int although type annotation says list of string.
+-        return commonprefix([
+-            ids for ids in ids_list  # type: ignore
+-            if ids != []
+-        ])
++        if not seq_block_ids:
++            return []
++
++        # Build per-sequence prefix of contiguous computed blocks (excluding
++        # the last block of each sequence).
++        computed_prefixes: List[List[int]] = []
++        for seq in seq_block_ids:
++            if not seq:
++                continue
++            upto = max(len(seq) - 1, 0)
++            prefix: List[int] = []
++            for bid in seq[:upto]:
++                if self.block_is_computed(bid):
++                    prefix.append(bid)
++                else:
++                    break
++            if prefix:
++                computed_prefixes.append(prefix)
++
++        if not computed_prefixes:
++            return []
++
++        # Compute common prefix across all sequences' computed prefixes.
++        first = computed_prefixes[0]
++        max_len = min(len(p) for p in computed_prefixes)
++        i = 0
++        while i < max_len:
++            token = first[i]
++            if any(p[i] != token for p in computed_prefixes[1:]):
++                break
++            i += 1
++        return first[:i]
+ 
+     def get_num_blocks_touched(self,
+                                blocks: List[Block],

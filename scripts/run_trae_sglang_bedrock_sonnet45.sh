@@ -7,8 +7,8 @@ echo "SGLang Performance Optimizations"
 echo "=========================================="
 echo ""
 
-# Navigate to perf-agents-bench directory
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+# Navigate to ISO-Bench directory
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Activate bench environment
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate

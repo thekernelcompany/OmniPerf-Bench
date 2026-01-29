@@ -98,7 +98,7 @@ agents:
       - task_done
 ```
 
-### 2. Bench Configuration (`perf-agents-bench/bench_test.yaml`)
+### 2. Bench Configuration (`ISO-Bench/bench_test.yaml`)
 **Critical Fix**: Update the config file path to use the correct absolute path:
 
 ```yaml
@@ -117,7 +117,7 @@ agents:
 
 ## Critical Code Modifications
 
-### 1. File Change Detection Fix (`perf-agents-bench/bench/prepare.py`)
+### 1. File Change Detection Fix (`ISO-Bench/bench/prepare.py`)
 
 **Problem**: TRAE agent file changes weren't being detected properly.
 
@@ -191,7 +191,7 @@ else:
                 logger.warning(f"Failed to parse run directory patch: {e3}")
 ```
 
-### 2. Real-Time Logging Fix (`perf-agents-bench/bench/prepare.py`)
+### 2. Real-Time Logging Fix (`ISO-Bench/bench/prepare.py`)
 
 **Problem**: TRAE agent used `subprocess.run()` which didn't provide real-time output.
 
@@ -312,7 +312,7 @@ if not task_completed:
     logger.error(f"Stderr: {stderr_content}")
 ```
 
-### 3. Success/Failure Logic Fix (`perf-agents-bench/bench/prepare.py`)
+### 3. Success/Failure Logic Fix (`ISO-Bench/bench/prepare.py`)
 
 **Problem**: TRAE internal API errors were incorrectly marking tasks as failed.
 
@@ -337,7 +337,7 @@ else:
 logger.info(f"Task status determined as: {status}")
 ```
 
-### 4. Patch File Handling Fix (`perf-agents-bench/bench/prepare.py`)
+### 4. Patch File Handling Fix (`ISO-Bench/bench/prepare.py`)
 
 **Problem**: Patch files weren't being copied from worktree to run directory.
 
@@ -372,7 +372,7 @@ else:
         logger.warning("No patch file found in worktree or run directory")
 ```
 
-### 5. Enhanced Error Handling (`perf-agents-bench/bench/prepare.py`)
+### 5. Enhanced Error Handling (`ISO-Bench/bench/prepare.py`)
 
 **Problem**: No file changes were incorrectly marking all tasks as errors.
 
@@ -427,9 +427,9 @@ export ANTHROPIC_API_KEY="your-anthropic-key"
 echo "OPENAI_API_KEY is set: $([ -n "$OPENAI_API_KEY" ] && echo "YES" || echo "NO")"
 
 # Test TRAE agent can access the key
-cd perf-agents-bench
+cd ISO-Bench
 source ../bench-env/bin/activate
-export PYTHONPATH=/path/to/OmniPerf-Bench/perf-agents-bench:$PYTHONPATH
+export PYTHONPATH=/path/to/OmniPerf-Bench/ISO-Bench:$PYTHONPATH
 python -c "
 import os
 from dotenv import load_dotenv
@@ -442,10 +442,10 @@ print('API key available:', bool(os.getenv('OPENAI_API_KEY')))
 
 ### Basic Execution Command
 ```bash
-cd /path/to/OmniPerf-Bench/perf-agents-bench
+cd /path/to/OmniPerf-Bench/ISO-Bench
 source ../bench-env/bin/activate
 export PATH=$HOME/.local/bin:$PATH
-export PYTHONPATH=/path/to/OmniPerf-Bench/perf-agents-bench:$PYTHONPATH
+export PYTHONPATH=/path/to/OmniPerf-Bench/ISO-Bench:$PYTHONPATH
 
 # Run TRAE agent on a task
 python -m bench.cli prepare tasks/chunked_local_attn_optimization.yaml \
@@ -494,7 +494,7 @@ python -m trae_agent.cli --help
 ### 2. Test Configuration
 ```bash
 # Check config file path resolution
-cd perf-agents-bench
+cd ISO-Bench
 python -c "
 import yaml
 with open('bench_test.yaml', 'r') as f:
@@ -510,15 +510,15 @@ print(f'Config exists: {os.path.exists(config_path)}')
 After a successful run, check:
 ```bash
 # Check the latest run directory
-LATEST_RUN=$(ls -t perf-agents-bench/state/runs | head -n1)
+LATEST_RUN=$(ls -t ISO-Bench/state/runs | head -n1)
 echo "Latest run: $LATEST_RUN"
 
 # Check if files were changed
-ls -la perf-agents-bench/state/runs/$LATEST_RUN/*/
-cat perf-agents-bench/state/runs/$LATEST_RUN/*/journal.json
+ls -la ISO-Bench/state/runs/$LATEST_RUN/*/
+cat ISO-Bench/state/runs/$LATEST_RUN/*/journal.json
 
 # Check the actual worktree
-WORKTREE=$(find perf-agents-bench/.work/worktrees -name "*chunked*" -type d | head -n1)
+WORKTREE=$(find ISO-Bench/.work/worktrees -name "*chunked*" -type d | head -n1)
 cd "$WORKTREE"
 git log --oneline -3
 git diff --name-only HEAD~1 HEAD
@@ -560,7 +560,7 @@ After successful setup, you should have:
 ```
 OmniPerf-Bench/
 ├── bench-env/                           # Virtual environment
-├── perf-agents-bench/
+├── ISO-Bench/
 │   ├── bench/prepare.py                 # Modified with fixes
 │   ├── bench_test.yaml                  # Updated config paths
 │   ├── tasks/                           # Task definitions
@@ -578,7 +578,7 @@ OmniPerf-Bench/
 ### Quick Test
 ```bash
 # Create a simple test task
-cd perf-agents-bench
+cd ISO-Bench
 cat > tasks/test_task.yaml << EOF
 id: "test_task"
 name: "Simple Test Task"
@@ -615,7 +615,7 @@ python -m bench.cli prepare tasks/test_task.yaml \
 Create a patch file with your modifications:
 ```bash
 cd /path/to/OmniPerf-Bench
-git add perf-agents-bench/bench/prepare.py perf-agents-bench/bench_test.yaml
+git add ISO-Bench/bench/prepare.py ISO-Bench/bench_test.yaml
 git commit -m "Add TRAE agent integration with real-time logging and file detection fixes"
 git format-patch HEAD~1 --stdout > trae_integration.patch
 ```
@@ -699,7 +699,7 @@ This repository includes an integrated TRAE Agent for performance optimization t
 
 2. **Run TRAE Agent**:
    ```bash
-   cd perf-agents-bench
+   cd ISO-Bench
    python -m bench.cli prepare tasks/your_task.yaml \
      --from-plan ./state/your_plan.json \
      --bench-cfg bench_test.yaml \
@@ -716,7 +716,7 @@ This repository includes an integrated TRAE Agent for performance optimization t
 - ✅ Git integration with proper commits
 
 ### Configuration
-- Edit `perf-agents-bench/bench_test.yaml` to switch between agents
+- Edit `ISO-Bench/bench_test.yaml` to switch between agents
 - Configure TRAE settings in `third-party/trae-agent/trae_config.yaml`
 - Set API keys via environment variables
 ```
@@ -752,8 +752,8 @@ uv pip list --format=freeze > uv_requirements.txt
 
 ### Backup Critical Files
 Always backup these modified files:
-- `perf-agents-bench/bench/prepare.py` (contains all the fixes)
-- `perf-agents-bench/bench_test.yaml` (config paths)
+- `ISO-Bench/bench/prepare.py` (contains all the fixes)
+- `ISO-Bench/bench_test.yaml` (config paths)
 - `third-party/trae-agent/trae_config.yaml` (TRAE settings)
 
 ### Version Pinning

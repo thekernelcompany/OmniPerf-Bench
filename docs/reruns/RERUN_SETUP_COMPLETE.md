@@ -4,8 +4,8 @@
 
 ✅ **Plan files created successfully!**
 
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_vllm.json` (99 commits)
-- `perf-agents-bench/state/plan_claude_sonnet45_rerun_sglang.json` (80 commits)
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_vllm.json` (99 commits)
+- `ISO-Bench/state/plan_claude_sonnet45_rerun_sglang.json` (80 commits)
 
 ✅ **TRAE Configuration Verified**
 - TRAE is already configured for Claude Sonnet 4.5 via AWS Bedrock
@@ -50,7 +50,7 @@ export AWS_REGION=us-east-1
 #### For vLLM (99 commits)
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -68,7 +68,7 @@ python -m bench.cli prepare \
 #### For SGLang (80 commits)
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 
 python -m bench.cli prepare \
@@ -100,7 +100,7 @@ LOG_FILE="/home/ubuntu/OmniPerf-Bench/trae_claude_sonnet45_rerun_vllm_${TIMESTAM
 
 cat > /tmp/run_vllm_rerun.sh << 'SCRIPT'
 #!/bin/bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 source /home/ubuntu/OmniPerf-Bench/bench-env/bin/activate
 export TRAE_PYTHON=/home/ubuntu/OmniPerf-Bench/bench-env/bin/python
 export TRAE_CONFIG=/home/ubuntu/OmniPerf-Bench/third-party/trae-agent/trae_config.yaml
@@ -138,7 +138,7 @@ Same as above, but change:
 ### Check Status
 
 ```bash
-cd /home/ubuntu/OmniPerf-Bench/perf-agents-bench
+cd /home/ubuntu/OmniPerf-Bench/ISO-Bench
 
 # Count successes and errors
 grep -c "Task status determined as: success" pipeline_run_*.log 2>/dev/null || echo "0"
@@ -159,8 +159,8 @@ tmux attach -t trae_claude_sonnet45_rerun_vllm
 
 ## Files Created
 
-1. ✅ `perf-agents-bench/state/plan_claude_sonnet45_rerun_vllm.json` - vLLM rerun plan (99 commits)
-2. ✅ `perf-agents-bench/state/plan_claude_sonnet45_rerun_sglang.json` - SGLang rerun plan (80 commits)
+1. ✅ `ISO-Bench/state/plan_claude_sonnet45_rerun_vllm.json` - vLLM rerun plan (99 commits)
+2. ✅ `ISO-Bench/state/plan_claude_sonnet45_rerun_sglang.json` - SGLang rerun plan (80 commits)
 3. ✅ `CLAUDE_SONNET45_RERUN_INSTRUCTIONS.md` - Complete instructions guide
 4. ✅ `create_claude_sonnet45_rerun_plans.py` - Extraction script (for future use)
 5. ✅ `simple_extract.py` - Simplified extraction script
