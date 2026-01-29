@@ -15,19 +15,29 @@ Each task provides a codebase with performance bottlenecks, precise performance 
 ## Quick Start
 
 ```bash
-# Clone with submodules
+# 1. Clone with submodules (required)
 git clone --recursive git@github.com:thekernelcompany/OmniPerf-Bench.git
 cd OmniPerf-Bench
 
-# Install dependencies
+# 2. Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.local/bin/env  # or restart your shell
+
+# 3. Create virtual environment and install ALL dependencies
 uv venv && source .venv/bin/activate
 uv sync
 
-# Run the dataset generation pipeline
-export OPENAI_API_KEY="your_key"
+# 4. Create .env file with your API key
+echo 'OPENAI_API_KEY="your_openai_api_key_here"' > .env
+
+# 5. Verify installation
+PYTHONPATH=src python -c "from collect.analysis.commits import PerfCommitAnalyzer; print('Setup complete')"
+
+# 6. Run the dataset generation pipeline
 python commit_to_dataset.py configs/experiments.yaml
 ```
+
+**Important**: Step 3 (`uv sync`) installs the `r2e` package from GitHub, which is required for the `PerfCommitAnalyzer` module. If you see `ModuleNotFoundError: No module named 'r2e'`, re-run `uv sync`.
 
 ## Available Datasets
 
@@ -47,22 +57,21 @@ gso = load_dataset('gso-bench/gso', split='test')
 OmniPerf-Bench/
 ├── commit_to_dataset.py         # Main entry point: dataset generation
 ├── pyproject.toml               # Python packaging and dependencies
+├── .env                         # API keys (create this file)
 ├── configs/                     # Configuration files
 │   └── experiments.yaml         # Example experiment configuration
 │
 ├── src/                         # Source code
 │   ├── collect/                 # Dataset generation pipeline
+│   │   ├── analysis/            # Commit analysis (PerfCommitAnalyzer)
+│   │   └── generate/            # Test generation
 │   ├── harness/                 # Docker-based evaluation system
 │   │   └── opt_at_k.py          # Main evaluation runner
-│   ├── eval/                    # Benchmark runners
-│   │   └── modal_benchmark.py   # Modal cloud GPU benchmarks
 │   ├── data/                    # Data models and schemas
-│   └── test_scripts/            # Test generation utilities
+│   └── utils/                   # Utility functions
 │
 ├── scripts/                     # Utility scripts
 │   ├── runners/                 # Benchmark runner scripts
-│   │   ├── local_docker_benchmark.py   # Local Docker benchmarks
-│   │   └── hero_3way_benchmark.py      # 3-way comparison runner
 │   ├── docker/                  # Docker image management
 │   └── upload/                  # HuggingFace upload scripts
 │
@@ -71,13 +80,10 @@ OmniPerf-Bench/
 │   └── tasks/                   # Task configs (vllm.yaml, sglang.yaml)
 │
 ├── data/                        # Generated datasets
-│   └── vllm_dataset_with_test.jsonl
+├── archive/                     # Archived experimental data
+│   └── misc/experiments/        # Commit extractions (used by pipeline)
 │
 ├── docs/                        # Documentation
-│   ├── REPRODUCTION.md          # Step-by-step reproduction guide
-│   ├── ENVIRONMENTS.md          # Virtual environment guide
-│   └── BENCHMARK_RUNNERS.md     # Canonical runner documentation
-│
 ├── vllm/, sglang/               # Git submodules
 └── third-party/                 # External dependencies
 ```
@@ -93,6 +99,12 @@ source .venv/bin/activate
 python commit_to_dataset.py configs/experiments.yaml
 # Output: data/vllm_dataset_with_test.jsonl
 ```
+
+The pipeline:
+1. Reads commit extraction JSONs from `archive/misc/experiments/commit_extractions_with_apis/`
+2. Uses `PerfCommitAnalyzer` to process commit metadata
+3. Generates performance tests via LLM (OpenAI/Anthropic)
+4. Outputs canonical dataset records
 
 ### 2. Evaluation Harness
 
@@ -134,28 +146,57 @@ This repository uses multiple virtual environments:
 | `bench-env/` | Agent benchmarking, Modal cloud execution |
 | `perf-agents-bench/.venv/` | OpenHands CLI |
 
-See [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md) for details.
-
 ## Environment Variables
 
+Create a `.env` file in the project root:
+
 ```bash
-# Required for dataset generation
-export OPENAI_API_KEY="your_openai_key"
+# Required for dataset generation (at least one)
+OPENAI_API_KEY="sk-..."
 # OR
-export ANTHROPIC_API_KEY="your_anthropic_key"
+ANTHROPIC_API_KEY="sk-ant-..."
 
 # Optional
-export HF_TOKEN="your_huggingface_token"  # For dataset uploads
-export GHAPI_TOKEN="your_github_token"    # For commit extraction
+OPENROUTER_API_KEY="sk-or-..."    # Alternative LLM provider
+HF_TOKEN="hf_..."                  # For dataset uploads
+GHAPI_TOKEN="ghp_..."              # For commit extraction
+```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'r2e'`
+
+The `r2e` package is installed from GitHub. Re-run:
+```bash
+uv sync
+```
+
+### `ModuleNotFoundError: No module named 'collect.analysis.commits'`
+
+Ensure you're running with PYTHONPATH:
+```bash
+PYTHONPATH=src python commit_to_dataset.py configs/experiments.yaml
+```
+
+### `PerfCommitAnalyzer is required but not available`
+
+The module failed to import. Check:
+```bash
+PYTHONPATH=src python -c "from collect.analysis.commits import PerfCommitAnalyzer"
+```
+
+### API key errors
+
+Ensure your `.env` file exists and contains valid keys:
+```bash
+cat .env  # Should show OPENAI_API_KEY="sk-..."
 ```
 
 ## Documentation
 
 - **[docs/REPRODUCTION.md](docs/REPRODUCTION.md)** - Step-by-step reproduction guide
 - **[docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md)** - Virtual environment setup
-- **[docs/BENCHMARK_RUNNERS.md](docs/BENCHMARK_RUNNERS.md)** - Benchmark runner documentation
 - **[docs/dataset_schema.md](docs/dataset_schema.md)** - Dataset schema specification
-- **[src/harness/README.md](src/harness/README.md)** - Evaluation harness guide
 
 ## Requirements
 
