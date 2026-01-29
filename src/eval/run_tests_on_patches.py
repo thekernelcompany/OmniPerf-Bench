@@ -121,7 +121,7 @@ class TestRunner:
 
         Args:
             repo_path: Path to the main repository (vllm)
-            state_root: Path to ISO-Bench/state directory
+            state_root: Path to perf-agents-bench/state directory
             output_dir: Directory to write evaluation results
             test_index: Pre-loaded commit->script index
             timeout: Timeout in seconds for each test execution
@@ -926,14 +926,11 @@ def cleanup_worktrees(repo_path: Path) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Compute project root dynamically
-    ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # src/eval/ -> OmniPerf-Bench/
-
     # Example usage
     runner = TestRunner(
-        repo_path=ROOT_DIR / "vllm",
-        state_root=ROOT_DIR / "ISO-Bench/state",
-        output_dir=ROOT_DIR / "eval_results",
+        repo_path=Path("/root/OmniPerf-Bench/vllm"),
+        state_root=Path("/root/OmniPerf-Bench/perf-agents-bench/state"),
+        output_dir=Path("/root/OmniPerf-Bench/eval_results"),
     )
 
     # Discover runs

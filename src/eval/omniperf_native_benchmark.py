@@ -1046,7 +1046,7 @@ def main():
     parser = argparse.ArgumentParser(description="Native OmniPerf Benchmarks")
     parser.add_argument("--vllm-repo", type=Path, required=True)
     parser.add_argument("--sglang-repo", type=Path, required=True)
-    parser.add_argument("--state-root", type=Path, default=Path("./ISO-Bench/state"))
+    parser.add_argument("--state-root", type=Path, default=Path("./perf-agents-bench/state"))
     parser.add_argument("--output-dir", type=Path, default=Path("/ephemeral/native_results"))
     parser.add_argument("--split", choices=["vllm", "sglang"], default="vllm")
     parser.add_argument("--limit", type=int)
