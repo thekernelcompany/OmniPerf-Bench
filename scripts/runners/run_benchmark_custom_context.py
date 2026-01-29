@@ -12,13 +12,15 @@ import sys
 import time
 from pathlib import Path
 
-# Configuration
+# Configuration - Compute project root dynamically
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # scripts/runners/ -> OmniPerf-Bench/
+
 HUMAN_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
-RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code")
+RESULTS_DIR = ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
-BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping_complete.json")
-AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping_complete.json"
+AGENT_PATCHES_DIR = ROOT_DIR / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 
 
 def get_hf_token() -> str:

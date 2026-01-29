@@ -17,10 +17,12 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-# Configuration
+# Configuration - Compute project root dynamically
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # scripts/runners/ -> OmniPerf-Bench/
+
 HUMAN_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 BASELINE_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
-PERF_DATA_FILE = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code/exports/full_results.jsonl")
+PERF_DATA_FILE = ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code/exports/full_results.jsonl"
 
 # Agent configurations - paths to agent patch directories
 AGENT_CONFIGS = {
@@ -34,16 +36,16 @@ AGENT_CONFIGS = {
     "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
 }
 
-# Output directories per agent type
+# Output directories per agent type (archived results)
 AGENT_OUTPUT_DIRS = {
-    "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
-    "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
-    "codex_cli": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex_cli"),  # Codex CLI results
-    "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
-    "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+    "claude_code": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code",
+    "codex_gpt5": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_codex",
+    "codex_cli": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_codex_cli",
+    "trae_gpt5": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_gpt5",
+    "trae_sonnet45": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_sonnet45",
     # TRAE specific run output dirs:
-    "trae_gpt5_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5_0123"),
-    "trae_sonnet45_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45_0123"),
+    "trae_gpt5_0123": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_gpt5_0123",
+    "trae_sonnet45_0123": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_sonnet45_0123",
 }
 
 # Model overrides for compatibility issues (e.g., RoPE scaling)
@@ -51,15 +53,15 @@ AGENT_OUTPUT_DIRS = {
 MODEL_OVERRIDES = {
     "meta-llama/Llama-3.1-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
     "meta-llama/Llama-3.1-70B-Instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
-    "ibm-ai-platform/Bamba-9B-v2": "meta-llama/Meta-Llama-3-8B-Instruct",  # Bamba not well supported
-    "ibm-ai-platform/Bamba-9B": "meta-llama/Meta-Llama-3-8B-Instruct",  # Bamba not well supported
+    "ibm-ai-platform/Bamba-9B-v2": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "ibm-ai-platform/Bamba-9B": "meta-llama/Meta-Llama-3-8B-Instruct",
 }
 
 # Default (for backward compatibility)
-RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code")
+RESULTS_DIR = ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
-BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping_complete.json")
-AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping_complete.json"
+AGENT_PATCHES_DIR = ROOT_DIR / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 
 
 def get_hf_token() -> str:
@@ -70,7 +72,7 @@ def get_hf_token() -> str:
     return ""
 
 
-BENCHMARK_MODE_MAPPING_FILE = Path("/root/OmniPerf-Bench/data/mappings/benchmark_mode_mapping.json")
+BENCHMARK_MODE_MAPPING_FILE = ROOT_DIR / "data/mappings/benchmark_mode_mapping.json"
 
 
 def load_benchmark_mode_mapping() -> Dict[str, dict]:
@@ -1439,7 +1441,7 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
 
     # Mount ShareGPT dataset if perf_command uses it
     sharegpt_mount = []
-    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    sharegpt_path = ROOT_DIR / 'data/sharegpt_dataset.json'
     if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
         sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
 
@@ -1678,7 +1680,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
 
     # Mount ShareGPT dataset if needed
     sharegpt_mount = []
-    sharegpt_path = Path('/root/OmniPerf-Bench/data/sharegpt_dataset.json')
+    sharegpt_path = ROOT_DIR / 'data/sharegpt_dataset.json'
     if sharegpt_path.exists() and 'sharegpt' in perf_command.lower():
         sharegpt_mount = ['-v', f'{sharegpt_path}:/data/sharegpt_dataset.json:ro']
 
@@ -2150,7 +2152,7 @@ def main():
 
     # Set agent-specific paths
     agent_type = args.agent_type
-    AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench") / AGENT_CONFIGS[agent_type]
+    AGENT_PATCHES_DIR = ROOT_DIR / AGENT_CONFIGS[agent_type]
     AGENT_OUTPUT_DIR = AGENT_OUTPUT_DIRS[agent_type] / "results"
 
     print(f"=== Agent Type: {agent_type} ===")

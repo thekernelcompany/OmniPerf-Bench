@@ -398,8 +398,11 @@ def print_summary(summaries: Dict[str, AgentSummary]) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
+    # Compute project root dynamically
+    ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # src/eval/ -> OmniPerf-Bench/
+
     # Example usage
-    output_dir = Path("/root/OmniPerf-Bench/eval_results")
+    output_dir = ROOT_DIR / "eval_results"
 
     if output_dir.exists():
         summaries = aggregate_results(output_dir)

@@ -18,8 +18,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Configuration
-BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping.json")
+# Configuration - Compute project root dynamically
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # scripts/docker/ -> OmniPerf-Bench/
+
+BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping.json"
 BASELINE_IMAGE_PREFIX = "ayushnangia16/vllm-baseline"  # Or your Docker Hub username
 HUMAN_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 FIXED_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"

@@ -926,11 +926,14 @@ def cleanup_worktrees(repo_path: Path) -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
+    # Compute project root dynamically
+    ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # src/eval/ -> OmniPerf-Bench/
+
     # Example usage
     runner = TestRunner(
-        repo_path=Path("/root/OmniPerf-Bench/vllm"),
-        state_root=Path("/root/OmniPerf-Bench/perf-agents-bench/state"),
-        output_dir=Path("/root/OmniPerf-Bench/eval_results"),
+        repo_path=ROOT_DIR / "vllm",
+        state_root=ROOT_DIR / "perf-agents-bench/state",
+        output_dir=ROOT_DIR / "eval_results",
     )
 
     # Discover runs

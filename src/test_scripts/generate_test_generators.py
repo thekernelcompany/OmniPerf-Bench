@@ -20,7 +20,11 @@ import ast
 import glob
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Compute project root dynamically
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # src/test_scripts/ -> OmniPerf-Bench/
 
 # Optional providers
 try:
@@ -58,7 +62,8 @@ def load_extraction(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", "/root/OmniPerf-Bench/third-party/effibench/prompts/claude_4_prompt_v2.md")
+_DEFAULT_PROMPT_PATH = str(ROOT_DIR / "third-party/effibench/prompts/claude_4_prompt_v2.md")
+PROMPT_TEMPLATE_PATH = os.getenv("TEST_CASE_GENERATOR_PROMPT", _DEFAULT_PROMPT_PATH)
 
 
 def read_prompt_template(path: str = PROMPT_TEMPLATE_PATH) -> str:

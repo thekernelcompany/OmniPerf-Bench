@@ -25,17 +25,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-# Configuration
+# Configuration - Compute project root dynamically
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # scripts/runners/ -> OmniPerf-Bench/
+
 DOCKER_IMAGE_PREFIX = "ayushnangia16/nvidia-vllm-docker"
 FIXED_IMAGE_PREFIX = "shikhar481/vllm_fixed_human_images"
-RESULTS_DIR = Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code")
+RESULTS_DIR = ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code"
 FULL_RESULTS_FILE = RESULTS_DIR / "full_results.jsonl"
 OUTPUT_DIR = RESULTS_DIR / "docker_benchmark_results"
 BASELINE_OUTPUT_DIR = RESULTS_DIR / "baseline_benchmark_results"
-BASELINE_MAPPING_FILE = Path("/root/OmniPerf-Bench/baseline_benchmark_mapping.json")
+BASELINE_MAPPING_FILE = ROOT_DIR / "baseline_benchmark_mapping.json"
 
 # Agent patches configuration (legacy - single agent)
-AGENT_PATCHES_DIR = Path("/root/OmniPerf-Bench/perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38")
+AGENT_PATCHES_DIR = ROOT_DIR / "perf-agents-bench/state/runs/vllm/claude_code/default/2025-12-22_21-40-38"
 AGENT_OUTPUT_DIR = RESULTS_DIR / "agent_benchmark_results"
 
 # Multi-agent configuration - paths to agent patch directories
@@ -49,15 +51,15 @@ AGENT_CONFIGS = {
     "trae_sonnet45_0123": "perf-agents-bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
 }
 
-# Output directories per agent type
+# Output directories per agent type (archived results)
 AGENT_OUTPUT_DIRS = {
-    "claude_code": Path("/root/OmniPerf-Bench/omniperf_results_3way_claude_code"),
-    "codex_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_codex"),
-    "trae_gpt5": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5"),
-    "trae_sonnet45": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45"),
+    "claude_code": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_claude_code",
+    "codex_gpt5": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_codex",
+    "trae_gpt5": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_gpt5",
+    "trae_sonnet45": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_sonnet45",
     # TRAE specific run output dirs:
-    "trae_gpt5_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_gpt5_0123"),
-    "trae_sonnet45_0123": Path("/root/OmniPerf-Bench/omniperf_results_3way_trae_sonnet45_0123"),
+    "trae_gpt5_0123": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_gpt5_0123",
+    "trae_sonnet45_0123": ROOT_DIR / "archive/results/2026-01/omniperf_results_3way_trae_sonnet45_0123",
 }
 
 
@@ -222,7 +224,7 @@ def load_agent_patch_mapping(agent_type: str = "claude_code") -> Dict[str, Path]
         print(f"WARNING: Unknown agent type: {agent_type}")
         return mapping
 
-    agent_dir = Path("/root/OmniPerf-Bench") / agent_subdir
+    agent_dir = ROOT_DIR / agent_subdir
     if not agent_dir.exists():
         print(f"WARNING: Agent patches directory not found: {agent_dir}")
         return mapping
