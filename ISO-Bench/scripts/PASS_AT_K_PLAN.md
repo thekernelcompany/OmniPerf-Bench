@@ -22,12 +22,14 @@ Nothing is batched.  Nothing sits on disk between samples.
 
 | Threat | Mitigation |
 |--------|-----------|
-| Agent reads previous patch from `state/runs/` | State dir nuked after confirmed HF push |
-| Agent reads previous worktree | Worktree nuked after confirmed HF push |
+| Agent reads previous patch from `state/runs/` | State dir nuked after verified HF push |
+| Agent reads previous worktree | Worktree nuked after verified HF push |
 | Agent reads git history of human commit | `detach_from_history=True` (existing, hardcoded in `prepare.py:126`) |
-| Agent accesses staging/temp files | Temp plan written to `.tmp_pass_at_k_plan.json`, deleted after each sample |
+| Agent accesses staging/temp files | Temp plan uses unique `tempfile.mkstemp()` per sample, deleted after each sample |
+| Agent reads cached state from `~/.claude` etc. | Agent cache dirs cleaned between samples (best-effort; true isolation requires containers) |
 | Crash leaves stale state on disk | `--resume` queries HF for completed `(item_id, sample_index)` pairs and skips them; stale local dirs are nuked before the next sample starts |
-| Push fails, state nuked prematurely | Nuke only fires after `push_single_row()` returns True; on failure, local state is preserved for manual recovery |
+| Push fails, state nuked prematurely | Nuke only fires after `push_single_row()` returns True AND verification confirms shard exists on HF; on failure, local state is preserved for manual recovery |
+| Timeout leaves zombie processes | Process group kill (`SIGTERM` → `SIGKILL`) ensures agent + child processes are cleaned up |
 
 ## HuggingFace Dataset Schema
 
