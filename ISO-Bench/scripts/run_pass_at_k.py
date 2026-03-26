@@ -337,11 +337,22 @@ def resolve_hf_token(cli_token: Optional[str] = None) -> Optional[str]:
     token = cli_token or os.environ.get("HF_TOKEN")
     if token:
         return token
+    # Try huggingface_hub API (works across versions)
     try:
-        from huggingface_hub import HfFolder
-        return HfFolder.get_token()
+        from huggingface_hub import HfApi
+        t = HfApi().token
+        if t:
+            return t
     except Exception:
-        return None
+        pass
+    # Fallback: read cached token file directly
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    try:
+        if token_path.exists():
+            return token_path.read_text().strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def push_single_row(
@@ -402,30 +413,58 @@ def fetch_completed_samples(
     """
     Query HF dataset and return set of (item_id, sample_index) already pushed.
 
-    Works with both the parquet shard format (filename-based) and the legacy
-    single-file format (column-based).
+    Supports three formats:
+    1. Per-sample shard filenames: {item_id}_s{idx}_{ts}.parquet  (fast path)
+    2. Standard HF auto-sharded parquet: train-NNNNN.parquet      (pandas path)
+    3. HF datasets library fallback                                (slow path)
     """
     completed: Set[Tuple[str, int]] = set()
     if not token:
         return completed
 
-    # First try fast path: parse shard filenames without downloading data
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+
+    # List all parquet files in data/
     try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=token)
-        files = api.list_repo_tree(repo_id, repo_type="dataset", path_in_repo="data")
-        for f in files:
-            name = f.rfilename
-            # Shard names: {item_id}_s{sample_idx}_{timestamp}.parquet
-            match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", name)
-            if match:
-                completed.add((match.group(1), int(match.group(2))))
+        files = list(api.list_repo_tree(repo_id, repo_type="dataset", path_in_repo="data"))
+    except Exception as e:
+        log.warning(f"Could not list HF repo files: {e}")
+        return completed
+
+    # Fast path: try per-sample shard naming convention
+    for f in files:
+        name = f.rfilename
+        match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", name)
+        if match:
+            completed.add((match.group(1), int(match.group(2))))
+    if completed:
+        return completed
+
+    # Standard HF parquet path: download shards and read item_id/sample_index columns
+    try:
+        import pandas as pd
+        from huggingface_hub import hf_hub_download
+
+        parquet_files = [f.rfilename for f in files if f.rfilename.endswith(".parquet")]
+        for pf in parquet_files:
+            try:
+                local = hf_hub_download(repo_id, pf, repo_type="dataset", token=token)
+                df = pd.read_parquet(local, columns=["item_id", "sample_index"])
+                for _, row in df.iterrows():
+                    iid = row.get("item_id", "")
+                    sidx = row.get("sample_index")
+                    if iid and sidx is not None:
+                        completed.add((str(iid), int(sidx)))
+            except Exception:
+                continue
         if completed:
             return completed
-    except Exception:
-        pass
+    except ImportError:
+        log.debug("pandas not available, falling back to datasets library")
 
-    # Fallback: load dataset and read columns (handles legacy format)
+    # Last resort: HF datasets library
     try:
         from datasets import load_dataset
         ds = load_dataset(repo_id, token=token, split="train")
@@ -434,7 +473,7 @@ def fetch_completed_samples(
             iid = r.get("item_id", "")
             sidx = r.get("sample_index")
             if iid and sidx is not None:
-                completed.add((iid, int(sidx)))
+                completed.add((str(iid), int(sidx)))
     except Exception as e:
         log.warning(f"Could not load existing HF dataset for resume: {e}")
     return completed
