@@ -40,13 +40,16 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -168,11 +171,73 @@ def nuke_run_dir(state_root: Path, run_id: str) -> None:
 
 
 def nuke_worktree(work_root: Path, repo_name: str, item_id: str) -> None:
-    """Remove the worktree directory."""
+    """Remove the worktree directory and prune stale git worktree registrations."""
     wt_dir = work_root / "worktrees" / repo_name / item_id
     if wt_dir.exists():
         shutil.rmtree(wt_dir)
         log.debug(f"Nuked worktree: {wt_dir}")
+    # Prune stale worktree registrations — detach_from_history removes the .git
+    # link but leaves the registration in the base repo, causing "already registered"
+    # errors on the next worktree add.
+    base_repo = work_root / "repos" / repo_name
+    if base_repo.exists():
+        try:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                cwd=str(base_repo),
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+
+# Directories that agents may write to outside the worktree/state dirs.
+# Cleaning these between samples prevents information leakage.
+AGENT_CACHE_DIRS = [
+    Path.home() / ".openhands",
+    Path.home() / ".trae",
+    Path.home() / ".codex",
+]
+
+# Inside ~/.claude, these hold auth/config that must survive between samples.
+# Everything else (sessions, cache, history, plans) is cleaned.
+_CLAUDE_PRESERVE = {".credentials.json", "settings.json", "settings.local.json"}
+
+
+def _clean_agent_caches(tag: str) -> None:
+    """Remove agent-specific cache directories that could leak between samples.
+
+    For ~/.claude we selectively clean session/cache data while preserving
+    auth credentials and settings — nuking the entire directory kills the
+    login token and causes all subsequent samples to fail.
+
+    NOTE: This is best-effort. True isolation requires running each sample
+    in a fresh container. Agents may also write to /tmp or other locations.
+    """
+    # Clean non-claude agent dirs entirely
+    for cache_dir in AGENT_CACHE_DIRS:
+        if cache_dir.exists():
+            try:
+                shutil.rmtree(cache_dir)
+                log.debug(f"{tag} Cleaned cache: {cache_dir}")
+            except Exception as e:
+                log.warning(f"{tag} Could not clean {cache_dir}: {e}")
+
+    # Selectively clean ~/.claude — preserve auth + settings
+    claude_dir = Path.home() / ".claude"
+    if claude_dir.exists():
+        for child in claude_dir.iterdir():
+            if child.name in _CLAUDE_PRESERVE:
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                log.debug(f"{tag} Cleaned claude cache: {child.name}")
+            except Exception as e:
+                log.warning(f"{tag} Could not clean {child}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -285,33 +350,48 @@ def push_single_row(
     token: str,
 ) -> bool:
     """
-    Push one sample row to HuggingFace, appending to the existing dataset.
+    Push one sample row to HuggingFace as an incremental parquet shard.
+
+    Uses huggingface_hub to upload a single-row parquet file directly,
+    avoiding the O(n^2) download-all-append-reupload pattern.
 
     Returns True on success.
     """
-    from datasets import Dataset, load_dataset
-
-    # Try to load existing dataset and append
-    try:
-        existing = load_dataset(repo_id, token=token, split="train")
-        # Append new row by converting to list, appending, rebuilding
-        rows = list(existing)
-        rows.append(row)
-        merged = Dataset.from_list(rows)
-    except Exception:
-        # Dataset doesn't exist yet or failed to load — create fresh
-        merged = Dataset.from_list([row])
+    from huggingface_hub import HfApi
 
     item_id = row["item_id"]
     sample_idx = row["sample_index"]
     agent = row.get("agent_name", "unknown")
     model = row.get("model_name", "unknown")
 
-    merged.push_to_hub(
-        repo_id,
-        token=token,
-        commit_message=f"sample {item_id}/s{sample_idx} ({agent}/{model})",
-    )
+    # Write row as a single-row parquet shard to a temp file
+    shard_name = f"{item_id}_s{sample_idx}_{int(time.time())}.parquet"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Use pandas for parquet serialization (lighter than datasets)
+        try:
+            import pandas as pd
+            df = pd.DataFrame([row])
+            shard_path = Path(tmpdir) / shard_name
+            df.to_parquet(shard_path, index=False)
+        except ImportError:
+            # Fallback to datasets if pandas not available
+            from datasets import Dataset
+            ds = Dataset.from_list([row])
+            shard_path = Path(tmpdir) / shard_name
+            ds.to_parquet(shard_path)
+
+        api = HfApi(token=token)
+        # Ensure the repo exists (creates if not)
+        api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+        # Upload shard into data/ directory — HF auto-discovers parquet shards
+        api.upload_file(
+            path_or_fileobj=str(shard_path),
+            path_in_repo=f"data/{shard_name}",
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"sample {item_id}/s{sample_idx} ({agent}/{model})",
+        )
+
     return True
 
 
@@ -321,10 +401,31 @@ def fetch_completed_samples(
 ) -> Set[Tuple[str, int]]:
     """
     Query HF dataset and return set of (item_id, sample_index) already pushed.
+
+    Works with both the parquet shard format (filename-based) and the legacy
+    single-file format (column-based).
     """
     completed: Set[Tuple[str, int]] = set()
     if not token:
         return completed
+
+    # First try fast path: parse shard filenames without downloading data
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        files = api.list_repo_tree(repo_id, repo_type="dataset", path_in_repo="data")
+        for f in files:
+            name = f.rfilename
+            # Shard names: {item_id}_s{sample_idx}_{timestamp}.parquet
+            match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", name)
+            if match:
+                completed.add((match.group(1), int(match.group(2))))
+        if completed:
+            return completed
+    except Exception:
+        pass
+
+    # Fallback: load dataset and read columns (handles legacy format)
     try:
         from datasets import load_dataset
         ds = load_dataset(repo_id, token=token, split="train")
@@ -391,11 +492,17 @@ def run_one_sample(
     # --- Pre-clean: nuke any leftover worktree from a crashed previous run ---
     nuke_worktree(work_root, repo_name, item_id)
 
-    # --- Write single-item plan to a temp file ---
-    # Put it outside state/ and work/ so the agent can't stumble on it
-    tmp_plan_path = ISO_BENCH_ROOT / ".tmp_pass_at_k_plan.json"
+    # --- Write single-item plan to a unique temp file ---
+    # Use tempfile to avoid race conditions with concurrent runs
+    tmp_fd, tmp_plan_str = tempfile.mkstemp(
+        prefix=f".pass_at_k_{item_id}_s{sample_idx}_",
+        suffix=".json",
+        dir=str(ISO_BENCH_ROOT),
+    )
+    tmp_plan_path = Path(tmp_plan_str)
     tmp_plan = make_single_item_plan(full_plan, plan_item)
-    tmp_plan_path.write_text(json.dumps(tmp_plan, indent=2))
+    with os.fdopen(tmp_fd, "w") as f:
+        json.dump(tmp_plan, f, indent=2)
 
     # --- Run prepare ---
     cmd = [
@@ -412,20 +519,40 @@ def run_one_sample(
     t0 = time.time()
 
     try:
-        result = subprocess.run(
+        # Use Popen + process group so we can kill the entire tree on timeout
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ISO_BENCH_ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=7200,  # 2h hard cap
+            start_new_session=True,  # creates new process group
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=7200)  # 2h hard cap
+        except subprocess.TimeoutExpired:
+            # Kill entire process group (agent + child processes / containers)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=30)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+                    proc.wait()
+            elapsed = time.time() - t0
+            log.error(f"{tag} prepare TIMED OUT after {elapsed:.0f}s — process tree killed")
+            stdout, stderr = "", ""
+        else:
+            elapsed = time.time() - t0
+            log.info(f"{tag} prepare done in {elapsed:.0f}s (rc={proc.returncode})")
+            if proc.returncode != 0:
+                log.warning(f"{tag} prepare stderr (last 500 chars):\n{stderr[-500:]}")
+    except Exception as e:
         elapsed = time.time() - t0
-        log.info(f"{tag} prepare done in {elapsed:.0f}s (rc={result.returncode})")
-        if result.returncode != 0:
-            log.warning(f"{tag} prepare stderr (last 500 chars):\n{result.stderr[-500:]}")
-    except subprocess.TimeoutExpired:
-        elapsed = time.time() - t0
-        log.error(f"{tag} prepare TIMED OUT after {elapsed:.0f}s")
+        log.error(f"{tag} prepare failed with exception: {e}")
 
     # --- Collect artifacts ---
     item_dir = find_run_dir(state_root, run_id, item_id)
@@ -460,10 +587,25 @@ def run_one_sample(
         tmp_plan_path.unlink(missing_ok=True)
         return True
 
-    # --- Nuke ONLY after confirmed push ---
+    # --- Verify push by checking the shard exists on HF ---
+    if pushed:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=hf_token)
+            files = [f.rfilename for f in api.list_repo_tree(hf_repo, repo_type="dataset", path_in_repo="data")]
+            shard_prefix = f"{item_id}_s{sample_idx}_"
+            if not any(f.startswith(shard_prefix) for f in files):
+                log.error(f"{tag} Push verification FAILED — shard not found on HF. Keeping local state.")
+                pushed = False
+        except Exception as e:
+            log.warning(f"{tag} Push verification could not complete: {e} — trusting push result")
+
+    # --- Nuke ONLY after verified push ---
     if pushed:
         nuke_run_dir(state_root, run_id)
         nuke_worktree(work_root, repo_name, item_id)
+        # Clean agent caches that might leak info between samples
+        _clean_agent_caches(tag)
         log.info(f"{tag} Local state nuked")
     else:
         log.warning(f"{tag} Push not confirmed — keeping local state for manual recovery")
@@ -490,6 +632,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="No agents, no push")
     parser.add_argument("--resume", action="store_true", help="Skip (item, sample) pairs already on HF")
     parser.add_argument("--items", nargs="*", default=None, help="Only these item IDs")
+    parser.add_argument("--max-parallel-items", type=int, default=1,
+                        help="Max items to run in parallel (samples of same item stay sequential)")
 
     args = parser.parse_args()
 
@@ -537,45 +681,90 @@ def main():
         already_done = fetch_completed_samples(args.hf_repo, hf_token)
         log.info(f"Found {len(already_done)} samples already on HF")
 
-    # --- Main loop ---
+    # --- Build work units: (item, sample_idx) pairs, filtering already-done ---
     total = len(items) * args.n
-    completed = 0
     skipped = 0
-    failed = 0
+    work_by_item: Dict[str, List[Tuple[Dict[str, Any], int]]] = {}
 
     for item in items:
         item_id = item["item_id"]
-
+        item_work = []
         for sample_idx in range(args.n):
-            tag = f"[{item_id}][s{sample_idx}]"
-            completed += 1
-
-            # Resume check
             if args.resume and (item_id, sample_idx) in already_done:
+                tag = f"[{item_id}][s{sample_idx}]"
                 log.info(f"{tag} Already on HF — skipping")
                 skipped += 1
-                continue
+            else:
+                item_work.append((item, sample_idx))
+        if item_work:
+            work_by_item[item_id] = item_work
 
-            log.info(f"{tag} ({completed}/{total})")
+    to_run = sum(len(v) for v in work_by_item.values())
+    log.info(f"Work plan: {to_run} samples to run, {skipped} already done, {total} total")
 
+    # --- Run samples: sequential within each item, parallel across items ---
+    completed = 0
+    failed = 0
+
+    def _run_item_samples(item_work: List[Tuple[Dict[str, Any], int]]) -> Tuple[int, int]:
+        """Run all samples for one item sequentially. Returns (completed, failed)."""
+        item_completed, item_failed = 0, 0
+        for plan_item, sample_idx in item_work:
             ok = run_one_sample(
                 task_yaml=task_yaml,
                 bench_cfg_path=bench_cfg_path,
                 bench_cfg=bench_cfg,
-                plan_item=item,
+                plan_item=plan_item,
                 full_plan=full_plan,
                 sample_idx=sample_idx,
                 hf_repo=args.hf_repo,
                 hf_token=hf_token,
                 dry_run=args.dry_run,
             )
-
+            item_completed += 1
             if not ok and not args.dry_run:
-                failed += 1
+                item_failed += 1
+        return item_completed, item_failed
 
-            log.info(f"{tag} progress: {completed}/{total} done, {skipped} skipped, {failed} failed")
+    if args.max_parallel_items <= 1:
+        # Sequential: simple loop
+        for item_id, item_work in work_by_item.items():
+            for plan_item, sample_idx in item_work:
+                tag = f"[{item_id}][s{sample_idx}]"
+                completed += 1
+                log.info(f"{tag} ({completed}/{to_run})")
+                ok = run_one_sample(
+                    task_yaml=task_yaml,
+                    bench_cfg_path=bench_cfg_path,
+                    bench_cfg=bench_cfg,
+                    plan_item=plan_item,
+                    full_plan=full_plan,
+                    sample_idx=sample_idx,
+                    hf_repo=args.hf_repo,
+                    hf_token=hf_token,
+                    dry_run=args.dry_run,
+                )
+                if not ok and not args.dry_run:
+                    failed += 1
+                log.info(f"{tag} progress: {completed}/{to_run} done, {skipped} skipped, {failed} failed")
+    else:
+        # Parallel across items, sequential within each item
+        with ThreadPoolExecutor(max_workers=args.max_parallel_items) as pool:
+            futures = {
+                pool.submit(_run_item_samples, item_work): item_id
+                for item_id, item_work in work_by_item.items()
+            }
+            for future in as_completed(futures):
+                item_id = futures[future]
+                try:
+                    c, f = future.result()
+                    completed += c
+                    failed += f
+                    log.info(f"[{item_id}] done: {c} samples, {f} failed")
+                except Exception as e:
+                    log.error(f"[{item_id}] item runner crashed: {e}")
 
-    log.info(f"Finished: {completed} total, {skipped} skipped, {failed} failed")
+    log.info(f"Finished: {completed} run, {skipped} skipped, {failed} failed, {total} total")
 
 
 if __name__ == "__main__":
