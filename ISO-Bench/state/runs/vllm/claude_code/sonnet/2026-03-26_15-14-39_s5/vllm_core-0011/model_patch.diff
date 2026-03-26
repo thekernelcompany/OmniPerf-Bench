@@ -1,0 +1,127 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..23e92a7 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -108,6 +108,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         self.metric_data = CacheMetricData()
+ 
++        # Precompute block-id → zero-offset index mapping for O(1) lookup.
++        # all_block_ids is a frozenset that never changes after construction.
++        self._physical_block_id_index: Dict[BlockId, int] = {
++            block_id: idx
++            for idx, block_id in enumerate(sorted(self.all_block_ids))
++        }
++
+     # Implements Block.Factory.
+     def _create_block(
+         self,
+@@ -147,22 +154,26 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+-        # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None)
+-        assert block.content_hash is not None
++        # Compute the content hash directly without creating a temporary block
++        # object, avoiding the overhead of block initialization on cache miss.
++        is_first_block = prev_block is None
++        prev_block_hash = (None if is_first_block else
++                           prev_block.content_hash)  # type: ignore
++        content_hash = PrefixCachingBlock.hash_block_tokens(
++            is_first_block, prev_block_hash, cur_block_token_ids=token_ids)
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        cached_block_id = self._cached_blocks.get(content_hash)
+         if cached_block_id is not None:
+             self.metric_data.query(hit=True)
++            block = self._block_pool.init_block(prev_block=prev_block,
++                                                token_ids=token_ids,
++                                                block_size=self._block_size,
++                                                physical_block_id=None)
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block)
+             return block
+-        self.metric_data.query(hit=False)
+-        self._block_pool.free_block(block)
+ 
++        self.metric_data.query(hit=False)
+         # No cached block => Allocate a new block
+         block = self.allocate_mutable_block(prev_block)
+         block.append_token_ids(token_ids)
+@@ -395,13 +406,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         given the absolute block id.
+ 
+         Args:
+-            absolute_id (int): The absolute block id for the block 
++            absolute_id (int): The absolute block id for the block
+                 in whole allocator.
+ 
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        return self._physical_block_id_index[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -412,9 +423,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def is_block_cached(self, block: Block) -> bool:
+         assert block.content_hash is not None
+-        if block.content_hash in self._cached_blocks:
+-            return True
+-        return False
++        return block.content_hash in self._cached_blocks
+ 
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+@@ -498,8 +507,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+ 
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
++            tracker = self._block_tracker[block_id]
++            if tracker.active:
++                tracker.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -512,8 +522,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+         assert block_id is not None
+-        self._block_tracker[block_id].enable()
+-        self._block_tracker[block_id].computed = computed
++        tracker = self._block_tracker[block_id]
++        tracker.enable()
++        tracker.computed = computed
+ 
+     def _untrack_block_id(self, block_id: Optional[BlockId]) -> None:
+         assert block_id is not None
+@@ -593,9 +604,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             else:
+                 # If the block has a match in the cache and the cached block
+                 # is not referenced, then we still count it as a touched block
+-                if not self.is_block_cached(block) or \
+-                    (block.content_hash is not None and \
+-                     self._cached_blocks[block.content_hash] in self.evictor):
++                cached_id = self._cached_blocks.get(block.content_hash)
++                if cached_id is None or cached_id in self.evictor:
+                     num_touched_blocks += 1
+         return num_touched_blocks
+ 
+@@ -741,9 +751,6 @@ class PrefixCachingBlock(Block):
+         if len(token_ids) == 0:
+             return
+ 
+-        # Ensure there are input tokens
+-        assert token_ids, "Got token_ids = {}".format(token_ids)
+-
+         # Naive block handles CoW.
+         self._block.append_token_ids(token_ids)
+         self._update_num_tokens_total()

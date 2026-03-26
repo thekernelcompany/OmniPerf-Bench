@@ -1,0 +1,99 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..fea1222 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -78,6 +78,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         for block_id in block_ids:
+             self._block_tracker[block_id] = BlockTracker()
+ 
++        # Precompute block_id -> rank (index in sorted order) for O(1) lookup
++        # in get_physical_block_id. Block ids are fixed at init and never change.
++        self._block_id_to_rank: Dict[BlockId, int] = {
++            bid: i
++            for i, bid in enumerate(sorted(self._block_tracker.keys()))
++        }
++
+         # Pre-allocate "num_blocks * extra_factor" block objects.
+         # The "* extra_factor" is a buffer to allow more block objects
+         # than physical blocks
+@@ -395,13 +402,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         given the absolute block id.
+ 
+         Args:
+-            absolute_id (int): The absolute block id for the block 
++            absolute_id (int): The absolute block id for the block
+                 in whole allocator.
+ 
+         Returns:
+             int: The rzero-offset block id on certain device.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        return self._block_id_to_rank[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -412,9 +419,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def is_block_cached(self, block: Block) -> bool:
+         assert block.content_hash is not None
+-        if block.content_hash in self._cached_blocks:
+-            return True
+-        return False
++        return block.content_hash in self._cached_blocks
+ 
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+@@ -498,8 +503,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+ 
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
++            tracker = self._block_tracker[block_id]
++            if tracker.active:
++                tracker.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -520,10 +526,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self._block_tracker[block_id].disable()
+ 
+     def block_is_computed(self, block_id: int) -> bool:
+-        if self._block_tracker[block_id].active:
+-            return self._block_tracker[block_id].computed
+-        else:
+-            return block_id in self.evictor
++        tracker = self._block_tracker[block_id]
++        if tracker.active:
++            return tracker.computed
++        return block_id in self.evictor
+ 
+     def get_computed_block_ids(self,
+                                prev_computed_block_ids: List[int],
+@@ -539,9 +545,15 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert prev_prefix_size <= cur_size
+ 
+         ret = prev_computed_block_ids
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+         for i in range(prev_prefix_size, cur_size):
+             block_id = block_ids[i]
+-            if self.block_is_computed(block_id):
++            tracker = block_tracker[block_id]
++            if tracker.active:
++                if tracker.computed:
++                    ret.append(block_id)
++            elif block_id in evictor:
+                 ret.append(block_id)
+         return ret
+ 
+@@ -840,7 +852,8 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        return hash((is_first_block, prev_block_hash) +
++                    tuple(cur_block_token_ids))
+ 
+ 
+ class ComputedBlocksTracker:

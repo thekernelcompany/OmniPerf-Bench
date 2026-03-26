@@ -1,0 +1,121 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index dfe7102..72f100d 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -45,12 +45,20 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze_(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++    repetition_penalties = repetition_penalties.unsqueeze_(dim=1)
++    combined_mask = prompt_mask | output_mask
++    pos_mask = logits > 0
++    # Compute the per-element repetition multiplier using broadcasting:
++    # positive logits in combined positions: multiply by 1/rep (dampen)
++    # non-positive logits in combined positions: multiply by rep (dampen)
++    # non-combined positions: multiply by 1.0 (no-op)
++    # This replaces two boolean-indexed ops and eliminates the .repeat() call.
++    rep_mult = torch.where(
++        combined_mask,
++        torch.where(pos_mask, 1.0 / repetition_penalties, repetition_penalties),
++        1.0,
++    )
++    logits.mul_(rep_mult)
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+     logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index df1da89..c094ac4 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -69,29 +69,27 @@ class RejectionSampler(nn.Module):
+         # to the model runner with a persistent manner for better
+         # performance.
+         spec_token_ids = sampling_metadata.spec_token_ids
+-        max_spec_len = max(len(s) for s in spec_token_ids)
+         batch_size = len(spec_token_ids)
+-        draft_token_ids = torch.full((batch_size, max_spec_len),
+-                                     INVALID_TOKEN_ID,
+-                                     device="cpu",
+-                                     dtype=torch.long)
+-
+-        target_token_ids = torch.full((batch_size, max_spec_len + 1),
+-                                      fill_value=INVALID_TOKEN_ID,
+-                                      device=logits.device,
+-                                      dtype=torch.long)
+-
+-        # TODO: Vectorize the following loop for better performance.
+-        start_loc = 0
+-        for i in range(batch_size):
+-            num_spec_tokens = len(spec_token_ids[i])
+-            draft_token_ids[i, :num_spec_tokens] = torch.tensor(
+-                spec_token_ids[i], device="cpu", dtype=torch.long)
+-            end_loc = start_loc + num_spec_tokens + 1
+-            # Assume greedy sampling.
+-            target_token_ids[i, :num_spec_tokens + 1] = torch.argmax(
+-                logits[start_loc:end_loc], dim=-1)
+-            start_loc = end_loc
++        spec_lens = [len(s) for s in spec_token_ids]
++        sample_lens = [x + 1 for x in spec_lens]
++        max_spec_len = max(spec_lens)
++
++        # Vectorize draft token IDs: build CPU tensors then pad in one shot.
++        spec_tensors = [
++            torch.tensor(s, device="cpu", dtype=torch.long)
++            for s in spec_token_ids
++        ]
++        draft_token_ids = pad_sequence(spec_tensors,
++                                       batch_first=True,
++                                       padding_value=INVALID_TOKEN_ID)
++
++        # Vectorize target token IDs: single argmax across all tokens, then
++        # split by sequence lengths and pad — replaces the per-item loop.
++        all_target_ids = logits.argmax(dim=-1)
++        split_targets = list(all_target_ids.split(sample_lens))
++        target_token_ids = pad_sequence(split_targets,
++                                        batch_first=True,
++                                        padding_value=INVALID_TOKEN_ID)
+ 
+         vocab_size = logits.size(-1)
+         # NOTE: CPU <-> GPU synchronization happens here.
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index ec6374d..6f33e0c 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -219,11 +219,26 @@ class Sampler(nn.Module):
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> torch.Tensor:
+-        # TODO(houseroad): this implementation is extremely inefficient.
+-        # One idea is implement this as a PyTorch C++ op, and we may
+-        # even optimize the logit_bias layout.
+-        for i, logit_bias in enumerate(sampling_metadata.logit_bias):
++        logit_bias_list = sampling_metadata.logit_bias
++        if not any(logit_bias_list):
++            return logits
++        # Collect all (batch_idx, token_id, bias) entries and apply them in a
++        # single index_put_ call instead of per-element GPU kernel launches.
++        batch_indices = []
++        token_indices = []
++        bias_values = []
++        for i, logit_bias in enumerate(logit_bias_list):
+             if logit_bias:
+                 for token_id, bias in logit_bias.items():
+-                    logits[i, token_id] += bias
++                    batch_indices.append(i)
++                    token_indices.append(token_id)
++                    bias_values.append(bias)
++        if batch_indices:
++            rows = torch.tensor(batch_indices, dtype=torch.long,
++                                device=logits.device)
++            cols = torch.tensor(token_indices, dtype=torch.long,
++                                device=logits.device)
++            vals = torch.tensor(bias_values, dtype=logits.dtype,
++                                device=logits.device)
++            logits.index_put_((rows, cols), vals, accumulate=True)
+         return logits
