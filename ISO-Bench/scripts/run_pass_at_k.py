@@ -631,7 +631,7 @@ def run_one_sample(
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
-            files = [f.rfilename for f in api.list_repo_tree(hf_repo, repo_type="dataset", path_in_repo="data")]
+            files = [f.rfilename.split("/")[-1] for f in api.list_repo_tree(hf_repo, repo_type="dataset", path_in_repo="data")]
             shard_prefix = f"{item_id}_s{sample_idx}_"
             if not any(f.startswith(shard_prefix) for f in files):
                 log.error(f"{tag} Push verification FAILED — shard not found on HF. Keeping local state.")
