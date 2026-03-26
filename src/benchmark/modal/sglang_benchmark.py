@@ -159,9 +159,10 @@ AGENT_PORT = 30003
 # Using spawn() + get(timeout=...) provides proper timeout handling and cleanup.
 
 # Lightweight orchestrator image (runs on CPU, creates GPU sandbox inside)
+# NOTE: numpy is needed for Modal serialization even though we don't use it directly
 orchestrator_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("requests", "aiohttp")
+    .pip_install("requests", "aiohttp", "numpy")
 )
 
 
@@ -3213,7 +3214,41 @@ results = {{
     "status": "error",
     "error": None,
     "raw_output": "",
+    "docker_commit_proof": {{}},
 }}
+
+# =========================================================================
+# DOCKER COMMIT PROOF: Read original /opt/sglang_commit.txt from Docker build
+# This is created by local_build.py during Docker image creation
+# MUST read BEFORE anything overwrites it
+# =========================================================================
+print("[DOCKER PROOF] Reading original commit proof from Docker image...")
+docker_proof_path = "/opt/sglang_commit.txt"
+if os.path.exists(docker_proof_path):
+    try:
+        with open(docker_proof_path, "r") as f:
+            docker_proof_content = f.read().strip()
+        lines = docker_proof_content.split("\\n")
+        results["docker_commit_proof"] = {{
+            "exists": True,
+            "raw_content": docker_proof_content,
+            "commit_from_build": lines[0] if lines else "unknown",
+            "builder_note": lines[1] if len(lines) > 1 else "unknown",
+        }}
+        print(f"[DOCKER PROOF] Found: {{docker_proof_content}}")
+        # Verify commit matches expected
+        if lines and COMMIT.startswith(lines[0][:8]):
+            print(f"[DOCKER PROOF] ✓ Commit MATCHES expected: {{COMMIT[:8]}}")
+            results["docker_commit_proof"]["matches_expected"] = True
+        else:
+            print(f"[DOCKER PROOF] ⚠ Commit MISMATCH: expected {{COMMIT[:8]}}, got {{lines[0][:8] if lines else 'none'}}")
+            results["docker_commit_proof"]["matches_expected"] = False
+    except Exception as e:
+        print(f"[DOCKER PROOF] Error reading: {{e}}")
+        results["docker_commit_proof"] = {{"exists": True, "error": str(e)}}
+else:
+    print(f"[DOCKER PROOF] Not found at {{docker_proof_path}}")
+    results["docker_commit_proof"] = {{"exists": False, "note": "No /opt/sglang_commit.txt - older Docker image?"}}
 
 def find_sglang_path():
     """Find where SGLang is installed."""
@@ -3408,9 +3443,17 @@ def run_benchmark(port: int, perf_command: str):
     existing_path = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = ":".join(sglang_python_paths + ([existing_path] if existing_path else []))
 
+    print(f"[BENCHMARK] Running command: {{cmd[:200]}}...")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600, env=env)
     output = result.stdout + result.stderr
-    return output, parse_benchmark_output(output)
+    print(f"[BENCHMARK] Return code: {{result.returncode}}")
+    print(f"[BENCHMARK] Output length: {{len(output)}} chars")
+    # Print last 2000 chars of output for debugging
+    print(f"[BENCHMARK] Output (last 2000 chars):")
+    print(output[-2000:] if len(output) > 2000 else output)
+    metrics = parse_benchmark_output(output)
+    print(f"[BENCHMARK] Parsed metrics: {{metrics}}")
+    return output, metrics
 
 # Main execution
 print(f"=" * 60)
@@ -3802,6 +3845,10 @@ def run_3way_benchmark_docker_parallel(
         "baseline_raw": "",
         "human_raw": "",
         "agent_raw": "",
+        # Docker commit proofs for verification
+        "human_commit_proof": {},
+        "baseline_commit_proof": {},
+        "agent_commit_proof": {},
     }
 
     start_time = time.time()
@@ -3954,12 +4001,13 @@ def run_3way_benchmark_docker_parallel(
                 "raw_output": "",
             }
 
-    # Combine results - metrics AND raw outputs
+    # Combine results - metrics, raw outputs, AND commit proofs
     errors = []
 
     if "human" in phase_results:
         result["human_metrics"] = phase_results["human"].get("metrics", {})
         result["human_raw"] = phase_results["human"].get("raw_output", "")
+        result["human_commit_proof"] = phase_results["human"].get("docker_commit_proof", {})
         if phase_results["human"].get("status") == "success":
             result["status"] = "success"
         elif phase_results["human"].get("error"):
@@ -3968,12 +4016,14 @@ def run_3way_benchmark_docker_parallel(
     if "baseline" in phase_results:
         result["baseline_metrics"] = phase_results["baseline"].get("metrics", {})
         result["baseline_raw"] = phase_results["baseline"].get("raw_output", "")
+        result["baseline_commit_proof"] = phase_results["baseline"].get("docker_commit_proof", {})
         if phase_results["baseline"].get("error"):
             errors.append(f"BASELINE: {phase_results['baseline']['error']}")
 
     if "agent" in phase_results:
         result["agent_metrics"] = phase_results["agent"].get("metrics", {})
         result["agent_raw"] = phase_results["agent"].get("raw_output", "")
+        result["agent_commit_proof"] = phase_results["agent"].get("docker_commit_proof", {})
         if phase_results["agent"].get("error"):
             errors.append(f"AGENT: {phase_results['agent']['error']}")
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any
 
-from datasets import load_dataset
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(
@@ -36,23 +36,33 @@ CLAUDE_CODE_RUNS_DIR = {
 }
 RESULTS_DIR = Path("benchmark_results")
 
-# HuggingFace dataset
-HF_DATASET = "Ayushnangia/omniperf_v1"
+# Local parquet dataset paths (ground truth)
+LOCAL_PARQUET_PATHS = {
+    "sglang": Path("data/omniperf_v1_hf_latest/sglang/train-00000-of-00001.parquet"),
+    "vllm": Path("data/omniperf_v1_hf_latest/vllm/train-00000-of-00001.parquet"),
+}
 
 
 def find_dataset_row(commit: str, repo: str) -> Optional[Dict]:
-    """Find the dataset row for a commit."""
-    logger.info(f"Loading HuggingFace dataset: {HF_DATASET} config={repo}")
-    ds = load_dataset(HF_DATASET, repo, split="train")
+    """Find the dataset row for a commit from local parquet file."""
+    parquet_path = LOCAL_PARQUET_PATHS.get(repo)
+
+    if not parquet_path or not parquet_path.exists():
+        logger.error(f"Local parquet not found: {parquet_path}")
+        logger.error(f"Make sure data/omniperf_v1_hf_latest/{repo}/ exists with the parquet file")
+        return None
+
+    logger.info(f"Loading local parquet: {parquet_path}")
+    df = pd.read_parquet(parquet_path)
 
     commit_short = commit[:8]
-    for row in ds:
+    for _, row in df.iterrows():
         row_commit = row.get("commit_hash", "")
-        if row_commit.startswith(commit_short) or commit_short in row_commit:
+        if row_commit and (row_commit.startswith(commit_short) or commit_short in row_commit):
             logger.info(f"Found commit in dataset: {row_commit[:12]}")
-            return dict(row)
+            return row.to_dict()
 
-    logger.error(f"Commit {commit_short} not found in {repo} dataset")
+    logger.error(f"Commit {commit_short} not found in {repo} parquet ({len(df)} rows)")
     return None
 
 
@@ -367,7 +377,7 @@ def save_results(
     """Save benchmark results to organized folder structure.
 
     Creates:
-        benchmark_results/{repo}/{commit_short}/{timestamp}/
+        benchmark_results/{repo}/{full_commit}/{timestamp}/
             ├── metrics.json          # Parsed metrics (small, structured)
             ├── metadata.json         # Run metadata
             ├── baseline_raw.txt      # Full raw output (no truncation)
@@ -375,13 +385,17 @@ def save_results(
             ├── agent_raw.txt         # Full raw output (no truncation)
             ├── agent_patch.diff      # The patch file
             ├── perf_command.txt      # The benchmark command
+            ├── commit_proof.json     # Docker commit verification
             └── summary.txt           # Human-readable summary
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    commit_short = commit[:8]
 
-    # Create organized folder structure
-    run_dir = RESULTS_DIR / repo / commit_short / timestamp
+    # Use full commit hash from dataset for folder name (not short)
+    full_commit = dataset_row.get("commit_hash", commit)
+    commit_short = commit[:12]  # For display only
+
+    # Create organized folder structure with FULL commit hash
+    run_dir = RESULTS_DIR / repo / full_commit / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Saving results to: {run_dir}")
@@ -406,6 +420,7 @@ def save_results(
     # 2. Save metadata.json
     metadata = {
         "commit": commit,
+        "commit_full": full_commit,
         "commit_short": commit_short,
         "repo": repo,
         "timestamp": timestamp,
@@ -427,6 +442,18 @@ def save_results(
         },
     }
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, default=str))
+
+    # 2b. Save commit_proof.json (Docker container commit verification)
+    commit_proof = {
+        "expected_commit": full_commit,
+        "docker_proof": result.get("docker_commit_proof", {}),
+        "verification": {
+            "human": result.get("human_commit_proof", {}),
+            "baseline": result.get("baseline_commit_proof", {}),
+            "agent": result.get("agent_commit_proof", {}),
+        },
+    }
+    (run_dir / "commit_proof.json").write_text(json.dumps(commit_proof, indent=2, default=str))
 
     # 3. Save perf_command.txt (full command, no truncation)
     perf_command = dataset_row.get("perf_command", "")
@@ -456,7 +483,8 @@ def save_results(
 
     # 6. Save human-readable summary
     with open(run_dir / "summary.txt", "w") as f:
-        f.write(f"Benchmark Results for {repo} commit {commit_short}\n")
+        f.write(f"Benchmark Results for {repo} commit {full_commit}\n")
+        f.write(f"(short: {commit_short})\n")
         f.write(f"=" * 60 + "\n\n")
         f.write(f"PR: {dataset_row.get('pr_url', 'N/A')}\n")
         f.write(f"Subject: {dataset_row.get('commit_subject', 'N/A')}\n")
@@ -550,7 +578,7 @@ Examples:
     print(f"[1/4] Looking up commit {args.commit[:8]} in {args.repo} dataset...")
     dataset_row = find_dataset_row(args.commit, args.repo)
     if not dataset_row:
-        print(f"ERROR: Commit not found in HuggingFace dataset")
+        print(f"ERROR: Commit not found in local parquet dataset")
         sys.exit(1)
 
     print(f"  Found: {dataset_row.get('commit_subject', 'N/A')[:60]}")
