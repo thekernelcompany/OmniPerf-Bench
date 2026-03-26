@@ -433,36 +433,41 @@ def fetch_completed_samples(
         log.warning(f"Could not list HF repo files: {e}")
         return completed
 
-    # Fast path: try per-sample shard naming convention
+    # Collect from per-sample shard filenames (new format)
+    per_sample_shards = []
+    standard_shards = []
     for f in files:
         name = f.rfilename
-        match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", name)
+        basename = name.split("/")[-1]
+        match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", basename)
         if match:
             completed.add((match.group(1), int(match.group(2))))
+            per_sample_shards.append(name)
+        elif basename.endswith(".parquet"):
+            standard_shards.append(name)
+
+    # Also read standard HF shards (train-NNNNN.parquet) — repos may have both formats
+    if standard_shards:
+        try:
+            import pandas as pd
+            from huggingface_hub import hf_hub_download
+
+            for pf in standard_shards:
+                try:
+                    local = hf_hub_download(repo_id, pf, repo_type="dataset", token=token)
+                    df = pd.read_parquet(local, columns=["item_id", "sample_index"])
+                    for _, row in df.iterrows():
+                        iid = row.get("item_id", "")
+                        sidx = row.get("sample_index")
+                        if iid and sidx is not None:
+                            completed.add((str(iid), int(sidx)))
+                except Exception:
+                    continue
+        except ImportError:
+            log.debug("pandas not available for standard shards")
+
     if completed:
         return completed
-
-    # Standard HF parquet path: download shards and read item_id/sample_index columns
-    try:
-        import pandas as pd
-        from huggingface_hub import hf_hub_download
-
-        parquet_files = [f.rfilename for f in files if f.rfilename.endswith(".parquet")]
-        for pf in parquet_files:
-            try:
-                local = hf_hub_download(repo_id, pf, repo_type="dataset", token=token)
-                df = pd.read_parquet(local, columns=["item_id", "sample_index"])
-                for _, row in df.iterrows():
-                    iid = row.get("item_id", "")
-                    sidx = row.get("sample_index")
-                    if iid and sidx is not None:
-                        completed.add((str(iid), int(sidx)))
-            except Exception:
-                continue
-        if completed:
-            return completed
-    except ImportError:
-        log.debug("pandas not available, falling back to datasets library")
 
     # Last resort: HF datasets library
     try:
