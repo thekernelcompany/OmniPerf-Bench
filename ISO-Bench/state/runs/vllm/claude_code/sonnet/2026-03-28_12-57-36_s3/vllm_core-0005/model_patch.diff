@@ -1,0 +1,82 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 7978730..afac074 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -873,6 +873,12 @@ def init_cached_hf_modules() -> None:
+     init_hf_modules()
+ 
+ 
++@cache
++def _get_ldconfig_lines() -> list[str]:
++    """Cache the ldconfig output so all find_library calls share one subprocess."""
++    return subprocess.check_output(["/sbin/ldconfig", "-p"]).decode().splitlines()
++
++
+ @cache
+ def find_library(lib_name: str) -> str:
+     """
+@@ -884,10 +890,12 @@ def find_library(lib_name: str) -> str:
+     # According to https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard
+     # `/sbin/ldconfig` should exist in all Linux systems.
+     # `/sbin/ldconfig` searches the library in the system
+-    libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode()
+     # each line looks like the following:
+     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
+-    locs = [line.split()[-1] for line in libs.splitlines() if lib_name in line]
++    locs = [
++        line.split()[-1] for line in _get_ldconfig_lines()
++        if lib_name in line
++    ]
+     # `LD_LIBRARY_PATH` searches the library in the user-defined paths
+     env_ld_library_path = envs.LD_LIBRARY_PATH
+     if not locs and env_ld_library_path:
+@@ -1185,11 +1193,10 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
+             if arg.startswith('--'):
+                 if '=' in arg:
+                     key, value = arg.split('=', 1)
+-                    key = '--' + key[len('--'):].replace('_', '-')
++                    key = '--' + key[2:].replace('_', '-')
+                     processed_args.append(f'{key}={value}')
+                 else:
+-                    processed_args.append('--' +
+-                                          arg[len('--'):].replace('_', '-'))
++                    processed_args.append('--' + arg[2:].replace('_', '-'))
+             elif arg.startswith('-O') and arg != '-O' and len(arg) == 2:
+                 # allow -O flag to be used without space, e.g. -O3
+                 processed_args.append('-O')
+@@ -1525,7 +1532,9 @@ class LazyDict(Mapping[str, T], Generic[T]):
+         if key not in self._dict:
+             if key not in self._factory:
+                 raise KeyError(key)
+-            self._dict[key] = self._factory[key]()
++            value = self._factory[key]()
++            self._dict[key] = value
++            return value
+         return self._dict[key]
+ 
+     def __setitem__(self, key: str, value: Callable[[], T]):
+@@ -1612,6 +1621,15 @@ def import_from_path(module_name: str, file_path: Union[str, os.PathLike]):
+     return module
+ 
+ 
++def _req_package_name(req: str) -> str:
++    """Extract the package name from a PEP 508 requirement string."""
++    for sep in (';', '>=', '<=', '=='):
++        idx = req.find(sep)
++        if idx != -1:
++            return req[:idx]
++    return req
++
++
+ @cache
+ def get_vllm_optional_dependencies():
+     metadata = importlib.metadata.metadata("vllm")
+@@ -1620,7 +1638,7 @@ def get_vllm_optional_dependencies():
+ 
+     return {
+         extra: [
+-            re.split(r";|>=|<=|==", req)[0] for req in requirements
++            _req_package_name(req) for req in requirements
+             if req.endswith(f'extra == "{extra}"')
+         ]
+         for extra in extras

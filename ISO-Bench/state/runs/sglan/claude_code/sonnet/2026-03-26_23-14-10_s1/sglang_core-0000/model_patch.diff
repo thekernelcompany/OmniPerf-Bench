@@ -1,0 +1,157 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..df84daf 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -16,7 +16,7 @@
+ # and "Punica: Multi-Tenant LoRA Serving"
+ 
+ import logging
+-from typing import Dict, List, Set, Tuple
++from typing import Dict, List, Optional, Set, Tuple
+ 
+ import torch
+ 
+@@ -223,31 +223,22 @@ class LoRAManager:
+         self.lora_backend.set_batch_info(batch_info)
+ 
+         # call set_lora_info for each lora modules
++        # Use precomputed _module_weight_name to avoid repeated get_weight_name() calls
++        get_tensor = self.memory_pool.get_tensor
++        module_weight_name = self._module_weight_name
+         for layer_id, modules in self.lora_modules.items():
+             for module_name, module in modules:
+-                if "qkv_proj" in module_name:
++                weight_name = module_weight_name[module_name]
++                if weight_name is None:
+                     module.set_lora_info(
+-                        self.memory_pool.get_tensor(
+-                            "qkv_proj", layer_id, LoRAType.LORA_A
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            "q_proj", layer_id, LoRAType.LORA_B
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            "kv_proj", layer_id, LoRAType.LORA_B
+-                        ),
++                        get_tensor("qkv_proj", layer_id, LoRAType.LORA_A),
++                        get_tensor("q_proj", layer_id, LoRAType.LORA_B),
++                        get_tensor("kv_proj", layer_id, LoRAType.LORA_B),
+                     )
+                 else:
+-                    weight_name = get_weight_name(
+-                        module_name, self.lora_weight_names, LoRAType.LORA_A
+-                    )
+                     module.set_lora_info(
+-                        self.memory_pool.get_tensor(
+-                            weight_name, layer_id, LoRAType.LORA_A
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            weight_name, layer_id, LoRAType.LORA_B
+-                        ),
++                        get_tensor(weight_name, layer_id, LoRAType.LORA_A),
++                        get_tensor(weight_name, layer_id, LoRAType.LORA_B),
+                     )
+ 
+     def set_lora_module(self, module_name, module):
+@@ -284,3 +275,17 @@ class LoRAManager:
+                 self.lora_modules[layer_id].append(
+                     (module_name, self.set_lora_module(module_name, module))
+                 )
++
++        # Precompute weight name for each module to avoid repeated get_weight_name()
++        # calls and string checks in the hot path of prepare_lora_batch().
++        # Maps module_name -> weight_name for LORA_A, or None for qkv_proj modules.
++        self._module_weight_name: Dict[str, Optional[str]] = {}
++        for modules in self.lora_modules.values():
++            for module_name, _ in modules:
++                if module_name not in self._module_weight_name:
++                    if "qkv_proj" in module_name:
++                        self._module_weight_name[module_name] = None
++                    else:
++                        self._module_weight_name[module_name] = get_weight_name(
++                            module_name, self.lora_weight_names, LoRAType.LORA_A
++                        )
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..b6d8dc3 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -54,6 +54,11 @@ class LoRAMemoryPool:
+         # Here we don't initialize to None since None is a valid uid
+         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
+ 
++        # Cache mapping from checkpoint weight key to normalized lora weight name.
++        # Shared across all adapter loads since get_weight_name() result depends
++        # only on substring matches against self.lora_weight_names (set at init).
++        self._weight_name_cache: Dict[str, str] = {}
++
+     def get_lora_A_shape(
+         self, module_name: str, base_model: torch.nn.Module
+     ) -> Tuple[int]:
+@@ -99,6 +104,14 @@ class LoRAMemoryPool:
+         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
+         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
+         device = next(base_model.parameters()).device
++
++        # Cache get_stacked_multiply() for all weight names to avoid repeated dict
++        # lookups and key-presence checks in the weight-loading hot path.
++        all_weight_names = set(lora_weight_names[0]) | set(lora_weight_names[1])
++        self._stacked_multiply_cache: Dict[str, int] = {
++            name: get_stacked_multiply(name) for name in all_weight_names
++        }
++
+         # Init A tensor, column_major=False
+         for module_A in lora_weight_names[0]:
+             lora_A_shape = self.get_lora_A_shape(module_A, base_model)
+@@ -170,20 +183,26 @@ class LoRAMemoryPool:
+ 
+         assert lora_adapter is not None
+         lora_rank = lora_adapter.config.hf_config["r"]
++        weight_name_cache = self._weight_name_cache
+         for layer_id in range(self.num_layer):
+             layer_weights = lora_adapter.layers[layer_id].weights
+             temp_A_buffer: Dict[str, torch.Tensor] = {}
+             temp_B_buffer: Dict[str, torch.Tensor] = {}
+             for name, weights in layer_weights.items():
++                lora_weight_name = weight_name_cache.get(name)
++                if lora_weight_name is None:
++                    if "lora_A" in name:
++                        lora_weight_name = get_weight_name(
++                            name, self.lora_weight_names, LoRAType.LORA_A
++                        )
++                    else:
++                        lora_weight_name = get_weight_name(
++                            name, self.lora_weight_names, LoRAType.LORA_B
++                        )
++                    weight_name_cache[name] = lora_weight_name
+                 if "lora_A" in name:
+-                    lora_weight_name = get_weight_name(
+-                        name, self.lora_weight_names, LoRAType.LORA_A
+-                    )
+                     temp_A_buffer[lora_weight_name] = weights
+                 else:
+-                    lora_weight_name = get_weight_name(
+-                        name, self.lora_weight_names, LoRAType.LORA_B
+-                    )
+                     temp_B_buffer[lora_weight_name] = weights
+ 
+             if self.tp_size > 1:
+@@ -210,8 +229,9 @@ class LoRAMemoryPool:
+                             temp_B_buffer[weight_name], self.tp_rank
+                         )
+ 
++            stacked_multiply = self._stacked_multiply_cache
+             for name, weights in temp_A_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = stacked_multiply[name]
+                 buffer_view = self.A_buffer[name][layer_id][buffer_id][
+                     : lora_rank * c, :
+                 ]
+@@ -219,7 +239,7 @@ class LoRAMemoryPool:
+                 buffer_view.copy_(weights)
+ 
+             for name, weights in temp_B_buffer.items():
+-                c = get_stacked_multiply(name)
++                c = stacked_multiply[name]
+                 if c > 1:
+                     for stacked_id in range(c):
+                         buffer_view = self.B_buffer[name][layer_id][stacked_id][

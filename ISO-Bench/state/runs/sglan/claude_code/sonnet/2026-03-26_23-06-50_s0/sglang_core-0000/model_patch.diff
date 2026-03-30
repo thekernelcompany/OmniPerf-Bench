@@ -1,0 +1,184 @@
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 45050df..15042e5 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -125,6 +125,14 @@ class LoRAManager:
+         # misc lora configs
+         self.max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
+ 
++        # Pre-cache lora rank and scaling per adapter (constant after loading)
++        self._lora_rank: Dict[str, int] = {
++            name: lora.config.hf_config["r"] for name, lora in self.loras.items()
++        }
++        self._lora_scaling: Dict[str, float] = {
++            name: lora.scaling for name, lora in self.loras.items()
++        }
++
+         if self.lora_backend == "flashinfer":
+             # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
+             max_lora_dim = max([x.hf_config["r"] for x in self.configs.values()])
+@@ -150,6 +158,48 @@ class LoRAManager:
+         # Initialize target lora modules in memory pool
+         self.memory_pool.init_buffers(self.lora_weight_names, self.base_model)
+ 
++        # Pre-cache (module, tensor_args) tuples so prepare_lora_batch avoids
++        # repeated string checks, get_weight_name calls, and get_tensor lookups.
++        self._build_module_info_cache()
++
++    def _build_module_info_cache(self):
++        """Pre-compute per-module tensor references for use in prepare_lora_batch."""
++        # Each entry is a tuple:
++        #   is_qkv=True:  (True,  tensor_A_qkv, tensor_B_q, tensor_B_kv, module)
++        #   is_qkv=False: (False, tensor_A,     tensor_B,   module)
++        cache = []
++        for layer_id, modules in self.lora_modules.items():
++            for module_name, module in modules:
++                if "qkv_proj" in module_name:
++                    cache.append((
++                        True,
++                        self.memory_pool.get_tensor(
++                            "qkv_proj", layer_id, LoRAType.LORA_A
++                        ),
++                        self.memory_pool.get_tensor(
++                            "q_proj", layer_id, LoRAType.LORA_B
++                        ),
++                        self.memory_pool.get_tensor(
++                            "kv_proj", layer_id, LoRAType.LORA_B
++                        ),
++                        module,
++                    ))
++                else:
++                    weight_name = get_weight_name(
++                        module_name, self.lora_weight_names, LoRAType.LORA_A
++                    )
++                    cache.append((
++                        False,
++                        self.memory_pool.get_tensor(
++                            weight_name, layer_id, LoRAType.LORA_A
++                        ),
++                        self.memory_pool.get_tensor(
++                            weight_name, layer_id, LoRAType.LORA_B
++                        ),
++                        module,
++                    ))
++        self._module_info_cache = cache
++
+     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+         # load active loras into lora memory pool
+         cur_uids = set(forward_batch.lora_paths)
+@@ -180,13 +230,13 @@ class LoRAManager:
+                     self.memory_pool.get_buffer_id(lora_path)
+                 )
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    self.cuda_graph_batch_info.lora_ranks[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.config.hf_config["r"]
+-                    self.cuda_graph_batch_info.scalings[
+-                        self.cuda_graph_batch_info.weight_indices[i]
+-                    ] = lora.scaling
++                    idx = self.cuda_graph_batch_info.weight_indices[i]
++                    self.cuda_graph_batch_info.lora_ranks[idx] = (
++                        self._lora_rank[lora_path]
++                    )
++                    self.cuda_graph_batch_info.scalings[idx] = (
++                        self._lora_scaling[lora_path]
++                    )
+             batch_info = self.cuda_graph_batch_info
+         else:
+             seg_lens = (
+@@ -208,9 +258,8 @@ class LoRAManager:
+             for i, lora_path in enumerate(forward_batch.lora_paths):
+                 weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                 if lora_path is not None:
+-                    lora = self.loras[lora_path]
+-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+-                    scalings[weight_indices[i]] = lora.scaling
++                    lora_ranks[weight_indices[i]] = self._lora_rank[lora_path]
++                    scalings[weight_indices[i]] = self._lora_scaling[lora_path]
+             batch_info = LoRABatchInfo(
+                 bs=bs,
+                 seg_lens=seg_lens,
+@@ -222,33 +271,12 @@ class LoRAManager:
+             )
+         self.lora_backend.set_batch_info(batch_info)
+ 
+-        # call set_lora_info for each lora modules
+-        for layer_id, modules in self.lora_modules.items():
+-            for module_name, module in modules:
+-                if "qkv_proj" in module_name:
+-                    module.set_lora_info(
+-                        self.memory_pool.get_tensor(
+-                            "qkv_proj", layer_id, LoRAType.LORA_A
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            "q_proj", layer_id, LoRAType.LORA_B
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            "kv_proj", layer_id, LoRAType.LORA_B
+-                        ),
+-                    )
+-                else:
+-                    weight_name = get_weight_name(
+-                        module_name, self.lora_weight_names, LoRAType.LORA_A
+-                    )
+-                    module.set_lora_info(
+-                        self.memory_pool.get_tensor(
+-                            weight_name, layer_id, LoRAType.LORA_A
+-                        ),
+-                        self.memory_pool.get_tensor(
+-                            weight_name, layer_id, LoRAType.LORA_B
+-                        ),
+-                    )
++        # call set_lora_info for each lora module using pre-cached tensor references
++        for entry in self._module_info_cache:
++            if entry[0]:
++                entry[4].set_lora_info(entry[1], entry[2], entry[3])
++            else:
++                entry[3].set_lora_info(entry[1], entry[2])
+ 
+     def set_lora_module(self, module_name, module):
+         lora_module = get_lora_layer(module, self.lora_backend)
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 8b8d213..d5be8a7 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -54,6 +54,9 @@ class LoRAMemoryPool:
+         # Here we don't initialize to None since None is a valid uid
+         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
+ 
++        # Set of buffer slots that are currently unoccupied (uid == "")
++        self._free_slots: Set[int] = set(range(self.max_loras_per_batch))
++
+     def get_lora_A_shape(
+         self, module_name: str, base_model: torch.nn.Module
+     ) -> Tuple[int]:
+@@ -129,10 +132,11 @@ class LoRAMemoryPool:
+     ):
+ 
+         def get_available_buffer_slot():
+-            for buffer_id in range(self.max_loras_per_batch):
+-                # Prioritize empty slots
+-                if self.buffer_id_to_uid[buffer_id] == "":
+-                    return buffer_id, ""
++            # O(1) free-slot lookup using the maintained free-slots set
++            if self._free_slots:
++                buffer_id = next(iter(self._free_slots))
++                self._free_slots.discard(buffer_id)
++                return buffer_id, ""
+ 
+             for buffer_id in range(self.max_loras_per_batch):
+                 # Evict unneeded lora
+@@ -163,9 +167,9 @@ class LoRAMemoryPool:
+             ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+ 
+         if uid is None:
+-            for i in range(self.num_layer):
+-                for k in self.A_buffer.keys():
+-                    self.A_buffer[k][i][buffer_id] = 0
++            for bufs in self.A_buffer.values():
++                for i in range(self.num_layer):
++                    bufs[i][buffer_id].zero_()
+             return
+ 
+         assert lora_adapter is not None

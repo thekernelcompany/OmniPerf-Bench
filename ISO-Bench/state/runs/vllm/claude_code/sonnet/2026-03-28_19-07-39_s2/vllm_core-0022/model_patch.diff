@@ -1,0 +1,75 @@
+diff --git a/vllm/v1/spec_decode/ngram_proposer.py b/vllm/v1/spec_decode/ngram_proposer.py
+index 9b116e0..a285fa0 100644
+--- a/vllm/v1/spec_decode/ngram_proposer.py
++++ b/vllm/v1/spec_decode/ngram_proposer.py
+@@ -75,32 +75,26 @@ class NgramProposer:
+         n: int,
+         k: int,
+     ) -> Optional[np.ndarray]:
+-        context_len = context_token_ids.shape[0]
++        context_len = len(context_token_ids)
+         assert n > 0
+ 
+-        pattern = context_token_ids[-n:]
+-        # Precompute lps array for Y
+-        lps = NgramProposer._kmp_lps_array(pattern)
++        # Need at least 2*n tokens: n for the pattern + n tokens to search in
++        if context_len < 2 * n:
++            return None
+ 
+-        i = 0
+-        j = 0
+-        # -n because the last n tokens are used as pattern
+-        while i < context_len - n:
+-            if context_token_ids[i] == pattern[j]:
+-                i += 1
+-                j += 1
++        # Convert to numpy array for vectorized comparison if needed
++        context_arr = np.asarray(context_token_ids)
++        pattern = context_arr[-n:]
++        search_space = context_arr[:context_len - n]
+ 
+-                # If we have matched the entire Y
+-                if j == n:
+-                    # Found pattern in context, gather the next K elements
+-                    return context_token_ids[i:i + k]
+-            else:
+-                # Mismatch
+-                if j != 0:
+-                    # Use the lps array to avoid re-checking elements
+-                    j = lps[j - 1]
+-                else:
+-                    i += 1
++        # Vectorized sliding window comparison (faster than Python KMP loop)
++        windows = np.lib.stride_tricks.sliding_window_view(search_space, n)
++        matches = np.all(windows == pattern, axis=1)
++        match_indices = np.nonzero(matches)[0]
++
++        if len(match_indices) == 0:
++            return None
+ 
+-        # Y not found
+-        return None
++        # Return k tokens following the first match
++        start = int(match_indices[0]) + n
++        return context_token_ids[start:start + k]
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 0ecc00a..19a1928 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -430,12 +430,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Get the number of scheduled tokens for each request.
+         # TODO: The Python loop can be slow. Optimize.
+         num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
+-        max_num_scheduled_tokens = 0
+         for i, req_id in enumerate(self.input_batch.req_ids):
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens[i] = num_tokens
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
++            num_scheduled_tokens[i] = scheduler_output.num_scheduled_tokens[
++                req_id]
++        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+ 
+         # Get request indices.
+         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]

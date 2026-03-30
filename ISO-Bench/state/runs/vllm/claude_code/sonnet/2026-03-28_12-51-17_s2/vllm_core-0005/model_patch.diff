@@ -1,0 +1,90 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 7978730..d954735 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -15,6 +15,7 @@ import importlib.metadata
+ import importlib.util
+ import inspect
+ import ipaddress
++import itertools
+ import multiprocessing
+ import os
+ import re
+@@ -251,12 +252,11 @@ class LRUCache(Generic[_K, _V]):
+ 
+     def get(self, key: _K, default: Optional[_V] = None) -> Optional[_V]:
+         value: Optional[_V]
+-        if key in self.cache:
++        try:
+             value = self.cache[key]
+             self.cache.move_to_end(key)
+-
+             self._hits += 1
+-        else:
++        except KeyError:
+             value = default
+ 
+         self._total += 1
+@@ -699,7 +699,7 @@ def create_kv_caches_with_random(
+     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
+ 
+     scale = head_size**-0.5
+-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
++    x = 16 // get_dtype_size(torch_dtype)
+     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
+     key_caches: list[torch.Tensor] = []
+     for _ in range(num_layers):
+@@ -780,8 +780,9 @@ def make_ndarray_with_pad(
+ 
+     padded_x = np.full((len(x), max_len), pad, dtype=dtype)
+     for ind, blocktb in enumerate(x):
+-        assert len(blocktb) <= max_len
+-        padded_x[ind, :len(blocktb)] = blocktb
++        n = len(blocktb)
++        assert n <= max_len
++        padded_x[ind, :n] = blocktb
+ 
+     return padded_x
+ 
+@@ -822,9 +823,16 @@ def async_tensor_h2d(
+     return t.to(device=target_device, non_blocking=True)
+ 
+ 
++_DTYPE_SIZE_CACHE: dict[torch.dtype, int] = {}
++
++
+ def get_dtype_size(dtype: torch.dtype) -> int:
+     """Get the size of the data type in bytes."""
+-    return torch.tensor([], dtype=dtype).element_size()
++    size = _DTYPE_SIZE_CACHE.get(dtype)
++    if size is None:
++        size = torch.tensor([], dtype=dtype).element_size()
++        _DTYPE_SIZE_CACHE[dtype] = size
++    return size
+ 
+ 
+ # `collections` helpers
+@@ -847,7 +855,7 @@ def is_list_of(
+ 
+ def flatten_2d_lists(lists: Iterable[Iterable[T]]) -> list[T]:
+     """Flatten a list of lists to a single list."""
+-    return [item for sublist in lists for item in sublist]
++    return list(itertools.chain.from_iterable(lists))
+ 
+ 
+ def full_groupby(values: Iterable[_V], *, key: Callable[[_V], _K]):
+@@ -2185,9 +2193,12 @@ def bind_kv_cache(
+         set(
+             extract_layer_index(layer_name)
+             for layer_name in layer_need_kv_cache))
++    layer_index_to_cache_idx = {
++        idx: i
++        for i, idx in enumerate(layer_index_sorted)
++    }
+     for layer_name in layer_need_kv_cache:
+-        kv_cache_idx = layer_index_sorted.index(
+-            extract_layer_index(layer_name))
++        kv_cache_idx = layer_index_to_cache_idx[extract_layer_index(layer_name)]
+         forward_ctx = ctx[layer_name]
+         assert len(forward_ctx.kv_cache) == len(kv_cache)
+         for ve, ve_kv_cache in enumerate(kv_cache):

@@ -409,14 +409,17 @@ def push_single_row(
 def fetch_completed_samples(
     repo_id: str,
     token: Optional[str],
+    agent_name: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> Set[Tuple[str, int]]:
     """
-    Query HF dataset and return set of (item_id, sample_index) already pushed.
+    Query HF dataset and return set of (item_id, sample_index) that are
+    **valid** (status=success AND non-empty model_patch) for a specific
+    agent/model combination.
 
-    Supports three formats:
-    1. Per-sample shard filenames: {item_id}_s{idx}_{ts}.parquet  (fast path)
-    2. Standard HF auto-sharded parquet: train-NNNNN.parquet      (pandas path)
-    3. HF datasets library fallback                                (slow path)
+    Downloads each parquet shard and inspects content — slower than filename
+    matching but prevents counting rate-limited/failed runs as complete,
+    and avoids cross-agent contamination.
     """
     completed: Set[Tuple[str, int]] = set()
     if not token:
@@ -426,61 +429,60 @@ def fetch_completed_samples(
 
     api = HfApi(token=token)
 
-    # List all parquet files in data/
+    # List all repo files
     try:
-        files = list(api.list_repo_tree(repo_id, repo_type="dataset", path_in_repo="data"))
-    except Exception as e:
-        log.warning(f"Could not list HF repo files: {e}")
-        return completed
-
-    # Collect from per-sample shard filenames (new format)
-    per_sample_shards = []
-    standard_shards = []
-    for f in files:
-        name = f.rfilename
-        basename = name.split("/")[-1]
-        match = re.match(r"^(.+)_s(\d+)_\d+\.parquet$", basename)
-        if match:
-            completed.add((match.group(1), int(match.group(2))))
-            per_sample_shards.append(name)
-        elif basename.endswith(".parquet"):
-            standard_shards.append(name)
-
-    # Also read standard HF shards (train-NNNNN.parquet) — repos may have both formats
-    if standard_shards:
+        files = api.list_repo_files(repo_id, repo_type="dataset")
+    except Exception:
         try:
-            import pandas as pd
-            from huggingface_hub import hf_hub_download
+            files = [
+                getattr(e, "path", str(e))
+                for e in api.list_repo_tree(
+                    repo_id, repo_type="dataset",
+                    path_in_repo="data", recursive=True,
+                )
+            ]
+        except Exception as e:
+            log.warning(f"Could not list HF repo files: {e}")
+            return completed
 
-            for pf in standard_shards:
-                try:
-                    local = hf_hub_download(repo_id, pf, repo_type="dataset", token=token)
-                    df = pd.read_parquet(local, columns=["item_id", "sample_index"])
-                    for _, row in df.iterrows():
-                        iid = row.get("item_id", "")
-                        sidx = row.get("sample_index")
-                        if iid and sidx is not None:
-                            completed.add((str(iid), int(sidx)))
-                except Exception:
-                    continue
-        except ImportError:
-            log.debug("pandas not available for standard shards")
+    parquet_files = [f for f in files
+                     if isinstance(f, str) and f.startswith("data/") and f.endswith(".parquet")]
 
-    if completed:
+    if not parquet_files:
         return completed
 
-    # Last resort: HF datasets library
+    filter_desc = f"agent={agent_name or '*'}, model={model_name or '*'}"
+    log.info(f"Validating {len(parquet_files)} shards on HF ({filter_desc}) ...")
+
     try:
-        from datasets import load_dataset
-        ds = load_dataset(repo_id, token=token, split="train")
-        for entry in ds:
-            r = dict(entry)  # type: ignore[arg-type]
-            iid = r.get("item_id", "")
-            sidx = r.get("sample_index")
-            if iid and sidx is not None:
-                completed.add((str(iid), int(sidx)))
-    except Exception as e:
-        log.warning(f"Could not load existing HF dataset for resume: {e}")
+        import pandas as pd
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        log.warning("pandas or huggingface_hub not available for content-aware resume")
+        return completed
+
+    cols = ["item_id", "sample_index", "status", "model_patch", "agent_name", "model_name"]
+    checked = 0
+    for pf in parquet_files:
+        try:
+            local = hf_hub_download(repo_id, pf, repo_type="dataset", token=token)
+            df = pd.read_parquet(local, columns=cols)
+            for _, row in df.iterrows():
+                # Filter by agent/model
+                if agent_name and str(row.get("agent_name", "")) != agent_name:
+                    continue
+                if model_name and str(row.get("model_name", "")) != model_name:
+                    continue
+                # Check validity
+                status = str(row.get("status", ""))
+                patch = str(row.get("model_patch", ""))
+                if status == "success" and patch.strip():
+                    completed.add((str(row["item_id"]), int(row["sample_index"])))
+            checked += 1
+        except Exception:
+            continue
+
+    log.info(f"Validated {checked}/{len(parquet_files)} shards → {len(completed)} valid samples ({filter_desc})")
     return completed
 
 
@@ -612,6 +614,16 @@ def run_one_sample(
 
     row = build_hf_row(item_id, sample_idx, run_id, artifacts)
 
+    # --- Gate: only push successful runs with a real patch ---
+    run_status = row.get("status", "unknown")
+    has_patch = bool(row.get("model_patch", "").strip())
+    if run_status != "success" or not has_patch:
+        log.warning(f"{tag} Run {run_status}, patch={'yes' if has_patch else 'EMPTY'} — NOT pushing to HF")
+        nuke_run_dir(state_root, run_id)
+        nuke_worktree(work_root, repo_name, item_id)
+        tmp_plan_path.unlink(missing_ok=True)
+        return False
+
     # --- Push to HF ---
     pushed = False
     if hf_repo and hf_token:
@@ -636,11 +648,13 @@ def run_one_sample(
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
-            files = [f.rfilename.split("/")[-1] for f in api.list_repo_tree(hf_repo, repo_type="dataset", path_in_repo="data")]
-            shard_prefix = f"{item_id}_s{sample_idx}_"
-            if not any(f.startswith(shard_prefix) for f in files):
+            repo_files = api.list_repo_files(hf_repo, repo_type="dataset")
+            shard_prefix = f"data/{item_id}_s{sample_idx}_"
+            if not any(f.startswith(shard_prefix) for f in repo_files):
                 log.error(f"{tag} Push verification FAILED — shard not found on HF. Keeping local state.")
                 pushed = False
+            else:
+                log.info(f"{tag} Push verified on HF")
         except Exception as e:
             log.warning(f"{tag} Push verification could not complete: {e} — trusting push result")
 
@@ -721,9 +735,9 @@ def main():
     # --- Resume: fetch already-pushed samples from HF ---
     already_done: Set[Tuple[str, int]] = set()
     if args.resume and args.hf_repo:
-        log.info("Fetching completed samples from HF for resume ...")
-        already_done = fetch_completed_samples(args.hf_repo, hf_token)
-        log.info(f"Found {len(already_done)} samples already on HF")
+        log.info(f"Fetching completed samples from HF for resume (agent={agent_name}, model={model_name}) ...")
+        already_done = fetch_completed_samples(args.hf_repo, hf_token, agent_name=agent_name, model_name=model_name)
+        log.info(f"Found {len(already_done)} valid samples on HF for {agent_name}/{model_name}")
 
     # --- Build work units: (item, sample_idx) pairs, filtering already-done ---
     total = len(items) * args.n
@@ -770,26 +784,113 @@ def main():
                 item_failed += 1
         return item_completed, item_failed
 
+    def _detect_rate_limit(state_root: Path, run_id: str, item_id: str) -> bool:
+        """Check if a just-completed run was a rate-limit failure."""
+        item_dir = state_root / "runs" / run_id / item_id
+        if not item_dir.exists():
+            return False
+        journal_path = item_dir / "journal.json"
+        if not journal_path.exists():
+            return False
+        try:
+            j = json.loads(journal_path.read_text())
+        except Exception:
+            return False
+        if j.get("status") == "success":
+            return False
+        # Check duration — rate limits fail fast (< 30s)
+        for agent_key in ("claude_code", "trae", "codex", "openhands", "codex_cli"):
+            block = j.get(agent_key, {})
+            if isinstance(block, dict) and "duration_s" in block:
+                if block["duration_s"] > 30:
+                    return False  # Genuine failure, not rate limit
+                break
+        # Check stdout for rate limit markers
+        for agent_key in ("claude_code", "trae", "codex", "openhands"):
+            stdout_path = item_dir / f"{agent_key}_stdout.txt"
+            if stdout_path.exists():
+                stdout = stdout_path.read_text().lower()
+                if "limit" in stdout or "resets" in stdout or "rate" in stdout:
+                    return True
+                break
+        return False
+
+    def _nuke_failed_run(state_root: Path, run_id: str, item_id: str) -> None:
+        """Remove a rate-limited run directory so it doesn't poison dedup."""
+        item_dir = state_root / "runs" / run_id / item_id
+        if item_dir.exists():
+            shutil.rmtree(item_dir)
+        # Clean empty parent dirs
+        run_dir = state_root / "runs" / run_id
+        if run_dir.exists():
+            try:
+                run_dir.rmdir()
+            except OSError:
+                pass
+
     if args.max_parallel_items <= 1:
-        # Sequential: simple loop
+        # Sequential: simple loop with rate-limit retry
+        rate_limit_wait = 300  # start with 5 min backoff
+        max_rate_limit_wait = 3600  # cap at 1 hour
+        consecutive_rate_limits = 0
+
         for item_id, item_work in work_by_item.items():
             for plan_item, sample_idx in item_work:
                 tag = f"[{item_id}][s{sample_idx}]"
                 completed += 1
                 log.info(f"{tag} ({completed}/{to_run})")
-                ok = run_one_sample(
-                    task_yaml=task_yaml,
-                    bench_cfg_path=bench_cfg_path,
-                    bench_cfg=bench_cfg,
-                    plan_item=plan_item,
-                    full_plan=full_plan,
-                    sample_idx=sample_idx,
-                    hf_repo=args.hf_repo,
-                    hf_token=hf_token,
-                    dry_run=args.dry_run,
-                )
-                if not ok and not args.dry_run:
+
+                max_retries = 10
+                for attempt in range(max_retries):
+                    ok = run_one_sample(
+                        task_yaml=task_yaml,
+                        bench_cfg_path=bench_cfg_path,
+                        bench_cfg=bench_cfg,
+                        plan_item=plan_item,
+                        full_plan=full_plan,
+                        sample_idx=sample_idx,
+                        hf_repo=args.hf_repo,
+                        hf_token=hf_token,
+                        dry_run=args.dry_run,
+                    )
+                    if args.dry_run:
+                        break
+
+                    # Check for rate limit
+                    agent_name_l = str(bench_cfg.get("agents", {}).get("default", "unknown"))
+                    model_name_l = get_model_name(bench_cfg, agent_name_l)
+                    repo_short_l = extract_repo_name(full_plan["repo"])
+                    # Find the most recent run dir for this sample
+                    run_base = Path(bench_cfg["paths"]["state_root"]).resolve() / "runs"
+                    repo_agent_model = run_base / repo_short_l / agent_name_l / model_name_l
+                    if repo_agent_model.exists():
+                        # Find the latest run dir ending with _s{sample_idx}
+                        candidates = sorted(
+                            [d for d in os.listdir(repo_agent_model) if d.endswith(f"_s{sample_idx}")],
+                            reverse=True
+                        )
+                        if candidates:
+                            latest_run_id = f"{repo_short_l}/{agent_name_l}/{model_name_l}/{candidates[0]}"
+                            if _detect_rate_limit(run_base, latest_run_id, item_id):
+                                consecutive_rate_limits += 1
+                                wait = min(rate_limit_wait * (2 ** min(consecutive_rate_limits - 1, 4)), max_rate_limit_wait)
+                                log.warning(f"{tag} RATE LIMITED (attempt {attempt+1}/{max_retries}). "
+                                          f"Waiting {wait}s before retry...")
+                                # Nuke the failed run so it doesn't shadow future success
+                                _nuke_failed_run(run_base, latest_run_id, item_id)
+                                time.sleep(wait)
+                                continue
+                            else:
+                                consecutive_rate_limits = 0
+
+                    # Not rate limited — accept result
+                    if not ok:
+                        failed += 1
+                    break
+                else:
+                    log.error(f"{tag} EXHAUSTED {max_retries} retries — giving up on this sample")
                     failed += 1
+
                 log.info(f"{tag} progress: {completed}/{to_run} done, {skipped} skipped, {failed} failed")
     else:
         # Parallel across items, sequential within each item

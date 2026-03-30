@@ -145,6 +145,20 @@ class PrepareExecutor:
                 logger.info(f"Resolved pre commit: {pre}")
 
             wt_dir = rm.create_worktree(pre, item_id, detach_from_history=detach_from_history)
+            comparison_base = pre
+            if detach_from_history:
+                try:
+                    comparison_base = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=wt_dir,
+                        text=True,
+                        timeout=10,
+                    ).strip()
+                    logger.info(f"Using detached worktree base commit for local diffs: {comparison_base}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to resolve detached worktree base commit, falling back to pre commit: {e}"
+                    )
 
             # Determine target files: if none provided, derive from pre..human diff
             provided_targets = task_cfg["optimization_contract"].get("target_files", [])
@@ -509,6 +523,7 @@ class PrepareExecutor:
                         cli, "-m", "trae_agent.cli", "run",
                         "--file", str(task_file),
                         "--working-dir", str(wt_dir),
+                        "--base-commit", str(comparison_base),
                         "--max-steps", str(iterations),
                         "--must-patch",
                         "--patch-path", str((jw.dir / "model_patch.diff").resolve()),
@@ -588,7 +603,7 @@ class PrepareExecutor:
                 while not stop_watch.is_set():
                     try:
                         commits = subprocess.check_output(
-                            ["git", "log", "--oneline", f"{pre}..HEAD"],
+                            ["git", "log", "--oneline", f"{comparison_base}..HEAD"],
                             cwd=wt_dir,
                             text=True,
                             timeout=5,
@@ -983,7 +998,7 @@ class PrepareExecutor:
                         # Check if agent made commits despite API errors
                         try:
                             commits = subprocess.check_output([
-                                "git", "log", "--oneline", f"{pre}..HEAD"
+                                "git", "log", "--oneline", f"{comparison_base}..HEAD"
                             ], cwd=wt_dir, text=True).strip()
                             if commits:
                                 logger.info(f"{agent_label} agent made commits despite API errors: {len(commits.splitlines())} commits")
@@ -1029,7 +1044,7 @@ class PrepareExecutor:
                         try:
                             # Get files changed in the latest commit made by agent
                             changed = subprocess.check_output([
-                                "git", "diff", "--name-only", pre, "HEAD"
+                                "git", "diff", "--name-only", comparison_base, "HEAD"
                             ], cwd=wt_dir, text=True, timeout=30).strip().splitlines()
                             changed = [f for f in changed if f.strip()]  # Filter empty lines
                             logger.debug(f"Git diff detected {len(changed)} changed files")
@@ -1106,7 +1121,7 @@ class PrepareExecutor:
                         # Check if there are any commits made by agent
                         try:
                             commits = subprocess.check_output([
-                                "git", "log", "--oneline", f"{pre}..HEAD"
+                                "git", "log", "--oneline", f"{comparison_base}..HEAD"
                             ], cwd=wt_dir, text=True, timeout=10).strip()
                             if commits:
                                 logger.warning(f"Agent made {len(commits.splitlines())} commits but file detection failed. This may be a detection bug.")
@@ -1142,7 +1157,7 @@ class PrepareExecutor:
                     try:
                         # Compute unified diff against base (pre) commit, excluding scratch artifacts
                         diff_text = subprocess.check_output([
-                            "git", "diff", f"{pre}", "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"
+                            "git", "diff", f"{comparison_base}", "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"
                         ], cwd=wt_dir).decode()
                     except Exception:
                         diff_text = ""
@@ -1210,7 +1225,7 @@ class PrepareExecutor:
                     try:
                         # commit count
                         _commits_txt = subprocess.check_output(
-                            ["git", "log", "--oneline", f"{pre}..HEAD"],
+                            ["git", "log", "--oneline", f"{comparison_base}..HEAD"],
                             cwd=wt_dir,
                             text=True,
                             timeout=10
@@ -1227,7 +1242,7 @@ class PrepareExecutor:
                     if not diff_for_metrics:
                         try:
                             diff_for_metrics = subprocess.check_output(
-                                ["git", "diff", pre, "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"],
+                                ["git", "diff", comparison_base, "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"],
                                 cwd=wt_dir,
                                 timeout=10
                             ).decode()

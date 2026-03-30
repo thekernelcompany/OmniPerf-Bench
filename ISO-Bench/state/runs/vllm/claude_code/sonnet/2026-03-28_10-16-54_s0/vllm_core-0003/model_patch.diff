@@ -1,0 +1,78 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 0026031..625525e 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -891,6 +891,26 @@ def get_default_config(
+     return config
+ 
+ 
++@functools.lru_cache(maxsize=None)
++def _try_get_optimal_moe_config_cached(
++    w1_shape: Tuple[int, ...],
++    w2_shape: Tuple[int, ...],
++    top_k: int,
++    dtype: Optional[str],
++    M: int,
++    is_marlin: bool = False,
++    block_shape: Optional[Tuple[int, ...]] = None,
++) -> Dict[str, Any]:
++    E, _, N = w2_shape
++    block_n = block_shape[0] if block_shape else 0
++    block_k = block_shape[1] if block_shape else 0
++    configs = get_moe_configs(E, N, dtype, block_n, block_k)
++    if configs:
++        return configs[min(configs, key=lambda x: abs(x - M))]
++    return get_default_config(M, E, N, w1_shape[2], top_k, dtype, is_marlin,
++                               list(block_shape) if block_shape else None)
++
++
+ def try_get_optimal_moe_config(
+     w1_shape: Tuple[int, ...],
+     w2_shape: Tuple[int, ...],
+@@ -903,23 +923,11 @@ def try_get_optimal_moe_config(
+     from vllm.model_executor.layers.fused_moe import get_config
+     override_config = get_config()
+     if override_config:
+-        config = override_config
+-    else:
+-        # First try to load optimal config from the file
+-        E, _, N = w2_shape
+-        block_n = block_shape[0] if block_shape else 0
+-        block_k = block_shape[1] if block_shape else 0
+-        configs = get_moe_configs(E, N, dtype, block_n, block_k)
+-
+-        if configs:
+-            # If an optimal configuration map has been found, look up the
+-            # optimal config
+-            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+-        else:
+-            # Else use the default config
+-            config = get_default_config(M, E, N, w1_shape[2], top_k, dtype,
+-                                        is_marlin, block_shape)
+-    return config
++        return override_config
++    block_shape_key = tuple(block_shape) if block_shape is not None else None
++    return _try_get_optimal_moe_config_cached(
++        w1_shape, w2_shape, top_k, dtype, M, is_marlin, block_shape_key
++    )
+ 
+ 
+ def fused_topk(
+@@ -1281,7 +1289,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+             # do not need to be adjusted.
+             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+             intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
+-                                                      topk_ids.shape[1]]
++                                                      top_k_num]
+             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+             config = get_config_func(tokens_in_chunk)
+ 
+@@ -1341,7 +1349,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
+                                 use_int4_w4a16=use_int4_w4a16,
+                                 block_shape=block_shape)
+ 
+-        ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
++        ops.moe_sum(intermediate_cache3,
+                     out_hidden_states[begin_chunk_idx:end_chunk_idx])
+     return out_hidden_states
+ 
