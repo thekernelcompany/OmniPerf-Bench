@@ -1144,8 +1144,10 @@ def get_sglang_image(parent_commit: str) -> str:
 
     # ayushnangia16 images have consistent torch 2.6+cu124 with matching sgl_kernel
     # shikhar481 images have torch 2.7+cu126 which causes sgl_kernel ABI mismatch
+    # NOTE: ayushnangia16 has TWO repos: nvidia-sglang-docker AND sglang-docker
     candidates = [
         f"ayushnangia16/nvidia-sglang-docker:{parent_commit}",
+        f"ayushnangia16/sglang-docker:{parent_commit}",
         f"shikhar481/sglang-images:{short8}",
         f"shikhar481/sglang-images:{short8}-src",
     ]
