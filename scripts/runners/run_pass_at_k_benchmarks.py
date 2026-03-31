@@ -1142,12 +1142,12 @@ def get_sglang_image(parent_commit: str) -> str:
     short8 = parent_commit[:8]
     short12 = parent_commit[:12]
 
-    # ayushnangia16 images have consistent torch 2.6+cu124 with matching sgl_kernel
-    # shikhar481 images have torch 2.7+cu126 which causes sgl_kernel ABI mismatch
-    # NOTE: ayushnangia16 has TWO repos: nvidia-sglang-docker AND sglang-docker
+    # ayushnangia16/sglang-docker has correct sgl_kernel ABI (torch 2.6+cu124)
+    # ayushnangia16/nvidia-sglang-docker has BROKEN sgl_kernel ABI — deprioritize
+    # shikhar481 images have torch 2.7+cu126 which also causes ABI mismatch
     candidates = [
-        f"ayushnangia16/nvidia-sglang-docker:{parent_commit}",
         f"ayushnangia16/sglang-docker:{parent_commit}",
+        f"ayushnangia16/nvidia-sglang-docker:{parent_commit}",
         f"shikhar481/sglang-images:{short8}",
         f"shikhar481/sglang-images:{short8}-src",
     ]
@@ -1172,9 +1172,9 @@ def setup_sglang_container(container_id: str) -> bool:
     """One-time setup for SGLang Docker container."""
     setup_script = """
 apt-get update -qq 2>/dev/null && apt-get install -y -qq libnuma-dev 2>/dev/null
-# CRITICAL: Do NOT upgrade transformers — it breaks sgl_kernel ABI compatibility
-# Instead downgrade compressed_tensors to match existing transformers
-pip install 'compressed_tensors<0.9' -q 2>/dev/null || true
+# Do NOT downgrade compressed_tensors or transformers — sglang-docker images
+# ship with matching versions. Downgrading breaks newer model support
+# (e.g., nvfp4_pack_quantized for Llama-4 quantized models).
 pip install 'numpy<2.0' aiohttp requests tqdm sentencepiece -q 2>/dev/null
 
 export PYTHONPATH="/sgl-workspace/sglang/python:$PYTHONPATH"
