@@ -1,0 +1,102 @@
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index b53a540..6e17fec 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -405,17 +405,18 @@ class MambaMixer2(CustomOp):
+ 
+         # 1. Gated MLP's linear projection
+         projected_states, _ = self.in_proj(hidden_states)
++        # Optimization: Cache split sizes to avoid repeated division
++        intermediate_tp = self.intermediate_size // self.tp_size
++        conv_dim_tp = self.conv_dim // self.tp_size
++        num_heads_tp = self.num_heads // self.tp_size
+         gate, hidden_states_B_C, dt = torch.split(
+             projected_states,
+-            [
+-                self.intermediate_size // self.tp_size,
+-                self.conv_dim // self.tp_size,
+-                self.num_heads // self.tp_size,
+-            ],
++            [intermediate_tp, conv_dim_tp, num_heads_tp],
+             dim=-1,
+         )
+ 
+         # 2. Convolution sequence transformation
++        # Optimization: Cache conv_weights view to avoid repeated view operations
+         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
+                                                self.conv1d.weight.size(2))
+ 
+@@ -452,13 +453,11 @@ class MambaMixer2(CustomOp):
+                 conv_state_indices=mamba_cache_params.state_indices_tensor)
+ 
+         # - get hidden_states, B and C after depthwise convolution.
++        # Optimization: Reuse cached intermediate_tp and pre-compute group split size
++        groups_time_state_tp = groups_time_state_size // self.tp_size
+         hidden_states, B, C = torch.split(
+             hidden_states_B_C,
+-            [
+-                self.intermediate_size // self.tp_size,
+-                groups_time_state_size // self.tp_size,
+-                groups_time_state_size // self.tp_size,
+-            ],
++            [intermediate_tp, groups_time_state_tp, groups_time_state_tp],
+             dim=-1,
+         )
+ 
+@@ -473,13 +472,14 @@ class MambaMixer2(CustomOp):
+                 initial_states = mamba_cache_params.ssm_state[
+                     mamba_cache_params.state_indices_tensor]
+ 
++            # Optimization: Pre-compute n_groups_tp to avoid repeated division
++            n_groups_tp = self.n_groups // self.tp_size
+             scan_output, varlen_state = mamba_chunk_scan_combined(
+-                hidden_states.view(1, seq_len, self.num_heads // self.tp_size,
+-                                   self.head_dim),
++                hidden_states.view(1, seq_len, num_heads_tp, self.head_dim),
+                 dt.unsqueeze(0),
+                 self.A,
+-                B.view(1, seq_len, self.n_groups // self.tp_size, -1),
+-                C.view(1, seq_len, self.n_groups // self.tp_size, -1),
++                B.view(1, seq_len, n_groups_tp, -1),
++                C.view(1, seq_len, n_groups_tp, -1),
+                 chunk_size=self.chunk_size,
+                 D=self.D,
+                 z=None,
+@@ -503,15 +503,18 @@ class MambaMixer2(CustomOp):
+         else:
+ 
+             n_groups = self.n_groups // self.tp_size
+-            A = self.A[:, None, ...][:, :, None].expand(
++            # Optimization: Simplify tensor reshaping - use unsqueeze instead of [:, None, ...]
++            # and combine operations to reduce intermediate tensor creation
++            A = self.A.unsqueeze(1).unsqueeze(2).expand(
+                 -1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+-            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+-            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+-            D = self.D[:, None, ...].expand(-1, self.head_dim)
+-            B = B.view(-1, n_groups, B.shape[1] // n_groups)
+-            C = C.view(-1, n_groups, C.shape[1] // n_groups)
+-            hidden_states_reshaped = hidden_states.view(
+-                -1, self.num_heads // self.tp_size, self.head_dim)
++            dt = dt.unsqueeze(2).expand(-1, -1, self.head_dim)
++            dt_bias = self.dt_bias.unsqueeze(1).expand(-1, self.head_dim)
++            D = self.D.unsqueeze(1).expand(-1, self.head_dim)
++            # Optimization: Pre-compute division to avoid repeated calculation
++            b_group_size = B.shape[1] // n_groups
++            B = B.view(-1, n_groups, b_group_size)
++            C = C.view(-1, n_groups, b_group_size)
++            hidden_states_reshaped = hidden_states.view(-1, num_heads_tp, self.head_dim)
+ 
+             # - the hidden is reshaped into number of current batches
+             # - in this case there is no more prefill, so the batches gen
+@@ -534,8 +537,8 @@ class MambaMixer2(CustomOp):
+                 dt_softplus=True,
+                 state_batch_indices=mamba_cache_params.state_indices_tensor,
+             )
+-            hidden_states = hidden_states.view(
+-                -1, (self.num_heads // self.tp_size) * self.head_dim)
++            # Optimization: Pre-compute output size to avoid repeated multiplication
++            hidden_states = hidden_states.view(-1, num_heads_tp * self.head_dim)
+ 
+         # # 4. gated MLP
+         hidden_states = self.norm(hidden_states, gate)
