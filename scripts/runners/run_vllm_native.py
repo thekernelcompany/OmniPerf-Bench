@@ -141,6 +141,7 @@ def setup_venv_overlay(commit_short: str, parent_full: str, log,
          "transformers>=4.42,<4.45",
          f"outlines{outlines_pin}",
          "lm-format-enforcer==0.10.1",
+         "numpy<2",  # outlines 0.0.34 imports numpy.lib.function_base, removed in numpy 2.x
          "aiohttp", "pandas", "pillow"],
         capture_output=True, text=True, timeout=300, env=env,
     )
@@ -356,6 +357,14 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
     #     a different synthetic mode (very old style) — leave it alone.
     #   - If --dataset-name=sharegpt is set without path, inject local path.
     #   - Else if --dataset-name is missing entirely: inject sharegpt + path.
+    # benchmark_throughput.py at older vLLMs uses `--dataset PATH` rather than
+    # `--dataset-name sharegpt`. Rewrite when targeting old throughput bench.
+    if "benchmark_throughput" in bench_script.name:
+        if '--dataset-name sharegpt' in bench_args or '--dataset-name=sharegpt' in bench_args:
+            bench_args = re.sub(r'--dataset-name(?:\s+|=)sharegpt',
+                                f'--dataset {SHAREGPT_PATH}', bench_args)
+        bench_args = re.sub(r'--dataset-name(?:\s+|=)random', '', bench_args)
+
     # Some Lossfunk perf_commands use the older `--input-len` / `--output-len`
     # flags. Modern benchmark_serving.py renamed these to `--random-input-len`
     # / `--random-output-len` (and requires `--dataset-name random`). Rewrite.
