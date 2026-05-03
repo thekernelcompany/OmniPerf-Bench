@@ -1,0 +1,209 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c37679..c753b8e 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -182,12 +182,12 @@ def _get_bin_counts_and_mask(
+     num_seqs: int,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     # Compute the bin counts for the tokens.
+-    # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
++    bin_counts = torch.zeros((num_seqs, vocab_size),
+                              dtype=torch.long,
+                              device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+-    bin_counts = bin_counts[:, :vocab_size]
++    # Clamp tokens to vocab_size-1 to handle any padding tokens
++    clamped_tokens = torch.clamp(tokens, max=vocab_size - 1)
++    bin_counts.scatter_add_(1, clamped_tokens, torch.ones_like(clamped_tokens))
+     mask = bin_counts > 0
+ 
+     return bin_counts, mask
+@@ -220,7 +220,7 @@ def _apply_min_tokens_penalty(
+             seqs_to_penalize: List[int] = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+-                if len(seq_data.output_token_ids) < min_tokens:
++                if seq_data.get_output_len() < min_tokens:
+                     seqs_to_penalize.append(j)
+ 
+             if seqs_to_penalize:
+@@ -251,10 +251,17 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    # Combine masks once
++    combined_mask = prompt_mask | output_mask
++    
++    # Apply repetition penalties only where needed
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(1)
++    logits = torch.where(
++        combined_mask,
++        torch.where(logits > 0, logits / repetition_penalties_expanded,
++                   logits * repetition_penalties_expanded),
++        logits
++    )
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+@@ -271,10 +278,11 @@ def _apply_top_k_top_p(
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     # Apply top-k.
+-    top_k_mask = logits_sort.size(1) - k.to(torch.long)
++    k_long = k.long()
++    top_k_threshold_idx = (logits_sort.size(1) - k_long).unsqueeze(1)
+     # Get all the top_k values.
+-    top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+-    top_k_mask = logits_sort < top_k_mask
++    top_k_threshold = logits_sort.gather(1, top_k_threshold_idx)
++    top_k_mask = logits_sort < top_k_threshold
+     logits_sort.masked_fill_(top_k_mask, -float("inf"))
+ 
+     # Apply top-p.
+@@ -286,8 +294,8 @@ def _apply_top_k_top_p(
+     logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    src = torch.arange(logits_idx.shape[-1],
+-                       device=logits_idx.device).expand_as(logits_idx)
++    vocab_size = logits_idx.shape[-1]
++    src = torch.arange(vocab_size, device=logits_idx.device).expand_as(logits_idx)
+     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+                                                            index=logits_idx,
+                                                            src=src)
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d1..845fb23 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -271,10 +271,11 @@ def _prepare_seq_groups(
+             logit_idx += prompt_logprob_len
+         if do_sample:
+             sample_indices.extend(range(logit_idx, logit_idx + sample_len))
++            # Avoid creating intermediate list from zip
+             categorized_sample_indices[sampling_params.sampling_type].extend(
+-                list(
+-                    zip(range(logit_idx, logit_idx + sample_len),
+-                        range(sample_idx, sample_idx + sample_len))))
++                (i, j) for i, j in zip(
++                    range(logit_idx, logit_idx + sample_len),
++                    range(sample_idx, sample_idx + sample_len)))
+             logit_idx += sample_len
+             sample_idx += sample_len
+ 
+@@ -290,8 +291,8 @@ def _prepare_seq_groups(
+                 query_len=query_len,
+                 generator=generator,
+                 is_prompt=is_prompt,
+-                prompt_logprob_indices=list(prompt_logprob_indices),
+-                sample_indices=list(sample_indices)))
++                prompt_logprob_indices=prompt_logprob_indices,
++                sample_indices=sample_indices))
+     return (seq_groups, selected_token_indices, categorized_sample_indices,
+             num_prompts)
+ 
+@@ -389,24 +390,25 @@ class SamplingTensors:
+                 query_len = seq_group.query_len
+                 assert query_len is not None
+                 prefill_len = len(seq_group.prompt_logprob_indices)
+-                temperatures += [temperature] * prefill_len
+-                top_ps += [top_p] * prefill_len
+-                top_ks += [top_k] * prefill_len
+-                min_ps += [min_p] * prefill_len
+-                presence_penalties += [0] * prefill_len
+-                frequency_penalties += [0] * prefill_len
+-                repetition_penalties += [1] * prefill_len
++                temperatures.extend([temperature] * prefill_len)
++                top_ps.extend([top_p] * prefill_len)
++                top_ks.extend([top_k] * prefill_len)
++                min_ps.extend([min_p] * prefill_len)
++                presence_penalties.extend([0] * prefill_len)
++                frequency_penalties.extend([0] * prefill_len)
++                repetition_penalties.extend([1] * prefill_len)
+ 
+             if seq_group.do_sample:
+                 sample_lens = len(seq_group.sample_indices)
+                 assert sample_lens == len(seq_ids)
+-                temperatures += [temperature] * len(seq_ids)
+-                top_ps += [top_p] * len(seq_ids)
+-                top_ks += [top_k] * len(seq_ids)
+-                min_ps += [min_p] * len(seq_ids)
+-                presence_penalties += [p] * len(seq_ids)
+-                frequency_penalties += [f] * len(seq_ids)
+-                repetition_penalties += [r] * len(seq_ids)
++                num_seq_ids = len(seq_ids)
++                temperatures.extend([temperature] * num_seq_ids)
++                top_ps.extend([top_p] * num_seq_ids)
++                top_ks.extend([top_k] * num_seq_ids)
++                min_ps.extend([min_p] * num_seq_ids)
++                presence_penalties.extend([p] * num_seq_ids)
++                frequency_penalties.extend([f] * num_seq_ids)
++                repetition_penalties.extend([r] * num_seq_ids)
+ 
+             if is_prompt:
+                 prompt_best_of.append(sampling_params.best_of)
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 0cd4c7e..de1142b 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -128,12 +128,19 @@ class SequenceData:
+         # The number of tokens that are computed (that run against the model).
+         self._num_computed_tokens = 0
+         self._stage: SequenceStage = SequenceStage.PREFILL
++        
++        # Cache lengths for performance
++        self._prompt_len = len(self._prompt_token_ids)
++        self._output_len = len(self._output_token_ids)
+ 
+         self._update_cached_all_tokens()
+ 
+     def _update_cached_all_tokens(self):
+-        self._cached_all_token_ids: List[int] = (self._prompt_token_ids +
+-                                                 self._output_token_ids)
++        # Avoid creating a new list if output tokens are empty
++        if not self._output_token_ids:
++            self._cached_all_token_ids = self._prompt_token_ids
++        else:
++            self._cached_all_token_ids = self._prompt_token_ids + self._output_token_ids
+ 
+     @property
+     def prompt_token_ids(self) -> Tuple[int, ...]:
+@@ -143,6 +150,7 @@ class SequenceData:
+     def prompt_token_ids(self, new_prompt_token_ids) -> None:
+         self._prompt_token_ids = list(new_prompt_token_ids)
+         self._prompt_token_ids_tuple = tuple(new_prompt_token_ids)
++        self._prompt_len = len(self._prompt_token_ids)
+         self._update_cached_all_tokens()
+ 
+     @property
+@@ -152,21 +160,23 @@ class SequenceData:
+     @output_token_ids.setter
+     def output_token_ids(self, new_output_token_ids) -> None:
+         self._output_token_ids = list(new_output_token_ids)
++        self._output_len = len(self._output_token_ids)
+         self._update_cached_all_tokens()
+ 
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self._output_token_ids.append(token_id)
+         self._cached_all_token_ids.append(token_id)
++        self._output_len += 1
+         self.cumulative_logprob += logprob
+ 
+     def get_len(self) -> int:
+-        return len(self._output_token_ids) + len(self._prompt_token_ids)
++        return self._output_len + self._prompt_len
+ 
+     def get_prompt_len(self) -> int:
+-        return len(self._prompt_token_ids)
++        return self._prompt_len
+ 
+     def get_output_len(self) -> int:
+-        return len(self._output_token_ids)
++        return self._output_len
+ 
+     def get_token_ids(self) -> List[int]:
+         return self._cached_all_token_ids

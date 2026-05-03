@@ -1,0 +1,113 @@
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 3a4c259..14637d7 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -259,12 +259,13 @@ class MinPLogitsProcessor(LogitsProcessor):
+             return
+ 
+         needs_update = False
++        min_p_cpu = self.min_p_cpu
+         # Process added requests.
+         for index, params, _ in batch_update.added:
+             min_p = params.min_p if isinstance(params, SamplingParams) else 0.0
+-            if self.min_p_cpu[index] != min_p:
++            if min_p_cpu[index] != min_p:
+                 needs_update = True
+-                self.min_p_cpu[index] = min_p
++                min_p_cpu[index] = min_p
+             if min_p:
+                 self.min_p_count += 1
+ 
+@@ -272,19 +273,19 @@ class MinPLogitsProcessor(LogitsProcessor):
+             # Process removed requests.
+             needs_update |= bool(batch_update.removed)
+             for index in batch_update.removed:
+-                if self.min_p_cpu[index]:
++                if min_p_cpu[index]:
+                     self.min_p_count -= 1
+ 
+             # Process moved requests, unidirectional (a->b) and swap (a<->b)
+             for adx, bdx, direct in batch_update.moved:
+-                change = (min_p_a :=
+-                          self.min_p_cpu[adx]) != (min_p_b :=
+-                                                   self.min_p_cpu[bdx])
++                min_p_a = min_p_cpu[adx]
++                min_p_b = min_p_cpu[bdx]
++                change = min_p_a != min_p_b
+                 needs_update |= change
+                 if change:
+-                    self.min_p_cpu[bdx] = min_p_a
++                    min_p_cpu[bdx] = min_p_a
+                     if direct == MoveDirectionality.SWAP:
+-                        self.min_p_cpu[adx] = min_p_b
++                        min_p_cpu[adx] = min_p_b
+ 
+         # Update tensors if needed.
+         size = batch_update.batch_size
+@@ -301,16 +302,10 @@ class MinPLogitsProcessor(LogitsProcessor):
+ 
+         # Convert logits to probability distribution
+         probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
+-        # Adjust min_p
+-        adjusted_min_p = max_probabilities.mul_(self.min_p)
+-        # Identify valid tokens using threshold comparison
+-        invalid_token_mask = probability_values < adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[invalid_token_mask] = -float('inf')
++        # Calculate maximum probabilities per sequence and adjust min_p in one step
++        adjusted_min_p = torch.amax(probability_values, dim=-1, keepdim=True).mul_(self.min_p)
++        # Apply mask using in-place operation
++        logits.masked_fill_(probability_values < adjusted_min_p, -float('inf'))
+         return logits
+ 
+ 
+@@ -370,11 +365,10 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
+ 
+         # Update tensors if needed.
+         if needs_update:
+-            reqs, tok_ids, biases = [], [], []
+-            for req, lb in self.biases.items():
+-                reqs.extend([req] * len(lb))
+-                tok_ids.extend(lb.keys())
+-                biases.extend(lb.values())
++            biases_items = list(self.biases.items())
++            reqs = [req for req, lb in biases_items for _ in range(len(lb))]
++            tok_ids = [tok_id for _, lb in biases_items for tok_id in lb.keys()]
++            biases = [bias for _, lb in biases_items for bias in lb.values()]
+ 
+             self.bias_tensor = self._device_tensor(biases, torch.float32)
+             self.logits_slice = (self._device_tensor(reqs, torch.int32),
+@@ -460,9 +454,9 @@ class MinTokensLogitsProcessor(LogitsProcessor):
+ 
+         if self.min_toks:
+             # Check for any requests that have attained their min tokens.
+-            to_remove = tuple(index for index, (min_toks, out_tok_ids,
+-                                                _) in self.min_toks.items()
+-                              if len(out_tok_ids) >= min_toks)
++            to_remove = [index for index, (min_toks, out_tok_ids,
++                                           _) in self.min_toks.items()
++                         if len(out_tok_ids) >= min_toks]
+             if to_remove:
+                 needs_update = True
+                 for index in to_remove:
+@@ -470,11 +464,11 @@ class MinTokensLogitsProcessor(LogitsProcessor):
+ 
+         # Update tensors if needed.
+         if needs_update:
+-            reqs: list[int] = []
+-            tok_ids: list[int] = []
+-            for req, (_, _, stop_tok_ids) in self.min_toks.items():
+-                reqs.extend([req] * len(stop_tok_ids))
+-                tok_ids.extend(stop_tok_ids)
++            min_toks_items = list(self.min_toks.items())
++            reqs = [req for req, (_, _, stop_tok_ids) in min_toks_items 
++                    for _ in range(len(stop_tok_ids))]
++            tok_ids = [tok_id for _, (_, _, stop_tok_ids) in min_toks_items 
++                       for tok_id in stop_tok_ids]
+ 
+             self.logits_slice = (self._device_tensor(reqs, torch.int32),
+                                  self._device_tensor(tok_ids, torch.int32))

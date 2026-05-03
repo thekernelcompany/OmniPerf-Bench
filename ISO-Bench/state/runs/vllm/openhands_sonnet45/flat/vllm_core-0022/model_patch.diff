@@ -1,0 +1,165 @@
+diff --git a/vllm/v1/spec_decode/ngram_proposer.py b/vllm/v1/spec_decode/ngram_proposer.py
+index 9b116e0..fbdded0 100644
+--- a/vllm/v1/spec_decode/ngram_proposer.py
++++ b/vllm/v1/spec_decode/ngram_proposer.py
+@@ -51,11 +51,12 @@ class NgramProposer:
+         Build the lps (longest proper prefix which is also suffix) 
+         array for the pattern.
+         """
+-        lps = [0] * len(pattern)
++        pattern_len = len(pattern)
++        lps = [0] * pattern_len
+         prev_lps = 0  # length of the previous longest prefix suffix
+         i = 1
+ 
+-        while i < len(pattern):
++        while i < pattern_len:
+             if pattern[i] == pattern[prev_lps]:
+                 prev_lps += 1
+                 lps[i] = prev_lps
+@@ -78,14 +79,17 @@ class NgramProposer:
+         context_len = context_token_ids.shape[0]
+         assert n > 0
+ 
+-        pattern = context_token_ids[-n:]
++        pattern_np = context_token_ids[-n:]
++        # Convert to list once for faster indexing in the loop
++        pattern = pattern_np.tolist()
+         # Precompute lps array for Y
+         lps = NgramProposer._kmp_lps_array(pattern)
+ 
+         i = 0
+         j = 0
++        search_limit = context_len - n
+         # -n because the last n tokens are used as pattern
+-        while i < context_len - n:
++        while i < search_limit:
+             if context_token_ids[i] == pattern[j]:
+                 i += 1
+                 j += 1
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 0ecc00a..8d355f0 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -428,14 +428,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.input_batch.block_table.commit(num_reqs)
+ 
+         # Get the number of scheduled tokens for each request.
+-        # TODO: The Python loop can be slow. Optimize.
+-        num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
+-        max_num_scheduled_tokens = 0
+-        for i, req_id in enumerate(self.input_batch.req_ids):
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens[i] = num_tokens
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
++        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
++        req_ids = self.input_batch.req_ids
++        num_scheduled_tokens = np.array(
++            [num_scheduled_tokens_dict[req_id] for req_id in req_ids],
++            dtype=np.int32)
++        max_num_scheduled_tokens = num_scheduled_tokens.max()
+ 
+         # Get request indices.
+         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+@@ -486,15 +484,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # where K is the max_num_blocks_per_req and the block size is 2.
+         # NOTE(woosuk): We can't simply use `token_indices // block_size` here
+         # because M (max_model_len) is not necessarily divisible by block_size.
++        block_size = self.block_size
+         block_table_indices = (req_indices * self.max_num_blocks_per_req +
+-                               positions_np // self.block_size)
++                               positions_np // block_size)
+         # NOTE(woosuk): We use torch.index_select instead of np.take here
+         # because torch.index_select is much faster than np.take for large
+         # tensors.
+         block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
+         block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+-        block_offsets = positions_np % self.block_size
+-        np.add(block_numbers * self.block_size,
++        block_offsets = positions_np % block_size
++        np.add(block_numbers * block_size,
+                block_offsets,
+                out=self.slot_mapping_np[:total_num_scheduled_tokens])
+ 
+@@ -655,8 +654,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             common_prefix_len,
+             self.input_batch.num_computed_tokens_cpu[:num_reqs].min())
+         # common_prefix_len should be a multiple of the block size.
+-        common_prefix_len = (common_prefix_len // self.block_size *
+-                             self.block_size)
++        block_size = self.block_size
++        common_prefix_len = (common_prefix_len // block_size * block_size)
+         use_cascade = FlashAttentionBackend.use_cascade_attention(
+             common_prefix_len=common_prefix_len,
+             query_lens=num_scheduled_tokens,
+@@ -670,14 +669,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+         mrope_pos_ptr = 0
++        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+         for index, req_id in enumerate(self.input_batch.req_ids):
+             req = self.requests[req_id]
+             assert req.mrope_positions is not None
+ 
+             num_computed_tokens = \
+                 self.input_batch.num_computed_tokens_cpu[index]
+-            num_scheduled_tokens = \
+-                scheduler_output.num_scheduled_tokens[req_id]
++            num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
+             num_prompt_tokens = len(req.prompt_token_ids)
+ 
+             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+@@ -727,10 +726,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+     ) -> torch.Tensor:
+         # Get the number of spec decode tokens for each request.
+         num_reqs = self.input_batch.num_reqs
+-        num_spec_decode_tokens = np.empty(num_reqs, dtype=np.int32)
+-        for i, req_id in enumerate(self.input_batch.req_ids):
+-            num_spec_decode_tokens[i] = len(
+-                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
++        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
++        num_spec_decode_tokens = np.array(
++            [len(scheduled_spec_tokens.get(req_id, ()))
++             for req_id in self.input_batch.req_ids],
++            dtype=np.int32)
+ 
+         # Get spec decode logits indices.
+         # E.g.,   num_scheduled_tokens: [4, 100, 3,   100, 2]
+@@ -819,9 +819,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         scheduler_output: "SchedulerOutput",
+     ) -> List[torch.Tensor]:
+         encoder_outputs: List[torch.Tensor] = []
++        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+         for req_id in self.input_batch.req_ids:
+-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+-                req_id]
++            num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
+             req_state = self.requests[req_id]
+             num_computed_tokens = req_state.num_computed_tokens
+             mm_positions = req_state.mm_positions
+@@ -952,10 +952,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # TODO(woosuk): The following loop can be slow since it iterates over
+         # the requests one by one. Optimize.
++        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+         for i, req_id in enumerate(self.input_batch.req_ids):
+             req_state = self.requests[req_id]
+             seq_len = (req_state.num_computed_tokens +
+-                       scheduler_output.num_scheduled_tokens[req_id])
++                       num_scheduled_tokens_dict[req_id])
+             if seq_len < req_state.num_tokens:
+                 # Ignore the sampled token.
+                 # Rewind the generator state as if the token was not sampled.
+@@ -1065,9 +1066,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Since prompt logprobs are a rare feature, prioritize simple,
+         # maintainable loop over optimal performance.
+         completed_prefill_reqs = []
++        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+         for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
+ 
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
++            num_tokens = num_scheduled_tokens_dict[req_id]
+ 
+             # Get metadata for this request.
+             request = self.requests[req_id]

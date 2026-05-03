@@ -1,0 +1,74 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..60231a9 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -476,9 +476,13 @@ class BlockSpaceManager:
+ 
+         ids_list = [
+             self.get_all_computed_blocks(seq)
+-            for seq in iter(seq_group.seqs_dict.values())
++            for seq in seq_group.seqs_dict.values()
+         ]
+-        return commonprefix([ids for ids in ids_list if ids != []])
++        # Filter out empty lists before calling commonprefix
++        non_empty_ids = [ids for ids in ids_list if ids]
++        if not non_empty_ids:
++            return []
++        return commonprefix(non_empty_ids)
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+         if self.enable_caching:
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..030f3e2 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -64,37 +64,24 @@ class LRUEvictor(Evictor):
+     def __contains__(self, block_hash: int) -> bool:
+         return block_hash in self.free_table
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        if len(self.free_table) == 0:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
++        # Single-pass algorithm to find the block to evict
++        # We want the block with the lowest timestamp, and among those,
++        # the one with the highest num_hashed_tokens
+         evicted_block: Optional[PhysicalTokenBlock] = None
++        lowest_timestamp = float('inf')
++        highest_num_hashed_tokens = -1
+ 
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
++        for block in self.free_table.values():
++            if (block.last_accessed < lowest_timestamp or
++                (block.last_accessed == lowest_timestamp and
++                 block.num_hashed_tokens > highest_num_hashed_tokens)):
+                 evicted_block = block
+-                break
++                lowest_timestamp = block.last_accessed
++                highest_num_hashed_tokens = block.num_hashed_tokens
+ 
+         assert evicted_block is not None
+ 

@@ -1,0 +1,483 @@
+diff --git a/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+new file mode 100644
+index 0000000..bbb15a3
+--- /dev/null
++++ b/benchmark/kernels/fused_moe_triton/benchmark_ep_pre_reorder_triton.py
+@@ -0,0 +1,301 @@
++#!/usr/bin/env python3
++"""
++Benchmark script for EP MOE pre-reorder Triton kernels.
++
++This script benchmarks the performance of the pre_reorder_triton_kernel and
++deepep_permute_triton_kernel used in expert parallelism for Mixture of Experts models.
++"""
++
++import argparse
++import sys
++import time
++from typing import Dict, List
++
++import torch
++import triton
++
++# Add the python directory to the path
++sys.path.insert(0, "python")
++
++from sglang.srt.layers.moe.ep_moe.kernels import (
++    deepep_permute_triton_kernel,
++    deepep_run_moe_deep_preprocess,
++    pre_reorder_triton_kernel,
++    run_moe_ep_preproess,
++)
++
++
++def benchmark_kernel(
++    kernel_fn,
++    grid,
++    args,
++    num_warmup: int = 10,
++    num_runs: int = 100,
++) -> float:
++    """
++    Benchmark a Triton kernel.
++    
++    Args:
++        kernel_fn: The kernel function to benchmark
++        grid: Grid configuration for the kernel
++        args: Arguments to pass to the kernel
++        num_warmup: Number of warmup iterations
++        num_runs: Number of benchmark iterations
++        
++    Returns:
++        Average execution time in milliseconds
++    """
++    # Warmup
++    for _ in range(num_warmup):
++        kernel_fn[grid](*args)
++    torch.cuda.synchronize()
++    
++    # Benchmark
++    start = time.perf_counter()
++    for _ in range(num_runs):
++        kernel_fn[grid](*args)
++    torch.cuda.synchronize()
++    end = time.perf_counter()
++    
++    avg_time_ms = (end - start) / num_runs * 1000
++    return avg_time_ms
++
++
++def benchmark_pre_reorder_kernel(
++    num_tokens: int,
++    hidden_size: int,
++    topk: int,
++    num_experts: int,
++    block_size: int = 128,
++    num_runs: int = 100,
++) -> Dict[str, float]:
++    """
++    Benchmark the pre_reorder_triton_kernel.
++    
++    Args:
++        num_tokens: Number of input tokens
++        hidden_size: Hidden dimension size
++        topk: Number of top experts per token
++        num_experts: Total number of experts
++        block_size: Block size for the kernel
++        num_runs: Number of benchmark iterations
++        
++    Returns:
++        Dictionary with benchmark results
++    """
++    device = torch.device("cuda")
++    
++    # Create test data
++    input_data = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float16)
++    gateup_input = torch.empty(num_tokens * topk, hidden_size, device=device, dtype=torch.float16)
++    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), device=device, dtype=torch.int32)
++    
++    # Preprocess to get src2dst
++    _, src2dst, _ = run_moe_ep_preproess(topk_ids, num_experts)
++    
++    # Benchmark
++    grid = (num_tokens,)
++    args = (
++        input_data,
++        gateup_input,
++        src2dst,
++        topk_ids,
++        None,  # a1_scales_ptr
++        0,     # start_expert_id
++        num_experts - 1,  # end_expert_id
++        topk,
++        hidden_size,
++        block_size,
++    )
++    
++    avg_time_ms = benchmark_kernel(pre_reorder_triton_kernel, grid, args, num_runs=num_runs)
++    
++    # Calculate throughput
++    total_elements = num_tokens * hidden_size * topk
++    throughput_gb_s = (total_elements * 2) / (avg_time_ms / 1000) / 1e9  # 2 bytes per fp16
++    
++    return {
++        "avg_time_ms": avg_time_ms,
++        "throughput_gb_s": throughput_gb_s,
++    }
++
++
++def benchmark_deepep_permute_kernel(
++    num_tokens: int,
++    hidden_size: int,
++    topk: int,
++    num_experts: int,
++    block_size: int = 128,
++    num_runs: int = 100,
++) -> Dict[str, float]:
++    """
++    Benchmark the deepep_permute_triton_kernel.
++    
++    Args:
++        num_tokens: Number of input tokens
++        hidden_size: Hidden dimension size
++        topk: Number of top experts per token
++        num_experts: Total number of experts
++        block_size: Block size for the kernel
++        num_runs: Number of benchmark iterations
++        
++    Returns:
++        Dictionary with benchmark results
++    """
++    device = torch.device("cuda")
++    
++    # Create test data
++    input_data = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.float16)
++    gateup_input = torch.empty(num_tokens * topk, hidden_size, device=device, dtype=torch.float16)
++    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), device=device, dtype=torch.int32)
++    
++    # Preprocess to get src2dst
++    _, src2dst, _ = deepep_run_moe_deep_preprocess(topk_ids, num_experts)
++    
++    # Benchmark
++    grid = (num_tokens,)
++    args = (
++        input_data,
++        gateup_input,
++        src2dst,
++        topk_ids,
++        None,  # a1_scales_ptr
++        topk,
++        hidden_size,
++        block_size,
++    )
++    
++    avg_time_ms = benchmark_kernel(deepep_permute_triton_kernel, grid, args, num_runs=num_runs)
++    
++    # Calculate throughput
++    total_elements = num_tokens * hidden_size * topk
++    throughput_gb_s = (total_elements * 2) / (avg_time_ms / 1000) / 1e9  # 2 bytes per fp16
++    
++    return {
++        "avg_time_ms": avg_time_ms,
++        "throughput_gb_s": throughput_gb_s,
++    }
++
++
++def benchmark_preprocess(
++    num_tokens: int,
++    topk: int,
++    num_experts: int,
++    num_runs: int = 100,
++) -> Dict[str, float]:
++    """
++    Benchmark the preprocessing functions.
++    
++    Args:
++        num_tokens: Number of input tokens
++        topk: Number of top experts per token
++        num_experts: Total number of experts
++        num_runs: Number of benchmark iterations
++        
++    Returns:
++        Dictionary with benchmark results
++    """
++    device = torch.device("cuda")
++    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), device=device, dtype=torch.int32)
++    
++    # Warmup
++    for _ in range(10):
++        run_moe_ep_preproess(topk_ids, num_experts)
++    torch.cuda.synchronize()
++    
++    # Benchmark
++    start = time.perf_counter()
++    for _ in range(num_runs):
++        run_moe_ep_preproess(topk_ids, num_experts)
++    torch.cuda.synchronize()
++    end = time.perf_counter()
++    
++    avg_time_ms = (end - start) / num_runs * 1000
++    
++    return {
++        "avg_time_ms": avg_time_ms,
++    }
++
++
++def print_results(name: str, config: Dict, results: Dict):
++    """Print benchmark results in a formatted way."""
++    print(f"\n{name}")
++    print("-" * 80)
++    print(f"Config: num_tokens={config['num_tokens']}, hidden_size={config.get('hidden_size', 'N/A')}, "
++          f"topk={config['topk']}, num_experts={config['num_experts']}")
++    print(f"Average time: {results['avg_time_ms']:.4f} ms")
++    if 'throughput_gb_s' in results:
++        print(f"Throughput: {results['throughput_gb_s']:.2f} GB/s")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Benchmark EP MOE pre-reorder Triton kernels")
++    parser.add_argument("--num-tokens", type=int, nargs="+", default=[512, 1024, 2048],
++                        help="Number of tokens to benchmark")
++    parser.add_argument("--hidden-size", type=int, nargs="+", default=[2048, 4096],
++                        help="Hidden sizes to benchmark")
++    parser.add_argument("--topk", type=int, nargs="+", default=[2, 4],
++                        help="Top-k values to benchmark")
++    parser.add_argument("--num-experts", type=int, nargs="+", default=[8, 16],
++                        help="Number of experts to benchmark")
++    parser.add_argument("--block-size", type=int, default=128,
++                        help="Block size for kernels")
++    parser.add_argument("--num-runs", type=int, default=100,
++                        help="Number of benchmark runs")
++    
++    args = parser.parse_args()
++    
++    if not torch.cuda.is_available():
++        print("CUDA not available, exiting")
++        return
++    
++    print("=" * 80)
++    print("EP MOE Pre-Reorder Triton Kernels Benchmark")
++    print("=" * 80)
++    
++    # Generate test configurations
++    configs = []
++    for num_tokens in args.num_tokens:
++        for hidden_size in args.hidden_size:
++            for topk in args.topk:
++                for num_experts in args.num_experts:
++                    configs.append({
++                        "num_tokens": num_tokens,
++                        "hidden_size": hidden_size,
++                        "topk": topk,
++                        "num_experts": num_experts,
++                    })
++    
++    # Benchmark each configuration
++    for config in configs:
++        print(f"\n{'=' * 80}")
++        print(f"Configuration: {config}")
++        print(f"{'=' * 80}")
++        
++        # Benchmark pre_reorder_kernel
++        results = benchmark_pre_reorder_kernel(
++            **config,
++            block_size=args.block_size,
++            num_runs=args.num_runs,
++        )
++        print_results("pre_reorder_triton_kernel", config, results)
++        
++        # Benchmark deepep_permute_kernel
++        results = benchmark_deepep_permute_kernel(
++            **config,
++            block_size=args.block_size,
++            num_runs=args.num_runs,
++        )
++        print_results("deepep_permute_triton_kernel", config, results)
++        
++        # Benchmark preprocess
++        preprocess_config = {k: v for k, v in config.items() if k != "hidden_size"}
++        results = benchmark_preprocess(
++            **preprocess_config,
++            num_runs=args.num_runs,
++        )
++        print_results("run_moe_ep_preproess", preprocess_config, results)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 8c00552..0f722a0 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -37,20 +37,19 @@ def deepep_permute_triton_kernel(
+     OutDtype = gateup_input_ptr.dtype.element_ty
+ 
+     src_idx = tl.program_id(0)
+-    src2dst_ptr = src2dst_ptr + src_idx * topk
++    src2dst_base = src2dst_ptr + src_idx * topk
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+ 
+-    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-        mask = offset < hidden_size
+-        in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+-
+-        for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            if dst_idx >= 0:
+-                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
++    for idx in range(topk):
++        dst_idx = tl.load(src2dst_base + idx)
++        if dst_idx >= 0:
++            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
++            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++                offset = start_offset + tl.arange(0, BLOCK_SIZE)
++                mask = offset < hidden_size
++                in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+                 tl.store(dst_ptr + offset, in_data, mask=mask)
+ 
+ 
+@@ -68,9 +67,9 @@ def deepep_post_reorder_triton_kernel(
+     InDtype = down_output_ptr.dtype.element_ty
+ 
+     src_idx = tl.program_id(0)
+-    src2dst_ptr = src2dst_ptr + src_idx * topk
++    src2dst_base = src2dst_ptr + src_idx * topk
+     topk_ids_ptr = topk_ids_ptr + src_idx * topk
+-    topk_weights_ptr = topk_weights_ptr + src_idx * topk
++    topk_weights_base = topk_weights_ptr + src_idx * topk
+ 
+     store_ptr = output_ptr + src_idx * hidden_size
+     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+@@ -78,9 +77,9 @@ def deepep_post_reorder_triton_kernel(
+         mask = offset < hidden_size
+         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+         for idx in range(topk):
+-            dst_idx = tl.load(src2dst_ptr + idx)
++            dst_idx = tl.load(src2dst_base + idx)
+             if dst_idx >= 0:
+-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
++                weigh_scale = tl.load(topk_weights_base + idx).to(InDtype)
+                 load_ptr = down_output_ptr + dst_idx * hidden_size
+                 in_data = tl.load(load_ptr + offset, mask=mask)
+                 sum_vec += in_data * weigh_scale
+@@ -151,12 +150,14 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
+ 
+ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+-    seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
++    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+ 
+-    compute_seg_indptr_triton_kernel[(num_experts,)](
+-        reorder_topk_ids, seg_indptr, topk_ids.numel()
++    # Use torch.searchsorted instead of triton binary search for better performance
++    expert_ids = torch.arange(
++        num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
+     )
++    torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
+ 
+     BLOCK_SIZE = 512
+     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
+@@ -182,24 +183,28 @@ def pre_reorder_triton_kernel(
+     OutDtype = gateup_input_ptr.dtype.element_ty
+ 
+     src_idx = tl.program_id(0)
+-    src2dst_ptr = src2dst_ptr + src_idx * topk
+-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
++    src2dst_base = src2dst_ptr + src_idx * topk
++    topk_ids_base = topk_ids_ptr + src_idx * topk
+ 
+     src_ptr = input_ptr + src_idx * hidden_size
+-    for idx in range(topk):
+-        expert_id = tl.load(topk_ids_ptr + idx)
+-        if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-            if a1_scales_ptr is not None:
+-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+-            else:
+-                scale = 1.0
++    
++    # Process each block of hidden_size
++    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++        offset = start_offset + tl.arange(0, BLOCK_SIZE)
++        mask = offset < hidden_size
++        in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++        
++        # Write to each expert
++        for idx in range(topk):
++            expert_id = tl.load(topk_ids_base + idx)
++            if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                if a1_scales_ptr is not None:
++                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
++                else:
++                    scale = 1.0
+ 
+-            dst_idx = tl.load(src2dst_ptr + idx)
+-            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+-            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-                mask = offset < hidden_size
+-                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
++                dst_idx = tl.load(src2dst_base + idx)
++                dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+                 out_data = (in_data * scale).to(OutDtype)
+                 tl.store(dst_ptr + offset, out_data, mask=mask)
+ 
+@@ -475,29 +480,35 @@ def post_reorder_triton_kernel(
+     InDtype = down_output_ptr.dtype.element_ty
+ 
+     src_idx = tl.program_id(0)
+-    src2dst_ptr = src2dst_ptr + src_idx * topk
+-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+-    topk_weights_ptr = topk_weights_ptr + src_idx * topk
++    src2dst_base = src2dst_ptr + src_idx * topk
++    topk_ids_base = topk_ids_ptr + src_idx * topk
++    topk_weights_base = topk_weights_ptr + src_idx * topk
+ 
+-    computed = False
+     store_ptr = output_ptr + src_idx * hidden_size
+-    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+-        mask = offset < hidden_size
+-
+-        sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
+-        for idx in range(topk):
+-            expert_id = tl.load(topk_ids_ptr + idx)
+-            if expert_id >= start_expert_id and expert_id <= end_expert_id:
+-                computed = True
+-                dst_idx = tl.load(src2dst_ptr + idx)
+-                weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+-                load_ptr = down_output_ptr + dst_idx * hidden_size
+-                in_data = tl.load(load_ptr + offset, mask=mask)
+-                sum_vec += in_data * weigh_scale
+-        tl.store(store_ptr + offset, sum_vec, mask=mask)
++    
++    # Check which experts are valid and preload metadata
++    computed = False
++    for idx in range(topk):
++        expert_id = tl.load(topk_ids_base + idx)
++        if expert_id >= start_expert_id and expert_id <= end_expert_id:
++            computed = True
++    
++    if computed:
++        for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
++            offset = start_offset + tl.arange(0, BLOCK_SIZE)
++            mask = offset < hidden_size
+ 
+-    if computed == False:
++            sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
++            for idx in range(topk):
++                expert_id = tl.load(topk_ids_base + idx)
++                if expert_id >= start_expert_id and expert_id <= end_expert_id:
++                    dst_idx = tl.load(src2dst_base + idx)
++                    weigh_scale = tl.load(topk_weights_base + idx).to(InDtype)
++                    load_ptr = down_output_ptr + dst_idx * hidden_size
++                    in_data = tl.load(load_ptr + offset, mask=mask)
++                    sum_vec += in_data * weigh_scale
++            tl.store(store_ptr + offset, sum_vec, mask=mask)
++    else:
+         for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+             offset = start_offset + tl.arange(0, BLOCK_SIZE)
+             mask = offset < hidden_size

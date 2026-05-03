@@ -1,0 +1,35 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index a9ef973..51a5198 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -45,12 +45,24 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++    
++    # Combine masks once
++    combined_mask = prompt_mask | output_mask
++    
++    # Use broadcasting instead of repeat to avoid memory allocation
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(dim=1)
++    
++    # Apply repetition penalties more efficiently
++    positive_mask = logits > 0
++    negative_mask = ~positive_mask
++    
++    # Create penalty multiplier tensor once
++    penalty_multiplier = torch.where(combined_mask, repetition_penalties_expanded, 1.0)
++    
++    # Apply penalties using in-place operations where possible
++    logits[positive_mask] /= penalty_multiplier[positive_mask]
++    logits[negative_mask] *= penalty_multiplier[negative_mask]
++    
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+     logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts

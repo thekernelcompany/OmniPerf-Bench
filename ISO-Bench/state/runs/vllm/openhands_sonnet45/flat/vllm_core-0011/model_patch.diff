@@ -1,0 +1,216 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..84c0810 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -148,20 +148,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+         # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None)
++        block_pool = self._block_pool
++        block = block_pool.init_block(prev_block=prev_block,
++                                      token_ids=token_ids,
++                                      block_size=self._block_size,
++                                      physical_block_id=None)
+         assert block.content_hash is not None
+ 
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
++        cached_blocks = self._cached_blocks
++        cached_block_id = cached_blocks.get(block.content_hash, None)
+         if cached_block_id is not None:
+             self.metric_data.query(hit=True)
+             block.block_id = cached_block_id
+             self._incr_refcount_cached_block(block)
+             return block
+         self.metric_data.query(hit=False)
+-        self._block_pool.free_block(block)
++        block_pool.free_block(block)
+ 
+         # No cached block => Allocate a new block
+         block = self.allocate_mutable_block(prev_block)
+@@ -217,14 +219,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         refcount = self._refcounter.incr(block_id)
+         if refcount == 1:
+             # In case a cached block was evicted, restore its tracking
+-            if block_id in self.evictor:
+-                self.evictor.remove(block_id)
++            evictor = self.evictor
++            if block_id in evictor:
++                evictor.remove(block_id)
+ 
+             self._track_block_id(block_id, computed=True)
+ 
+     def _decr_refcount_cached_block(self, block: Block) -> None:
+         # Ensure this is immutable/cached block
+-        assert block.content_hash is not None
++        content_hash = block.content_hash
++        assert content_hash is not None
+ 
+         block_id = block.block_id
+         assert block_id is not None
+@@ -237,12 +241,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             assert refcount == 0
+ 
+         # No longer used
+-        assert block.content_hash in self._cached_blocks
++        assert content_hash in self._cached_blocks
+ 
+         # Add the cached block to the evictor
+         # (This keeps the cached block around so it can be reused)
+-        self.evictor.add(block_id, block.content_hash, block.num_tokens_total,
+-                         self._block_tracker[block_id].last_accessed)
++        block_tracker = self._block_tracker
++        self.evictor.add(block_id, content_hash, block.num_tokens_total,
++                         block_tracker[block_id].last_accessed)
+ 
+         # Stop tracking the block
+         self._untrack_block_id(block_id)
+@@ -361,18 +366,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+         forked_blocks: List[Block] = []
+         prev_block = None
++        refcounter = self._refcounter
++        block_pool = self._block_pool
++        block_size = self._block_size
++        
+         for block in source_blocks:
+             block_id = block.block_id
+             assert block_id is not None
+ 
+-            refcount = self._refcounter.incr(block_id)
++            refcount = refcounter.incr(block_id)
+             assert refcount != 1, "can't fork free'd block_id = {}".format(
+                 block_id)
+ 
+-            forked_block = self._block_pool.init_block(
++            forked_block = block_pool.init_block(
+                 prev_block=prev_block,
+                 token_ids=block.token_ids,
+-                block_size=self._block_size,
++                block_size=block_size,
+                 physical_block_id=block_id)
+ 
+             forked_blocks.append(forked_block)
+@@ -412,9 +421,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def is_block_cached(self, block: Block) -> bool:
+         assert block.content_hash is not None
+-        if block.content_hash in self._cached_blocks:
+-            return True
+-        return False
++        return block.content_hash in self._cached_blocks
+ 
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+@@ -433,20 +440,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                 the previously cached block matching the same content.
+         """
+         # Ensure block can be promoted
+-        assert block.content_hash is not None
++        content_hash = block.content_hash
++        assert content_hash is not None
+         assert block.block_id is not None
+         assert self._refcounter.get(block.block_id) > 0
+ 
+-        if block.content_hash not in self._cached_blocks:
++        cached_blocks = self._cached_blocks
++        if content_hash not in cached_blocks:
+             # No cached content hash => Set this block as cached
+             # (Note that this block is not computed yet =>
+             #  Will be computed after free())
+-            self._cached_blocks[block.content_hash] = block.block_id
++            cached_blocks[content_hash] = block.block_id
+             return block.block_id
+ 
+         # Reuse the cached content hash
+         self._decr_refcount_hashless_block(block)
+-        block.block_id = self._cached_blocks[block.content_hash]
++        block.block_id = cached_blocks[content_hash]
+ 
+         # Increment refcount of the cached block and (possibly) restore
+         # it from the evictor.
+@@ -496,12 +505,14 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
+-
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
+-            elif block_id in self.evictor:
+-                self.evictor.update(block_id, now)
++            tracker = block_tracker[block_id]
++            if tracker.active:
++                tracker.last_accessed = now
++            elif block_id in evictor:
++                evictor.update(block_id, now)
+             else:
+                 raise ValueError(
+                     "Mark block as accessed which is not belonged to GPU")
+@@ -539,9 +550,15 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert prev_prefix_size <= cur_size
+ 
+         ret = prev_computed_block_ids
++        block_tracker = self._block_tracker
++        evictor = self.evictor
+         for i in range(prev_prefix_size, cur_size):
+             block_id = block_ids[i]
+-            if self.block_is_computed(block_id):
++            # Inline block_is_computed for performance
++            if block_tracker[block_id].active:
++                if block_tracker[block_id].computed:
++                    ret.append(block_id)
++            elif block_id in evictor:
+                 ret.append(block_id)
+         return ret
+ 
+@@ -583,19 +600,23 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                 swapping in/out the given blocks and num_lookahead_slots.
+         """
+         num_touched_blocks = 0
++        cached_blocks = self._cached_blocks
++        evictor = self.evictor
++        block_size = self._block_size
++        
+         for block in blocks:
+             if not block.is_full:
+                 num_touched_blocks += 1
+                 if num_lookahead_slots > block.num_empty_slots:
+                     num_touched_blocks += cdiv(
+                         num_lookahead_slots - block.num_empty_slots,
+-                        self._block_size)
++                        block_size)
+             else:
+                 # If the block has a match in the cache and the cached block
+                 # is not referenced, then we still count it as a touched block
+-                if not self.is_block_cached(block) or \
+-                    (block.content_hash is not None and \
+-                     self._cached_blocks[block.content_hash] in self.evictor):
++                content_hash = block.content_hash
++                if content_hash is None or content_hash not in cached_blocks or \
++                   cached_blocks[content_hash] in evictor:
+                     num_touched_blocks += 1
+         return num_touched_blocks
+ 
+@@ -617,6 +638,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         Args:
+             blocks: List of blocks to be swapped in.
+         """
++        block_pool = self._block_pool
+         for block in blocks:
+             # Here we allocate either immutable or mutable block and then
+             # extract its block_id. Note that the block object is released
+@@ -631,7 +653,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                 tmp_block.append_token_ids(block.token_ids)
+ 
+             block_id = tmp_block.block_id
+-            self._block_pool.free_block(tmp_block)
++            block_pool.free_block(tmp_block)
+ 
+             block.block_id = block_id  # Assign block_id
+ 

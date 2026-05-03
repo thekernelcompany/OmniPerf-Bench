@@ -1,0 +1,177 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 29f18f0..1acec89 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -17,6 +17,7 @@
+ """Inference-only DeepseekV2 model."""
+ 
+ import logging
++import math
+ import os
+ from enum import IntEnum, auto
+ from typing import Any, Dict, Iterable, Optional, Tuple
+@@ -225,6 +226,9 @@ class DeepseekV2MoE(nn.Module):
+         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+         self.config = config
+         self.layer_id = layer_id
++        
++        enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
++        ep_num_redundant_experts = global_server_args_dict["ep_num_redundant_experts"]
+ 
+         if self.tp_size > config.n_routed_experts:
+             raise ValueError(
+@@ -243,7 +247,7 @@ class DeepseekV2MoE(nn.Module):
+         self.experts = get_moe_impl_class()(
+             num_experts=config.n_routed_experts
+             + self.n_share_experts_fusion
+-            + global_server_args_dict["ep_num_redundant_experts"],
++            + ep_num_redundant_experts,
+             top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
+             hidden_size=config.hidden_size,
+             intermediate_size=config.moe_intermediate_size,
+@@ -258,14 +262,13 @@ class DeepseekV2MoE(nn.Module):
+             prefix=add_prefix("experts", prefix),
+             **(
+                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
+-                if global_server_args_dict["enable_deepep_moe"]
++                if enable_deepep_moe
+                 else {}
+             ),
+         )
+ 
+         if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
+             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+-            # disable tp for shared experts when enable deepep moe
+             self.shared_experts = DeepseekV2MLP(
+                 hidden_size=config.hidden_size,
+                 intermediate_size=intermediate_size,
+@@ -275,26 +278,26 @@ class DeepseekV2MoE(nn.Module):
+                 prefix=add_prefix("shared_experts", prefix),
+                 **(
+                     dict(tp_rank=0, tp_size=1)
+-                    if global_server_args_dict["enable_deepep_moe"]
++                    if enable_deepep_moe
+                     else {}
+                 ),
+             )
+ 
+         self.top_k = config.num_experts_per_tok
+ 
+-        if global_server_args_dict["enable_deepep_moe"]:
+-            # TODO: we will support tp < ep in the future
++        if enable_deepep_moe:
+             self.ep_size = get_tensor_model_parallel_world_size()
+             self.num_experts = (
+                 config.n_routed_experts
+-                + global_server_args_dict["ep_num_redundant_experts"]
++                + ep_num_redundant_experts
+             )
+             self.renormalize = config.norm_topk_prob
+             self.topk_group = config.topk_group
+             self.num_expert_group = config.n_group
++            gate_bias = self.gate.e_score_correction_bias
+             self.correction_bias = (
+-                self.gate.e_score_correction_bias.data
+-                if self.gate.e_score_correction_bias is not None
++                gate_bias.data
++                if gate_bias is not None
+                 else None
+             )
+ 
+@@ -311,7 +314,7 @@ class DeepseekV2MoE(nn.Module):
+                 return_recv_hook=True,
+             )
+ 
+-        self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
++        self._enable_deepep_moe = enable_deepep_moe
+ 
+     def get_moe_weights(self):
+         return [
+@@ -538,8 +541,6 @@ class DeepseekV2MoE(nn.Module):
+ 
+ 
+ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+-    import math
+-
+     if scale <= 1:
+         return 1.0
+     return 0.1 * mscale * math.log(scale) + 1.0
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f..56b80c8 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -51,8 +51,9 @@ def compute_split_seq_index(
+ 
+ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+     overall_sum = sum(arr)
++    half_sum = overall_sum >> 1
+     left_sum = 0
+-    min_diff = float("inf")
++    min_diff = overall_sum
+     best_index = 0
+ 
+     for i in range(1, len(arr)):
+@@ -62,6 +63,8 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
+         if diff <= min_diff:
+             min_diff = diff
+             best_index = i
++            if left_sum >= half_sum:
++                break
+         else:
+             break
+ 
+@@ -264,6 +267,8 @@ class TboForwardBatchPreparer:
+ 
+         num_tokens = batch.input_ids.shape[0]
+         num_seqs = batch.batch_size
++        token_slice = slice(start_token_index, end_token_index)
++        seq_slice = slice(start_seq_index, end_seq_index)
+ 
+         output_dict = dict()
+ 
+@@ -276,7 +281,7 @@ class TboForwardBatchPreparer:
+             assert (
+                 old_value.shape[0] == num_tokens
+             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+-            output_dict[key] = old_value[start_token_index:end_token_index]
++            output_dict[key] = old_value[token_slice]
+ 
+         for key in [
+             "req_pool_indices",
+@@ -296,7 +301,7 @@ class TboForwardBatchPreparer:
+             assert (
+                 len(old_value) == num_seqs
+             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+-            output_dict[key] = old_value[start_seq_index:end_seq_index]
++            output_dict[key] = old_value[seq_slice]
+ 
+         for key in [
+             "forward_mode",
+@@ -540,15 +545,18 @@ def _model_forward_filter_inputs(
+ 
+ 
+ def _model_forward_tbo_merge_outputs(output_a, output_b):
+-    def _handle_key(name):
+-        value_a = output_a[name]
+-        value_b = output_b[name]
+-        assert (value_a is None) == (value_b is None)
+-        if value_a is None:
+-            return None
+-        return torch.concat([value_a, value_b], dim=0)
+-
+-    return _handle_key("hidden_states"), _handle_key("residual")
++    hidden_states_a = output_a["hidden_states"]
++    hidden_states_b = output_b["hidden_states"]
++    residual_a = output_a["residual"]
++    residual_b = output_b["residual"]
++    
++    assert (hidden_states_a is None) == (hidden_states_b is None)
++    assert (residual_a is None) == (residual_b is None)
++    
++    hidden_states = None if hidden_states_a is None else torch.concat([hidden_states_a, hidden_states_b], dim=0)
++    residual = None if residual_a is None else torch.concat([residual_a, residual_b], dim=0)
++    
++    return hidden_states, residual
+ 
+ 
+ # -------------------------------- Utilities and wrappers ---------------------------------------

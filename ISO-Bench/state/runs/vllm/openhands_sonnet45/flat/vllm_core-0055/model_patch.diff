@@ -1,0 +1,115 @@
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 49e63c2..6cc00a5 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -260,29 +260,29 @@ class BlockTable:
+                                        device: Device) -> List[Block]:
+         blocks: List[Block] = []
+ 
+-        block_token_ids = []
+-        tail_token_ids = []
+-        for cur_token_ids in chunk_list(token_ids, self._block_size):
+-            if len(cur_token_ids) == self._block_size:
+-                block_token_ids.append(cur_token_ids)
+-            else:
+-                tail_token_ids.append(cur_token_ids)
+-
+-        if block_token_ids:
++        # Calculate number of full blocks and remaining tokens
++        num_tokens = len(token_ids)
++        num_full_blocks = num_tokens // self._block_size
++        num_tail_tokens = num_tokens % self._block_size
++
++        # Allocate immutable blocks for full blocks
++        if num_full_blocks > 0:
++            block_token_ids = [
++                token_ids[i * self._block_size:(i + 1) * self._block_size]
++                for i in range(num_full_blocks)
++            ]
+             blocks.extend(
+                 self._allocator.allocate_immutable_blocks(
+                     prev_block, block_token_ids=block_token_ids,
+                     device=device))
+             prev_block = blocks[-1]
+ 
+-        if tail_token_ids:
+-            assert len(tail_token_ids) == 1
+-            cur_token_ids = tail_token_ids[0]
+-
++        # Allocate mutable block for tail tokens
++        if num_tail_tokens > 0:
++            tail_token_ids = token_ids[num_full_blocks * self._block_size:]
+             block = self._allocator.allocate_mutable_block(
+                 prev_block=prev_block, device=device)
+-            block.append_token_ids(cur_token_ids)
+-
++            block.append_token_ids(tail_token_ids)
+             blocks.append(block)
+ 
+         return blocks
+@@ -338,9 +338,13 @@ class BlockTable:
+         continue generation, or if it must be preempted.
+         """
+ 
+-        all_token_ids = token_ids + [-1] * num_lookahead_slots
+-        token_blocks = self._chunk_token_blocks_for_append(all_token_ids)
+-        return len(token_blocks)
++        total_slots = len(token_ids) + num_lookahead_slots
++        first_chunk_size = self._block_size - (self._num_full_slots %
++                                               self._block_size)
++        if total_slots <= first_chunk_size:
++            return 1
++        remaining_slots = total_slots - first_chunk_size
++        return 1 + cdiv(remaining_slots, self._block_size)
+ 
+     def _chunk_token_blocks_for_append(
+             self, token_ids: List[int]) -> List[List[int]]:
+diff --git a/vllm/core/block/common.py b/vllm/core/block/common.py
+index 1e808e2..f2a443c 100644
+--- a/vllm/core/block/common.py
++++ b/vllm/core/block/common.py
+@@ -243,9 +243,7 @@ class BlockList:
+         self._blocks = blocks
+ 
+         # Cache block ids for fast query
+-        self._block_ids = []
+-        for block in self._blocks:
+-            self._add_block_id(block.block_id)
++        self._block_ids = [block.block_id for block in self._blocks]
+ 
+     def append_token_ids(self, block_index: int, token_ids: List[int]) -> None:
+         block = self._blocks[block_index]
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 1cebf68..d795850 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -13,6 +13,7 @@ from vllm.lora.request import LoRARequest
+ from vllm.pooling_params import PoolingParams
+ from vllm.prompt_adapter.request import PromptAdapterRequest
+ from vllm.sampling_params import SamplingParams
++from vllm.utils import cdiv
+ 
+ if TYPE_CHECKING:
+     from vllm.inputs import LLMInputs
+@@ -275,7 +276,7 @@ class Sequence:
+ 
+     @property
+     def n_blocks(self) -> int:
+-        return math.ceil(self.get_len() / self.block_size)
++        return cdiv(self.get_len(), self.block_size)
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+diff --git a/vllm/utils.py b/vllm/utils.py
+index f3025a6..6ab1b3a 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -422,7 +422,7 @@ def chunk_list(lst: List[T], chunk_size: int) -> List[List[T]]:
+ 
+ def cdiv(a: int, b: int) -> int:
+     """Ceiling division."""
+-    return -(a // -b)
++    return (a + b - 1) // b
+ 
+ 
+ def _generate_random_fp8(

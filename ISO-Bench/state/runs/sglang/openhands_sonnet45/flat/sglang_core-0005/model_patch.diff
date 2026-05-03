@@ -1,0 +1,161 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/memory_pool.py b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+index 6e8edaf..f950250 100644
+--- a/python/sglang/srt/disaggregation/mooncake/memory_pool.py
++++ b/python/sglang/srt/disaggregation/mooncake/memory_pool.py
+@@ -11,15 +11,20 @@ from torch.cuda.memory import CUDAPluggableAllocator
+ class MooncakeNVLinkAllocator:
+     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
+     _lock: Final = threading.Lock()
++    _cached_so_path: Optional[str] = None
+ 
+     @classmethod
+     def _get_so_path(cls) -> str:
+         """Dynamically locate hook.so in the mooncake package installation"""
++        if cls._cached_so_path is not None:
++            return cls._cached_so_path
++
+         try:
+             # Attempt to locate package resource
+             with resources.path("mooncake", "hook.so") as so_path:
+                 if so_path.exists():
+-                    return str(so_path)
++                    cls._cached_so_path = str(so_path)
++                    return cls._cached_so_path
+         except (ImportError, FileNotFoundError, TypeError):
+             pass
+ 
+@@ -30,7 +35,8 @@ class MooncakeNVLinkAllocator:
+             base_path = os.path.dirname(os.path.abspath(mooncake.__file__))
+             so_path = os.path.join(base_path, "hook.so")
+             if os.path.exists(so_path):
+-                return so_path
++                cls._cached_so_path = so_path
++                return cls._cached_so_path
+         except (ImportError, FileNotFoundError, TypeError):
+             raise ImportError(
+                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f..a3379b7 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
+ import abc
+ import logging
+ import os
++from collections import deque
+ from contextlib import nullcontext
+ from typing import List, Optional, Tuple, Union
+ 
+@@ -67,7 +68,7 @@ class ReqToTokenPool:
+             self.req_to_token = torch.zeros(
+                 (size, max_context_len), dtype=torch.int32, device=device
+             )
+-        self.free_slots = list(range(size))
++        self.free_slots = deque(range(size))
+ 
+     def write(self, indices, values):
+         self.req_to_token[indices] = values
+@@ -79,19 +80,18 @@ class ReqToTokenPool:
+         if need_size > len(self.free_slots):
+             return None
+ 
+-        select_index = self.free_slots[:need_size]
+-        self.free_slots = self.free_slots[need_size:]
++        select_index = [self.free_slots.popleft() for _ in range(need_size)]
+ 
+         return select_index
+ 
+     def free(self, free_index: Union[int, List[int]]):
+-        if isinstance(free_index, (int,)):
++        if isinstance(free_index, int):
+             self.free_slots.append(free_index)
+         else:
+             self.free_slots.extend(free_index)
+ 
+     def clear(self):
+-        self.free_slots = list(range(self.size))
++        self.free_slots = deque(range(self.size))
+ 
+ 
+ class KVCache(abc.ABC):
+@@ -324,11 +324,10 @@ class MHATokenToKVPool(KVCache):
+             dtype=torch.uint64,
+             device=self.device,
+         )
++        # Cache stride computation: all buffers have the same stride
++        stride = self.head_num * self.head_dim * self.k_buffer[0].dtype.itemsize
+         self.data_strides = torch.tensor(
+-            [
+-                np.prod(x.shape[1:]) * x.dtype.itemsize
+-                for x in self.k_buffer + self.v_buffer
+-            ],
++            [stride] * len(self.k_buffer + self.v_buffer),
+             device=self.device,
+         )
+ 
+@@ -351,27 +350,22 @@ class MHATokenToKVPool(KVCache):
+     def get_contiguous_buf_infos(self):
+         # layer_num x [seq_len, head_num, head_dim]
+         # layer_num x [page_num, page_size, head_num, head_dim]
+-        kv_data_ptrs = [
+-            self.get_key_buffer(i).data_ptr()
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ] + [
+-            self.get_value_buffer(i).data_ptr()
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ]
+-        kv_data_lens = [
+-            self.get_key_buffer(i).nbytes
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ] + [
+-            self.get_value_buffer(i).nbytes
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ]
+-        kv_item_lens = [
+-            self.get_key_buffer(i)[0].nbytes * self.page_size
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ] + [
+-            self.get_value_buffer(i)[0].nbytes * self.page_size
+-            for i in range(self.start_layer, self.start_layer + self.layer_num)
+-        ]
++        kv_data_ptrs = []
++        kv_data_lens = []
++        kv_item_lens = []
++        
++        for i in range(self.start_layer, self.start_layer + self.layer_num):
++            k_buf = self.get_key_buffer(i)
++            kv_data_ptrs.append(k_buf.data_ptr())
++            kv_data_lens.append(k_buf.nbytes)
++            kv_item_lens.append(k_buf[0].nbytes * self.page_size)
++        
++        for i in range(self.start_layer, self.start_layer + self.layer_num):
++            v_buf = self.get_value_buffer(i)
++            kv_data_ptrs.append(v_buf.data_ptr())
++            kv_data_lens.append(v_buf.nbytes)
++            kv_item_lens.append(v_buf[0].nbytes * self.page_size)
++        
+         return kv_data_ptrs, kv_data_lens, kv_item_lens
+ 
+     def maybe_get_custom_mem_pool(self):
+@@ -645,11 +639,16 @@ class MLATokenToKVPool(KVCache):
+     # for disagg
+     def get_contiguous_buf_infos(self):
+         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+-        kv_item_lens = [
+-            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+-        ]
++        kv_data_ptrs = []
++        kv_data_lens = []
++        kv_item_lens = []
++        
++        for i in range(self.layer_num):
++            buf = self.kv_buffer[i]
++            kv_data_ptrs.append(buf.data_ptr())
++            kv_data_lens.append(buf.nbytes)
++            kv_item_lens.append(buf[0].nbytes * self.page_size)
++        
+         return kv_data_ptrs, kv_data_lens, kv_item_lens
+ 
+     def maybe_get_custom_mem_pool(self):

@@ -1,0 +1,69 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index f5dceac..2ab6524 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -12,7 +12,6 @@
+ # limitations under the License.
+ # ==============================================================================
+ 
+-import math
+ from typing import Callable, Optional
+ 
+ import torch
+@@ -49,11 +48,6 @@ def fused_topk_native(
+     assert (
+         hidden_states.shape[0] == gating_output.shape[0]
+     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+-    M, _ = hidden_states.shape
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+     topk_weights = F.softmax(gating_output.float(), dim=-1)
+     topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+     if renormalize:
+@@ -87,7 +81,6 @@ def fused_topk(
+         token_expert_indicies,
+         gating_output.float(),
+     )
+-    del token_expert_indicies
+ 
+     return _fused_topk_postprocess(
+         topk_weights=topk_weights,
+@@ -145,7 +138,7 @@ def grouped_topk(
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
++    tmp_scores = scores.masked_fill(score_mask == 0, 0.0)  # [n, e]
+     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     if num_fused_shared_experts:
+         topk_ids[:, -1] = torch.randint(
+@@ -206,7 +199,7 @@ def biased_grouped_topk_impl(
+         .reshape(num_token, -1)
+     )  # [n, e]
+     tmp_scores = scores_for_choice.masked_fill(
+-        ~score_mask.bool(), float("-inf")
++        score_mask == 0, float("-inf")
+     )  # [n, e]
+     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     topk_weights = scores.gather(1, topk_ids)
+@@ -236,7 +229,7 @@ def biased_grouped_topk_impl(
+ 
+ 
+ def is_power_of_two(n):
+-    return n > 0 and math.log2(n).is_integer()
++    return n > 0 and (n & (n - 1)) == 0
+ 
+ 
+ def _mask_topk_ids_padded_region(
+@@ -245,8 +238,7 @@ def _mask_topk_ids_padded_region(
+ ):
+     if num_token_non_padded is None:
+         return
+-    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+-    topk_ids[indices >= num_token_non_padded, :] = -1
++    topk_ids[num_token_non_padded:, :] = -1
+ 
+ 
+ def biased_grouped_topk(

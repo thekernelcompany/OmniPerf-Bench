@@ -1,0 +1,95 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a4..af68177 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -263,8 +263,6 @@ def set_global_expert_location_metadata(value):
+ def _compute_logical_to_all_physical_map(
+     physical_to_logical_map: torch.Tensor, num_logical_experts: int
+ ):
+-    # This is rarely called, so we use for loops for maximum clarity
+-
+     num_layers, num_physical_experts = physical_to_logical_map.shape
+ 
+     logical_to_all_physical_map = [
+@@ -289,15 +287,27 @@ def _compute_logical_to_all_physical_map(
+ 
+ 
+ def _pad_nested_array(arr, pad_value):
+-    max_len = max(len(inner) for outer in arr for inner in outer)
+-    padded = [
+-        [inner + [pad_value] * (max_len - len(inner)) for inner in outer]
+-        for outer in arr
+-    ]
++    # Find max length more efficiently
++    max_len = 0
++    for outer in arr:
++        for inner in outer:
++            inner_len = len(inner)
++            if inner_len > max_len:
++                max_len = inner_len
++    
++    # Pad arrays
++    padded = []
++    for outer in arr:
++        padded_outer = []
++        for inner in outer:
++            if len(inner) < max_len:
++                padded_outer.append(inner + [pad_value] * (max_len - len(inner)))
++            else:
++                padded_outer.append(inner)
++        padded.append(padded_outer)
+     return padded
+ 
+ 
+-# TODO optimize performance (rewrite and/or run in separate process with overlap)
+ def compute_logical_to_rank_dispatch_physical_map(
+     logical_to_all_physical_map: torch.Tensor,
+     num_gpus: int,
+@@ -369,8 +379,16 @@ def _compute_gpu_id_of_physical_expert(
+ 
+ 
+ def _fair_choices(arr: List, k: int, r: random.Random) -> List:
+-    quotient, remainder = divmod(k, len(arr))
+-    ans = arr * quotient + r.sample(arr, k=remainder)
++    arr_len = len(arr)
++    if arr_len == 0:
++        return []
++    quotient, remainder = divmod(k, arr_len)
++    if quotient == 0:
++        # Fast path for small k
++        return r.sample(arr, k=remainder)
++    ans = arr * quotient
++    if remainder > 0:
++        ans.extend(r.sample(arr, k=remainder))
+     r.shuffle(ans)
+     return ans
+ 
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01..b351bc8 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -91,13 +91,18 @@ def _topk_ids_logical_to_physical_dynamic(
+ ) -> torch.Tensor:
+     topk_ids_original_shape = topk_ids.shape
+     device = topk_ids.device
+-    topk_ids = topk_ids.flatten()
++    topk_ids_flat = topk_ids.flatten()
+ 
++    # Get the number of valid physical experts for each logical expert
++    num_valid = info.partial_logical_to_all_physical_map_num_valid[topk_ids_flat]
++
++    # Generate random indices and take modulo with num_valid
+     chosen_dispatch_index = (
+-        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
++        torch.randint(0, 65536, topk_ids_flat.shape, dtype=torch.int32, device=device)
++        % num_valid
+     )
+-    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+ 
+-    topk_ids = topk_ids.view(topk_ids_original_shape)
+-    return topk_ids
++    # Index into the physical map
++    result = info.partial_logical_to_all_physical_map[topk_ids_flat, chosen_dispatch_index]
++
++    return result.view(topk_ids_original_shape)

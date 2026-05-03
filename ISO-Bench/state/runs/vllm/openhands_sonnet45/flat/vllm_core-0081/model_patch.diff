@@ -1,0 +1,89 @@
+diff --git a/vllm/model_executor/guided_decoding/xgrammar_decoding.py b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+index 329b03a..f5679f8 100644
+--- a/vllm/model_executor/guided_decoding/xgrammar_decoding.py
++++ b/vllm/model_executor/guided_decoding/xgrammar_decoding.py
+@@ -5,7 +5,6 @@ from __future__ import annotations
+ 
+ import copy
+ import json
+-import re
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, List
+ 
+@@ -74,10 +73,11 @@ class TokenizerDataCache:
+             # Vendored from xgrammar logic since we cannot pickle the tokenizer
+             # https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98 # noqa: E501
+             try:
+-                encoded_vocab = [
+-                    token for token, _ in sorted(tokenizer.get_vocab().items(),
+-                                                 key=lambda x: x[1])
+-                ]
++                vocab = tokenizer.get_vocab()
++                # Optimize: create list directly sized to vocab, avoiding sort overhead
++                encoded_vocab = [''] * len(vocab)
++                for token, idx in vocab.items():
++                    encoded_vocab[idx] = token
+             except AttributeError as e:
+                 raise ValueError(
+                     f"Cannot get the vocabulary of the tokenizer "
+@@ -251,16 +251,18 @@ class GrammarConfig:
+     @staticmethod
+     def escape_ebnf_string(s: str) -> str:
+         """Escape special characters in a EBNF string."""
+-        # Escape double quotes and backslashes
+-        return re.sub(r'(["\\])', r'\\\1', s)
++        # Escape double quotes and backslashes using str.replace (faster than regex)
++        return s.replace('\\', '\\\\').replace('"', '\\"')
+ 
+     @staticmethod
+     def choice_as_grammar(choice: List[str] | None) -> str:
+         if choice is None:
+             raise ValueError("Choice is not set")
+-        escaped_choices = (GrammarConfig.escape_ebnf_string(c) for c in choice)
+-        grammar = ('root ::= ' + ' | '.join(f'"{c}"' for c in escaped_choices))
+-        return grammar
++        # Optimize: use list comprehension and single join operation
++        escaped_choices = [
++            f'"{GrammarConfig.escape_ebnf_string(c)}"' for c in choice
++        ]
++        return 'root ::= ' + ' | '.join(escaped_choices)
+ 
+ 
+ @dataclass
+@@ -316,17 +318,22 @@ class XGrammarLogitsProcessor:
+             # Have not sampled a token yet
+             self.prefilled = True
+         else:
+-            for i, matcher in enumerate(self.matchers):
++            # Optimize: cache matchers list to avoid repeated attribute lookup
++            matchers = self.matchers
++            sampled_token = input_ids[-1]
++            for i, matcher in enumerate(matchers):
+                 if not matcher.is_terminated():
+-                    sampled_token = input_ids[-1]
+-                    assert self.matchers[i].accept_token(sampled_token)
++                    assert matchers[i].accept_token(sampled_token)
+ 
+-        for i, matcher in enumerate(self.matchers):
++        # Optimize: cache matchers list to avoid repeated attribute lookup
++        matchers = self.matchers
++        token_bitmask = self.token_bitmask
++        for i, matcher in enumerate(matchers):
+             if not matcher.is_terminated():
+                 # @ubospica: ideally, fill_next_token_bitmask should be
+                 # parallelized with model decoding
+                 # See https://github.com/vllm-project/vllm/pull/10785/files#r1864278303
+-                matcher.fill_next_token_bitmask(self.token_bitmask, i)
++                matcher.fill_next_token_bitmask(token_bitmask, i)
+ 
+         # token_bitmask is a CPU tensor for use with accept_token and
+         # fill_next_token_bitmask so we move it to the device of scores
+@@ -341,7 +348,7 @@ class XGrammarLogitsProcessor:
+         # on CPU device fails, but on GPU it runs without error. Hence the
+         # unsqueeze above for scores, to match the token bitmask shape
+         xgr.apply_token_bitmask_inplace(
+-            scores, self.token_bitmask.to(scores.device, non_blocking=True))
++            scores, token_bitmask.to(scores.device, non_blocking=True))
+         if device_type != "cuda":
+             scores = scores.to(dtype).to(device_type).squeeze()
+ 

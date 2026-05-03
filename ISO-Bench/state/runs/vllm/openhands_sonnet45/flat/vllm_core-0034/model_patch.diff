@@ -1,0 +1,123 @@
+diff --git a/tests/basic_correctness/test_chunked_prefill.py b/tests/basic_correctness/test_chunked_prefill.py
+index fc6f829..5d292da 100644
+--- a/tests/basic_correctness/test_chunked_prefill.py
++++ b/tests/basic_correctness/test_chunked_prefill.py
+@@ -191,6 +191,8 @@ def test_with_prefix_caching(
+     max_num_batched_tokens = max_num_seqs = chunk_size
+     outputs = {}  # type: ignore
+     check_result = True
++    # Cache the modulo check outside the loop
++    chunk_not_aligned = chunk_size % 16 != 0
+     for enable in (True, False):
+         with vllm_runner(
+                 model,
+@@ -205,7 +207,7 @@ def test_with_prefix_caching(
+         ) as vllm_model:
+             # It should fail when prefix caching is enable and chunk
+             # size is not a multiple of block size (16).
+-            should_fail = chunk_size % 16 != 0 and enable
++            should_fail = chunk_not_aligned and enable
+             check_result &= not should_fail
+             outputs[enable] = []
+             # Send the request one-by-one to ensure the cache is populated.
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4c2f715..709429d 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -394,6 +394,20 @@ class Scheduler:
+         # will be stopped during schedule() call and added to this stop list
+         # for processing and deallocation by the free_finished_seq_groups()
+         self._async_stopped: List[SequenceGroup] = []
++        
++        # Validate and cache prefix caching alignment check
++        if (self.scheduler_config.chunked_prefill_enabled and 
++            self.cache_config.enable_prefix_caching):
++            block_size = self.cache_config.block_size
++            token_budget = self.scheduler_config.max_num_batched_tokens
++            reminder = token_budget % block_size
++            if reminder != 0:
++                raise ValueError("When enabling chunked prefill and "
++                                 "prefix caching, max_num_batched_tokens "
++                                 "(chunk size) must be dividable by "
++                                 "block size, but got chunk_size "
++                                 f"({token_budget}) % block_size "
++                                 f"({block_size}) = {reminder}")
+ 
+     @property
+     def next_cache_id(self):
+@@ -449,18 +463,28 @@ class Scheduler:
+                     # Appending aborted group into pending list.
+                     aborted_groups.append(seq_group)
+                     request_ids.remove(seq_group.request_id)
+-            for aborted_group in aborted_groups:
+-                # Remove the sequence group from the state queue.
+-                state_queue.remove(aborted_group)
+-                # Remove the aborted request from the Mamba cache.
+-                self._finished_requests_ids.append(aborted_group.request_id)
+-                for seq in aborted_group.get_seqs():
+-                    if seq.is_finished():
+-                        continue
+-                    seq.status = SequenceStatus.FINISHED_ABORTED
+-                    self.free_seq(seq)
+-
+-                self._free_seq_group_cross_attn_blocks(aborted_group)
++            
++            if aborted_groups:
++                # Rebuild the deque without aborted groups (O(n) instead of O(n*m))
++                aborted_ids = {group.request_id for group in aborted_groups}
++                # Save original queue content before clearing
++                original_queue = list(state_queue)
++                state_queue.clear()
++                state_queue.extend(
++                    seq_group for seq_group in original_queue
++                    if seq_group.request_id not in aborted_ids
++                )
++                
++                for aborted_group in aborted_groups:
++                    # Remove the aborted request from the Mamba cache.
++                    self._finished_requests_ids.append(aborted_group.request_id)
++                    for seq in aborted_group.get_seqs():
++                        if seq.is_finished():
++                            continue
++                        seq.status = SequenceStatus.FINISHED_ABORTED
++                        self.free_seq(seq)
++
++                    self._free_seq_group_cross_attn_blocks(aborted_group)
+ 
+     def _free_seq_group_cross_attn_blocks(
+         self,
+@@ -897,12 +921,12 @@ class Scheduler:
+         )
+         # Make sure we include num running seqs before scheduling prefill,
+         # so that we don't schedule beyond max_num_seqs for prefill.
++        curr_loras = set() if self.lora_enabled else None
+         for seq_group in self.running:
+             budget.add_num_seqs(seq_group.request_id,
+                                 seq_group.get_max_num_running_seqs())
+-        curr_loras = set(
+-            seq_group.lora_int_id for seq_group in self.running
+-            if seq_group.lora_int_id > 0) if self.lora_enabled else None
++            if self.lora_enabled and seq_group.lora_int_id > 0:
++                curr_loras.add(seq_group.lora_int_id)
+ 
+         prefills = SchedulerPrefillOutputs.create_empty()
+         running_scheduled = SchedulerRunningOutputs.create_empty()
+@@ -1464,16 +1488,9 @@ class Scheduler:
+                 # When prefix caching is enabled, we always allocate
+                 # the number of new tokens that is dividable by the block size
+                 # to avoid partial block matching.
+-                block_size = self.cache_config.block_size
+-                reminder = budget.token_budget % block_size
+-                if reminder != 0:
+-                    raise ValueError("When enabling chunked prefill and "
+-                                     "prefix caching, max_num_batched_tokens "
+-                                     "(chunk size) must be dividable by "
+-                                     "block size, but got chunk_size "
+-                                     f"({budget.token_budget}) % block_size "
+-                                     f"({block_size}) = {reminder}")
++                # Note: alignment is validated at initialization time
+                 if remaining_token_budget < num_new_tokens:
++                    block_size = self.cache_config.block_size
+                     num_new_tokens = (remaining_token_budget //
+                                       block_size) * block_size
+             else:

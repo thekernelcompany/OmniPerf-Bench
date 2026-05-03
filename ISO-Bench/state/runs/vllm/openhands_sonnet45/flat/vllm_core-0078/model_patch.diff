@@ -1,0 +1,123 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..aedf66c 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -156,9 +156,11 @@ def _apply_min_tokens_penalty(
+     """Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
+         have not been generated yet
+     """
+-    # list of indices in logits that will be set to -inf
+-    logits_to_penalize: List[Tuple[int, int]] = []
++    # Collect all penalties to apply in batched lists
++    seq_indices_to_penalize: List[int] = []
++    token_ids_to_penalize_list: List[int] = []
+     logits_applied = 0
++    
+     for seq_group in sampling_metadata.seq_groups:
+         seq_ids = seq_group.seq_ids
+         sampling_params = seq_group.sampling_params
+@@ -173,23 +175,17 @@ def _apply_min_tokens_penalty(
+         min_tokens = sampling_params.min_tokens
+         token_ids_to_penalize = sampling_params.all_stop_token_ids
+         if min_tokens > 0 and token_ids_to_penalize:
+-            seqs_to_penalize = []
+             for j, seq_id in enumerate(seq_ids):
+                 seq_data = seq_group.seq_data[seq_id]
+                 if len(seq_data.output_token_ids) < min_tokens:
+-                    seqs_to_penalize.append(j)
+-
+-            if seqs_to_penalize:
+-                # convert to the index into logits
+-                seqs_to_penalize = [start_idx + j for j in seqs_to_penalize]
+-                # itertools.product pairs each seq index with every token id
+-                logits_to_penalize.extend(
+-                    itertools.product(seqs_to_penalize, token_ids_to_penalize))
++                    seq_idx = start_idx + j
++                    # Add all token penalties for this sequence
++                    seq_indices_to_penalize.extend([seq_idx] * len(token_ids_to_penalize))
++                    token_ids_to_penalize_list.extend(token_ids_to_penalize)
+ 
+-    if logits_to_penalize:
+-        # use zip and * to group indices along each dimension
+-        # eg. [ (1,2), (1,3), (5,6) ] -> ( (1,1,5), (2,3,6) )
+-        logits[tuple(zip(*logits_to_penalize))] = -float("inf")
++    if seq_indices_to_penalize:
++        # Apply all penalties at once using advanced indexing
++        logits[seq_indices_to_penalize, token_ids_to_penalize_list] = -float("inf")
+ 
+     # verifies that no rows in logits were missed unexpectedly
+     assert logits_applied == logits.shape[0]
+@@ -207,10 +203,14 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    # Use broadcasting instead of repeat to avoid allocating a large tensor
++    combined_mask = prompt_mask | output_mask
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(1)
++    logits = torch.where(combined_mask,
++                        torch.where(logits > 0, 
++                                   logits / repetition_penalties_expanded,
++                                   logits * repetition_penalties_expanded),
++                        logits)
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+@@ -242,8 +242,10 @@ def _apply_top_k_top_p(
+     logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    src = torch.arange(logits_idx.shape[-1],
+-                       device=logits_idx.device).expand_as(logits_idx)
++    # Use unsqueeze and expand instead of expand_as for better performance
++    vocab_size = logits_idx.shape[-1]
++    src = torch.arange(vocab_size, device=logits_idx.device, dtype=logits_idx.dtype)
++    src = src.unsqueeze(0).expand_as(logits_idx)
+     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+                                                            index=logits_idx,
+                                                            src=src)
+@@ -259,10 +261,15 @@ def _apply_min_p(
+     Adapted from
+     https://github.com/oobabooga/text-generation-webui/blob/3146124ec01f02c8fb1650a6517cf1b60b537aaf/modules/sampler_hijack.py#L16C17-L16C17
+     """
+-    probs = torch.softmax(logits, dim=-1)
+-    top_probs, _ = probs.max(dim=-1, keepdim=True)
+-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+-    tokens_to_remove = probs < scaled_min_p
++    # Use max logit instead of max prob to avoid redundant softmax
++    # Since softmax is monotonic, max(softmax(x)) = softmax(max(x))
++    top_logits, _ = logits.max(dim=-1, keepdim=True)
++    # Convert min_p threshold from probability space to logit space
++    # If prob_i / max_prob < min_p, then exp(logit_i - max_logit) < min_p
++    # So logit_i < max_logit + log(min_p)
++    min_p_unsqueezed = min_p.unsqueeze_(dim=1)
++    logit_threshold = top_logits + torch.log(min_p_unsqueezed)
++    tokens_to_remove = logits < logit_threshold
+     logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
+ 
+     return logits
+@@ -397,7 +404,8 @@ def _beam_search_sample(
+                 seq_group.seq_data[seq_id].cumulative_logprob
+                 for seq_id in seq_ids
+             ]
+-            cumulative_logprobs_tensor = torch.tensor(
++            # Use torch.as_tensor to avoid unnecessary copies
++            cumulative_logprobs_tensor = torch.as_tensor(
+                 cumulative_logprobs,
+                 dtype=torch.float,
+                 device=seq_group_logprobs.device)
+@@ -761,8 +769,9 @@ def _get_logprobs(
+         empty_prompt_logprob: Optional[PromptLogprobs] = None
+         return [empty_prompt_logprob], [empty_sampled_logprob]
+ 
+-    query_indices_gpu = torch.tensor(query_indices, device=logprobs.device)
+-    next_token_ids_gpu = torch.tensor(next_token_ids, device=logprobs.device)
++    # Use torch.as_tensor with dtype to avoid unnecessary copies
++    query_indices_gpu = torch.as_tensor(query_indices, dtype=torch.long, device=logprobs.device)
++    next_token_ids_gpu = torch.as_tensor(next_token_ids, dtype=torch.long, device=logprobs.device)
+ 
+     # (num_selected_query_tokens, num_logprobs). Note that query_indices can
+     # contain duplicates if beam search is enabled.

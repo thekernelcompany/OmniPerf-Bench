@@ -1,0 +1,232 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e791453..d26f162 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -167,6 +167,32 @@ class InputBatch:
+         self.num_logprobs: Dict[str, int] = {}
+         self.prompt_logprob_reqs: Set[str] = set()
+ 
++        # Cached property values for performance
++        self._cached_num_reqs: int = 0
++        self._cached_all_greedy: bool = True
++        self._cached_all_random: bool = True
++        self._cached_no_top_p: bool = True
++        self._cached_no_top_k: bool = True
++        self._cached_no_penalties: bool = True
++        self._cached_max_num_logprobs: int = 0
++        self._cached_no_logprob: bool = True
++        self._cached_no_prompt_logprob: bool = True
++
++    def _invalidate_cache(self) -> None:
++        """Invalidate cached property values."""
++        self._cached_num_reqs = len(self.req_id_to_index)
++        self._cached_all_greedy = len(self.random_reqs) == 0
++        self._cached_all_random = len(self.greedy_reqs) == 0
++        self._cached_no_top_p = len(self.top_p_reqs) == 0
++        self._cached_no_top_k = len(self.top_k_reqs) == 0
++        self._cached_no_penalties = (len(self.presence_penalties_reqs) == 0
++                                     and len(self.frequency_penalties_reqs) == 0
++                                     and len(self.repetition_penalties_reqs) == 0)
++        self._cached_max_num_logprobs = (max(self.num_logprobs.values())
++                                         if self.num_logprobs else 0)
++        self._cached_no_logprob = len(self.num_logprobs) == 0
++        self._cached_no_prompt_logprob = len(self.prompt_logprob_reqs) == 0
++
+     def add_request(
+         self,
+         request: "CachedRequestState",
+@@ -233,6 +259,9 @@ class InputBatch:
+         if sampling_params.prompt_logprobs:
+             self.prompt_logprob_reqs.add(req_id)
+ 
++        # Invalidate cache after adding request
++        self._invalidate_cache()
++
+     def remove_request(self, req_id: str) -> Optional[int]:
+         req_index = self.req_id_to_index.pop(req_id, None)
+         if req_index is None:
+@@ -249,6 +278,9 @@ class InputBatch:
+         self.generators.pop(req_index, None)
+         self.num_logprobs.pop(req_id, None)
+         self.prompt_logprob_reqs.discard(req_id)
++        
++        # Invalidate cache after removing request
++        self._invalidate_cache()
+         return req_index
+ 
+     def clear(self) -> None:
+@@ -264,6 +296,9 @@ class InputBatch:
+         self.generators.clear()
+         self.num_logprobs.clear()
+         self.prompt_logprob_reqs.clear()
++        
++        # Invalidate cache after clearing
++        self._invalidate_cache()
+ 
+     def condense(self, empty_req_indices: List[int]) -> None:
+         if self.num_reqs == 0:
+@@ -350,18 +385,16 @@ class InputBatch:
+                 # there are requests which need penalties to be applied.
+                 self.prompt_token_ids = self._make_prompt_token_ids_tensor()
+ 
+-        output_token_ids: List[List[int]] = []
+-
+-        for req_id in self.req_ids[:self.num_reqs]:
+-            assert req_id is not None
+-            # Currently we create a tensor for output_token_ids from scratch
+-            # at each step. However, for the penalties computation what we
+-            # need is stats about the token ids present in the output. This
+-            # stats can be maintained incrementally instead of computing it
+-            # from scratch at each step.
+-            # TODO - Replace this with incremental update to output token
+-            # statistics.
+-            output_token_ids.append(req_id_output_token_ids[req_id])
++        # OPTIMIZATION: Use list comprehension for better performance.
++        # Currently we create a tensor for output_token_ids from scratch
++        # at each step. However, for the penalties computation what we
++        # need is stats about the token ids present in the output. This
++        # stats can be maintained incrementally instead of computing it
++        # from scratch at each step.
++        # TODO - Replace this with incremental update to output token
++        # statistics.
++        output_token_ids = [req_id_output_token_ids[req_id]
++                           for req_id in self.req_ids[:self.num_reqs]]
+ 
+         return SamplingMetadata(
+             temperature=self.temperature[:self.num_reqs],
+@@ -395,45 +428,45 @@ class InputBatch:
+             self.token_ids_cpu[:self.num_reqs, :max_prompt_len])
+         # Use the value of vocab_size as a pad since we don't have a
+         # token_id of this value.
+-        for i in range(self.num_reqs):
+-            prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
++        # OPTIMIZATION: Use numpy broadcasting instead of Python loop.
++        mask = (np.arange(max_prompt_len)[np.newaxis, :] >=
++                self.num_prompt_tokens[:self.num_reqs, np.newaxis])
++        prompt_token_ids[mask] = self.vocab_size
+         return prompt_token_ids_cpu_tensor.to(device=self.device,
+                                               non_blocking=True)
+ 
+     @property
+     def num_reqs(self) -> int:
+-        return len(self.req_id_to_index)
++        return self._cached_num_reqs
+ 
+     @property
+     def all_greedy(self) -> bool:
+-        return len(self.random_reqs) == 0
++        return self._cached_all_greedy
+ 
+     @property
+     def all_random(self) -> bool:
+-        return len(self.greedy_reqs) == 0
++        return self._cached_all_random
+ 
+     @property
+     def no_top_p(self) -> bool:
+-        return len(self.top_p_reqs) == 0
++        return self._cached_no_top_p
+ 
+     @property
+     def no_top_k(self) -> bool:
+-        return len(self.top_k_reqs) == 0
++        return self._cached_no_top_k
+ 
+     @property
+     def no_penalties(self) -> bool:
+-        return (len(self.presence_penalties_reqs) == 0
+-                and len(self.frequency_penalties_reqs) == 0
+-                and len(self.repetition_penalties_reqs) == 0)
++        return self._cached_no_penalties
+ 
+     @property
+     def max_num_logprobs(self) -> int:
+-        return max(self.num_logprobs.values()) if self.num_logprobs else 0
++        return self._cached_max_num_logprobs
+ 
+     @property
+     def no_logprob(self) -> bool:
+-        return len(self.num_logprobs) == 0
++        return self._cached_no_logprob
+ 
+     @property
+     def no_prompt_logprob(self) -> bool:
+-        return len(self.prompt_logprob_reqs) == 0
++        return self._cached_no_prompt_logprob
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54..285d95d 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -280,16 +280,13 @@ class GPUModelRunner:
+             non_blocking=True)
+ 
+         # Get the number of scheduled tokens for each request.
+-        # TODO: The Python loop can be slow. Optimize.
+-        num_scheduled_tokens = []
+-        max_num_scheduled_tokens = 0
+-        for req_id in self.input_batch.req_ids[:num_reqs]:
+-            assert req_id is not None
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens.append(num_tokens)
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
+-        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
++        # OPTIMIZATION: Use list comprehension + numpy for better performance.
++        req_ids = self.input_batch.req_ids[:num_reqs]
++        num_scheduled_tokens = np.array(
++            [scheduler_output.num_scheduled_tokens[req_id]
++             for req_id in req_ids],
++            dtype=np.int32)
++        max_num_scheduled_tokens = num_scheduled_tokens.max()
+         assert max_num_scheduled_tokens > 0
+ 
+         # Get request indices.
+@@ -631,20 +628,37 @@ class GPUModelRunner:
+         )
+ 
+         sampled_token_ids = sampler_output.sampled_token_ids
+-        # TODO(woosuk): The following loop can be slow since it iterates over
+-        # the requests one by one. Optimize.
++        # OPTIMIZATION: Vectorize the token ID updates where possible.
+         num_reqs = self.input_batch.num_reqs
+-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+-            assert req_id is not None
++        req_ids = self.input_batch.req_ids[:num_reqs]
++        
++        # Pre-compute seq_lens and masks for vectorization
++        seq_lens = np.array([
++            self.requests[req_id].num_computed_tokens +
++            scheduler_output.num_scheduled_tokens[req_id]
++            for req_id in req_ids
++        ], dtype=np.int32)
++        num_tokens = np.array([
++            self.requests[req_id].num_tokens
++            for req_id in req_ids
++        ], dtype=np.int32)
++        
++        # Mask for requests that need token updates
++        update_mask = seq_lens == num_tokens
++        update_indices = np.where(update_mask)[0]
++        
++        # Vectorized token ID updates
++        if len(update_indices) > 0:
++            self.input_batch.token_ids_cpu[
++                update_indices, seq_lens[update_indices]
++            ] = sampled_token_ids[update_indices]
++        
++        # Handle per-request updates and generator state
++        for i, req_id in enumerate(req_ids):
+             req_state = self.requests[req_id]
+-            seq_len = (req_state.num_computed_tokens +
+-                       scheduler_output.num_scheduled_tokens[req_id])
+-            assert seq_len <= req_state.num_tokens
+-            if seq_len == req_state.num_tokens:
++            if update_mask[i]:
+                 # Append the sampled token to the output token ids.
+-                token_id = sampled_token_ids[i]
+-                self.input_batch.token_ids_cpu[i, seq_len] = token_id
+-                req_state.output_token_ids.append(token_id)
++                req_state.output_token_ids.append(sampled_token_ids[i])
+             else:
+                 # Ignore the sampled token from the partial request.
+                 # Rewind the generator state as if the token was not sampled.

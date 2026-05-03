@@ -1,0 +1,212 @@
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index 122e2ed..a28e4d0 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -543,27 +543,27 @@ class LLM:
+         beam_search_params = SamplingParams(logprobs=2 * beam_width,
+                                             max_tokens=1,
+                                             temperature=temperature)
+-        instances: list[BeamSearchInstance] = []
+-
+-        for prompt in prompts:
+-            if is_token_prompt(prompt):
+-                prompt_tokens = prompt["prompt_token_ids"]
+-            else:
+-                prompt_tokens = tokenizer.encode(prompt["prompt"])
+-            instances.append(BeamSearchInstance(prompt_tokens))
++        instances: list[BeamSearchInstance] = [
++            BeamSearchInstance(
++                prompt["prompt_token_ids"] if is_token_prompt(prompt)
++                else tokenizer.encode(prompt["prompt"])
++            )
++            for prompt in prompts
++        ]
+ 
+         for _ in range(max_tokens):
+             all_beams: list[BeamSearchSequence] = list(
+                 sum((instance.beams for instance in instances), []))
++            all_beams_len = len(all_beams)
++            if all_beams_len == 0:
++                break
++            
+             pos = [0] + list(
+                 itertools.accumulate(
+                     len(instance.beams) for instance in instances))
+             instance_start_and_end: list[tuple[int, int]] = list(
+                 zip(pos[:-1], pos[1:]))
+ 
+-            if len(all_beams) == 0:
+-                break
+-
+             prompts_batch = [
+                 TokensPrompt(prompt_token_ids=beam.tokens)
+                 for beam in all_beams
+@@ -1242,28 +1242,24 @@ class LLM:
+         if prompts is not None:
+             num_requests = len(prompts)
+         if prompt_token_ids is not None:
++            prompt_token_ids_len = len(prompt_token_ids)
+             if (num_requests is not None
+-                    and num_requests != len(prompt_token_ids)):
++                    and num_requests != prompt_token_ids_len):
+                 raise ValueError("The lengths of prompts and prompt_token_ids "
+                                  "must be the same.")
+ 
+-            num_requests = len(prompt_token_ids)
++            num_requests = prompt_token_ids_len
+         if num_requests is None:
+             raise ValueError("Either prompts or prompt_token_ids must be "
+                              "provided.")
+ 
+-        parsed_prompts: list[PromptType] = []
+-        for i in range(num_requests):
+-            item: PromptType
+-
+-            if prompts is not None:
+-                item = TextPrompt(prompt=prompts[i])
+-            elif prompt_token_ids is not None:
+-                item = TokensPrompt(prompt_token_ids=prompt_token_ids[i])
+-            else:
+-                raise AssertionError
+-
+-            parsed_prompts.append(item)
++        if prompts is not None:
++            parsed_prompts = [TextPrompt(prompt=prompts[i]) for i in range(num_requests)]
++        elif prompt_token_ids is not None:
++            parsed_prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids[i]) 
++                            for i in range(num_requests)]
++        else:
++            raise AssertionError
+ 
+         return parsed_prompts
+ 
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 98e9ea0..28f274b 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import asyncio
++import itertools
+ import json
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+@@ -530,7 +531,8 @@ class OpenAIServingChat(OpenAIServing):
+                         delta_message = DeltaMessage(content=delta_text)
+ 
+                     # set the previous values for the next iteration
+-                    previous_num_tokens[i] += len(output.token_ids)
++                    output_token_ids_len = len(output.token_ids)
++                    previous_num_tokens[i] += output_token_ids_len
+ 
+                     # if the message delta is None (e.g. because it was a
+                     # "control token" for tool calls or the parser otherwise
+@@ -555,10 +557,9 @@ class OpenAIServingChat(OpenAIServing):
+                         # only happens if we are NOT using guided decoding
+                         auto_tools_called = False
+                         if tool_parser:
+-                            auto_tools_called = len(
+-                                tool_parser.prev_tool_call_arr) > 0
+-                            index = len(tool_parser.prev_tool_call_arr
+-                                        ) - 1 if auto_tools_called else 0
++                            prev_tool_call_arr_len = len(tool_parser.prev_tool_call_arr)
++                            auto_tools_called = prev_tool_call_arr_len > 0
++                            index = prev_tool_call_arr_len - 1 if auto_tools_called else 0
+                         else:
+                             index = 0
+ 
+@@ -854,17 +855,18 @@ class OpenAIServingChat(OpenAIServing):
+     def _get_top_logprobs(
+             self, logprobs: dict[int, Logprob], top_logprobs: Optional[int],
+             tokenizer: AnyTokenizer) -> list[ChatCompletionLogProb]:
++        if not top_logprobs:
++            return []
+         return [
+             ChatCompletionLogProb(token=(token := self._get_decoded_token(
+-                p[1],
+-                p[0],
++                logprob_obj,
++                token_id,
+                 tokenizer,
+                 return_as_token_id=self.return_tokens_as_token_ids)),
+-                                  logprob=max(p[1].logprob, -9999.0),
++                                  logprob=max(logprob_obj.logprob, -9999.0),
+                                   bytes=list(
+                                       token.encode("utf-8", errors="replace")))
+-            for i, p in enumerate(logprobs.items())
+-            if top_logprobs and i < top_logprobs
++            for token_id, logprob_obj in itertools.islice(logprobs.items(), top_logprobs)
+         ]
+ 
+     def _create_chat_logprobs(
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index ed09af8..2d176b9 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import asyncio
++import itertools
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
+@@ -321,8 +322,10 @@ class OpenAIServingCompletion(OpenAIServing):
+                     else:
+                         logprobs = None
+ 
+-                    previous_text_lens[i] += len(output.text)
+-                    previous_num_tokens[i] += len(output.token_ids)
++                    output_text_len = len(output.text)
++                    output_token_ids_len = len(output.token_ids)
++                    previous_text_lens[i] += output_text_len
++                    previous_num_tokens[i] += output_token_ids_len
+                     finish_reason = output.finish_reason
+                     stop_reason = output.stop_reason
+ 
+@@ -524,16 +527,17 @@ class OpenAIServingCompletion(OpenAIServing):
+                 out_top_logprobs.append({
+                     # Convert float("-inf") to the
+                     # JSON-serializable float that OpenAI uses
+-                    self._get_decoded_token(top_lp[1],
+-                                            top_lp[0],
++                    self._get_decoded_token(logprob_obj,
++                                            token_id,
+                                             tokenizer,
+                                             return_as_token_id=self.return_tokens_as_token_ids):
+-                    max(top_lp[1].logprob, -9999.0)
+-                    for i, top_lp in enumerate(step_top_logprobs.items())
+-                    if num_output_top_logprobs >= i
++                    max(logprob_obj.logprob, -9999.0)
++                    for token_id, logprob_obj in itertools.islice(
++                        step_top_logprobs.items(), num_output_top_logprobs + 1)
+                 })
+ 
+-            if len(out_text_offset) == 0:
++            out_text_offset_len = len(out_text_offset)
++            if out_text_offset_len == 0:
+                 out_text_offset.append(initial_text_offset)
+             else:
+                 out_text_offset.append(out_text_offset[-1] + last_token_len)
+diff --git a/vllm/entrypoints/openai/serving_transcription.py b/vllm/entrypoints/openai/serving_transcription.py
+index 77f016a..528a4aa 100644
+--- a/vllm/entrypoints/openai/serving_transcription.py
++++ b/vllm/entrypoints/openai/serving_transcription.py
+@@ -140,6 +140,7 @@ ISO639_1_OTHER_LANGS = {
+ # As per https://platform.openai.com/docs/guides/speech-to-text#overview.
+ # TODO configurable
+ MAX_AUDIO_CLIP_FILESIZE_MB = 25
++_MB_DIVISOR = 1024 * 1024
+ # TODO get from processor.feature_extractor.chunk_length
+ MAX_AUDIO_CLIP_DURATION_S = 30
+ 
+@@ -192,7 +193,7 @@ class OpenAIServingTranscription(OpenAIServing):
+                     f" {list(ISO639_1_SUPPORTED_LANGS.values())}" +
+                     f"or {list(ISO639_1_OTHER_LANGS.values())}")
+ 
+-        if len(audio_data) / 1024**2 > MAX_AUDIO_CLIP_FILESIZE_MB:
++        if len(audio_data) / _MB_DIVISOR > MAX_AUDIO_CLIP_FILESIZE_MB:
+             raise ValueError("Maximum file size exceeded.")
+ 
+         with io.BytesIO(audio_data) as bytes_:

@@ -1,0 +1,126 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index 9dbc270..7e87f74 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -97,11 +97,11 @@ $ python -m sglang.srt.disaggregation.mini_lb --prefill http://127.0.0.1:30000 -
+ 
+ ```bash
+ # prefill 0
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
+ # prefill 1
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode prefill --host ${local_ip} --port 30000 --trust-remote-code --dist-init-addr ${prefill_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode normal --mem-fraction-static 0.8
+ # decode 0
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 0 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ # decode 1
+-$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 ---disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
++$ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-transfer-backend nixl --disaggregation-mode decode --host ${local_ip} --port 30001 --trust-remote-code --dist-init-addr ${decode_master_ip}:5000 --nnodes 2 --node-rank 1 --tp-size 16 --dp-size 8 --enable-dp-attention --enable-deepep-moe --deepep-mode low_latency --mem-fraction-static 0.8 --max-running-requests 128
+ ```
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 940a25d..4b11c7c 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -308,7 +308,8 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++        endpoint = f"tcp://{remote}:{dst_port}"
++        self._connect(endpoint).send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -350,22 +351,22 @@ class MooncakeKVManager(BaseKVManager):
+ 
+                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                         # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+-                        if len(chunked_dst_kv_indice) < len(
+-                            kv_chunk.prefill_kv_indices
+-                        ):
++                        chunked_len = len(chunked_dst_kv_indice)
++                        prefill_len = len(kv_chunk.prefill_kv_indices)
++                        if chunked_len < prefill_len:
+                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+-                                : len(chunked_dst_kv_indice)
++                                :chunked_len
+                             ]
+                             logger.warning(
+-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
++                                f"len(chunked_dst_kv_indice) = {chunked_len}, len(kv_chunk.prefill_kv_indices) = {prefill_len}"
+                             )
+ 
++                        # Cache the decode_kv_args lookup
++                        decode_kv_args = self.decode_kv_args_table[req.mooncake_session_id]
+                         ret = self.send_kvcache(
+                             req.mooncake_session_id,
+                             kv_chunk.prefill_kv_indices,
+-                            self.decode_kv_args_table[
+-                                req.mooncake_session_id
+-                            ].dst_kv_ptrs,
++                            decode_kv_args.dst_kv_ptrs,
+                             chunked_dst_kv_indice,
+                             executor,
+                         )
+@@ -393,9 +394,7 @@ class MooncakeKVManager(BaseKVManager):
+                             ret = self.send_aux(
+                                 req.mooncake_session_id,
+                                 kv_chunk.prefill_aux_index,
+-                                self.decode_kv_args_table[
+-                                    req.mooncake_session_id
+-                                ].dst_aux_ptrs,
++                                decode_kv_args.dst_aux_ptrs,
+                                 req.dst_aux_index,
+                             )
+                             polls.append(True if ret == 0 else False)
+@@ -765,6 +764,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
+         self.session_id = self.kv_mgr.get_session_id()
+         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+         self.conclude_state = None
++        # Cache local IP to avoid repeated function calls
++        self._local_ip = get_local_ip_by_remote()
+ 
+         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
+             self.prefill_tp_size, self.prefill_dp_size = (
+@@ -925,19 +926,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
++            kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++            aux_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++            packed_kv_data_ptrs = struct.pack(f"{len(kv_ptrs)}Q", *kv_ptrs)
++            packed_aux_data_ptrs = struct.pack(f"{len(aux_ptrs)}Q", *aux_ptrs)
+ 
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+                         "None".encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
++                        self._local_ip.encode("ascii"),
+                         str(self.kv_mgr.rank_port).encode("ascii"),
+                         self.session_id.encode("ascii"),
+                         packed_kv_data_ptrs,
+@@ -962,12 +961,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             )
+             is_dummy = bootstrap_info["is_dummy"]
+ 
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+                         str(self.bootstrap_room).encode("ascii"),
+-                        get_local_ip_by_remote().encode("ascii"),
++                        self._local_ip.encode("ascii"),
+                         str(self.kv_mgr.rank_port).encode("ascii"),
+                         self.session_id.encode("ascii"),
+                         kv_indices.tobytes() if not is_dummy else b"",

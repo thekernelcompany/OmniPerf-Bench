@@ -1,0 +1,260 @@
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index fda4d00..8eab3ce 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -112,20 +112,22 @@ class PyNcclCommunicator:
+         # nccl communicator created on a specific device
+         # will only work on tensors on the same device
+         # otherwise it will cause "illegal memory access"
+-        assert in_tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {in_tensor.device}")
++        if in_tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {in_tensor.device}")
+ 
+         out_tensor = torch.empty_like(in_tensor)
+ 
+         if stream is None:
+             stream = torch.cuda.current_stream()
+-        self.nccl.ncclAllReduce(buffer_type(in_tensor.data_ptr()),
+-                                buffer_type(out_tensor.data_ptr()),
+-                                in_tensor.numel(),
+-                                ncclDataTypeEnum.from_torch(in_tensor.dtype),
+-                                ncclRedOpTypeEnum.from_torch(op), self.comm,
+-                                cudaStream_t(stream.cuda_stream))
++        nccl = self.nccl
++        nccl.ncclAllReduce(buffer_type(in_tensor.data_ptr()),
++                           buffer_type(out_tensor.data_ptr()),
++                           in_tensor.numel(),
++                           ncclDataTypeEnum.from_torch(in_tensor.dtype),
++                           ncclRedOpTypeEnum.from_torch(op), self.comm,
++                           cudaStream_t(stream.cuda_stream))
+         return out_tensor
+ 
+     def all_gather(self,
+@@ -137,9 +139,10 @@ class PyNcclCommunicator:
+         # nccl communicator created on a specific device
+         # will only work on tensors on the same device
+         # otherwise it will cause "illegal memory access"
+-        assert input_tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {input_tensor.device}")
++        if input_tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {input_tensor.device}")
+         if stream is None:
+             stream = torch.cuda.current_stream()
+         self.nccl.ncclAllGather(
+@@ -158,9 +161,10 @@ class PyNcclCommunicator:
+         # nccl communicator created on a specific device
+         # will only work on tensors on the same device
+         # otherwise it will cause "illegal memory access"
+-        assert input_tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {input_tensor.device}")
++        if input_tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {input_tensor.device}")
+         if stream is None:
+             stream = torch.cuda.current_stream()
+         self.nccl.ncclReduceScatter(
+@@ -173,9 +177,10 @@ class PyNcclCommunicator:
+     def send(self, tensor: torch.Tensor, dst: int, stream=None):
+         if self.disabled:
+             return
+-        assert tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {tensor.device}")
++        if tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {tensor.device}")
+         if stream is None:
+             stream = torch.cuda.current_stream()
+         self.nccl.ncclSend(buffer_type(tensor.data_ptr()), tensor.numel(),
+@@ -185,9 +190,10 @@ class PyNcclCommunicator:
+     def recv(self, tensor: torch.Tensor, src: int, stream=None):
+         if self.disabled:
+             return
+-        assert tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {tensor.device}")
++        if tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {tensor.device}")
+         if stream is None:
+             stream = torch.cuda.current_stream()
+         self.nccl.ncclRecv(buffer_type(tensor.data_ptr()), tensor.numel(),
+@@ -197,18 +203,20 @@ class PyNcclCommunicator:
+     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
+         if self.disabled:
+             return
+-        assert tensor.device == self.device, (
+-            f"this nccl communicator is created to work on {self.device}, "
+-            f"but the input tensor is on {tensor.device}")
++        if tensor.device != self.device:
++            raise AssertionError(
++                f"this nccl communicator is created to work on {self.device}, "
++                f"but the input tensor is on {tensor.device}")
+         if stream is None:
+             stream = torch.cuda.current_stream()
++        tensor_ptr = buffer_type(tensor.data_ptr())
+         if src == self.rank:
+-            sendbuff = buffer_type(tensor.data_ptr())
++            sendbuff = tensor_ptr
+             # NCCL requires the sender also to have a receive buffer
+-            recvbuff = buffer_type(tensor.data_ptr())
++            recvbuff = tensor_ptr
+         else:
+             sendbuff = buffer_type()
+-            recvbuff = buffer_type(tensor.data_ptr())
++            recvbuff = tensor_ptr
+         self.nccl.ncclBroadcast(sendbuff, recvbuff, tensor.numel(),
+                                 ncclDataTypeEnum.from_torch(tensor.dtype), src,
+                                 self.comm, cudaStream_t(stream.cuda_stream))
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a837c1d..18cb09b 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -63,8 +63,9 @@ def _split_tensor_dict(
+     """
+     metadata_list: List[Tuple[str, Any]] = []
+     tensor_list: List[torch.Tensor] = []
++    torch_tensor_type = torch.Tensor
+     for key, value in tensor_dict.items():
+-        if isinstance(value, torch.Tensor):
++        if type(value) is torch_tensor_type or isinstance(value, torch_tensor_type):
+             # Note: we cannot use `value.device` here,
+             # because it contains not only the device type but also the device
+             # index (e.g. "cuda:0"). We only need the device type.
+@@ -254,36 +255,44 @@ class GroupCoordinator:
+     @property
+     def first_rank(self):
+         """Return the global rank of the first process in the group"""
+-        return self.ranks[0]
++        if not hasattr(self, '_first_rank'):
++            self._first_rank = self.ranks[0]
++        return self._first_rank
+ 
+     @property
+     def last_rank(self):
+         """Return the global rank of the last process in the group"""
+-        return self.ranks[-1]
++        if not hasattr(self, '_last_rank'):
++            self._last_rank = self.ranks[-1]
++        return self._last_rank
+ 
+     @property
+     def is_first_rank(self):
+         """Return whether the caller is the first process in the group"""
+-        return self.rank == self.first_rank
++        if not hasattr(self, '_is_first_rank'):
++            self._is_first_rank = self.rank == self.first_rank
++        return self._is_first_rank
+ 
+     @property
+     def is_last_rank(self):
+         """Return whether the caller is the last process in the group"""
+-        return self.rank == self.last_rank
++        if not hasattr(self, '_is_last_rank'):
++            self._is_last_rank = self.rank == self.last_rank
++        return self._is_last_rank
+ 
+     @property
+     def next_rank(self):
+         """Return the global rank of the process that follows the caller"""
+-        rank_in_group = self.rank_in_group
+-        world_size = self.world_size
+-        return self.ranks[(rank_in_group + 1) % world_size]
++        if not hasattr(self, '_next_rank'):
++            self._next_rank = self.ranks[(self.rank_in_group + 1) % self.world_size]
++        return self._next_rank
+ 
+     @property
+     def prev_rank(self):
+         """Return the global rank of the process that precedes the caller"""
+-        rank_in_group = self.rank_in_group
+-        world_size = self.world_size
+-        return self.ranks[(rank_in_group - 1) % world_size]
++        if not hasattr(self, '_prev_rank'):
++            self._prev_rank = self.ranks[(self.rank_in_group - 1) % self.world_size]
++        return self._prev_rank
+ 
+     @contextmanager
+     def graph_capture(
+diff --git a/vllm/utils.py b/vllm/utils.py
+index a92b77e..0d63c5c 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -551,7 +551,8 @@ def update_environment_variables(envs: Dict[str, str]):
+ 
+ def chunk_list(lst: List[T], chunk_size: int):
+     """Yield successive chunk_size chunks from lst."""
+-    for i in range(0, len(lst), chunk_size):
++    lst_len = len(lst)
++    for i in range(0, lst_len, chunk_size):
+         yield lst[i:i + chunk_size]
+ 
+ 
+@@ -583,21 +584,23 @@ def _generate_random_fp8(
+ def get_kv_cache_torch_dtype(
+         cache_dtype: Optional[Union[str, torch.dtype]],
+         model_dtype: Optional[Union[str, torch.dtype]] = None) -> torch.dtype:
+-    if isinstance(cache_dtype, str):
++    cache_dtype_type = type(cache_dtype)
++    if cache_dtype_type is str:
+         if cache_dtype == "auto":
+-            if isinstance(model_dtype, str):
++            model_dtype_type = type(model_dtype)
++            if model_dtype_type is str:
+                 torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[model_dtype]
+-            elif isinstance(model_dtype, torch.dtype):
++            elif model_dtype_type is torch.dtype or isinstance(model_dtype, torch.dtype):
+                 torch_dtype = model_dtype
+             else:
+                 raise ValueError(f"Invalid model dtype: {model_dtype}")
+-        elif cache_dtype in ["half", "bfloat16", "float"]:
+-            torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+         elif cache_dtype == "fp8":
+             torch_dtype = torch.uint8
+         else:
+-            raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+-    elif isinstance(cache_dtype, torch.dtype):
++            torch_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype)
++            if torch_dtype is None:
++                raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
++    elif cache_dtype_type is torch.dtype or isinstance(cache_dtype, torch.dtype):
+         torch_dtype = cache_dtype
+     else:
+         raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+@@ -804,7 +807,7 @@ def is_list_of(
+     *,
+     check: Literal["first", "all"] = "first",
+ ) -> TypeIs[List[T]]:
+-    if not isinstance(value, list):
++    if type(value) is not list:
+         return False
+ 
+     if check == "first":
+diff --git a/vllm/worker/multi_step_model_runner.py b/vllm/worker/multi_step_model_runner.py
+index a2c2ceb..704a507 100644
+--- a/vllm/worker/multi_step_model_runner.py
++++ b/vllm/worker/multi_step_model_runner.py
+@@ -414,8 +414,10 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+         has_async_callback = output_proc_callback is not None
+ 
+         outputs = []
+-        for step_num, output in enumerate(model_input.cached_outputs):
+-            is_last_step = step_num == len(model_input.cached_outputs) - 1
++        cached_outputs = model_input.cached_outputs
++        num_cached_outputs = len(cached_outputs)
++        for step_num, output in enumerate(cached_outputs):
++            is_last_step = step_num == num_cached_outputs - 1
+ 
+             # For non-async case:
+             #   -- We simply add the outputs

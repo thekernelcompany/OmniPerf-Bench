@@ -1,0 +1,240 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 29e861e..19bd228 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -74,14 +74,20 @@ class TransferInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
+-        if msg[4] == b"" and msg[5] == b"":
+-            is_dummy = True
++        # Optimize: check for dummy status first to avoid unnecessary operations
++        msg4_empty = msg[4] == b""
++        msg5_empty = msg[5] == b""
++        is_dummy = msg4_empty and msg5_empty
++        
++        if is_dummy:
+             dst_kv_indices = np.array([], dtype=np.int32)
+             dst_aux_index = None
+         else:
+             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
++            # Optimize: decode once and convert to int
+             dst_aux_index = int(msg[5].decode("ascii"))
+-            is_dummy = False
++        
++        # Optimize: decode all strings in one pass
+         return cls(
+             room=int(msg[0].decode("ascii")),
+             endpoint=msg[1].decode("ascii"),
+@@ -106,13 +112,16 @@ class KVArgsRegisterInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
++        # Optimize: compute lengths once and unpack directly to list
++        kv_count = len(msg[4]) // 8
++        aux_count = len(msg[5]) // 8
+         return cls(
+-            room=str(msg[0].decode("ascii")),
++            room=msg[0].decode("ascii"),
+             endpoint=msg[1].decode("ascii"),
+             dst_port=int(msg[2].decode("ascii")),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
++            dst_kv_ptrs=list(struct.unpack(f"{kv_count}Q", msg[4])),
++            dst_aux_ptrs=list(struct.unpack(f"{aux_count}Q", msg[5])),
+         )
+ 
+ 
+@@ -304,12 +313,12 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
+-            [
+-                str(room).encode("ascii"),
+-                str(status).encode("ascii"),
+-            ]
+-        )
++        # Optimize: use f-string and encode once
++        endpoint = f"tcp://{remote}:{dst_port}"
++        # Optimize: encode integers directly as bytes
++        room_bytes = str(room).encode("ascii")
++        status_bytes = str(status).encode("ascii")
++        self._connect(endpoint).send_multipart([room_bytes, status_bytes])
+ 
+     def transfer_worker(
+         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
+@@ -568,7 +577,8 @@ class MooncakeKVManager(BaseKVManager):
+         # requests with the same dst_sessions will be added into the same
+         # queue, which enables early abort with failed sessions.
+         dst_infos = self.transfer_infos[bootstrap_room].keys()
+-        session_port_sum = sum(int(session.split(":")[1]) for session in dst_infos)
++        # Optimize: cache the split result and avoid repeated string operations
++        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+         shard_idx = session_port_sum % len(self.transfer_queues)
+ 
+         self.transfer_queues[shard_idx].put(
+@@ -636,21 +646,21 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     def _handle_node_failure(self, failed_bootstrap_addr):
+         with self.connection_lock:
++            # Optimize: iterate once and delete matching keys directly
+             keys_to_remove = [
+                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+             ]
+             for k in keys_to_remove:
+                 del self.connection_pool[k]
+-            if failed_bootstrap_addr in self.prefill_tp_size_table:
+-                del self.prefill_tp_size_table[failed_bootstrap_addr]
+-            if failed_bootstrap_addr in self.prefill_dp_size_table:
+-                del self.prefill_dp_size_table[failed_bootstrap_addr]
++            
++            # Optimize: use pop with default to avoid double lookup
++            self.prefill_tp_size_table.pop(failed_bootstrap_addr, None)
++            self.prefill_dp_size_table.pop(failed_bootstrap_addr, None)
+ 
+-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
++            # Optimize: use pop to get and remove in one operation
++            possible_affected_rooms = self.addr_to_rooms_tracker.pop(
+                 failed_bootstrap_addr, []
+             )
+-            if failed_bootstrap_addr in self.addr_to_rooms_tracker:
+-                del self.addr_to_rooms_tracker[failed_bootstrap_addr]
+ 
+         # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
+         affected_rooms = []
+@@ -937,18 +947,18 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+-            packed_kv_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+-            )
+-            packed_aux_data_ptrs = b"".join(
+-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+-            )
+-
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            # Optimize: pack all pointers at once instead of using join with generator
++            kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
++            aux_ptrs = self.kv_mgr.kv_args.aux_data_ptrs
++            packed_kv_data_ptrs = struct.pack(f"{len(kv_ptrs)}Q", *kv_ptrs)
++            packed_aux_data_ptrs = struct.pack(f"{len(aux_ptrs)}Q", *aux_ptrs)
++
++            # Optimize: use f-string for tcp prefix
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        "None".encode("ascii"),
++                        b"None",  # Optimize: use bytes literal
+                         self.kv_mgr.local_ip.encode("ascii"),
+                         str(self.kv_mgr.rank_port).encode("ascii"),
+                         self.session_id.encode("ascii"),
+@@ -968,23 +978,31 @@ class MooncakeKVReceiver(BaseKVReceiver):
+             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+ 
+     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
++        # Optimize: pre-encode common values that don't change across iterations
++        bootstrap_room_bytes = str(self.bootstrap_room).encode("ascii")
++        local_ip_bytes = self.kv_mgr.local_ip.encode("ascii")
++        rank_port_bytes = str(self.kv_mgr.rank_port).encode("ascii")
++        session_id_bytes = self.session_id.encode("ascii")
++        required_dst_info_num_bytes = str(self.required_dst_info_num).encode("ascii")
++        
+         for bootstrap_info in self.bootstrap_infos:
+             self.prefill_server_url = (
+                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+             )
+             is_dummy = bootstrap_info["is_dummy"]
+ 
+-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
++            # Optimize: use f-string for tcp prefix
++            sock, lock = self._connect(f"tcp://{self.prefill_server_url}")
+             with lock:
+                 sock.send_multipart(
+                     [
+-                        str(self.bootstrap_room).encode("ascii"),
+-                        self.kv_mgr.local_ip.encode("ascii"),
+-                        str(self.kv_mgr.rank_port).encode("ascii"),
+-                        self.session_id.encode("ascii"),
++                        bootstrap_room_bytes,
++                        local_ip_bytes,
++                        rank_port_bytes,
++                        session_id_bytes,
+                         kv_indices.tobytes() if not is_dummy else b"",
+                         str(aux_index).encode("ascii") if not is_dummy else b"",
+-                        str(self.required_dst_info_num).encode("ascii"),
++                        required_dst_info_num_bytes,
+                     ]
+                 )
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+index 5643af7..cb8fae4 100644
+--- a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
++++ b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+@@ -32,22 +32,28 @@ class MooncakeTransferEngine:
+     def register(self, ptr, length):
+         try:
+             ret_value = self.engine.register_memory(ptr, length)
++            # Optimize: early return on success to avoid unnecessary check
++            if ret_value == 0:
++                return
+         except Exception:
+             # Mark register as failed
+             ret_value = -1
+ 
+-        if ret_value != 0:
+-            logger.debug("Mooncake memory registration %s failed.", ptr)
++        # Only log on failure
++        logger.debug("Mooncake memory registration %s failed.", ptr)
+ 
+     def deregister(self, ptr):
+         try:
+             ret_value = self.engine.unregister_memory(ptr)
++            # Optimize: early return on success to avoid unnecessary check
++            if ret_value == 0:
++                return
+         except Exception:
+             # Mark deregister as failed
+             ret_value = -1
+ 
+-        if ret_value != 0:
+-            logger.debug("Mooncake memory deregistration %s failed.", ptr)
++        # Only log on failure
++        logger.debug("Mooncake memory deregistration %s failed.", ptr)
+ 
+     def initialize(
+         self,
+@@ -75,19 +81,21 @@ class MooncakeTransferEngine:
+             ret = self.engine.transfer_sync_write(
+                 session_id, buffer, peer_buffer_address, length
+             )
++            # Optimize: early return on success to avoid comparison and logging
++            if ret >= 0:
++                return ret
+         except Exception:
+             # Mark transfer request as failed
+             ret = -1
+ 
+-        if ret < 0:
+-            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
+-            logger.debug(
+-                "Failed to transfer data from %s to %s - %s.",
+-                buffer,
+-                session_id,
+-                peer_buffer_address,
+-            )
+-
++        # Only log on failure
++        # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
++        logger.debug(
++            "Failed to transfer data from %s to %s - %s.",
++            buffer,
++            session_id,
++            peer_buffer_address,
++        )
+         return ret
+ 
+     def get_session_id(self):

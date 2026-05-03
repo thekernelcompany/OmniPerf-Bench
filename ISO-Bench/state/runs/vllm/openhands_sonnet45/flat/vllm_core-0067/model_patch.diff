@@ -1,0 +1,235 @@
+diff --git a/tests/core/block/e2e/test_correctness.py b/tests/core/block/e2e/test_correctness.py
+index e9b537e..181683c 100644
+--- a/tests/core/block/e2e/test_correctness.py
++++ b/tests/core/block/e2e/test_correctness.py
+@@ -1,7 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-from itertools import cycle
+-
+ import pytest
+ 
+ from vllm import SamplingParams
+@@ -64,7 +62,7 @@ def test_block_manager_with_preemption(baseline_llm_generator,
+         "The future of AI is",
+     ]
+ 
+-    prompts = [prompt for prompt, _ in zip(cycle(prompts), range(batch_size))]
++    prompts = [prompts[i % len(prompts)] for i in range(batch_size)]
+ 
+     sampling_params = SamplingParams(
+         max_tokens=output_len,
+@@ -158,7 +156,7 @@ def test_lookahead_greedy_equality_with_preemption(baseline_llm_generator,
+         "The future of AI is",
+     ]
+ 
+-    prompts = [prompt for prompt, _ in zip(cycle(prompts), range(batch_size))]
++    prompts = [prompts[i % len(prompts)] for i in range(batch_size)]
+ 
+     sampling_params = SamplingParams(
+         max_tokens=output_len,
+@@ -236,7 +234,7 @@ def test_chunked_prefill_block_manager(baseline_llm_generator,
+         "The future of AI is",
+     ]
+ 
+-    prompts = [prompt for prompt, _ in zip(cycle(prompts), range(batch_size))]
++    prompts = [prompts[i % len(prompts)] for i in range(batch_size)]
+ 
+     sampling_params = SamplingParams(
+         max_tokens=output_len,
+@@ -317,7 +315,7 @@ def test_block_manager_prefix_caching_enabled_with_preemption(
+         "The future of AI is",
+     ]
+ 
+-    prompts = [prompt for prompt, _ in zip(cycle(prompts), range(batch_size))]
++    prompts = [prompts[i % len(prompts)] for i in range(batch_size)]
+ 
+     sampling_params = SamplingParams(
+         max_tokens=output_len,
+@@ -391,7 +389,7 @@ def test_auto_prefix_caching_with_preemption(baseline_llm_generator,
+         "The future of AI is",
+     ]
+ 
+-    prompts = [prompt for prompt, _ in zip(cycle(prompts), range(batch_size))]
++    prompts = [prompts[i % len(prompts)] for i in range(batch_size)]
+ 
+     sampling_params = SamplingParams(
+         max_tokens=output_len,
+diff --git a/vllm/attention/ops/prefix_prefill.py b/vllm/attention/ops/prefix_prefill.py
+index e0478c2..caae3fd 100644
+--- a/vllm/attention/ops/prefix_prefill.py
++++ b/vllm/attention/ops/prefix_prefill.py
+@@ -3,6 +3,8 @@
+ # The kernels in this file are adapted from LightLLM's context_attention_fwd:
+ # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
+ 
++import math
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -774,7 +776,7 @@ if triton.__version__ >= "2.1.0":
+         Lk_padded = triton.next_power_of_2(Lk)
+ 
+         if sm_scale is None:
+-            sm_scale = 1.0 / (Lq**0.5)
++            sm_scale = 1.0 / math.sqrt(Lq)
+         batch, head = b_seq_len.shape[0], q.shape[1]
+         num_queries_per_kv = q.shape[1] // k.shape[1]
+ 
+@@ -785,6 +787,34 @@ if triton.__version__ >= "2.1.0":
+         if sliding_window is None or sliding_window <= 0:
+             sliding_window = 0
+ 
++        # Pre-compute shape and stride values to avoid repeated attribute access
++        v_cache_shape_3 = v_cache.shape[3]
++        k_cache_shape_4 = k_cache.shape[4]
++        
++        b_loc_stride_0 = b_loc.stride(0)
++        b_loc_stride_1 = b_loc.stride(1)
++        q_stride_0 = q.stride(0)
++        q_stride_1 = q.stride(1)
++        q_stride_2 = q.stride(2)
++        k_stride_0 = k.stride(0)
++        k_stride_1 = k.stride(1)
++        k_stride_2 = k.stride(2)
++        v_stride_0 = v.stride(0)
++        v_stride_1 = v.stride(1)
++        v_stride_2 = v.stride(2)
++        o_stride_0 = o.stride(0)
++        o_stride_1 = o.stride(1)
++        o_stride_2 = o.stride(2)
++        k_cache_stride_0 = k_cache.stride(0)
++        k_cache_stride_1 = k_cache.stride(1)
++        k_cache_stride_2 = k_cache.stride(2)
++        k_cache_stride_3 = k_cache.stride(3)
++        k_cache_stride_4 = k_cache.stride(4)
++        v_cache_stride_0 = v_cache.stride(0)
++        v_cache_stride_1 = v_cache.stride(1)
++        v_cache_stride_2 = v_cache.stride(2)
++        v_cache_stride_3 = v_cache.stride(3)
++
+         if alibi_slopes is not None:
+             _fwd_kernel_alibi[grid](
+                 q,
+@@ -799,35 +829,32 @@ if triton.__version__ >= "2.1.0":
+                 b_start_loc,
+                 b_seq_len,
+                 alibi_slopes,
+-                v_cache.shape[3],
+-                k_cache.shape[4],
++                v_cache_shape_3,
++                k_cache_shape_4,
+                 o,
+-                b_loc.stride(0),
+-                b_loc.stride(1),
+-                q.stride(0),
+-                q.stride(1),
+-                q.stride(2),
+-                k.stride(0),
+-                k.stride(1),
+-                k.stride(2),
+-                v.stride(0),
+-                v.stride(1),
+-                v.stride(2),
+-                o.stride(0),
+-                o.stride(1),
+-                o.stride(2),
+-                k_cache.stride(0),
+-                k_cache.stride(1),
+-                k_cache.stride(2),
+-                k_cache.stride(3),
+-                k_cache.stride(
+-                    4
+-                ),  #[num_blocks, num_kv_heads, head_size/x, block_size, x]
+-                v_cache.stride(0),
+-                v_cache.stride(1),
+-                v_cache.stride(2),
+-                v_cache.stride(
+-                    3),  #[num_blocks, num_kv_heads, head_size, block_size]
++                b_loc_stride_0,
++                b_loc_stride_1,
++                q_stride_0,
++                q_stride_1,
++                q_stride_2,
++                k_stride_0,
++                k_stride_1,
++                k_stride_2,
++                v_stride_0,
++                v_stride_1,
++                v_stride_2,
++                o_stride_0,
++                o_stride_1,
++                o_stride_2,
++                k_cache_stride_0,
++                k_cache_stride_1,
++                k_cache_stride_2,
++                k_cache_stride_3,
++                k_cache_stride_4,  #[num_blocks, num_kv_heads, head_size/x, block_size, x]
++                v_cache_stride_0,
++                v_cache_stride_1,
++                v_cache_stride_2,
++                v_cache_stride_3,  #[num_blocks, num_kv_heads, head_size, block_size]
+                 num_queries_per_kv=num_queries_per_kv,
+                 IN_PRECISION=IN_PRECISION,
+                 BLOCK_M=BLOCK,
+@@ -852,34 +879,32 @@ if triton.__version__ >= "2.1.0":
+             v_scale,
+             b_start_loc,
+             b_seq_len,
+-            v_cache.shape[3],
+-            k_cache.shape[4],
++            v_cache_shape_3,
++            k_cache_shape_4,
+             o,
+-            b_loc.stride(0),
+-            b_loc.stride(1),
+-            q.stride(0),
+-            q.stride(1),
+-            q.stride(2),
+-            k.stride(0),
+-            k.stride(1),
+-            k.stride(2),
+-            v.stride(0),
+-            v.stride(1),
+-            v.stride(2),
+-            o.stride(0),
+-            o.stride(1),
+-            o.stride(2),
+-            k_cache.stride(0),
+-            k_cache.stride(1),
+-            k_cache.stride(2),
+-            k_cache.stride(3),
+-            k_cache.stride(
+-                4),  #[num_blocks, num_kv_heads, head_size/x, block_size, x]
+-            v_cache.stride(0),
+-            v_cache.stride(1),
+-            v_cache.stride(2),
+-            v_cache.stride(
+-                3),  #[num_blocks, num_kv_heads, head_size, block_size]
++            b_loc_stride_0,
++            b_loc_stride_1,
++            q_stride_0,
++            q_stride_1,
++            q_stride_2,
++            k_stride_0,
++            k_stride_1,
++            k_stride_2,
++            v_stride_0,
++            v_stride_1,
++            v_stride_2,
++            o_stride_0,
++            o_stride_1,
++            o_stride_2,
++            k_cache_stride_0,
++            k_cache_stride_1,
++            k_cache_stride_2,
++            k_cache_stride_3,
++            k_cache_stride_4,  #[num_blocks, num_kv_heads, head_size/x, block_size, x]
++            v_cache_stride_0,
++            v_cache_stride_1,
++            v_cache_stride_2,
++            v_cache_stride_3,  #[num_blocks, num_kv_heads, head_size, block_size]
+             num_queries_per_kv=num_queries_per_kv,
+             IN_PRECISION=IN_PRECISION,
+             BLOCK_M=BLOCK,

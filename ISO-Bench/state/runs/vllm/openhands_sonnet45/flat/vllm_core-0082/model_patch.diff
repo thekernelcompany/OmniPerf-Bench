@@ -1,0 +1,242 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 6667233..10994ac 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -287,8 +287,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+ 
+         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
+ 
+-        self_num_required_blocks = self._get_seq_num_required_blocks(
+-            seq_group.get_seqs(status=SequenceStatus.WAITING)[0])
++        # Optimization: avoid creating list when we only need the first element
++        waiting_seq = seq_group.get_first_seq_with_status(SequenceStatus.WAITING)
++        self_num_required_blocks = self._get_seq_num_required_blocks(waiting_seq)
+         cross_num_required_blocks = self._get_seq_num_required_blocks(
+             seq_group.get_encoder_seq())
+         num_required_blocks = self_num_required_blocks + \
+@@ -346,13 +347,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # decoder prompt.
+         wait_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+         seq = wait_seqs[0]
++        num_seqs = seq_group.num_seqs()
+         block_table: BlockTable = \
+-            self._allocate_sequence(seq,
+-                                    seq_group.num_seqs(),
+-                                    is_encoder_decoder)
++            self._allocate_sequence(seq, num_seqs, is_encoder_decoder)
+ 
+         # Assign the self-attention block tables for each sequence.
+-        if len(wait_seqs) == 1:
++        num_wait_seqs = len(wait_seqs)
++        if num_wait_seqs == 1:
+             self.block_tables[seq.seq_id] = block_table
+         else:
+             for seq in wait_seqs:
+diff --git a/vllm/core/block_manager_v2.py b/vllm/core/block_manager_v2.py
+index 7d2db43..31b1088 100644
+--- a/vllm/core/block_manager_v2.py
++++ b/vllm/core/block_manager_v2.py
+@@ -113,7 +113,8 @@ class BlockSpaceManagerV2(BlockSpaceManager):
+ 
+         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
+ 
+-        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
++        # Optimization: avoid creating list when we only need the first element
++        seq = seq_group.get_first_seq_with_status(SequenceStatus.WAITING)
+         num_required_blocks = BlockTable.get_num_required_blocks(
+             seq.get_token_ids(),
+             block_size=self.block_size,
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index fbc53af..26ddb8e 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -68,11 +68,9 @@ class SchedulingBudget:
+         return self.token_budget - self.num_batched_tokens
+ 
+     def add_num_batched_tokens(self, req_id: str, num_batched_tokens: int):
+-        if req_id in self._request_ids_num_batched_tokens:
+-            return
+-
+-        self._request_ids_num_batched_tokens.add(req_id)
+-        self._num_batched_tokens += num_batched_tokens
++        if req_id not in self._request_ids_num_batched_tokens:
++            self._request_ids_num_batched_tokens.add(req_id)
++            self._num_batched_tokens += num_batched_tokens
+ 
+     def subtract_num_batched_tokens(self, req_id: str,
+                                     num_batched_tokens: int):
+@@ -81,11 +79,9 @@ class SchedulingBudget:
+             self._num_batched_tokens -= num_batched_tokens
+ 
+     def add_num_seqs(self, req_id: str, num_curr_seqs: int):
+-        if req_id in self._request_ids_num_curr_seqs:
+-            return
+-
+-        self._request_ids_num_curr_seqs.add(req_id)
+-        self._num_curr_seqs += num_curr_seqs
++        if req_id not in self._request_ids_num_curr_seqs:
++            self._request_ids_num_curr_seqs.add(req_id)
++            self._num_curr_seqs += num_curr_seqs
+ 
+     def subtract_num_seqs(self, req_id: str, num_curr_seqs: int):
+         if req_id in self._request_ids_num_curr_seqs:
+@@ -578,15 +574,15 @@ class Scheduler:
+                 self.running = tmp
+ 
+             while not self._can_append_slots(seq_group):
+-                budget.subtract_num_batched_tokens(seq_group.request_id,
+-                                                   num_running_tokens)
++                req_id = seq_group.request_id
++                budget.subtract_num_batched_tokens(req_id, num_running_tokens)
+                 num_running_seqs = seq_group.get_max_num_running_seqs()
+-                budget.subtract_num_seqs(seq_group.request_id,
+-                                         num_running_seqs)
++                budget.subtract_num_seqs(req_id, num_running_seqs)
+ 
+-                if (curr_loras is not None and seq_group.lora_int_id > 0
+-                        and seq_group.lora_int_id in curr_loras):
+-                    curr_loras.remove(seq_group.lora_int_id)
++                lora_int_id = seq_group.lora_int_id
++                if (curr_loras is not None and lora_int_id > 0
++                        and lora_int_id in curr_loras):
++                    curr_loras.remove(lora_int_id)
+ 
+                 if running_queue:
+                     # Preempt the lowest-priority sequence groups.
+@@ -623,17 +619,18 @@ class Scheduler:
+                     decode_seq_groups.append(scheduled_seq_group)
+                     ret.decode_seq_groups_list.append(seq_group)
+ 
+-                budget.add_num_batched_tokens(seq_group.request_id,
+-                                              num_running_tokens)
++                req_id = seq_group.request_id
++                budget.add_num_batched_tokens(req_id, num_running_tokens)
+                 # OPTIMIZATION:  Note that get_max_num_running_seqs is
+                 # expensive. For the default scheduling chase where
+                 # enable_chunking is False, num_seqs are updated before running
+                 # this method, so we don't have to update it again here.
+                 if enable_chunking:
+                     num_running_seqs = seq_group.get_max_num_running_seqs()
+-                    budget.add_num_seqs(seq_group.request_id, num_running_seqs)
+-                if curr_loras is not None and seq_group.lora_int_id > 0:
+-                    curr_loras.add(seq_group.lora_int_id)
++                    budget.add_num_seqs(req_id, num_running_seqs)
++                lora_int_id = seq_group.lora_int_id
++                if curr_loras is not None and lora_int_id > 0:
++                    curr_loras.add(lora_int_id)
+ 
+         self._scheduler_running_outputs_cache[self.next_cache_id].reset()
+         self._scheduled_seq_group_cache[self.next_cache_id].reset()
+@@ -801,6 +798,7 @@ class Scheduler:
+         while self._passed_delay(time.time()) and waiting_queue:
+             seq_group = waiting_queue[0]
+ 
++            # Optimization: avoid creating list when we only need the first element
+             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+             assert len(waiting_seqs) == 1, (
+                 "Waiting sequence group should have only one prompt "
+@@ -869,8 +867,9 @@ class Scheduler:
+             seq_groups.append(
+                 ScheduledSequenceGroup(seq_group=seq_group,
+                                        token_chunk_size=num_new_tokens))
+-            budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
+-            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
++            req_id = seq_group.request_id
++            budget.add_num_batched_tokens(req_id, num_new_tokens)
++            budget.add_num_seqs(req_id, num_new_seqs)
+ 
+         # Queue requests that couldn't be scheduled.
+         waiting_queue.extendleft(leftover_waiting_sequences)
+@@ -924,8 +923,10 @@ class Scheduler:
+ 
+             # If any sequence group is preempted, do not swap in any sequence
+             # group. because it means there's no slot for new running requests.
+-            if len(running_scheduled.preempted) + len(
+-                    running_scheduled.swapped_out) == 0:
++            # Optimization: cache len() results
++            num_preempted = len(running_scheduled.preempted)
++            num_swapped_out = len(running_scheduled.swapped_out)
++            if num_preempted + num_swapped_out == 0:
+                 swapped_in = self._schedule_swapped(budget, curr_loras)
+ 
+         assert (budget.num_batched_tokens <=
+@@ -946,8 +947,7 @@ class Scheduler:
+ 
+         # Update swapped requests.
+         self.swapped.extend(running_scheduled.swapped_out)
+-        preempted = (len(running_scheduled.preempted) +
+-                     len(running_scheduled.swapped_out))
++        preempted = num_preempted + num_swapped_out
+ 
+         # There should be no prefill from running queue because this policy
+         # doesn't allow chunked prefills.
+@@ -1012,8 +1012,10 @@ class Scheduler:
+ 
+         # Schedule swapped out requests.
+         # If preemption happens, it means we don't have space for swap-in.
+-        if len(running_scheduled.preempted) + len(
+-                running_scheduled.swapped_out) == 0:
++        # Optimization: cache len() results
++        num_preempted = len(running_scheduled.preempted)
++        num_swapped_out = len(running_scheduled.swapped_out)
++        if num_preempted + num_swapped_out == 0:
+             swapped_in = self._schedule_swapped(budget, curr_loras)
+ 
+         # Schedule new prefills.
+@@ -1028,11 +1030,18 @@ class Scheduler:
+         # Update waiting requests.
+         self.waiting.extendleft(running_scheduled.preempted)
+         # Update new running requests.
++        # Optimization: use cached lists when available to avoid list comprehensions
+         self.running.extend([s.seq_group for s in prefills.seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in running_scheduled.decode_seq_groups])
+-        self.running.extend(
+-            [s.seq_group for s in running_scheduled.prefill_seq_groups])
++        if running_scheduled.decode_seq_groups_list:
++            self.running.extend(running_scheduled.decode_seq_groups_list)
++        else:
++            self.running.extend(
++                [s.seq_group for s in running_scheduled.decode_seq_groups])
++        if running_scheduled.prefill_seq_groups_list:
++            self.running.extend(running_scheduled.prefill_seq_groups_list)
++        else:
++            self.running.extend(
++                [s.seq_group for s in running_scheduled.prefill_seq_groups])
+         self.running.extend(
+             [s.seq_group for s in swapped_in.decode_seq_groups])
+         self.running.extend(
+@@ -1057,8 +1066,7 @@ class Scheduler:
+             swapped_in.infeasible_seq_groups,
+             num_lookahead_slots=running_scheduled.num_lookahead_slots,
+             running_queue_size=len(self.running),
+-            preempted=(len(running_scheduled.preempted) +
+-                       len(running_scheduled.swapped_out)),
++            preempted=(num_preempted + num_swapped_out),
+         )
+ 
+     def _schedule(self) -> SchedulerOutputs:
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 3125acc..d415d97 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -737,6 +737,19 @@ class SequenceGroup:
+ 
+         return [seq for seq in self.seqs if seq.status == status]
+ 
++    def get_first_seq_with_status(
++        self,
++        status: SequenceStatus,
++    ) -> Optional[Sequence]:
++        """Get the first sequence with the given status without creating a list."""
++        if self.is_single_seq:
++            return self.seqs[0] if self.seqs[0].status == status else None
++        
++        for seq in self.seqs:
++            if seq.status == status:
++                return seq
++        return None
++
+     def is_encoder_decoder(self) -> bool:
+         return self.encoder_seq is not None
+ 

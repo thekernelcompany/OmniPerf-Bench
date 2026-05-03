@@ -1,0 +1,129 @@
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index 4198550..cd201a2 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -57,28 +57,24 @@ class SchedulingBudget:
+         return self.token_budget - self.num_batched_tokens
+ 
+     def add_num_batched_tokens(self, req_id: str, num_batched_tokens: int):
+-        if req_id in self._requeset_ids_num_batched_tokens:
+-            return
+-
+-        self._requeset_ids_num_batched_tokens.add(req_id)
+-        self._num_batched_tokens += num_batched_tokens
++        if req_id not in self._requeset_ids_num_batched_tokens:
++            self._requeset_ids_num_batched_tokens.add(req_id)
++            self._num_batched_tokens += num_batched_tokens
+ 
+     def subtract_num_batched_tokens(self, req_id: str,
+                                     num_batched_tokens: int):
+         if req_id in self._requeset_ids_num_batched_tokens:
+-            self._requeset_ids_num_batched_tokens.remove(req_id)
++            self._requeset_ids_num_batched_tokens.discard(req_id)
+             self._num_batched_tokens -= num_batched_tokens
+ 
+     def add_num_seqs(self, req_id: str, num_curr_seqs: int):
+-        if req_id in self._requeset_ids_num_curr_seqs:
+-            return
+-
+-        self._requeset_ids_num_curr_seqs.add(req_id)
+-        self._num_curr_seqs += num_curr_seqs
++        if req_id not in self._requeset_ids_num_curr_seqs:
++            self._requeset_ids_num_curr_seqs.add(req_id)
++            self._num_curr_seqs += num_curr_seqs
+ 
+     def subtract_num_seqs(self, req_id: str, num_curr_seqs: int):
+         if req_id in self._requeset_ids_num_curr_seqs:
+-            self._requeset_ids_num_curr_seqs.remove(req_id)
++            self._requeset_ids_num_curr_seqs.discard(req_id)
+             self._num_curr_seqs -= num_curr_seqs
+ 
+     @property
+@@ -318,18 +314,21 @@ class Scheduler:
+         request_ids = set(request_id)
+         for state_queue in [self.waiting, self.running, self.swapped]:
+             aborted_groups: List[SequenceGroup] = []
++            # Build new queue without aborted groups in a single pass
++            new_queue = deque(
++                seq_group for seq_group in state_queue
++                if seq_group.request_id not in request_ids
++            )
++            # Collect aborted groups
+             for seq_group in state_queue:
+-                if not request_ids:
+-                    # Using 'break' here may add two extra iterations,
+-                    # but is acceptable to reduce complexity .
+-                    break
+                 if seq_group.request_id in request_ids:
+-                    # Appending aborted group into pending list.
+                     aborted_groups.append(seq_group)
+-                    request_ids.remove(seq_group.request_id)
++            
++            if aborted_groups:
++                state_queue.clear()
++                state_queue.extend(new_queue)
++                
+             for aborted_group in aborted_groups:
+-                # Remove the sequence group from the state queue.
+-                state_queue.remove(aborted_group)
+                 for seq in aborted_group.get_seqs():
+                     if seq.is_finished():
+                         continue
+@@ -594,7 +593,7 @@ class Scheduler:
+         seq_groups: List[SequenceGroup] = []
+         # We don't sort waiting queue because we assume it is sorted.
+         # Copy the queue so that the input queue is not modified.
+-        waiting_queue = deque([s for s in waiting_queue])
++        waiting_queue = deque(waiting_queue)
+ 
+         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+         while self._passed_delay(time.time()) and waiting_queue:
+@@ -640,7 +639,7 @@ class Scheduler:
+                 lora_int_id = seq_group.lora_int_id
+                 assert curr_loras is not None
+                 assert self.lora_config is not None
+-                if (self.lora_enabled and lora_int_id > 0
++                if (lora_int_id > 0
+                         and lora_int_id not in curr_loras
+                         and len(curr_loras) >= self.lora_config.max_loras):
+                     # We don't have a space for another LoRA, so
+@@ -899,15 +898,15 @@ class Scheduler:
+             # seq_id -> physical block numbers
+             block_tables: Dict[int, List[int]] = {}
+ 
+-            for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
++            running_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
++            for seq in running_seqs:
+                 seq_id = seq.seq_id
+                 seq_data[seq_id] = seq.data
+                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                 self.block_manager.access_all_blocks_in_seq(seq, now)
+ 
+             common_computed_block_nums = (
+-                self.block_manager.get_common_computed_block_ids(
+-                    seq_group.get_seqs(status=SequenceStatus.RUNNING)))
++                self.block_manager.get_common_computed_block_ids(running_seqs))
+ 
+             # It assumes the scheduled_seq_groups is ordered by
+             # prefill < decoding.
+@@ -1064,7 +1063,7 @@ class Scheduler:
+         # Delay scheduling prompts to let waiting queue fill up
+         if self.scheduler_config.delay_factor > 0 and self.waiting:
+             earliest_arrival_time = min(
+-                [e.metrics.arrival_time for e in self.waiting])
++                e.metrics.arrival_time for e in self.waiting)
+             passed_delay = (
+                 (now - earliest_arrival_time) >
+                 (self.scheduler_config.delay_factor * self.last_prompt_latency)
+@@ -1097,10 +1096,8 @@ class Scheduler:
+         sequences (e.g., running beam search), it means it is in decoding
+         phase, so chunking doesn't happen.
+         """
+-        num_new_tokens = 0
+         seqs = seq_group.get_seqs(status=status)
+-        for seq in seqs:
+-            num_new_tokens += seq.get_num_new_tokens()
++        num_new_tokens = sum(seq.get_num_new_tokens() for seq in seqs)
+         # Chunk if a running request cannot fit in.
+         # If number of seq > 1, it means it is doing beam search in a
+         # decode phase. Do not chunk in that case.

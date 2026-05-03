@@ -1,0 +1,197 @@
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index cf2f1c6..b537c9e 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -270,25 +270,26 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+             self.encoder_seq_len = encoder_seq_len
+ 
+             if reinit:
+-                if len(self.seq_ids) == 1 and reinit_use_defaults:
++                num_seq_ids = len(self.seq_ids)
++                if num_seq_ids == 1 and reinit_use_defaults:
+                     self.simple_reinit()
+                 else:
+                     if input_tokens:
+                         self.input_tokens = input_tokens
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.input_tokens[seq_id].clear()
+ 
+                     if input_positions:
+                         self.input_positions = input_positions
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.input_positions[seq_id].clear()
+ 
+                     if token_types:
+                         self.token_types = token_types
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.token_types[seq_id].clear()
+ 
+                     self.mrope_input_positions = None
+@@ -296,32 +297,32 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+                     if seq_lens:
+                         self.seq_lens = seq_lens
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.seq_lens[seq_id] = 0
+ 
+                     if orig_seq_lens:
+                         self.orig_seq_lens = orig_seq_lens
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.orig_seq_lens[seq_id] = 0
+ 
+                     if query_lens:
+                         self.query_lens = query_lens
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.query_lens[seq_id] = 0
+ 
+                     if context_lens:
+                         self.context_lens = context_lens
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.context_lens[seq_id] = 0
+ 
+                     if curr_sliding_window_blocks:
+                         self.curr_sliding_window_blocks = \
+                             curr_sliding_window_blocks
+                     else:
+-                        for seq_id in range(len(self.seq_ids)):
++                        for seq_id in range(num_seq_ids):
+                             self.curr_sliding_window_blocks[seq_id] = 0
+ 
+                     if lora_index_mapping:
+@@ -819,14 +820,36 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+         """Finalize the builder intermediate data and
+         create on-device tensors.
+         """
+-        # Combine and flatten intermediate data.
++        # Combine and flatten intermediate data in a single pass.
+         input_tokens = []
+         token_types = []
++        input_positions = []
++        seq_lens = []
++        query_lens = []
++        max_decode_seq_len = 0
++        max_encoder_seq_len = 0
++        has_mrope = False
++        
+         for inter_data in self.inter_data_list:
+             for cur_input_tokens in inter_data.input_tokens:
+                 input_tokens.extend(cur_input_tokens)
+             for cur_token_types in inter_data.token_types:
+                 token_types.extend(cur_token_types)
++            for cur_input_positions in inter_data.input_positions:
++                input_positions.extend(cur_input_positions)
++            
++            seq_lens.extend(inter_data.seq_lens)
++            query_lens.extend(inter_data.query_lens)
++            
++            if not inter_data.is_prompt and inter_data.seq_lens:
++                max_decode_seq_len = max(max_decode_seq_len,
++                                         max(inter_data.seq_lens))
++                if self.runner.model_config.is_encoder_decoder:
++                    max_encoder_seq_len = max(max_encoder_seq_len,
++                                              inter_data.encoder_seq_len)
++            
++            if inter_data.mrope_input_positions is not None:
++                has_mrope = True
+ 
+         if not input_tokens:
+             # This may happen when all prefill requests hit
+@@ -834,8 +857,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+             return self.model_input_cls()
+ 
+         mrope_input_positions: Optional[List[List[int]]] = None
+-        if any(inter_data.mrope_input_positions is not None
+-               for inter_data in self.inter_data_list):
++        if has_mrope:
+             mrope_input_positions = [[] for _ in range(3)]
+             for idx in range(3):
+                 for inter_data in self.inter_data_list:
+@@ -849,25 +871,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+                             mrope_input_positions[idx].extend(
+                                 _seq_mrope_input_positions[idx])
+             input_positions = None
+-        else:
+-            input_positions = []
+-            for inter_data in self.inter_data_list:
+-                for cur_input_positions in inter_data.input_positions:
+-                    input_positions.extend(cur_input_positions)
+-
+-        seq_lens = []
+-        query_lens = []
+-        max_decode_seq_len = 0
+-        max_encoder_seq_len = 0
+-        for inter_data in self.inter_data_list:
+-            seq_lens.extend(inter_data.seq_lens)
+-            query_lens.extend(inter_data.query_lens)
+-            if not inter_data.is_prompt:
+-                max_decode_seq_len = max(max_decode_seq_len,
+-                                         max(inter_data.seq_lens))
+-                if self.runner.model_config.is_encoder_decoder:
+-                    max_encoder_seq_len = max(max_encoder_seq_len,
+-                                              inter_data.encoder_seq_len)
+ 
+         # Mapping from request IDs to sequence IDs. Used for Jamba models
+         # that manages the cache by itself.
+@@ -927,19 +930,19 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+         lora_requests = set()
+         lora_mapping = None
+         if self.enable_lora:
+-            lora_requests = set(r for data in self.inter_data_list
+-                                for r in data.lora_requests)
+-            lora_index_mapping = flatten_2d_lists([
+-                flatten_2d_lists(inter_data.lora_index_mapping)
++            for data in self.inter_data_list:
++                lora_requests.update(data.lora_requests)
++            lora_index_mapping = list(itertools.chain.from_iterable(
++                itertools.chain.from_iterable(inter_data.lora_index_mapping)
+                 for inter_data in self.inter_data_list
+-            ])
++            ))
+             if cuda_graph_pad_size:
+                 lora_index_mapping.extend(
+                     itertools.repeat(0, cuda_graph_pad_size))
+-            lora_prompt_mapping = flatten_2d_lists([
+-                flatten_2d_lists(inter_data.lora_prompt_mapping)
++            lora_prompt_mapping = list(itertools.chain.from_iterable(
++                itertools.chain.from_iterable(inter_data.lora_prompt_mapping)
+                 for inter_data in self.inter_data_list
+-            ])
++            ))
+ 
+             lora_mapping = LoRAMapping(
+                 **dict(index_mapping=lora_index_mapping,
+@@ -953,17 +956,17 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
+             prompt_adapter_requests = set(
+                 data.prompt_adapter_request for data in self.inter_data_list
+                 if data.prompt_adapter_request is not None)
+-            prompt_adapter_index_mapping = flatten_2d_lists([
++            prompt_adapter_index_mapping = list(itertools.chain.from_iterable(
+                 inter_data.prompt_adapter_index_mapping
+                 for inter_data in self.inter_data_list
+-            ])
++            ))
+             if cuda_graph_pad_size:
+                 prompt_adapter_index_mapping.extend(
+                     itertools.repeat(0, cuda_graph_pad_size))
+-            prompt_adapter_prompt_mapping = flatten_2d_lists([
++            prompt_adapter_prompt_mapping = list(itertools.chain.from_iterable(
+                 inter_data.prompt_adapter_prompt_mapping
+                 for inter_data in self.inter_data_list
+-            ])
++            ))
+             prompt_adapter_mapping = PromptAdapterMapping(
+                 prompt_adapter_index_mapping,
+                 prompt_adapter_prompt_mapping,

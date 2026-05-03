@@ -1,0 +1,108 @@
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477ef..059f200 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -130,6 +130,13 @@ class SequenceData:
+         self._num_computed_tokens = 0
+         self._stage: SequenceStage = SequenceStage.PREFILL
+ 
++        # Cache the total length for faster get_len() calls
++        self._prompt_len = len(self._prompt_token_ids)
++        self._output_len = len(self._output_token_ids)
++
++        # Cache for get_prefix_token_ids to avoid repeated tuple creation
++        self._prefix_cache: Dict[int, Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]] = {}
++
+         self._update_cached_all_tokens()
+ 
+     def _update_cached_all_tokens(self):
+@@ -144,6 +151,8 @@ class SequenceData:
+     def prompt_token_ids(self, new_prompt_token_ids) -> None:
+         self._prompt_token_ids = array('l', new_prompt_token_ids)
+         self._prompt_token_ids_tuple = tuple(new_prompt_token_ids)
++        self._prompt_len = len(self._prompt_token_ids)
++        self._prefix_cache.clear()
+         self._update_cached_all_tokens()
+ 
+     @property
+@@ -157,6 +166,8 @@ class SequenceData:
+     @output_token_ids.setter
+     def output_token_ids(self, new_output_token_ids) -> None:
+         self._output_token_ids = array('l', new_output_token_ids)
++        self._output_len = len(self._output_token_ids)
++        self._prefix_cache.clear()
+         self._update_cached_all_tokens()
+ 
+     @property
+@@ -166,16 +177,19 @@ class SequenceData:
+     def append_token_id(self, token_id: int, logprob: float) -> None:
+         self._output_token_ids.append(token_id)
+         self._cached_all_token_ids.append(token_id)
++        self._output_len += 1
+         self.cumulative_logprob += logprob
++        # Clear prefix cache when output tokens change
++        self._prefix_cache.clear()
+ 
+     def get_len(self) -> int:
+-        return len(self._output_token_ids) + len(self._prompt_token_ids)
++        return self._output_len + self._prompt_len
+ 
+     def get_prompt_len(self) -> int:
+-        return len(self._prompt_token_ids)
++        return self._prompt_len
+ 
+     def get_output_len(self) -> int:
+-        return len(self._output_token_ids)
++        return self._output_len
+ 
+     def get_token_ids(self) -> List[int]:
+         return self._cached_all_token_ids
+@@ -184,12 +198,20 @@ class SequenceData:
+             self, num_tokens: int
+     ) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
+         """Get prefix tokens, and make the return value hashable"""
+-        prompt_length = self.get_prompt_len()
++        # Check cache first
++        if num_tokens in self._prefix_cache:
++            return self._prefix_cache[num_tokens]
++        
++        prompt_length = self._prompt_len
+         if num_tokens > prompt_length:
+-            return (self._prompt_token_ids_tuple,
+-                    tuple(self._output_token_ids[:num_tokens - prompt_length]))
++            result = (self._prompt_token_ids_tuple,
++                     tuple(self._output_token_ids[:num_tokens - prompt_length]))
+         else:
+-            return (self._prompt_token_ids_tuple[:num_tokens], None)
++            result = (self._prompt_token_ids_tuple[:num_tokens], None)
++        
++        # Cache the result
++        self._prefix_cache[num_tokens] = result
++        return result
+ 
+     def get_num_computed_tokens(self) -> int:
+         """Return the number of prefill tokens that are already computed."""
+@@ -326,10 +348,13 @@ class Sequence:
+         self.read_offset = 0
+         # Input + output tokens
+         self.tokens: Optional[List[str]] = None
++        
++        # Cache n_blocks to avoid repeated division
++        self._cached_n_blocks = (self.data.get_len() + self.block_size - 1) // self.block_size
+ 
+     @property
+     def n_blocks(self) -> int:
+-        return (self.get_len() + self.block_size - 1) // self.block_size
++        return self._cached_n_blocks
+ 
+     @property
+     def prompt(self) -> Optional[str]:
+@@ -407,6 +432,8 @@ class Sequence:
+         assert token_id in logprobs
+         self.output_logprobs.append(logprobs)
+         self.data.append_token_id(token_id, logprobs[token_id].logprob)
++        # Update cached n_blocks
++        self._cached_n_blocks = (self.data.get_len() + self.block_size - 1) // self.block_size
+ 
+     def get_len(self) -> int:
+         return self.data.get_len()

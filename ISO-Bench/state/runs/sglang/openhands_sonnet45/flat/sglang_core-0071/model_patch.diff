@@ -1,0 +1,265 @@
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 0e1640f..f0b29ba 100644
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -55,9 +55,10 @@ TORCH_DEVICE_IDENTITY = None
+ 
+ 
+ def use_rowwise_torch_scaled_mm():
+-    _TORCH_VERSION = torch.__version__.split("+")[0]
++    version_str = torch.__version__.split("+", 1)[0]
+     try:
+-        _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
++        parts = version_str.split(".", 3)[:3]
++        _TORCH_VERSION_TUPLE = tuple(int(p) for p in parts)
+     except ValueError:
+         _TORCH_VERSION_TUPLE = (0, 0, 0)
+     if _is_hip:
+@@ -84,6 +85,9 @@ def cutlass_fp8_supported():
+     return False
+ 
+ 
++CUTLASS_FP8_SUPPORTED = cutlass_fp8_supported()
++
++
+ def normalize_e4m3fn_to_e4m3fnuz(
+     weight: torch.Tensor,
+     weight_scale: torch.Tensor,
+@@ -325,29 +329,23 @@ def block_quant_to_tensor_quant(
+     The outputs are tensor-wise quantization tensor and tensor-wise quantization scale.
+     Note only float8 is supported for now.
+     """
+-    block_n, block_k = block_size[0], block_size[1]
++    block_n, block_k = block_size
+     n, k = x_q_block.shape
+     n_tiles = (n + block_n - 1) // block_n
+     k_tiles = (k + block_k - 1) // block_k
+-    assert n_tiles == x_s.shape[0]
+-    assert k_tiles == x_s.shape[1]
++    x_s_shape = x_s.shape
++    assert n_tiles == x_s_shape[0]
++    assert k_tiles == x_s_shape[1]
+ 
+     x_dq_block = x_q_block.to(torch.float32)
+ 
+-    x_dq_block_tiles = [
+-        [
+-            x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            for i in range(k_tiles)
+-        ]
+-        for j in range(n_tiles)
+-    ]
+-
+-    for i in range(k_tiles):
+-        for j in range(n_tiles):
+-            x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
++    for j in range(n_tiles):
++        j_start = j * block_n
++        j_end = min((j + 1) * block_n, n)
++        for i in range(k_tiles):
++            i_start = i * block_k
++            i_end = min((i + 1) * block_k, k)
++            x_dq_block[j_start:j_end, i_start:i_end] *= x_s[j, i]
+ 
+     x_q_tensor, scale = (
+         scaled_fp8_quant(x_dq_block)
+@@ -368,26 +366,25 @@ def block_quant_dequant(
+     and the block size.
+     The output is an unquantized tensor with dtype.
+     """
+-    block_n, block_k = block_size[0], block_size[1]
++    block_n, block_k = block_size
+     n, k = x_q_block.shape
+     n_tiles = (n + block_n - 1) // block_n
+     k_tiles = (k + block_k - 1) // block_k
+-    assert n_tiles == x_s.shape[0]
+-    assert k_tiles == x_s.shape[1]
++    x_s_shape = x_s.shape
++    assert n_tiles == x_s_shape[0]
++    assert k_tiles == x_s_shape[1]
+ 
+     x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+ 
+     for j in range(n_tiles):
++        j_start = j * block_n
++        j_end = min((j + 1) * block_n, n)
+         for i in range(k_tiles):
+-            x_q_block_tile = x_q_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile = x_dq_block[
+-                j * block_n : min((j + 1) * block_n, n),
+-                i * block_k : min((i + 1) * block_k, k),
+-            ]
+-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
++            i_start = i * block_k
++            i_end = min((i + 1) * block_k, k)
++            x_dq_block[j_start:j_end, i_start:i_end] = (
++                x_q_block[j_start:j_end, i_start:i_end].to(torch.float32) * x_s[j, i]
++            )
+ 
+     return x_dq_block
+ 
+@@ -449,7 +446,7 @@ def apply_fp8_linear(
+     input_scale: Optional[torch.Tensor] = None,
+     input_scale_ub: Optional[torch.Tensor] = None,
+     bias: Optional[torch.Tensor] = None,
+-    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
++    cutlass_fp8_supported: bool = CUTLASS_FP8_SUPPORTED,
+     use_per_token_if_dynamic: bool = False,
+     pad_output: Optional[bool] = None,
+     compressed_tensor_quant: bool = False,
+@@ -464,13 +461,17 @@ def apply_fp8_linear(
+     output_padding = 17 if pad_output else None
+ 
+     # View input as 2D matrix for fp8 methods
+-    input_2d = input.view(-1, input.shape[-1])
+-    output_shape = [*input.shape[:-1], weight.shape[1]]
++    input_shape = input.shape
++    input_dtype = input.dtype
++    weight_shape = weight.shape
++    input_2d = input.view(-1, input_shape[-1])
++    output_shape = [*input_shape[:-1], weight_shape[1]]
+ 
+     if compressed_tensor_quant:
+         # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
+         # for sgl-kernel fp8_scaled_mm, it support per channel W now
+-        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
++        weight_scale_numel = weight_scale.numel()
++        if cutlass_fp8_supported and weight_scale_numel == weight_shape[1]:
+             qinput, x_scale = scaled_fp8_quant(
+                 input_2d,
+                 input_scale,
+@@ -483,21 +484,21 @@ def apply_fp8_linear(
+                 output = ops.cutlass_scaled_mm(
+                     qinput,
+                     weight,
+-                    out_dtype=input.dtype,
++                    out_dtype=input_dtype,
+                     scale_a=x_scale,
+                     scale_b=weight_scale,
+                     bias=bias,
+                 )
+             else:
+                 assert (
+-                    weight_scale.numel() == weight.shape[1]
++                    weight_scale_numel == weight_shape[1]
+                 ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                 output = fp8_scaled_mm(
+                     qinput,
+                     weight,
+                     x_scale,
+                     weight_scale,
+-                    out_dtype=input.dtype,
++                    out_dtype=input_dtype,
+                     bias=bias,
+                 )
+             return output.view(*output_shape)
+@@ -522,15 +523,17 @@ def apply_fp8_linear(
+                 )
+             )
+ 
+-            per_tensor_weights = weight_scale.numel() == 1
+-            per_tensor_activations = x_scale.numel() == 1
++            weight_scale_numel = weight_scale.numel()
++            x_scale_numel = x_scale.numel()
++            per_tensor_weights = weight_scale_numel == 1
++            per_tensor_activations = x_scale_numel == 1
+ 
+             if per_tensor_weights and per_tensor_activations:
+                 # Fused GEMM_DQ
+                 output = torch._scaled_mm(
+                     qinput,
+                     weight,
+-                    out_dtype=input.dtype,
++                    out_dtype=input_dtype,
+                     scale_a=x_scale,
+                     scale_b=weight_scale,
+                     bias=bias,
+@@ -553,7 +556,7 @@ def apply_fp8_linear(
+                 output = torch._scaled_mm(
+                     qinput,
+                     weight,
+-                    out_dtype=input.dtype,
++                    out_dtype=input_dtype,
+                     scale_a=x_scale,
+                     scale_b=weight_scale.t(),
+                     bias=bias,
+@@ -583,10 +586,11 @@ def apply_fp8_linear(
+                     input_2d.shape,
+                     output_shape,
+                     bias,
+-                    input.dtype,
++                    input_dtype,
+                 )
+     else:
+         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
++        weight_scale_numel = weight_scale.numel()
+         if input_scale is not None:
+             assert input_scale.numel() == 1
+             # broadcast per-tensor scale to per-token scale when supporting cutlass
+@@ -601,7 +605,7 @@ def apply_fp8_linear(
+                 # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+                 # final solution should be: 1. add support to per-tensor activation scaling.
+                 # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+-                if _is_hip and weight_scale.numel() == 1:
++                if _is_hip and weight_scale_numel == 1:
+                     qinput, x_scale = ops.scaled_fp8_quant(
+                         input_2d,
+                         input_scale,
+@@ -619,21 +623,21 @@ def apply_fp8_linear(
+                     output = ops.cutlass_scaled_mm(
+                         qinput,
+                         weight,
+-                        out_dtype=input.dtype,
++                        out_dtype=input_dtype,
+                         scale_a=x_scale,
+                         scale_b=weight_scale,
+                         bias=bias,
+                     )
+                 else:
+                     assert (
+-                        weight_scale.numel() == weight.shape[1]
++                        weight_scale_numel == weight_shape[1]
+                     ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                     output = fp8_scaled_mm(
+                         qinput,
+                         weight,
+                         x_scale,
+                         weight_scale,
+-                        out_dtype=input.dtype,
++                        out_dtype=input_dtype,
+                         bias=bias,
+                     )
+                 return output.view(*output_shape)
+@@ -642,15 +646,16 @@ def apply_fp8_linear(
+ 
+         # torch.scaled_mm supports per tensor weights + activations only
+         # so fallback to naive if per channel or per token
+-        per_tensor_weights = weight_scale.numel() == 1
+-        per_tensor_activations = x_scale.numel() == 1
++        x_scale_numel = x_scale.numel()
++        per_tensor_weights = weight_scale_numel == 1
++        per_tensor_activations = x_scale_numel == 1
+ 
+         if per_tensor_weights and per_tensor_activations:
+             # Fused GEMM_DQ
+             output = torch._scaled_mm(
+                 qinput,
+                 weight,
+-                out_dtype=input.dtype,
++                out_dtype=input_dtype,
+                 scale_a=x_scale,
+                 scale_b=weight_scale,
+                 bias=bias,
+@@ -680,5 +685,5 @@ def apply_fp8_linear(
+                 input_2d.shape,
+                 output_shape,
+                 bias,
+-                input.dtype,
++                input_dtype,
+             )

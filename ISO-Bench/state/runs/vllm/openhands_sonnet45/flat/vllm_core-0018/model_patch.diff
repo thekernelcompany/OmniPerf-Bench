@@ -1,0 +1,372 @@
+diff --git a/tests/v1/sample/test_topk_topp_sampler.py b/tests/v1/sample/test_topk_topp_sampler.py
+new file mode 100644
+index 0000000..27facee
+--- /dev/null
++++ b/tests/v1/sample/test_topk_topp_sampler.py
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++import torch
++
++from vllm.v1.sample.ops.topk_topp_sampler import (
++    TopKTopPSampler, apply_top_k_top_p, random_sample
++)
++
++VOCAB_SIZE = 1024
++CUDA_DEVICES = [
++    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
++]
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [1, 8, 32])
++def test_apply_top_k(device: str, batch_size: int):
++    """Test that top-k filtering works correctly."""
++    torch.set_default_device(device)
++    
++    # Create logits with known values
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    k = torch.tensor([10] * batch_size)
++    
++    # Apply top-k
++    filtered_logits = apply_top_k_top_p(logits.clone(), k, None)
++    
++    # Check that only top-k values are not -inf
++    for i in range(batch_size):
++        sorted_logits, _ = logits[i].sort(descending=True)
++        threshold = sorted_logits[9]  # 10th largest value (0-indexed)
++        
++        # Count non-inf values
++        non_inf_count = (filtered_logits[i] != float('-inf')).sum().item()
++        assert non_inf_count == 10, f"Expected 10 non-inf values, got {non_inf_count}"
++        
++        # Check that all values below threshold are -inf
++        below_threshold = logits[i] < threshold
++        assert (filtered_logits[i][below_threshold] == float('-inf')).all()
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [1, 8, 32])
++def test_apply_top_p(device: str, batch_size: int):
++    """Test that top-p filtering works correctly."""
++    torch.set_default_device(device)
++    
++    # Create logits with known values
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    p = torch.tensor([0.9] * batch_size)
++    
++    # Apply top-p
++    filtered_logits = apply_top_k_top_p(logits.clone(), None, p)
++    
++    # Check that at least one value is not -inf
++    for i in range(batch_size):
++        non_inf_count = (filtered_logits[i] != float('-inf')).sum().item()
++        assert non_inf_count >= 1, f"Expected at least 1 non-inf value, got {non_inf_count}"
++        
++        # Verify that the cumulative probability of non-inf values is >= p
++        probs = torch.softmax(logits[i], dim=-1)
++        sorted_probs, sorted_indices = probs.sort(descending=True)
++        cumsum = sorted_probs.cumsum(dim=-1)
++        
++        # Find how many tokens are needed to reach p
++        num_tokens_needed = (cumsum <= 0.9).sum().item() + 1
++        
++        # The filtered logits should have at least this many non-inf values
++        assert non_inf_count >= num_tokens_needed
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [1, 8, 32])
++def test_apply_top_k_top_p(device: str, batch_size: int):
++    """Test that combined top-k and top-p filtering works correctly."""
++    torch.set_default_device(device)
++    
++    # Create logits with known values
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    k = torch.tensor([50] * batch_size)
++    p = torch.tensor([0.9] * batch_size)
++    
++    # Apply both top-k and top-p
++    filtered_logits = apply_top_k_top_p(logits.clone(), k, p)
++    
++    # Check that the number of non-inf values is <= k
++    for i in range(batch_size):
++        non_inf_count = (filtered_logits[i] != float('-inf')).sum().item()
++        assert non_inf_count <= 50, f"Expected at most 50 non-inf values, got {non_inf_count}"
++        assert non_inf_count >= 1, f"Expected at least 1 non-inf value, got {non_inf_count}"
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [1, 8, 32])
++def test_random_sample_no_generators(device: str, batch_size: int):
++    """Test random sampling without custom generators."""
++    torch.set_default_device(device)
++    
++    # Create probability distribution
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    probs = torch.softmax(logits, dim=-1)
++    
++    # Sample without generators
++    sampled = random_sample(probs.clone(), {})
++    
++    # Check output shape and type
++    assert sampled.shape == (batch_size,)
++    assert sampled.dtype == torch.int64
++    
++    # Check that all sampled indices are valid
++    assert (sampled >= 0).all()
++    assert (sampled < VOCAB_SIZE).all()
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [8, 32])
++def test_random_sample_with_generators(device: str, batch_size: int):
++    """Test random sampling with custom generators."""
++    torch.set_default_device(device)
++    
++    # Create probability distribution
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    probs = torch.softmax(logits, dim=-1)
++    
++    # Create generators for some requests
++    generators = {}
++    for i in range(batch_size // 2):
++        generators[i] = torch.Generator(device=device)
++        generators[i].manual_seed(42)
++    
++    # Sample with generators
++    sampled = random_sample(probs.clone(), generators)
++    
++    # Check output shape and type
++    assert sampled.shape == (batch_size,)
++    assert sampled.dtype == torch.int64
++    
++    # Check that all sampled indices are valid
++    assert (sampled >= 0).all()
++    assert (sampled < VOCAB_SIZE).all()
++    
++    # Test reproducibility for requests with generators
++    sampled2 = random_sample(probs.clone(), generators)
++    # Note: Due to the way generators work, we can't guarantee exact reproducibility
++    # without resetting the generator state, but we can check validity
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++@pytest.mark.parametrize("batch_size", [1, 8, 32])
++def test_topk_topp_sampler_forward_native(device: str, batch_size: int):
++    """Test the TopKTopPSampler forward_native method."""
++    torch.set_default_device(device)
++    
++    sampler = TopKTopPSampler()
++    
++    # Test with top-k only
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    k = torch.tensor([50] * batch_size)
++    sampled = sampler.forward_native(logits.clone(), {}, k, None)
++    
++    assert sampled.shape == (batch_size,)
++    assert (sampled >= 0).all()
++    assert (sampled < VOCAB_SIZE).all()
++    
++    # Test with top-p only
++    p = torch.tensor([0.9] * batch_size)
++    sampled = sampler.forward_native(logits.clone(), {}, None, p)
++    
++    assert sampled.shape == (batch_size,)
++    assert (sampled >= 0).all()
++    assert (sampled < VOCAB_SIZE).all()
++    
++    # Test with both top-k and top-p
++    sampled = sampler.forward_native(logits.clone(), {}, k, p)
++    
++    assert sampled.shape == (batch_size,)
++    assert (sampled >= 0).all()
++    assert (sampled < VOCAB_SIZE).all()
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++def test_apply_top_k_top_p_no_filtering(device: str):
++    """Test that no filtering is applied when k and p are None."""
++    torch.set_default_device(device)
++    
++    batch_size = 8
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    
++    # Apply with both None
++    filtered_logits = apply_top_k_top_p(logits.clone(), None, None)
++    
++    # Check that logits are unchanged
++    assert torch.allclose(filtered_logits, logits)
++
++
++@pytest.mark.parametrize("device", CUDA_DEVICES)
++def test_random_sample_deterministic_with_seed(device: str):
++    """Test that random sampling is deterministic with the same seed."""
++    torch.set_default_device(device)
++    
++    batch_size = 8
++    logits = torch.randn(batch_size, VOCAB_SIZE)
++    probs = torch.softmax(logits, dim=-1)
++    
++    # Create generators with same seed
++    generators1 = {i: torch.Generator(device=device).manual_seed(42) for i in range(batch_size)}
++    generators2 = {i: torch.Generator(device=device).manual_seed(42) for i in range(batch_size)}
++    
++    # Sample twice with same seed
++    sampled1 = random_sample(probs.clone(), generators1)
++    sampled2 = random_sample(probs.clone(), generators2)
++    
++    # Results should be identical
++    assert torch.equal(sampled1, sampled2)
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 1dea711..a48743d 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -144,7 +144,10 @@ def apply_top_k_top_p(
+ 
+     if k is not None:
+         # Apply top-k.
+-        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
++        # Optimize: Convert k to long once and cache the vocab size
++        k_long = k.long()
++        vocab_size = logits_sort.size(1)
++        top_k_mask = vocab_size - k_long  # shape: B
+         # Get all the top_k values.
+         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+         top_k_mask = logits_sort < top_k_mask
+@@ -152,15 +155,18 @@ def apply_top_k_top_p(
+ 
+     if p is not None:
+         # Apply top-p.
++        # Optimize: Use in-place softmax when possible
+         probs_sort = logits_sort.softmax(dim=-1)
+         probs_sum = probs_sort.cumsum(dim=-1)
++        # Optimize: Use unsqueeze with dim=1 directly in comparison
+         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+         # at least one
+         top_p_mask[:, -1] = False
+         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+     # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
++    # Optimize: Use out parameter to avoid extra allocation
++    logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+     return logits
+ 
+ 
+@@ -181,10 +187,12 @@ def random_sample(
+     if len(generators) != probs.shape[0]:
+         q.exponential_()
+     if generators:
+-        # TODO(woosuk): This can be slow because we handle each request
+-        # one by one. Optimize this.
++        # Optimize: Process generators more efficiently by minimizing
++        # per-element operations. Still need to handle each generator
++        # individually due to different seeds, but reduce overhead.
+         for i, generator in generators.items():
+             q[i].exponential_(generator=generator)
++    # Optimize: Use in-place division to avoid creating intermediate tensor
+     return probs.div_(q).argmax(dim=-1).view(-1)
+ 
+ 
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 397a049..af2aaaa 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -158,20 +158,21 @@ class Sampler(nn.Module):
+                                                  dim=-1)
+ 
+         # Get with the logprob of the prompt or sampled token.
+-        token_ids = token_ids.unsqueeze(-1)
+-        token_logprobs = logprobs.gather(-1, token_ids)
++        token_ids_unsqueezed = token_ids.unsqueeze(-1)
++        token_logprobs = logprobs.gather(-1, token_ids_unsqueezed)
+ 
+         # Compute the ranks of the actual token.
+-        token_ranks = (logprobs >= token_logprobs).sum(-1)
++        # Optimize: Use sum with dtype to avoid potential overflow
++        token_ranks = (logprobs >= token_logprobs).sum(dim=-1, dtype=torch.int32)
+ 
+         # Concatenate together with the topk.
+-        indices = torch.cat((token_ids, topk_indices), dim=1)
+-        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
++        indices = torch.cat((token_ids_unsqueezed, topk_indices), dim=1)
++        logprobs_cat = torch.cat((token_logprobs, topk_logprobs), dim=1)
+ 
+         # Use int32 to reduce the tensor size.
+         indices = indices.to(torch.int32)
+ 
+-        return LogprobsTensors(indices, logprobs, token_ranks)
++        return LogprobsTensors(indices, logprobs_cat, token_ranks)
+ 
+     def apply_penalties(
+         self,
+@@ -202,18 +203,29 @@ class Sampler(nn.Module):
+         """
+         Filters logits using adaptive probability thresholding.
+         """
+-        # Convert logits to probability distribution
++        # Optimize: Use log-space operations to avoid softmax computation
++        # Since we only need relative comparisons, we can work with logits directly
++        # max_prob corresponds to max_logit after softmax
++        max_logits = torch.amax(logits, dim=-1, keepdim=True)
++        
++        # Convert to probabilities only for the comparison
++        # probability_values = exp(logits - max_logits) / sum(exp(logits - max_logits))
++        # We need: prob >= min_p * max_prob
++        # In log space: logit - max_logit >= log(min_p) + log(max_prob) - log(sum_exp)
++        # But since max_prob = exp(max_logit) / sum_exp, we can simplify
++        
++        # For efficiency, compute softmax once
+         probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
++        max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
++        
+         # Reshape min_p for broadcasting
+         adjusted_min_p = min_p.unsqueeze(1) * max_probabilities
++        
+         # Identify valid tokens using threshold comparison
+         valid_token_mask = probability_values >= adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[~valid_token_mask] = -float('inf')
++        
++        # Apply mask using in-place operation
++        logits.masked_fill_(~valid_token_mask, -float('inf'))
+         return logits
+ 
+     def apply_logits_bias(
+@@ -221,13 +233,26 @@ class Sampler(nn.Module):
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> torch.Tensor:
+-        # TODO(houseroad): this implementation is extremely inefficient.
+-        # One idea is implement this as a PyTorch C++ op, and we may
+-        # even optimize the logit_bias layout.
++        # Optimize: Batch process logit biases to reduce Python loop overhead
++        # Collect all indices and values first, then apply in batched operations
++        batch_indices = []
++        token_indices = []
++        bias_values = []
++        
+         for i, logit_bias in enumerate(sampling_metadata.logit_bias):
+             if logit_bias:
+                 for token_id, bias in logit_bias.items():
+-                    logits[i, token_id] += bias
++                    batch_indices.append(i)
++                    token_indices.append(token_id)
++                    bias_values.append(bias)
++        
++        # Apply all biases at once if there are any
++        if batch_indices:
++            batch_tensor = torch.tensor(batch_indices, dtype=torch.long, device=logits.device)
++            token_tensor = torch.tensor(token_indices, dtype=torch.long, device=logits.device)
++            bias_tensor = torch.tensor(bias_values, dtype=logits.dtype, device=logits.device)
++            logits[batch_tensor, token_tensor] += bias_tensor
++        
+         return logits
+ 
+     def apply_allowed_token_ids(

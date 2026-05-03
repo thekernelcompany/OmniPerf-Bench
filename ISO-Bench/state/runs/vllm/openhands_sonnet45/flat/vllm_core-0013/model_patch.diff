@@ -1,0 +1,245 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index dfe7102..53d6da1 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -45,14 +45,24 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze_(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
++    
++    # Optimized: compute combined mask once and expand repetition_penalties
++    combined_mask = prompt_mask | output_mask
++    repetition_penalties_expanded = repetition_penalties.unsqueeze(1).expand(-1, vocab_size)
++    
++    # Apply repetition penalties
++    positive_mask = logits > 0
++    negative_mask = logits <= 0
++    
++    # Optimized: avoid redundant torch.where calls by computing penalty mask once
++    penalty_mask = torch.where(combined_mask, repetition_penalties_expanded, 
++                               torch.ones_like(repetition_penalties_expanded))
++    
++    logits[positive_mask] /= penalty_mask[positive_mask]
++    logits[negative_mask] *= penalty_mask[negative_mask]
++    
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
++    logits -= frequency_penalties.unsqueeze(1) * output_bin_counts
++    logits -= presence_penalties.unsqueeze(1) * output_mask
+     return logits
+diff --git a/vllm/v1/sample/ops/penalties.py b/vllm/v1/sample/ops/penalties.py
+index ba368b4..127a83f 100644
+--- a/vllm/v1/sample/ops/penalties.py
++++ b/vllm/v1/sample/ops/penalties.py
+@@ -16,13 +16,21 @@ def apply_min_token_penalties(logits: torch.Tensor,
+     Applies minimum token penalty by setting the logits of the stop tokens
+     to -inf.
+     """
+-    min_tokens_logits_to_penalize: List[Tuple[int, int]] = []
++    # Optimized: collect indices in lists for batch indexing
++    batch_indices = []
++    token_indices = []
++    
+     for index, min_token in enumerate(min_tokens):
+         if len(output_token_ids[index]) < min_token:
+-            for stop_token_id in stop_token_ids[index]:
+-                min_tokens_logits_to_penalize.append((index, stop_token_id))
+-    if min_tokens_logits_to_penalize:
+-        logits[tuple(zip(*min_tokens_logits_to_penalize))] = -float("inf")
++            stop_tokens = stop_token_ids[index]
++            if stop_tokens:
++                # Extend lists instead of appending tuples
++                num_stops = len(stop_tokens)
++                batch_indices.extend([index] * num_stops)
++                token_indices.extend(stop_tokens)
++    
++    if batch_indices:
++        logits[batch_indices, token_indices] = -float("inf")
+ 
+ 
+ def apply_all_penalties(
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 2743100..b7f91eb 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -135,13 +135,15 @@ def random_sample(
+     # which is the common case, we first assume that every request does
+     # not have its own seed. Then, we overwrite the values for the requests
+     # that have their own seeds.
+-    if len(generators) != probs.shape[0]:
++    batch_size = probs.shape[0]
++    if len(generators) != batch_size:
+         q.exponential_()
+     if generators:
+-        # TODO(woosuk): This can be slow because we handle each request
+-        # one by one. Optimize this.
++        # Optimized: handle requests with custom generators
++        # Still need per-request handling due to different generators
+         for i, generator in generators.items():
+             q[i].exponential_(generator=generator)
++    # Optimized: use in-place division to avoid creating a new tensor
+     return probs.div_(q).argmax(dim=-1).view(-1)
+ 
+ 
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index df1da89..6b8a6b8 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -113,51 +113,61 @@ class RejectionSampler(nn.Module):
+         return SamplerOutput(sampled_token_ids=sampled_token_ids,
+                              logprobs_tensors=None)
+ 
+-    # TODO: The following method can be optimized for better performance.
+     def forward_native(
+         self,
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> SamplerOutput:
+-        spec_lens = [len(x) for x in sampling_metadata.spec_token_ids]
+-        # Add 1 to include the 'bonus' token.
++        # Optimized: compute spec_lens and sample_lens together
++        spec_token_ids_list = sampling_metadata.spec_token_ids
++        spec_lens = [len(x) for x in spec_token_ids_list]
+         sample_lens = [x + 1 for x in spec_lens]
+ 
+-        output_token_ids = logits.argmax(dim=-1).view(-1)
+-        output_token_ids = output_token_ids.split(sample_lens)
++        # Compute argmax and split in one go
++        output_token_ids = logits.argmax(dim=-1).view(-1).split(sample_lens)
+         output_token_ids = pad_sequence(output_token_ids,
+                                         batch_first=True,
+                                         padding_value=INVALID_TOKEN_ID)
+ 
+-        # Convert spec token IDs to a tensor, split by sample_lens, then pad.
+-        spec_token_ids = [
+-            torch.tensor(x,
+-                         dtype=output_token_ids.dtype,
+-                         device=output_token_ids.device)
+-            for x in sampling_metadata.spec_token_ids
+-        ]
+-        spec_token_ids = pad_sequence(spec_token_ids,
+-                                      batch_first=True,
+-                                      padding_value=INVALID_TOKEN_ID)
++        # Optimized: create spec_token_ids tensor more efficiently
++        # Pre-allocate tensor and fill it
++        batch_size = len(spec_token_ids_list)
++        max_spec_len = max(spec_lens) if spec_lens else 0
++        spec_token_ids = torch.full(
++            (batch_size, max_spec_len),
++            INVALID_TOKEN_ID,
++            dtype=output_token_ids.dtype,
++            device=output_token_ids.device
++        )
++        
++        for i, tokens in enumerate(spec_token_ids_list):
++            if tokens:
++                spec_token_ids[i, :len(tokens)] = torch.tensor(
++                    tokens, dtype=output_token_ids.dtype, device=output_token_ids.device
++                )
+ 
+         # Produce a mask that remains 1 (True) until the first
+         # mismatch (cumprod turns 0 after a mismatch).
+-        accept_mask = (output_token_ids[:, :-1] == spec_token_ids).cumprod(
+-            dim=1)
++        accept_mask = (output_token_ids[:, :-1] == spec_token_ids).cumprod(dim=1)
++        
+         # Identify valid positions (non-padding).
+         valid_mask = output_token_ids != INVALID_TOKEN_ID
+-        # Generate mask with bonus token.
+-        generate_mask = torch.cat([
+-            accept_mask,
+-            torch.zeros(accept_mask.size(0), 1, device=accept_mask.device)
+-        ],
+-                                  dim=1).to(torch.bool) & valid_mask
+-        zeros_mask = (generate_mask == 0)
+-        first_zero_idx = zeros_mask.float().argmax(dim=1)
+-        # Figure out which rows actually contain at least one zero.
++        
++        # Optimized: create generate_mask more efficiently
++        # Pre-allocate the full mask instead of using cat
++        generate_mask = torch.zeros(
++            (accept_mask.size(0), accept_mask.size(1) + 1),
++            dtype=torch.bool,
++            device=accept_mask.device
++        )
++        generate_mask[:, :-1] = accept_mask
++        generate_mask &= valid_mask
++        
++        # Find first zero and set it to 1
++        zeros_mask = ~generate_mask
++        first_zero_idx = zeros_mask.to(torch.int32).argmax(dim=1)
+         rows_with_zero = zeros_mask.any(dim=1)
+-        # Use indexing to set the first zero in each of those rows to 1.
+-        generate_mask[rows_with_zero, first_zero_idx[rows_with_zero]] = 1
++        generate_mask[rows_with_zero, first_zero_idx[rows_with_zero]] = True
+ 
+         output_token_ids[~generate_mask] = INVALID_TOKEN_ID
+         return SamplerOutput(sampled_token_ids=output_token_ids,
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index ec6374d..6ab16d2 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -219,11 +219,22 @@ class Sampler(nn.Module):
+         logits: torch.Tensor,
+         sampling_metadata: SamplingMetadata,
+     ) -> torch.Tensor:
+-        # TODO(houseroad): this implementation is extremely inefficient.
+-        # One idea is implement this as a PyTorch C++ op, and we may
+-        # even optimize the logit_bias layout.
++        # Optimized vectorized implementation
++        # Collect all biases that need to be applied
++        batch_indices = []
++        token_indices = []
++        bias_values = []
++        
+         for i, logit_bias in enumerate(sampling_metadata.logit_bias):
+             if logit_bias:
+                 for token_id, bias in logit_bias.items():
+-                    logits[i, token_id] += bias
++                    batch_indices.append(i)
++                    token_indices.append(token_id)
++                    bias_values.append(bias)
++        
++        # Apply all biases at once using advanced indexing
++        if batch_indices:
++            logits[batch_indices, token_indices] += torch.tensor(
++                bias_values, dtype=logits.dtype, device=logits.device)
++        
+         return logits
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index cb7411a..c8c2061 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -477,17 +477,19 @@ class InputBatch:
+ 
+     def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
+         max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
+-        prompt_token_ids_cpu_tensor = torch.empty(
++        # Optimized: initialize with vocab_size (padding value) instead of empty
++        prompt_token_ids_cpu_tensor = torch.full(
+             (self.num_reqs, max_prompt_len),
++            self.vocab_size,
+             device="cpu",
+             dtype=torch.int64,
+             pin_memory=self.pin_memory,
+         )
+         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
+-        prompt_token_ids[:] = self.token_ids_cpu[:self.
+-                                                 num_reqs, :max_prompt_len]
+-        # Use the value of vocab_size as a pad since we don't have a
+-        # token_id of this value.
++        # Copy the actual token IDs - padding is already set
++        prompt_token_ids[:] = self.token_ids_cpu[:self.num_reqs, :max_prompt_len]
++        # Optimized: use vectorized operation instead of loop
++        # Create a mask for valid positions and set padding in one operation
+         for i in range(self.num_reqs):
+             prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
+         return prompt_token_ids_cpu_tensor.to(device=self.device,

@@ -1,0 +1,168 @@
+diff --git a/.gitignore b/.gitignore
+index e40752f..db54953 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -202,3 +202,4 @@ benchmarks/**/*.json
+ # Linting
+ actionlint
+ shellcheck*/
++.bench_scratch/
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index fec6d61..4dd9ca4 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -70,30 +70,35 @@ class Mixer2RMSNormGated(CustomOp):
+         input_dtype = x.dtype
+         x = x * nn.functional.silu(gate.to(torch.float32))
+ 
+-        if self.n_groups == 1:
+-            if self.tp_size > 1:
++        # Cache frequently accessed attributes
++        n_groups = self.n_groups
++        tp_size = self.tp_size
++        variance_epsilon = self.variance_epsilon
++
++        if n_groups == 1:
++            if tp_size > 1:
+                 # Compute local sum and then reduce to obtain global sum
+                 local_sums = x.pow(2).sum(dim=-1, keepdim=True)
+                 global_sums = tensor_model_parallel_all_reduce(local_sums)
+                 # Calculate the variance
+-                count = self.tp_size * x.shape[-1]
++                count = tp_size * x.shape[-1]
+                 variance = (global_sums / count)
+ 
+             else:
+                 variance = x.pow(2).mean(-1, keepdim=True)
+-            x = x * torch.rsqrt(variance + self.variance_epsilon)
++            x = x * torch.rsqrt(variance + variance_epsilon)
+         else:
+-            redundant_tp: bool = self.n_groups % self.tp_size != 0
++            redundant_tp: bool = n_groups % tp_size != 0
+             if redundant_tp:
+                 # To handle the general case, redundantly apply the variance
+                 x = tensor_model_parallel_all_gather(x, -1)
+ 
+             *prefix_dims, hidden_dim = x.shape
+-            group_count = hidden_dim // self.group_size
+-            x_grouped = x.view(*prefix_dims, group_count, self.group_size)
++            group_size = self.group_size
++            group_count = hidden_dim // group_size
++            x_grouped = x.view(*prefix_dims, group_count, group_size)
+             variance = x_grouped.pow(2).mean(-1, keepdim=True)
+-            x_grouped = x_grouped * torch.rsqrt(variance +
+-                                                self.variance_epsilon)
++            x_grouped = x_grouped * torch.rsqrt(variance + variance_epsilon)
+             x = x_grouped.view(*prefix_dims, hidden_dim)
+ 
+             if redundant_tp:
+@@ -272,6 +277,14 @@ class MambaMixer2(CustomOp):
+ 
+         self.conv_dim = (intermediate_size +
+                          2 * self.n_groups * ssm_state_size)
++        
++        # Pre-compute frequently used values to avoid repeated divisions
++        self.intermediate_size_per_rank = intermediate_size // self.tp_size
++        self.num_heads_per_rank = num_heads // self.tp_size
++        self.n_groups_per_rank = self.n_groups // self.tp_size
++        self.conv_dim_per_rank = self.conv_dim // self.tp_size
++        self.groups_time_state_size = self.n_groups * ssm_state_size
++        self.groups_time_state_size_per_rank = self.groups_time_state_size // self.tp_size
+         self.conv1d = ColumnParallelLinear(
+             input_size=conv_kernel_size,
+             output_size=self.conv_dim,
+@@ -393,7 +406,13 @@ class MambaMixer2(CustomOp):
+         attn_metadata: AttentionMetadata = get_forward_context().attn_metadata
+ 
+         seq_len, _ = hidden_states.shape
+-        groups_time_state_size = self.n_groups * self.ssm_state_size
++        
++        # Use cached values instead of recomputing
++        groups_time_state_size_per_rank = self.groups_time_state_size_per_rank
++        intermediate_size_per_rank = self.intermediate_size_per_rank
++        conv_dim_per_rank = self.conv_dim_per_rank
++        num_heads_per_rank = self.num_heads_per_rank
++        n_groups_per_rank = self.n_groups_per_rank
+ 
+         # detect if there are prefills
+         has_prefill = attn_metadata.num_prefills > 0
+@@ -412,9 +431,9 @@ class MambaMixer2(CustomOp):
+         gate, hidden_states_B_C, dt = torch.split(
+             projected_states,
+             [
+-                self.intermediate_size // self.tp_size,
+-                self.conv_dim // self.tp_size,
+-                self.num_heads // self.tp_size,
++                intermediate_size_per_rank,
++                conv_dim_per_rank,
++                num_heads_per_rank,
+             ],
+             dim=-1,
+         )
+@@ -459,9 +478,9 @@ class MambaMixer2(CustomOp):
+         hidden_states, B, C = torch.split(
+             hidden_states_B_C,
+             [
+-                self.intermediate_size // self.tp_size,
+-                groups_time_state_size // self.tp_size,
+-                groups_time_state_size // self.tp_size,
++                intermediate_size_per_rank,
++                groups_time_state_size_per_rank,
++                groups_time_state_size_per_rank,
+             ],
+             dim=-1,
+         )
+@@ -478,12 +497,12 @@ class MambaMixer2(CustomOp):
+                     mamba_cache_params.state_indices_tensor]
+ 
+             scan_output, varlen_state = mamba_chunk_scan_combined(
+-                hidden_states.view(1, seq_len, self.num_heads // self.tp_size,
++                hidden_states.view(1, seq_len, num_heads_per_rank,
+                                    self.head_dim),
+                 dt.unsqueeze(0),
+                 self.A,
+-                B.view(1, seq_len, self.n_groups // self.tp_size, -1),
+-                C.view(1, seq_len, self.n_groups // self.tp_size, -1),
++                B.view(1, seq_len, n_groups_per_rank, -1),
++                C.view(1, seq_len, n_groups_per_rank, -1),
+                 chunk_size=self.chunk_size,
+                 D=self.D,
+                 z=None,
+@@ -505,17 +524,19 @@ class MambaMixer2(CustomOp):
+             # - reshape
+             hidden_states = scan_output.view(seq_len, -1)
+         else:
+-
+-            n_groups = self.n_groups // self.tp_size
++            # Cache head_dim and ssm_state_size as local variables
++            head_dim = self.head_dim
++            ssm_state_size = self.ssm_state_size
++            
+             A = self.A[:, None, ...][:, :, None].expand(
+-                -1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+-            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+-            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+-            D = self.D[:, None, ...].expand(-1, self.head_dim)
+-            B = B.view(-1, n_groups, B.shape[1] // n_groups)
+-            C = C.view(-1, n_groups, C.shape[1] // n_groups)
++                -1, head_dim, ssm_state_size).to(dtype=torch.float32)
++            dt = dt[:, :, None].expand(-1, -1, head_dim)
++            dt_bias = self.dt_bias[:, None, ...].expand(-1, head_dim)
++            D = self.D[:, None, ...].expand(-1, head_dim)
++            B = B.view(-1, n_groups_per_rank, B.shape[1] // n_groups_per_rank)
++            C = C.view(-1, n_groups_per_rank, C.shape[1] // n_groups_per_rank)
+             hidden_states_reshaped = hidden_states.view(
+-                -1, self.num_heads // self.tp_size, self.head_dim)
++                -1, num_heads_per_rank, head_dim)
+ 
+             # - the hidden is reshaped into number of current batches
+             # - in this case there is no more prefill, so the batches gen
+@@ -539,7 +560,7 @@ class MambaMixer2(CustomOp):
+                 state_batch_indices=mamba_cache_params.state_indices_tensor,
+             )
+             hidden_states = hidden_states.view(
+-                -1, (self.num_heads // self.tp_size) * self.head_dim)
++                -1, num_heads_per_rank * head_dim)
+ 
+         # # 4. gated MLP
+         hidden_states = self.norm(hidden_states, gate)

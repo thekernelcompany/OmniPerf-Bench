@@ -1,0 +1,76 @@
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index acc3a94..43281bf 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -6,6 +6,8 @@ import torch
+ 
+ @dataclass
+ class SamplerOutput:
++    __slots__ = ['sampled_token_ids', 'logprob_token_ids', 'logprobs',
++                 'prompt_logprob_token_ids', 'prompt_logprobs']
+ 
+     # [num_reqs]
+     sampled_token_ids: List[int]
+@@ -24,6 +26,8 @@ class SamplerOutput:
+ # This is expensive for torch.Tensor so prefer to use List instead.
+ @dataclass
+ class ModelRunnerOutput:
++    __slots__ = ['req_ids', 'req_id_to_index', 'sampled_token_ids',
++                 'logprob_token_ids_cpu', 'logprobs_cpu']
+ 
+     # [num_reqs]
+     req_ids: List[str]
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 7cd42ca..bc7aa10 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -66,7 +66,8 @@ class Sampler(nn.Module):
+         temp: torch.Tensor,
+     ) -> torch.Tensor:
+         # Avoid division by zero.
+-        temp = torch.where(temp < _SAMPLING_EPS, 1.0, temp)
++        # Optimize: clamp is faster than where for this use case
++        temp = temp.clamp(min=_SAMPLING_EPS)
+         # Use in-place division to avoid creating a new tensor.
+         logits.div_(temp.unsqueeze(dim=1))
+         return logits
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 4b3c325..b088b67 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -339,16 +339,12 @@ class GPUModelRunner:
+         self.input_batch.block_table.commit(num_reqs)
+ 
+         # Get the number of scheduled tokens for each request.
+-        # TODO: The Python loop can be slow. Optimize.
+-        num_scheduled_tokens = []
+-        max_num_scheduled_tokens = 0
+-        for req_id in self.input_batch.req_ids[:num_reqs]:
+-            assert req_id is not None
+-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_scheduled_tokens.append(num_tokens)
+-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+-                                           num_tokens)
+-        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
++        # Vectorized to avoid slow Python loop.
++        num_scheduled_tokens = np.array(
++            [scheduler_output.num_scheduled_tokens[req_id]
++             for req_id in self.input_batch.req_ids[:num_reqs]],
++            dtype=np.int32)
++        max_num_scheduled_tokens = int(num_scheduled_tokens.max())
+         assert max_num_scheduled_tokens > 0
+ 
+         # Get request indices.
+@@ -358,8 +354,10 @@ class GPUModelRunner:
+ 
+         # Get batched arange.
+         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+-        arange = np.concatenate(
+-            [self.arange_np[:n] for n in num_scheduled_tokens])
++        # Optimized: avoid list comprehension + concatenate for better performance
++        cumsum = np.concatenate([[0], np.cumsum(num_scheduled_tokens)[:-1]])
++        arange = (np.arange(total_num_scheduled_tokens, dtype=np.int32) -
++                  np.repeat(cumsum, num_scheduled_tokens))
+ 
+         # Get positions.
+         positions_np = self.positions_np[:total_num_scheduled_tokens]

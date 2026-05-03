@@ -1,0 +1,115 @@
+diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py
+index 3dd12e2..a48bb68 100644
+--- a/vllm/core/evictor_v2.py
++++ b/vllm/core/evictor_v2.py
+@@ -1,6 +1,7 @@
+ import enum
++import heapq
+ from abc import ABC, abstractmethod
+-from typing import OrderedDict, Tuple
++from typing import Dict, List, Tuple
+ 
+ 
+ class EvictionPolicy(enum.Enum):
+@@ -76,49 +77,74 @@ class LRUEvictor(Evictor):
+     """
+ 
+     def __init__(self):
+-        self.free_table: OrderedDict[int, BlockMetaData] = OrderedDict()
++        # Min-heap storing (last_accessed, -num_hashed_tokens, block_id)
++        # We negate num_hashed_tokens so blocks with more tokens are prioritized
++        self._heap: List[Tuple[float, int, int]] = []
++        
++        # Metadata for each block
++        self._block_metadata: Dict[int, BlockMetaData] = {}
++        
++        # Track which blocks are currently valid in the evictor
++        self._valid_blocks: set = set()
+ 
+     def __contains__(self, block_id: int) -> bool:
+-        return block_id in self.free_table
++        return block_id in self._valid_blocks
+ 
+     def evict(self) -> Tuple[int, int]:
+-        if len(self.free_table) == 0:
+-            raise ValueError("No usable cache memory left")
+-
+-        evicted_block = next(iter(self.free_table.values()))
+-        evicted_block_id = next(iter(self.free_table.keys()))
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block.last_accessed > block.last_accessed or (
+-                    evicted_block.last_accessed == block.last_accessed and
+-                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):
+-                evicted_block = block
+-                evicted_block_id = _id
+-
+-        self.free_table.pop(evicted_block_id)
+-
+-        return evicted_block_id, evicted_block.content_hash
++        # Pop from heap until we find a valid block
++        while self._heap:
++            last_accessed, neg_tokens, block_id = heapq.heappop(self._heap)
++            
++            # Check if this block is still valid
++            if block_id in self._valid_blocks:
++                # Verify the heap entry matches current metadata
++                metadata = self._block_metadata[block_id]
++                if (metadata.last_accessed == last_accessed and 
++                    -metadata.num_hashed_tokens == neg_tokens):
++                    # Valid entry found, remove it
++                    self._valid_blocks.remove(block_id)
++                    content_hash = metadata.content_hash
++                    del self._block_metadata[block_id]
++                    return block_id, content_hash
++        
++        # No valid blocks found
++        raise ValueError("No usable cache memory left")
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+             last_accessed: float):
+-        self.free_table[block_id] = BlockMetaData(content_hash,
+-                                                  num_hashed_tokens,
+-                                                  last_accessed)
++        # Store metadata
++        self._block_metadata[block_id] = BlockMetaData(
++            content_hash, num_hashed_tokens, last_accessed)
++        
++        # Add to valid blocks set
++        self._valid_blocks.add(block_id)
++        
++        # Push to heap (negate num_hashed_tokens for max-heap behavior)
++        heapq.heappush(self._heap, 
++                      (last_accessed, -num_hashed_tokens, block_id))
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        # Update metadata
++        metadata = self._block_metadata[block_id]
++        metadata.last_accessed = last_accessed
++        
++        # Add new entry to heap (old entries will be skipped during evict)
++        heapq.heappush(self._heap, 
++                      (last_accessed, -metadata.num_hashed_tokens, block_id))
+ 
+     def remove(self, block_id: int):
+-        if block_id not in self.free_table:
++        if block_id not in self._valid_blocks:
+             raise ValueError(
+                 "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
++        
++        # Remove from valid set and metadata
++        self._valid_blocks.remove(block_id)
++        del self._block_metadata[block_id]
++        # Note: We don't remove from heap, invalid entries will be skipped
+ 
+     @property
+     def num_blocks(self) -> int:
+-        return len(self.free_table)
++        return len(self._valid_blocks)
+ 
+ 
+ def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:

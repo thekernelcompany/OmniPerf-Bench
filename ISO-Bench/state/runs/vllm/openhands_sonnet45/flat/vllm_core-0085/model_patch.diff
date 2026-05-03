@@ -1,0 +1,238 @@
+diff --git a/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py b/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
+index a6b4240..81941e5 100644
+--- a/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
++++ b/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
+@@ -80,10 +80,14 @@ def bench_run(
+         a, score, topk, renormalize=False
+     )
+ 
+-    ab_strides1 = torch.full((num_experts,), k, device="cuda", dtype=torch.int64)
+-    ab_strides2 = torch.full((num_experts,), n, device="cuda", dtype=torch.int64)
+-    c_strides1 = torch.full((num_experts,), 2 * n, device="cuda", dtype=torch.int64)
+-    c_strides2 = torch.full((num_experts,), k, device="cuda", dtype=torch.int64)
++    ab_strides1 = torch.empty((num_experts,), device="cuda", dtype=torch.int64)
++    ab_strides1.fill_(k)
++    ab_strides2 = torch.empty((num_experts,), device="cuda", dtype=torch.int64)
++    ab_strides2.fill_(n)
++    c_strides1 = torch.empty((num_experts,), device="cuda", dtype=torch.int64)
++    c_strides1.fill_(2 * n)
++    c_strides2 = torch.empty((num_experts,), device="cuda", dtype=torch.int64)
++    c_strides2.fill_(k)
+ 
+     def run_triton_moe(
+         a: torch.Tensor,
+diff --git a/csrc/moe/moe_permute_unpermute_op.cu b/csrc/moe/moe_permute_unpermute_op.cu
+index 13aecd8..641ae89 100644
+--- a/csrc/moe/moe_permute_unpermute_op.cu
++++ b/csrc/moe/moe_permute_unpermute_op.cu
+@@ -139,11 +139,9 @@ __global__ void shuffleInputRowsKernel(const T* input,
+   int64_t const source_row_idx = dst2src_map[dest_row_idx];
+ 
+   if (blockIdx.x < num_dst_rows) {
+-    // Load 128-bits per thread
+-    constexpr int64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
++    constexpr int64_t ELEM_PER_THREAD = 16 / sizeof(T);
+     using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+ 
+-    // Duplicate and permute rows
+     auto const* source_row_ptr =
+         reinterpret_cast<DataElem const*>(input + source_row_idx * num_cols);
+     auto* dest_row_ptr =
+@@ -197,24 +195,22 @@ void shuffle_rows(const torch::Tensor& input_tensor,
+   int64_t const num_src_rows = input_tensor.size(0);
+   int64_t const num_cols = input_tensor.size(1);
+ 
+-  if (num_cols % (128 / sizeof(input_tensor.scalar_type()) / 8)) {
+-    // use slow kernel if num_cols can't be aligned to 128 bits
+-    MOE_DISPATCH(input_tensor.scalar_type(), [&] {
++  MOE_DISPATCH(input_tensor.scalar_type(), [&] {
++    constexpr int64_t ELEM_PER_THREAD = 16 / sizeof(scalar_t);
++    if (num_cols % ELEM_PER_THREAD) {
+       shuffleInputRowsKernelSlow<scalar_t><<<blocks, threads, 0, stream>>>(
+           reinterpret_cast<scalar_t*>(input_tensor.data_ptr()),
+           dst2src_map.data_ptr<int32_t>(),
+           reinterpret_cast<scalar_t*>(output_tensor.data_ptr()), num_src_rows,
+           num_dest_rows, num_cols);
+-    });
+-  } else {
+-    MOE_DISPATCH(input_tensor.scalar_type(), [&] {
++    } else {
+       shuffleInputRowsKernel<scalar_t><<<blocks, threads, 0, stream>>>(
+           reinterpret_cast<scalar_t*>(input_tensor.data_ptr()),
+           dst2src_map.data_ptr<int32_t>(),
+           reinterpret_cast<scalar_t*>(output_tensor.data_ptr()), num_src_rows,
+           num_dest_rows, num_cols);
+-    });
+-  }
++    }
++  });
+ }
+ 
+ #else
+diff --git a/tests/kernels/moe/test_cutlass_moe.py b/tests/kernels/moe/test_cutlass_moe.py
+index 37727b7..c22e17e 100644
+--- a/tests/kernels/moe/test_cutlass_moe.py
++++ b/tests/kernels/moe/test_cutlass_moe.py
+@@ -62,10 +62,14 @@ class MOETensors:
+         a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+         w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+         w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+-        ab_strides1 = torch.full((e, ), k, device="cuda", dtype=torch.int64)
+-        c_strides1 = torch.full((e, ), 2 * n, device="cuda", dtype=torch.int64)
+-        ab_strides2 = torch.full((e, ), n, device="cuda", dtype=torch.int64)
+-        c_strides2 = torch.full((e, ), k, device="cuda", dtype=torch.int64)
++        ab_strides1 = torch.empty(e, device="cuda", dtype=torch.int64)
++        ab_strides1.fill_(k)
++        c_strides1 = torch.empty(e, device="cuda", dtype=torch.int64)
++        c_strides1.fill_(2 * n)
++        ab_strides2 = torch.empty(e, device="cuda", dtype=torch.int64)
++        ab_strides2.fill_(n)
++        c_strides2 = torch.empty(e, device="cuda", dtype=torch.int64)
++        c_strides2.fill_(k)
+         return MOETensors(a=a,
+                           w1=w1,
+                           w2=w2,
+diff --git a/tests/kernels/moe/test_pplx_cutlass_moe.py b/tests/kernels/moe/test_pplx_cutlass_moe.py
+index 77adc89..08a9b89 100644
+--- a/tests/kernels/moe/test_pplx_cutlass_moe.py
++++ b/tests/kernels/moe/test_pplx_cutlass_moe.py
+@@ -124,22 +124,22 @@ def pplx_cutlass_moe(
+         num_local_experts=num_local_experts,
+         num_dispatchers=num_dispatchers)
+ 
+-    ab_strides1 = torch.full((num_local_experts, ),
+-                             hidden_dim,
++    ab_strides1 = torch.empty(num_local_experts,
+                              device="cuda",
+                              dtype=torch.int64)
+-    ab_strides2 = torch.full((num_local_experts, ),
+-                             intermediate_dim,
++    ab_strides1.fill_(hidden_dim)
++    ab_strides2 = torch.empty(num_local_experts,
+                              device="cuda",
+                              dtype=torch.int64)
+-    c_strides1 = torch.full((num_local_experts, ),
+-                            2 * intermediate_dim,
++    ab_strides2.fill_(intermediate_dim)
++    c_strides1 = torch.empty(num_local_experts,
+                             device="cuda",
+                             dtype=torch.int64)
+-    c_strides2 = torch.full((num_local_experts, ),
+-                            hidden_dim,
++    c_strides1.fill_(2 * intermediate_dim)
++    c_strides2 = torch.empty(num_local_experts,
+                             device="cuda",
+                             dtype=torch.int64)
++    c_strides2.fill_(hidden_dim)
+ 
+     experts = CutlassExpertsFp8(num_local_experts,
+                                 out_dtype,
+diff --git a/vllm/model_executor/layers/fused_moe/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+index ff49d7b..1bd36ff 100644
+--- a/vllm/model_executor/layers/fused_moe/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+@@ -94,9 +94,8 @@ def run_cutlass_moe_fp8(
+     assert a1q_scale is not None
+ 
+     if expert_map is not None:
+-        "Translate info from expert_map to topk_ids"
+-        local_topk_ids = torch.where(expert_map[topk_ids] != -1,
+-                                     expert_map[topk_ids], -1)
++        mapped_ids = expert_map[topk_ids]
++        local_topk_ids = torch.where(mapped_ids != -1, mapped_ids, -1)
+     else:
+         local_topk_ids = topk_ids
+ 
+@@ -106,7 +105,7 @@ def run_cutlass_moe_fp8(
+     if use_batched_format:
+         assert expert_num_tokens is not None
+ 
+-        expert_offsets = torch.empty((local_E),
++        expert_offsets = torch.empty(local_E,
+                                      dtype=torch.int32,
+                                      device=device)
+         problem_sizes1 = torch.empty((local_E, 3),
+@@ -126,7 +125,7 @@ def run_cutlass_moe_fp8(
+         a1q_scale = a1q_scale.reshape(-1, a1q_scale.size(2)).contiguous()
+ 
+     else:
+-        expert_offsets = torch.empty((global_num_experts + 1),
++        expert_offsets = torch.empty(global_num_experts + 1,
+                                      dtype=torch.int32,
+                                      device=device)
+         problem_sizes1 = torch.empty((global_num_experts, 3),
+@@ -136,19 +135,17 @@ def run_cutlass_moe_fp8(
+                                      dtype=torch.int32,
+                                      device=device)
+ 
+-        # With expert_map each Rank processes only a subset of experts. As
+-        # a result not all of a_map and c2 tensors are filled. We fill it
+-        # zeros for correctness.
++        map_size = local_topk_ids.numel()
+         if expert_map is not None:
+-            a_map = torch.zeros((local_topk_ids.numel()),
++            a_map = torch.zeros(map_size,
+                                 dtype=torch.int32,
+                                 device=device)
+         else:
+-            a_map = torch.empty((local_topk_ids.numel()),
++            a_map = torch.empty(map_size,
+                                 dtype=torch.int32,
+                                 device=device)
+ 
+-        c_map = torch.empty((local_topk_ids.numel()),
++        c_map = torch.empty(map_size,
+                             dtype=torch.int32,
+                             device=device)
+ 
+@@ -507,15 +504,14 @@ def run_cutlass_moe_fp4(
+     out_dtype = a.dtype
+     num_topk = topk_ids.size(1)
+ 
+-    expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
+-    blockscale_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
+-    # Problem size:  (num_experts, (m,2n,k))
++    expert_offsets = torch.empty(e + 1, dtype=torch.int32, device=device)
++    blockscale_offsets = torch.empty(e + 1, dtype=torch.int32, device=device)
+     problem_sizes1 = torch.empty((e, 3), dtype=torch.int32, device=device)
+-    # Problem size:  (num_experts, (m,n,k))
+     problem_sizes2 = torch.empty((e, 3), dtype=torch.int32, device=device)
+ 
+-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
++    map_size = topk_ids.numel()
++    a_map = torch.empty(map_size, dtype=torch.int32, device=device)
++    c_map = torch.empty(map_size, dtype=torch.int32, device=device)
+ 
+     if apply_router_weight_on_input:
+         # TODO: this only works for topK=1, will need to update for topK>1
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+index 1a31410..5313970 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+@@ -860,19 +860,18 @@ class CompressedTensorsW8A8Fp8MoECutlassMethod(CompressedTensorsMoEMethod):
+                                                         requires_grad=False)
+ 
+         device = layer.w13_weight.device
+-        # ab_strides1 and c_strides2 are the same
+-        self.ab_strides1_c_strides2 = torch.full((layer.local_num_experts, ),
+-                                                 layer.hidden_size,
++        self.ab_strides1_c_strides2 = torch.empty(layer.local_num_experts,
+                                                  device=device,
+                                                  dtype=torch.int64)
+-        self.ab_strides2 = torch.full((layer.local_num_experts, ),
+-                                      layer.intermediate_size_per_partition,
++        self.ab_strides1_c_strides2.fill_(layer.hidden_size)
++        self.ab_strides2 = torch.empty(layer.local_num_experts,
+                                       device=device,
+                                       dtype=torch.int64)
+-        self.c_strides1 = torch.full((layer.local_num_experts, ),
+-                                     2 * layer.intermediate_size_per_partition,
++        self.ab_strides2.fill_(layer.intermediate_size_per_partition)
++        self.c_strides1 = torch.empty(layer.local_num_experts,
+                                      device=device,
+                                      dtype=torch.int64)
++        self.c_strides1.fill_(2 * layer.intermediate_size_per_partition)
+ 
+     def select_gemm_impl(
+         self,

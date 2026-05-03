@@ -1,0 +1,506 @@
+diff --git a/tests/kernels/mamba/test_mamba_ssm.py b/tests/kernels/mamba/test_mamba_ssm.py
+index 8dece26..d6f8486 100644
+--- a/tests/kernels/mamba/test_mamba_ssm.py
++++ b/tests/kernels/mamba/test_mamba_ssm.py
+@@ -38,25 +38,38 @@ def selective_state_update_ref(state,
+     Return:
+         out: (batch, dim) or (batch, nheads, dim)
+     """
+-    has_heads = state.dim() > 3
+-    if state.dim() == 3:
++    # Cache dimension checks to avoid repeated calls
++    state_ndim = state.dim()
++    has_heads = state_ndim > 3
++    if state_ndim == 3:
+         state = state.unsqueeze(1)
+-    if x.dim() == 2:
++    x_ndim = x.dim()
++    if x_ndim == 2:
+         x = x.unsqueeze(1)
+-    if dt.dim() == 2:
++    dt_ndim = dt.dim()
++    if dt_ndim == 2:
+         dt = dt.unsqueeze(1)
+-    if A.dim() == 2:
++    A_ndim = A.dim()
++    if A_ndim == 2:
+         A = A.unsqueeze(0)
+-    if B.dim() == 2:
++    B_ndim = B.dim()
++    if B_ndim == 2:
+         B = B.unsqueeze(1)
+-    if C.dim() == 2:
++    C_ndim = C.dim()
++    if C_ndim == 2:
+         C = C.unsqueeze(1)
+-    if D is not None and D.dim() == 1:
+-        D = D.unsqueeze(0)
+-    if z is not None and z.dim() == 2:
+-        z = z.unsqueeze(1)
+-    if dt_bias is not None and dt_bias.dim() == 1:
+-        dt_bias = dt_bias.unsqueeze(0)
++    if D is not None:
++        D_ndim = D.dim()
++        if D_ndim == 1:
++            D = D.unsqueeze(0)
++    if z is not None:
++        z_ndim = z.dim()
++        if z_ndim == 2:
++            z = z.unsqueeze(1)
++    if dt_bias is not None:
++        dt_bias_ndim = dt_bias.dim()
++        if dt_bias_ndim == 1:
++            dt_bias = dt_bias.unsqueeze(0)
+     batch, nheads, dim, dstate = state.shape
+     assert x.shape == (batch, nheads, dim)
+     assert dt.shape == x.shape
+@@ -126,8 +139,11 @@ def selective_scan_ref(u,
+     if delta_softplus:
+         delta = F.softplus(delta)
+     batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+-    is_variable_B = B.dim() >= 3
+-    is_variable_C = C.dim() >= 3
++    # Cache dimension checks
++    B_ndim = B.dim()
++    C_ndim = C.dim()
++    is_variable_B = B_ndim >= 3
++    is_variable_C = C_ndim >= 3
+     B = B.float()
+     C = C.float()
+     x = A.new_zeros((batch, dim, dstate)) if prev_state is None else prev_state
+@@ -136,19 +152,21 @@ def selective_scan_ref(u,
+     if not is_variable_B:
+         deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+     else:
+-        if B.dim() == 3:
++        if B_ndim == 3:
+             deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+         else:
+             B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+             deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+-    if is_variable_C and C.dim() == 4:
++    if is_variable_C and C_ndim == 4:
+         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
++    # Cache C dimension for loop
++    C_final_ndim = C.dim()
+     for i in range(u.shape[2]):
+         x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+         if not is_variable_C:
+             y = torch.einsum('bdn,dn->bd', x, C)
+         else:
+-            if C.dim() == 3:
++            if C_final_ndim == 3:
+                 y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+             else:
+                 y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+@@ -195,13 +213,16 @@ def selective_scan_opcheck_fn(u,
+         C = C.contiguous()
+     if z is not None and z.stride(-1) != 1:
+         z = z.contiguous()
+-    if B.dim() == 3 and cu_seq_len is None:
++    # Cache dimension checks
++    B_ndim = B.dim()
++    C_ndim = C.dim()
++    if B_ndim == 3 and cu_seq_len is None:
+         B = B.unsqueeze(1)
+-    if B.dim() == 2 and cu_seq_len is not None:
++    if B_ndim == 2 and cu_seq_len is not None:
+         B = B.unsqueeze(0)
+-    if C.dim() == 3 and cu_seq_len is None:
++    if C_ndim == 3 and cu_seq_len is None:
+         C = C.unsqueeze(1)
+-    if C.dim() == 2 and cu_seq_len is not None:
++    if C_ndim == 2 and cu_seq_len is not None:
+         C = C.unsqueeze(0)
+ 
+     # Disable test_autograd_registration for now as it seems to trigger
+diff --git a/tests/kernels/mamba/test_mamba_ssm_ssd.py b/tests/kernels/mamba/test_mamba_ssm_ssd.py
+index 00c1a29..8cc95d9 100644
+--- a/tests/kernels/mamba/test_mamba_ssm_ssd.py
++++ b/tests/kernels/mamba/test_mamba_ssm_ssd.py
+@@ -22,13 +22,13 @@ def segsum(x):
+     """Calculates segment sum."""
+     T = x.size(-1)
+     x = repeat(x, "... d -> ... d e", e=T)
+-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool),
+-                      diagonal=-1)
+-    x = x.masked_fill(~mask, 0)
++    # Create base mask once and reuse for both operations
++    base_mask = torch.ones(T, T, device=x.device, dtype=bool)
++    mask_lower = torch.tril(base_mask, diagonal=-1)
++    x = x.masked_fill(~mask_lower, 0)
+     x_segsum = torch.cumsum(x, dim=-2)
+-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool),
+-                      diagonal=0)
+-    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
++    mask_diag = torch.tril(base_mask, diagonal=0)
++    x_segsum = x_segsum.masked_fill(~mask_diag, -torch.inf)
+     return x_segsum
+ 
+ 
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer.py b/vllm/model_executor/layers/mamba/mamba_mixer.py
+index 796c8d9..e8b90cb 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer.py
+@@ -177,13 +177,15 @@ class MambaMixer(CustomOp):
+ 
+         # 3. State Space Model sequence transformation
+         # 3.a. input varying initialization of time_step, B and C
+-
++        
++        # Cache transpose to avoid redundant computation
++        hidden_states_transposed = hidden_states.transpose(-2, -1)
+         if self.is_lora_enabled:
+             #   lora kernel requires contiguous tensor
+             ssm_parameters = self.x_proj(
+-                hidden_states.transpose(-2, -1).contiguous())[0]
++                hidden_states_transposed.contiguous())[0]
+         else:
+-            ssm_parameters = self.x_proj(hidden_states.transpose(-2, -1))[0]
++            ssm_parameters = self.x_proj(hidden_states_transposed)[0]
+ 
+         time_step, B, C = torch.split(
+             ssm_parameters,
+@@ -205,13 +207,16 @@ class MambaMixer(CustomOp):
+ 
+         if attn_metadata.query_start_loc is not None \
+             and attn_metadata.context_lens_tensor is not None:
++            # Cache B and C transposes
++            B_transposed = B.transpose(-2, -1)
++            C_transposed = C.transpose(-2, -1)
+             scan_outputs = selective_scan_fn(
+                 hidden_states,
+                 mamba_cache_params.ssm_state,
+                 discrete_time_step,
+                 self.A,
+-                B.transpose(-2, -1),
+-                C.transpose(-2, -1),
++                B_transposed,
++                C_transposed,
+                 self.D.float(),
+                 gate,
+                 time_proj_bias,
+@@ -235,11 +240,13 @@ class MambaMixer(CustomOp):
+             scan_outputs = scan_outputs.transpose(0, 1)
+ 
+         # 4. Final linear projection
++        # Cache transpose to avoid redundant computation
++        scan_outputs_transposed = scan_outputs.transpose(-2, -1)
+         if self.is_lora_enabled:
+             #  lora kernel requires contiguous tensor
+             contextualized_states = self.out_proj(
+-                scan_outputs.transpose(-2, -1).contiguous())[0]
++                scan_outputs_transposed.contiguous())[0]
+         else:
+             contextualized_states = self.out_proj(
+-                scan_outputs.transpose(-2, -1))[0]
++                scan_outputs_transposed)[0]
+         return contextualized_states
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index 36edac2..cf83cf2 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -523,8 +523,8 @@ class MambaMixer2(MambaBase, CustomOp):
+ 
+         if envs.VLLM_USE_V1 and attn_metadata is None:
+             # V1 profile run
+-            hidden_states_B_C = (hidden_states_B_C.transpose(
+-                0, 1).clone().transpose(0, 1)).contiguous()
++            # Optimize: transpose-clone-transpose is equivalent to just clone+contiguous
++            hidden_states_B_C = hidden_states_B_C.clone().contiguous()
+             hidden_states, _B, _C = split_hidden_states_B_C_fn(
+                 hidden_states_B_C)
+             hidden_states = self.norm(hidden_states, gate)
+diff --git a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+index 3f67fc3..4af488e 100644
+--- a/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
++++ b/vllm/model_executor/layers/mamba/ops/mamba_ssm.py
+@@ -226,25 +226,38 @@ def selective_state_update(state,
+     Return:
+         out: (batch, dim) or (batch, nheads, dim)
+     """
+-    has_heads = state.dim() > 3
+-    if state.dim() == 3:
++    # Cache dimension checks to avoid repeated calls
++    state_ndim = state.dim()
++    has_heads = state_ndim > 3
++    if state_ndim == 3:
+         state = state.unsqueeze(1)
+-    if x.dim() == 2:
++    x_ndim = x.dim()
++    if x_ndim == 2:
+         x = x.unsqueeze(1)
+-    if dt.dim() == 2:
++    dt_ndim = dt.dim()
++    if dt_ndim == 2:
+         dt = dt.unsqueeze(1)
+-    if A.dim() == 2:
++    A_ndim = A.dim()
++    if A_ndim == 2:
+         A = A.unsqueeze(0)
+-    if B.dim() == 2:
++    B_ndim = B.dim()
++    if B_ndim == 2:
+         B = B.unsqueeze(1)
+-    if C.dim() == 2:
++    C_ndim = C.dim()
++    if C_ndim == 2:
+         C = C.unsqueeze(1)
+-    if D is not None and D.dim() == 1:
+-        D = D.unsqueeze(0)
+-    if z is not None and z.dim() == 2:
+-        z = z.unsqueeze(1)
+-    if dt_bias is not None and dt_bias.dim() == 1:
+-        dt_bias = dt_bias.unsqueeze(0)
++    if D is not None:
++        D_ndim = D.dim()
++        if D_ndim == 1:
++            D = D.unsqueeze(0)
++    if z is not None:
++        z_ndim = z.dim()
++        if z_ndim == 2:
++            z = z.unsqueeze(1)
++    if dt_bias is not None:
++        dt_bias_ndim = dt_bias.dim()
++        if dt_bias_ndim == 1:
++            dt_bias = dt_bias.unsqueeze(0)
+ 
+     _, nheads, dim, dstate = state.shape
+     batch = x.shape[0]
+@@ -383,25 +396,36 @@ def selective_scan_fn(u,
+         output: (dim, total_length) for varlen or (batch, dim, seqlen) 
+                 supports inplace replacement
+     """
+-    if u.stride(-1) != 1:
++    # Batch contiguity checks and dimension checks
++    u_not_contig = u.stride(-1) != 1
++    if u_not_contig:
+         u = u.contiguous()
+-    if delta.stride(-1) != 1:
++    delta_not_contig = delta.stride(-1) != 1
++    if delta_not_contig:
+         delta = delta.contiguous()
+     if D is not None:
+         D = D.contiguous()
+-    if B.stride(-1) != 1:
++    B_not_contig = B.stride(-1) != 1
++    if B_not_contig:
+         B = B.contiguous()
+-    if C.stride(-1) != 1:
++    C_not_contig = C.stride(-1) != 1
++    if C_not_contig:
+         C = C.contiguous()
+-    if z is not None and z.stride(-1) != 1:
+-        z = z.contiguous()
+-    if B.dim() == 3 and query_start_loc is None:
++    if z is not None:
++        z_not_contig = z.stride(-1) != 1
++        if z_not_contig:
++            z = z.contiguous()
++    
++    # Cache dimension checks
++    B_ndim = B.dim()
++    C_ndim = C.dim()
++    if B_ndim == 3 and query_start_loc is None:
+         B = B.unsqueeze(1)
+-    if B.dim() == 2 and query_start_loc is not None:
++    if B_ndim == 2 and query_start_loc is not None:
+         B = B.unsqueeze(0)
+-    if C.dim() == 3 and query_start_loc is None:
++    if C_ndim == 3 and query_start_loc is None:
+         C = C.unsqueeze(1)
+-    if C.dim() == 2 and query_start_loc is not None:
++    if C_ndim == 2 and query_start_loc is not None:
+         C = C.unsqueeze(0)
+ 
+     ops.selective_scan_fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus,
+diff --git a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
+index 61eff0c..669af72 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
++++ b/vllm/model_executor/layers/mamba/ops/ssd_chunk_scan.py
+@@ -507,6 +507,17 @@ def _chunk_scan_fwd(
+         if chunk_offsets is None else len(chunk_offsets), nheads)
+     z_strides = ((z.stride(0), z.stride(1), z.stride(2),
+                   z.stride(3)) if z is not None else (0, 0, 0, 0))
++    
++    # Cache stride calls for better performance
++    cb_strides = (cb.stride(0), cb.stride(1), cb.stride(2), cb.stride(3), cb.stride(4))
++    x_strides = (x.stride(0), x.stride(1), x.stride(2), x.stride(3))
++    out_strides = (out.stride(0), out.stride(1), out.stride(2), out.stride(3))
++    dt_strides = (dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3))
++    dA_cumsum_strides = (dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3))
++    seq_idx_strides = ((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0))
++    C_strides = (C.stride(0), C.stride(1), C.stride(2), C.stride(3))
++    states_strides = (states.stride(0), states.stride(1), states.stride(2), states.stride(3), states.stride(4))
++    
+     _chunk_scan_fwd_kernel[grid](
+         cb,
+         x,
+@@ -529,42 +540,42 @@ def _chunk_scan_fwd(
+         batch,
+         seqlen,
+         nheads // ngroups,
+-        cb.stride(0),
+-        cb.stride(1),
+-        cb.stride(2),
+-        cb.stride(3),
+-        cb.stride(4),
+-        x.stride(0),
+-        x.stride(1),
+-        x.stride(2),
+-        x.stride(3),
++        cb_strides[0],
++        cb_strides[1],
++        cb_strides[2],
++        cb_strides[3],
++        cb_strides[4],
++        x_strides[0],
++        x_strides[1],
++        x_strides[2],
++        x_strides[3],
+         z_strides[0],
+         z_strides[1],
+         z_strides[2],
+         z_strides[3],
+-        out.stride(0),
+-        out.stride(1),
+-        out.stride(2),
+-        out.stride(3),
+-        dt.stride(0),
+-        dt.stride(2),
+-        dt.stride(1),
+-        dt.stride(3),
+-        dA_cumsum.stride(0),
+-        dA_cumsum.stride(2),
+-        dA_cumsum.stride(1),
+-        dA_cumsum.stride(3),
+-        *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else
+-          (0, 0)),
+-        C.stride(0),
+-        C.stride(1),
+-        C.stride(2),
+-        C.stride(3),
+-        states.stride(0),
+-        states.stride(1),
+-        states.stride(2),
+-        states.stride(3),
+-        states.stride(4),
++        out_strides[0],
++        out_strides[1],
++        out_strides[2],
++        out_strides[3],
++        dt_strides[0],
++        dt_strides[1],
++        dt_strides[2],
++        dt_strides[3],
++        dA_cumsum_strides[0],
++        dA_cumsum_strides[1],
++        dA_cumsum_strides[2],
++        dA_cumsum_strides[3],
++        seq_idx_strides[0],
++        seq_idx_strides[1],
++        C_strides[0],
++        C_strides[1],
++        C_strides[2],
++        C_strides[3],
++        states_strides[0],
++        states_strides[1],
++        states_strides[2],
++        states_strides[3],
++        states_strides[4],
+         *((initial_states.stride(0), initial_states.stride(1),
+            initial_states.stride(2),
+            initial_states.stride(3)) if initial_states is not None else
+diff --git a/vllm/model_executor/layers/mamba/ops/ssd_combined.py b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+index b121275..5db38d4 100644
+--- a/vllm/model_executor/layers/mamba/ops/ssd_combined.py
++++ b/vllm/model_executor/layers/mamba/ops/ssd_combined.py
+@@ -50,18 +50,26 @@ def _mamba_chunk_scan_combined_fwd(x,
+         assert D.shape == (nheads, headdim) or D.shape == (nheads, )
+     if seq_idx is not None:
+         assert seq_idx.shape == (batch, seqlen)
+-    if B.stride(-1) != 1:
++    # Batch contiguity checks for better performance
++    B_not_contig = B.stride(-1) != 1
++    if B_not_contig:
+         B = B.contiguous()
+-    if C.stride(-1) != 1:
++    C_not_contig = C.stride(-1) != 1
++    if C_not_contig:
+         C = C.contiguous()
+-    if x.stride(-1) != 1 and x.stride(
+-            1) != 1:  # Either M or K dimension should be contiguous
++    x_stride_last = x.stride(-1)
++    x_stride_1 = x.stride(1)
++    if x_stride_last != 1 and x_stride_1 != 1:  # Either M or K dimension should be contiguous
+         x = x.contiguous()
+-    if z is not None and z.stride(-1) != 1 and z.stride(
+-            1) != 1:  # Either M or K dimension should be contiguous
+-        z = z.contiguous()
+-    if D is not None and D.stride(-1) != 1:
+-        D = D.contiguous()
++    if z is not None:
++        z_stride_last = z.stride(-1)
++        z_stride_1 = z.stride(1)
++        if z_stride_last != 1 and z_stride_1 != 1:  # Either M or K dimension should be contiguous
++            z = z.contiguous()
++    if D is not None:
++        D_not_contig = D.stride(-1) != 1
++        if D_not_contig:
++            D = D.contiguous()
+     if initial_states is not None:
+         if cu_seqlens is None:
+             assert initial_states.shape == (batch, nheads, headdim, dstate)
+diff --git a/vllm/model_executor/models/phi4flash.py b/vllm/model_executor/models/phi4flash.py
+index a4ded2b..1b69151 100644
+--- a/vllm/model_executor/models/phi4flash.py
++++ b/vllm/model_executor/models/phi4flash.py
+@@ -354,7 +354,9 @@ class Phi4Mamba(nn.Module):
+ 
+         # 3. State Space Model sequence transformation
+         # 3.a. input varying initialization of time_step, B and C
+-        ssm_parameters = self.x_proj(hidden_states.transpose(-2, -1))[0]
++        # Cache transpose to avoid redundant computation
++        hidden_states_transposed = hidden_states.transpose(-2, -1)
++        ssm_parameters = self.x_proj(hidden_states_transposed)[0]
+ 
+         time_step, B, C = torch.split(
+             ssm_parameters,
+@@ -371,13 +373,16 @@ class Phi4Mamba(nn.Module):
+ 
+         if attn_metadata.query_start_loc is not None \
+             and attn_metadata.context_lens_tensor is not None:
++            # Cache B and C transposes
++            B_transposed = B.transpose(-2, -1)
++            C_transposed = C.transpose(-2, -1)
+             scan_outputs = selective_scan_fn(
+                 hidden_states,
+                 mamba_cache_params.ssm_state,
+                 discrete_time_step,
+                 self.A,
+-                B.transpose(-2, -1),
+-                C.transpose(-2, -1),
++                B_transposed,
++                C_transposed,
+                 self.D.float(),
+                 # z,
+                 None if self.yoco_kv else gate,
+@@ -404,13 +409,15 @@ class Phi4Mamba(nn.Module):
+             scan_outputs = scan_outputs.transpose(0, 1)
+ 
+         # 4. Final linear projection
++        # Cache transpose to avoid redundant computation
++        scan_outputs_transposed = scan_outputs.transpose(-2, -1)
+         if self.yoco_kv:
+             # gate = gate.transpose(-1,-2).contiguous()
+-            yoco_key_values = scan_outputs.transpose(-2, -1)
++            yoco_key_values = scan_outputs_transposed
+             scan_outputs = self.swiGluActivation(scan_outputs, gate)
++            scan_outputs_transposed = scan_outputs.transpose(-2, -1)
+ 
+-        contextualized_states = self.out_proj(scan_outputs.transpose(-2,
+-                                                                     -1))[0]
++        contextualized_states = self.out_proj(scan_outputs_transposed)[0]
+ 
+         return contextualized_states, yoco_key_values
+ 
