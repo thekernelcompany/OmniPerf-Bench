@@ -19,7 +19,13 @@ LOGS_DIRS = [
 ]
 
 REPO = "Inferencebench/iso-bench-openhands-sonnet45-hard-metrics"
-TOKEN = "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"  # ssh-rebuttals — has write access to Inferencebench
+# Token must come from env (HF_TOKEN) or ~/.cache/huggingface/token; never hardcoded.
+TOKEN = os.environ.get("HF_TOKEN") or (
+    Path.home() / ".cache/huggingface/token"
+).read_text().strip() if (Path.home() / ".cache/huggingface/token").exists() else ""
+if not TOKEN:
+    print("ERROR: set HF_TOKEN env var or `huggingface-cli login` first")
+    sys.exit(1)
 
 # 1. Build summary
 summary = {
