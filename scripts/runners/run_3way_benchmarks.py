@@ -570,7 +570,7 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
                 'error': f'No {benchmark_mode} metrics in output',
                 'duration_s': duration,
                 'benchmark_mode': benchmark_mode,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         return {
@@ -578,7 +578,7 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
             'metrics': metrics,
             'duration_s': duration,
             'benchmark_mode': benchmark_mode,
-            'raw_output': output[-10000:]
+            'raw_output': output[-50000:]
         }
 
     except subprocess.TimeoutExpired:
@@ -1207,6 +1207,54 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
     fi
 
     # Start server using the Python that has vLLM
+    # Fix missing torchvision-bundled libcudart. Some baseline images carry
+    # 0-byte placeholders for libcudart.<hash>.so.12 in torchvision.libs/, OR
+    # udocker tar silently drops them. Without a working libcudart, vLLM's
+    # CudaRTLibrary() crashes the engine spawn process.
+    #
+    # Probe explicit paths (avoid `find /` which is glacial under PRoot).
+    REAL_CUDART=""
+    for cand in /usr/local/cuda-12.6/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.6/targets/x86_64-linux/lib/libcudart.so.12 \
+                /usr/local/cuda-12/lib64/libcudart.so.12 \
+                /usr/local/cuda/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.4/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcudart.so.12 \
+                /usr/local/cuda-12.1/lib64/libcudart.so.12 \
+                /usr/lib/x86_64-linux-gnu/libcudart.so.12; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then
+            REAL_CUDART="$cand"
+            echo "REAL_CUDART found: $cand ($(stat -c %s "$cand") bytes)"
+            break
+        fi
+    done
+    if [ -n "$REAL_CUDART" ]; then
+        # Probe known torchvision.libs locations (avoid find /).
+        for libroot in /usr/local/lib /usr/lib /opt/venv/lib /opt/conda/lib; do
+            for pyver in python3.10 python3.11 python3.12 python3.13; do
+                for sitedir in dist-packages site-packages; do
+                    tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
+                    [ -d "$tvdir" ] || continue
+                    for missing in "$tvdir"/libcudart.*.so.12; do
+                        [ -e "$missing" ] && [ -s "$missing" ] && continue
+                        cp "$REAL_CUDART" "$missing" 2>/dev/null && \
+                            echo "Patched libcudart: $missing <- $REAL_CUDART"
+                    done
+                done
+            done
+        done
+    else
+        echo "WARN: no working libcudart.so.12 found in container"
+    fi
+    # Add CUDA lib dirs to LD_LIBRARY_PATH so dlopen can find libcudart by name.
+    for cdir in /usr/local/cuda-12.6/lib64 \
+                /usr/local/cuda-12/lib64 \
+                /usr/local/cuda/lib64 \
+                /usr/local/cuda-12.6/targets/x86_64-linux/lib; do
+        [ -d "$cdir" ] && export LD_LIBRARY_PATH="$cdir:${{LD_LIBRARY_PATH:-}}"
+    done
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
     echo "=== Starting vLLM server for HUMAN benchmark ==="
     cd /tmp
     $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
@@ -1287,7 +1335,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                 'status': 'error',
                 'error': 'Server crashed during startup',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         if 'SERVER_TIMEOUT' in output:
@@ -1295,7 +1343,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                 'status': 'error',
                 'error': 'Server startup timeout',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         metrics = parse_serving_metrics(output)
@@ -1305,7 +1353,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                 'status': 'error',
                 'error': 'No metrics in output',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         return {
@@ -1531,7 +1579,7 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
                 'error': f'No {benchmark_type} metrics in agent output',
                 'duration_s': duration,
                 'benchmark_type': benchmark_type,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         return {
@@ -1770,7 +1818,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
                 'status': 'error',
                 'error': 'Server crashed after applying patch (wheel mode)',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         metrics = parse_metrics_by_type(output, benchmark_type)
@@ -1780,7 +1828,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
                 'status': 'error',
                 'error': f'No {benchmark_type} metrics in agent output (wheel mode)',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         return {
@@ -2038,6 +2086,54 @@ PATCH
 
     # No need to clone vLLM - we use /opt/vllm_baseline/benchmarks/ which has the full scripts
 
+    # Fix missing torchvision-bundled libcudart. Some baseline images carry
+    # 0-byte placeholders for libcudart.<hash>.so.12 in torchvision.libs/, OR
+    # udocker tar silently drops them. Without a working libcudart, vLLM's
+    # CudaRTLibrary() crashes the engine spawn process.
+    #
+    # Probe explicit paths (avoid `find /` which is glacial under PRoot).
+    REAL_CUDART=""
+    for cand in /usr/local/cuda-12.6/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.6/targets/x86_64-linux/lib/libcudart.so.12 \
+                /usr/local/cuda-12/lib64/libcudart.so.12 \
+                /usr/local/cuda/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.4/lib64/libcudart.so.12 \
+                /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcudart.so.12 \
+                /usr/local/cuda-12.1/lib64/libcudart.so.12 \
+                /usr/lib/x86_64-linux-gnu/libcudart.so.12; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then
+            REAL_CUDART="$cand"
+            echo "REAL_CUDART found: $cand ($(stat -c %s "$cand") bytes)"
+            break
+        fi
+    done
+    if [ -n "$REAL_CUDART" ]; then
+        # Probe known torchvision.libs locations (avoid find /).
+        for libroot in /usr/local/lib /usr/lib /opt/venv/lib /opt/conda/lib; do
+            for pyver in python3.10 python3.11 python3.12 python3.13; do
+                for sitedir in dist-packages site-packages; do
+                    tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
+                    [ -d "$tvdir" ] || continue
+                    for missing in "$tvdir"/libcudart.*.so.12; do
+                        [ -e "$missing" ] && [ -s "$missing" ] && continue
+                        cp "$REAL_CUDART" "$missing" 2>/dev/null && \
+                            echo "Patched libcudart: $missing <- $REAL_CUDART"
+                    done
+                done
+            done
+        done
+    else
+        echo "WARN: no working libcudart.so.12 found in container"
+    fi
+    # Add CUDA lib dirs to LD_LIBRARY_PATH so dlopen can find libcudart by name.
+    for cdir in /usr/local/cuda-12.6/lib64 \
+                /usr/local/cuda-12/lib64 \
+                /usr/local/cuda/lib64 \
+                /usr/local/cuda-12.6/targets/x86_64-linux/lib; do
+        [ -d "$cdir" ] && export LD_LIBRARY_PATH="$cdir:${{LD_LIBRARY_PATH:-}}"
+    done
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
     # Start server using the Python that has vLLM (with PYTHONPATH for baseline)
     echo "=== Starting vLLM server for AGENT benchmark ==="
     cd /tmp
@@ -2121,7 +2217,7 @@ PATCH
                 'status': 'error',
                 'error': 'Server crashed after applying patch',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         if 'SERVER_TIMEOUT' in output:
@@ -2129,7 +2225,7 @@ PATCH
                 'status': 'error',
                 'error': 'Server startup timeout after patch',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         metrics = parse_serving_metrics(output)
@@ -2139,7 +2235,7 @@ PATCH
                 'status': 'error',
                 'error': 'No metrics in agent output',
                 'duration_s': duration,
-                'raw_output': output[-10000:]
+                'raw_output': output[-50000:]
             }
 
         return {

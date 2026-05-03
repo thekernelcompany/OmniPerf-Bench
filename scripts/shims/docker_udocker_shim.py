@@ -174,6 +174,17 @@ def run_subcommand(argv):
         if v.endswith(":ro") or v.endswith(":rw"):
             v = v[:-3]
         run_argv += ["-v", v]
+    # Auto-mount host CUDA dirs when --gpus is requested. Some baseline images
+    # ship 0-byte placeholders for torchvision-bundled libcudart that need to
+    # be patched at docker_cmd time; doing so requires a real libcudart inside
+    # the container. Mounting host's /usr/local/cuda-* gives docker_cmd a
+    # source it can copy from.
+    if parsed["gpus"]:
+        import glob as _glob
+        for cudadir in _glob.glob("/usr/local/cuda-*"):
+            run_argv += ["-v", f"{cudadir}:{cudadir}"]
+        if os.path.isdir("/usr/local/cuda"):
+            run_argv += ["-v", "/usr/local/cuda:/usr/local/cuda"]
     for e in parsed["env"]:
         run_argv += ["-e", e]
     # Auto-propagate CUDA_VISIBLE_DEVICES from host env if not already specified.
