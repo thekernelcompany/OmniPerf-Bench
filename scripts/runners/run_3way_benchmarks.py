@@ -22,6 +22,49 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent  # scripts/runners/ -> 
 
 HUMAN_IMAGE_PREFIX = "anonymous/vllm-bench"
 BASELINE_IMAGE_PREFIX = "anonymous/vllm-baseline"
+
+# Multi-repo fallback for private benchmark images. Each entry is
+# (repo, tag-template); first that pulls successfully wins.
+HUMAN_IMAGE_CANDIDATES = [
+    ("shikhar481/vllm_fixed_human_images", "human-{full}"),
+    ("ayushnangia16/nvidia-vllm-docker", "{full}"),
+]
+BASELINE_IMAGE_CANDIDATES = [
+    ("shikhar481/vllm_fixed_human_images", "baseline-{short12}"),
+    ("shikhar481/vllm-baseline-images", "baseline-{short12}"),
+    ("ayushnangia16/nvidia-vllm-docker", "baseline-{short12}"),
+]
+_resolved_image_cache = {}
+
+
+def _try_pull(image: str) -> bool:
+    """Pull `image`. Idempotent: udocker no-op when complete locally."""
+    r = subprocess.run(["docker", "pull", image], capture_output=True, text=True, timeout=1800)
+    if r.returncode == 0:
+        return True
+    print(f"    pull miss: {image} -> rc={r.returncode}, tail: {(r.stderr or r.stdout)[-200:].strip()}")
+    return False
+
+
+def resolve_image(kind: str, full_hash: str) -> str:
+    """Resolve human/baseline image across multiple Docker Hub repos."""
+    key = (kind, full_hash)
+    if key in _resolved_image_cache:
+        return _resolved_image_cache[key]
+    candidates = HUMAN_IMAGE_CANDIDATES if kind == "human" else BASELINE_IMAGE_CANDIDATES
+    short12 = full_hash[:12]
+    for repo, tagtmpl in candidates:
+        tag = tagtmpl.format(full=full_hash, short12=short12)
+        image = f"{repo}:{tag}"
+        if _try_pull(image):
+            _resolved_image_cache[key] = image
+            print(f"    resolved {kind} {full_hash[:8]} -> {image}")
+            return image
+    raise RuntimeError(
+        f"No image found for {kind}/{full_hash[:12]} across "
+        f"{[c[0] for c in candidates]}"
+    )
+
 PERF_DATA_FILE = ROOT_DIR / "archive/results/2026-01/iso_bench_results_3way_claude_code/exports/full_results.jsonl"
 
 # Agent configurations - paths to agent patch directories
@@ -34,6 +77,8 @@ AGENT_CONFIGS = {
     # TRAE specific run paths:
     "trae_gpt5_0123": "ISO-Bench/state/runs/vllm/trae/gpt-5/2026-01-23_21-19-19",
     "trae_sonnet45_0123": "ISO-Bench/state/runs/vllm/trae/us-anthropic-claude-sonnet-4-5-20250929-v1-0/2026-01-23_16-40-44",
+    "openhands_sonnet45": "ISO-Bench/state/runs/vllm/openhands_sonnet45/flat",
+    "openhands_sonnet45_sglang": "ISO-Bench/state/runs/sglang/openhands_sonnet45/flat",
 }
 
 # Output directories per agent type (archived results)
@@ -46,6 +91,8 @@ AGENT_OUTPUT_DIRS = {
     # TRAE specific run output dirs:
     "trae_gpt5_0123": ROOT_DIR / "archive/results/2026-01/iso_bench_results_3way_trae_gpt5_0123",
     "trae_sonnet45_0123": ROOT_DIR / "archive/results/2026-01/iso_bench_results_3way_trae_sonnet45_0123",
+    "openhands_sonnet45": ROOT_DIR / "archive/results/2026-05/iso_bench_results_3way_openhands_sonnet45",
+    "openhands_sonnet45_sglang": ROOT_DIR / "archive/results/2026-05/iso_bench_results_3way_openhands_sonnet45_sglang",
 }
 
 # Model overrides for compatibility issues (e.g., RoPE scaling)
@@ -385,11 +432,12 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     if model != original_model and original_model in perf_command:
         perf_command = perf_command.replace(original_model, model)
 
-    docker_image = f"{HUMAN_IMAGE_PREFIX}:{human_commit}"
+    docker_image = resolve_image("human", human_commit)
 
     # Build the benchmark command - run perf_command directly
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     MODEL="{model}"
     COMMIT="{human_commit}"
 
@@ -574,11 +622,12 @@ def run_baseline_benchmark_offline(commit_info: dict, hf_token: str, timeout: in
         }
 
     # Baseline image uses parent commit hash
-    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+    baseline_image = resolve_image("baseline", parent_commit)
 
     # Build the benchmark command - use /opt/vllm_baseline
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     MODEL="{model}"
     COMMIT="{parent_commit}"
 
@@ -727,7 +776,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
         # Start vLLM server in background (use baseline vLLM)
         PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \\
             --model "$MODEL" \\
-            --port 8000 \\
+            --port $VLLM_PORT \\
             --disable-log-requests \\
             > /tmp/server.log 2>&1 &
         SERVER_PID=$!
@@ -737,7 +786,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
         MAX_WAIT=300
         WAITED=0
         while [ $WAITED -lt $MAX_WAIT ]; do
-            if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+            if curl -s http://localhost:$VLLM_PORT/health > /dev/null 2>&1; then
                 echo "Server is ready after $WAITED seconds"
                 break
             fi
@@ -755,7 +804,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
         fi
 
         # Run benchmark using downloaded v0.6.0 script (supports synthetic data)
-        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_serving.py $ARGS --base-url http://localhost:8000"
+        PERF_CMD="$VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_serving.py $ARGS --base-url http://localhost:$VLLM_PORT"
         echo "Running serving benchmark: $PERF_CMD"
         eval $PERF_CMD 2>&1 | tee /tmp/benchmark_output.txt
 
@@ -946,10 +995,11 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     bench_args = re.sub(r'python\s+benchmarks/benchmark_serving\.py\s*', '', perf_command)
     bench_args = re.sub(r'--dtype\s+\S+', '', bench_args)
 
-    docker_image = f"{HUMAN_IMAGE_PREFIX}:{human_commit}"
+    docker_image = resolve_image("human", human_commit)
 
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     COMMIT="{human_commit}"
     MODEL="{model}"
 
@@ -1157,12 +1207,12 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
     echo "=== Starting vLLM server for HUMAN benchmark ==="
     cd /tmp
     $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
-        --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+        --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
     SERVER_PID=$!
 
     # Wait for server (use Python since curl may not be available)
     for i in $(seq 1 300); do
-        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
             echo "SERVER_READY_AFTER=${{i}}s"
             break
         fi
@@ -1173,7 +1223,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
         sleep 1
     done
 
-    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
         echo "SERVER_TIMEOUT"
         exit 1
     fi
@@ -1187,7 +1237,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
     $VLLM_PYTHON /opt/vllm_bench/benchmarks/benchmark_serving.py \
         --model $MODEL \
         --backend vllm \
-        --port 8000 \
+        --port $VLLM_PORT \
         --dataset-name sonnet \
         --dataset-path /opt/vllm_bench/benchmarks/sonnet.txt \
         --sonnet-input-len 256 \
@@ -1301,10 +1351,11 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
         }
 
     # Use baseline image (has vLLM at parent commit)
-    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+    baseline_image = resolve_image("baseline", parent_commit)
 
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     PARENT_COMMIT="{parent_commit}"
     MODEL="{model}"
 
@@ -1539,6 +1590,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
 
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     PARENT_COMMIT="{parent_commit}"
     HUMAN_COMMIT="{human_commit}"
     MODEL="{model}"
@@ -1628,12 +1680,12 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
         echo "=== Running SERVING benchmark ==="
         # Start vLLM server
         python3 -m vllm.entrypoints.openai.api_server \\
-            --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+            --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
         SERVER_PID=$!
 
         # Wait for server
         for i in $(seq 1 300); do
-            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
                 echo "SERVER_READY_AFTER=${{i}}s"
                 break
             fi
@@ -1648,7 +1700,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
         python3 /tmp/benchmarks/benchmark_serving.py \\
             --model $MODEL \\
             --backend vllm \\
-            --port 8000 \\
+            --port $VLLM_PORT \\
             --dataset-name random \\
             --random-input-len 256 \\
             --random-output-len 64 \\
@@ -1776,7 +1828,7 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
         }
 
     # Check if baseline Docker image exists
-    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+    baseline_image = resolve_image("baseline", parent_commit)
     if not check_docker_image_exists(baseline_image):
         print(f"  Baseline image {baseline_image} not found, trying wheel-based fallback...")
         return run_agent_benchmark_from_wheel(commit_info, agent_patch, hf_token, timeout, benchmark_type)
@@ -1812,10 +1864,11 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
     bench_args = re.sub(r'\s+', ' ', bench_args).strip()
 
     # Use baseline image (has vLLM at parent commit)
-    baseline_image = f"{BASELINE_IMAGE_PREFIX}:baseline-{parent_commit[:12]}"
+    baseline_image = resolve_image("baseline", parent_commit)
 
     docker_cmd = f'''
     set -e
+    VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
     PARENT_COMMIT="{parent_commit}"
     MODEL="{model}"
 
@@ -1981,12 +2034,12 @@ PATCH
     echo "=== Starting vLLM server for AGENT benchmark ==="
     cd /tmp
     PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
-        --model $MODEL --port 8000 --max-model-len 4096 --disable-log-requests 2>&1 &
+        --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
     SERVER_PID=$!
 
     # Wait for server
     for i in $(seq 1 300); do
-        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
             echo "SERVER_READY_AFTER=${{i}}s"
             break
         fi
@@ -1997,7 +2050,7 @@ PATCH
         sleep 1
     done
 
-    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models', timeout=2)" 2>/dev/null; then
+    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
         echo "SERVER_TIMEOUT"
         exit 1
     fi
@@ -2012,7 +2065,7 @@ PATCH
     PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py \
         --model $MODEL \
         --backend vllm \
-        --port 8000 \
+        --port $VLLM_PORT \
         --dataset-name random \
         --random-input-len 256 \
         --random-output-len 64 \
@@ -2199,9 +2252,12 @@ def main():
             has_patch = commit in agent_patches
             print(f"\n{commit}:")
             print(f"  Model: {info.get('model', 'N/A')}")
-            print(f"  Human image: {HUMAN_IMAGE_PREFIX}:{info.get('human_commit_full', 'N/A')}")
-            parent = info.get('parent_commit') or 'N/A'
-            print(f"  Baseline image: {BASELINE_IMAGE_PREFIX}:baseline-{parent[:12]}")
+            human_full = info.get("human_commit_full", "")
+            human_cands = [f"{r}:{t.format(full=human_full, short12=human_full[:12])}" for r, t in HUMAN_IMAGE_CANDIDATES]
+            print(f"  Human image candidates: {human_cands}")
+            parent = info.get("parent_commit") or "N/A"
+            baseline_cands = [f"{r}:{t.format(full=parent, short12=parent[:12])}" for r, t in BASELINE_IMAGE_CANDIDATES]
+            print(f"  Baseline image candidates: {baseline_cands}")
             print(f"  Agent patch: {'YES' if has_patch else 'NO'}")
         return
 
