@@ -438,6 +438,7 @@ def run_human_benchmark_offline(commit_info: dict, hf_token: str, timeout: int =
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     MODEL="{model}"
     COMMIT="{human_commit}"
 
@@ -628,6 +629,7 @@ def run_baseline_benchmark_offline(commit_info: dict, hf_token: str, timeout: in
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     MODEL="{model}"
     COMMIT="{parent_commit}"
 
@@ -1000,6 +1002,7 @@ def run_human_benchmark(commit_info: dict, hf_token: str, timeout: int = 900) ->
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     COMMIT="{human_commit}"
     MODEL="{model}"
 
@@ -1212,7 +1215,7 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
 
     # Wait for server (use Python since curl may not be available)
     for i in $(seq 1 300); do
-        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
+        if $VLLM_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $VLLM_PORT)); s.close()" 2>>/tmp/healthcheck.err; then
             echo "SERVER_READY_AFTER=${{i}}s"
             break
         fi
@@ -1223,8 +1226,10 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
         sleep 1
     done
 
-    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
+    if ! $VLLM_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $VLLM_PORT)); s.close()" 2>>/tmp/healthcheck.err; then
         echo "SERVER_TIMEOUT"
+        echo "--- healthcheck.err tail ---"
+        tail -30 /tmp/healthcheck.err 2>/dev/null || true
         exit 1
     fi
 
@@ -1356,6 +1361,7 @@ def run_agent_benchmark_offline(commit_info: dict, agent_patch: Path, hf_token: 
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     PARENT_COMMIT="{parent_commit}"
     MODEL="{model}"
 
@@ -1591,6 +1597,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     PARENT_COMMIT="{parent_commit}"
     HUMAN_COMMIT="{human_commit}"
     MODEL="{model}"
@@ -1685,7 +1692,7 @@ def run_agent_benchmark_from_wheel(commit_info: dict, agent_patch: Path, hf_toke
 
         # Wait for server
         for i in $(seq 1 300); do
-            if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
+            if python3 -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $VLLM_PORT)); s.close()" 2>>/tmp/healthcheck.err; then
                 echo "SERVER_READY_AFTER=${{i}}s"
                 break
             fi
@@ -1869,6 +1876,7 @@ def run_agent_benchmark(commit_info: dict, agent_patch: Path, hf_token: str, tim
     docker_cmd = f'''
     set -e
     VLLM_PORT=$((8000 + ${{CUDA_VISIBLE_DEVICES:-0}}))
+    grep -q '^127.0.0.1.*localhost' /etc/hosts 2>/dev/null || echo '127.0.0.1 localhost' >> /etc/hosts
     PARENT_COMMIT="{parent_commit}"
     MODEL="{model}"
 
@@ -2039,7 +2047,7 @@ PATCH
 
     # Wait for server
     for i in $(seq 1 300); do
-        if $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
+        if $VLLM_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $VLLM_PORT)); s.close()" 2>>/tmp/healthcheck.err; then
             echo "SERVER_READY_AFTER=${{i}}s"
             break
         fi
@@ -2050,8 +2058,10 @@ PATCH
         sleep 1
     done
 
-    if ! $VLLM_PYTHON -c "import urllib.request; urllib.request.urlopen('http://localhost:$VLLM_PORT/v1/models', timeout=2)" 2>/dev/null; then
+    if ! $VLLM_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $VLLM_PORT)); s.close()" 2>>/tmp/healthcheck.err; then
         echo "SERVER_TIMEOUT"
+        echo "--- healthcheck.err tail ---"
+        tail -30 /tmp/healthcheck.err 2>/dev/null || true
         exit 1
     fi
 
