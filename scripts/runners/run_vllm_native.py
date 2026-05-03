@@ -93,17 +93,17 @@ def kill_port(port: int, log) -> None:
 SOURCE_ROOT = Path("/tmp/vllm_src")
 
 
-def setup_venv_from_source(commit_short: str, parent_full: str, log) -> Path:
-    """Source-build fallback for commits with no wheel at wheels.vllm.ai.
+def setup_venv_overlay(commit_short: str, parent_full: str, log,
+                       pypi_version: str = "",
+                       outlines_pin: str = "==0.0.46") -> Path:
+    """PyPI-vllm fallback for commits with no wheel at wheels.vllm.ai.
 
-    1. clone vllm-project/vllm to /tmp/vllm_src/<commit_short>
-    2. git checkout <parent_full>
-    3. install build deps (torch, cmake, ninja) into the venv
-    4. uv pip install -e . — this compiles CUDA kernels (~15-20 min)
+    Strategy: install vllm==<pypi_version> directly from PyPI. The PyPI
+    release is tagged at (or very near) the parent commit, so the installed
+    site-packages/vllm/ matches the baseline that the agent patch was
+    generated against. Apply the agent patch on top.
 
-    Uses Python 3.11 because old vllm-flash-attn (2.5.x) only ships wheels
-    for cp38/cp39/cp310/cp311 and uv refuses to resolve without a matching
-    cp312 wheel.
+    Uses Python 3.11 because old vllm (0.3-0.5) only ships cp38-cp311 wheels.
     """
     venv = VENV_ROOT / commit_short
     if venv.exists():
@@ -114,43 +114,49 @@ def setup_venv_from_source(commit_short: str, parent_full: str, log) -> Path:
                    check=True, capture_output=True, text=True, timeout=120)
     py = venv / "bin/python"
 
-    src = SOURCE_ROOT / commit_short
-    if not src.exists():
-        SOURCE_ROOT.mkdir(parents=True, exist_ok=True)
-        log(f"  Cloning vllm-project/vllm to {src}")
-        subprocess.run(["git", "clone", "https://github.com/vllm-project/vllm.git", str(src)],
-                       check=True, capture_output=True, text=True, timeout=300)
-    log(f"  Checking out {parent_full[:12]}")
-    subprocess.run(["git", "-C", str(src), "fetch", "--depth=1", "origin", parent_full],
-                   capture_output=True, text=True, timeout=120)
-    subprocess.run(["git", "-C", str(src), "checkout", parent_full],
-                   check=True, capture_output=True, text=True, timeout=60)
+    if not pypi_version:
+        raise RuntimeError(f"no PyPI vllm version mapped for {commit_short} (parent {parent_full[:12]})")
 
+    log(f"  Installing vllm=={pypi_version} from PyPI")
     env = os.environ.copy()
     env["UV_SKIP_WHEEL_FILENAME_CHECK"] = "1"
-    log(f"  Installing torch + build deps")
-    subprocess.run(
-        [str(UV_BIN), "pip", "install", "--python", str(py),
-         "torch>=2.1,<2.6", "cmake", "ninja", "packaging", "setuptools-scm",
-         "numpy<2", "wheel",
-         "--extra-index-url", "https://download.pytorch.org/whl/cu121",
-         "--index-strategy", "unsafe-best-match"],
-        check=True, capture_output=True, text=True, timeout=600, env=env,
-    )
-    log(f"  Building vllm from source (15-20 min)")
-    # MAX_JOBS keeps parallel compiles from saturating
-    env["MAX_JOBS"] = "8"
-    env["VLLM_TARGET_DEVICE"] = "cuda"
     r = subprocess.run(
-        [str(UV_BIN), "pip", "install", "--python", str(py), "-e", str(src),
-         "--no-build-isolation",
-         "--extra-index-url", "https://download.pytorch.org/whl/cu121",
+        [str(UV_BIN), "pip", "install", "--python", str(py),
+         f"vllm=={pypi_version}",
+         "setuptools",  # triton/build deps need it
          "--index-strategy", "unsafe-best-match"],
-        capture_output=True, text=True, timeout=2400, env=env,
+        capture_output=True, text=True, timeout=900, env=env,
     )
     if r.returncode != 0:
-        raise RuntimeError(f"source build failed: {(r.stderr or r.stdout)[-600:]}")
-    log(f"  Source build done")
+        raise RuntimeError(f"vllm=={pypi_version} install failed: {(r.stderr or r.stdout)[-500:]}")
+
+    # Pin transformers + outlines to versions that match this older vllm slice.
+    # PyPI vllm 0.5.x pulled torch 2.3.0; transformers 4.45+ wants torch>=2.4
+    # so use 4.42-4.44. Outlines 1.0+ removed `outlines.fsm` which old vllm
+    # imports — pin to <1.0. Also pin pydantic and lm-format-enforcer for
+    # compatibility with the baseline's call sites.
+    log(f"  Pinning baseline-compatible deps (transformers, outlines{outlines_pin}, lmformatenforcer)")
+    subprocess.run(
+        [str(UV_BIN), "pip", "install", "--python", str(py),
+         "transformers>=4.42,<4.45",
+         f"outlines{outlines_pin}",
+         "lm-format-enforcer==0.10.1",
+         "aiohttp", "pandas", "pillow"],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    # outlines 0.0.46 imports `from pyairports.airports import AIRPORT_LIST`
+    # at startup but the pinned pyairports==0.0.1 wheel is empty (no module).
+    # Stub it out — we don't use airport types in benchmarks.
+    site_pkgs = next((venv / "lib").glob("python3.*/site-packages"))
+    pa = site_pkgs / "pyairports"
+    pa.mkdir(parents=True, exist_ok=True)
+    (pa / "__init__.py").write_text("")
+    (pa / "airports.py").write_text(
+        "AIRPORT_LIST = []\n"
+        "class Airport: pass\n"
+        "class AirportNotFoundException(Exception): pass\n"
+    )
+    log(f"  Overlay (PyPI install) done")
     return venv
 
 
@@ -404,6 +410,12 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
         bench_args = re.sub(r"--served-model-name\s+\S+", '', bench_args)
         bench_args = re.sub(r"--tensor-parallel-size\s+\d+", '', bench_args)
         bench_args = re.sub(r"-tp\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--max-num-batched-tokens\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--max-num-seqs\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--block-size\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--swap-space\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--use-v2-block-manager\b", '', bench_args)
+        bench_args = re.sub(r"--num-scheduler-steps\s+\d+", '', bench_args)
         bench_args = re.sub(r"\s+", ' ', bench_args).strip()
 
     # Cap --num-prompts to keep wall-clock manageable. Lossfunk specifies up to
@@ -514,19 +526,25 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
     proc = None
     try:
         if use_source:
-            venv = setup_venv_from_source(commit_short, parent_full, log)
+            pypi_v = info.get("vllm_pypi_version", "")
+            outl = info.get("outlines_pin", "==0.0.46")
+            venv = setup_venv_overlay(commit_short, parent_full, log,
+                                      pypi_version=pypi_v, outlines_pin=outl)
+            # The overlay path already installed pinned deps for the older
+            # vllm; do NOT re-install transformers/datasets here (would
+            # pull newer outlines that's incompatible with vllm 0.5.x).
         else:
             venv = setup_venv(commit_short, parent_full, log)
-        # Install bench deps (always needed; not pulled by vllm wheel)
-        env = os.environ.copy()
-        pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
-        log(f"  Installing benchmark deps + transformers{pin}")
-        subprocess.run(
-            [str(UV_BIN), "pip", "install", "--python", str(venv / "bin/python"),
-             "aiohttp", "pandas", "datasets", "pillow",
-             f"transformers{pin}"],
-            capture_output=True, text=True, timeout=300, env=env,
-        )
+            # Install bench deps (always needed; not pulled by vllm wheel)
+            env = os.environ.copy()
+            pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
+            log(f"  Installing benchmark deps + transformers{pin}")
+            subprocess.run(
+                [str(UV_BIN), "pip", "install", "--python", str(venv / "bin/python"),
+                 "aiohttp", "pandas", "datasets", "pillow",
+                 f"transformers{pin}"],
+                capture_output=True, text=True, timeout=300, env=env,
+            )
         apply_patch(venv, patch_path, log)
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
