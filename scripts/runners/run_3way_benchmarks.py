@@ -1236,8 +1236,10 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                     tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
                     [ -d "$tvdir" ] || continue
                     for missing in "$tvdir"/libcudart.*.so.12; do
-                        [ -e "$missing" ] && [ -s "$missing" ] && continue
-                        cp "$REAL_CUDART" "$missing" 2>/dev/null && \
+                        # ALWAYS overwrite — we can't trust udocker tar; the
+                        # file may be a stale/corrupted leftover that vllm's
+                        # dlopen still rejects. Idempotent if file is good.
+                        cp -f "$REAL_CUDART" "$missing" 2>/dev/null && \
                             echo "Patched libcudart: $missing <- $REAL_CUDART"
                     done
                 done
@@ -2115,8 +2117,10 @@ PATCH
                     tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
                     [ -d "$tvdir" ] || continue
                     for missing in "$tvdir"/libcudart.*.so.12; do
-                        [ -e "$missing" ] && [ -s "$missing" ] && continue
-                        cp "$REAL_CUDART" "$missing" 2>/dev/null && \
+                        # ALWAYS overwrite — we can't trust udocker tar; the
+                        # file may be a stale/corrupted leftover that vllm's
+                        # dlopen still rejects. Idempotent if file is good.
+                        cp -f "$REAL_CUDART" "$missing" 2>/dev/null && \
                             echo "Patched libcudart: $missing <- $REAL_CUDART"
                     done
                 done
@@ -2168,13 +2172,36 @@ PATCH
     cd /opt/vllm_baseline
 
     echo "Running benchmark_serving.py for serving metrics..."
+    # Detect whether this baseline's benchmark_serving.py supports random dataset.
+    # Older vLLMs only support sharegpt/sonnet — fall back if so.
+    if $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py --help 2>&1 | grep -q "'random'"; then
+        BENCH_DS_ARGS="--dataset-name random --random-input-len 256 --random-output-len 64"
+    else
+        echo "Old benchmark_serving.py — falling back to sharegpt dataset"
+        # Try to find or download a sharegpt dataset file
+        DSFILE=""
+        for f in /opt/vllm_baseline/benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json \
+                 /tmp/ShareGPT_V3_unfiltered_cleaned_split.json; do
+            [ -f "$f" ] && DSFILE="$f" && break
+        done
+        if [ -z "$DSFILE" ]; then
+            echo "Downloading ShareGPT dataset..."
+            curl -sSL -o /tmp/ShareGPT_V3_unfiltered_cleaned_split.json \
+                https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json 2>/dev/null
+            [ -s /tmp/ShareGPT_V3_unfiltered_cleaned_split.json ] && DSFILE=/tmp/ShareGPT_V3_unfiltered_cleaned_split.json
+        fi
+        if [ -n "$DSFILE" ]; then
+            BENCH_DS_ARGS="--dataset-name sharegpt --dataset-path $DSFILE"
+        else
+            echo "WARN: no ShareGPT dataset; trying without dataset-name (some old versions infer)"
+            BENCH_DS_ARGS=""
+        fi
+    fi
     PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON /opt/vllm_baseline/benchmarks/benchmark_serving.py \
         --model $MODEL \
         --backend vllm \
         --port $VLLM_PORT \
-        --dataset-name random \
-        --random-input-len 256 \
-        --random-output-len 64 \
+        $BENCH_DS_ARGS \
         --num-prompts 100 \
         --request-rate inf \
         2>&1 | tee /tmp/benchmark_output.txt
