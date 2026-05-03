@@ -1223,8 +1223,14 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                 /usr/local/cuda-12.1/lib64/libcudart.so.12 \
                 /usr/lib/x86_64-linux-gnu/libcudart.so.12; do
         if [ -f "$cand" ] && [ -s "$cand" ]; then
-            REAL_CUDART="$cand"
-            echo "REAL_CUDART found: $cand ($(stat -c %s "$cand") bytes)"
+            REAL_CUDART="$(readlink -f "$cand")"
+            REAL_SZ=$(stat -c %s "$REAL_CUDART" 2>/dev/null || echo 0)
+            if [ "$REAL_SZ" -lt 100000 ]; then
+                echo "skipping $cand: realpath=$REAL_CUDART size=$REAL_SZ too small"
+                REAL_CUDART=""
+                continue
+            fi
+            echo "REAL_CUDART found: $REAL_CUDART (size=$REAL_SZ)"
             break
         fi
     done
@@ -1236,11 +1242,9 @@ with open('/opt/vllm_bench/benchmarks/sonnet.txt', 'w') as f:
                     tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
                     [ -d "$tvdir" ] || continue
                     for missing in "$tvdir"/libcudart.*.so.12; do
-                        # ALWAYS overwrite — we can't trust udocker tar; the
-                        # file may be a stale/corrupted leftover that vllm's
-                        # dlopen still rejects. Idempotent if file is good.
-                        cp -f "$REAL_CUDART" "$missing" 2>/dev/null && \
-                            echo "Patched libcudart: $missing <- $REAL_CUDART"
+                        cp -fL "$REAL_CUDART" "$missing"
+                        WSZ=$(stat -c %s "$missing" 2>/dev/null || echo 0)
+                        echo "Patched libcudart: $missing ($WSZ bytes) <- $REAL_CUDART"
                     done
                 done
             done
@@ -2104,8 +2108,14 @@ PATCH
                 /usr/local/cuda-12.1/lib64/libcudart.so.12 \
                 /usr/lib/x86_64-linux-gnu/libcudart.so.12; do
         if [ -f "$cand" ] && [ -s "$cand" ]; then
-            REAL_CUDART="$cand"
-            echo "REAL_CUDART found: $cand ($(stat -c %s "$cand") bytes)"
+            REAL_CUDART="$(readlink -f "$cand")"
+            REAL_SZ=$(stat -c %s "$REAL_CUDART" 2>/dev/null || echo 0)
+            if [ "$REAL_SZ" -lt 100000 ]; then
+                echo "skipping $cand: realpath=$REAL_CUDART size=$REAL_SZ too small"
+                REAL_CUDART=""
+                continue
+            fi
+            echo "REAL_CUDART found: $REAL_CUDART (size=$REAL_SZ)"
             break
         fi
     done
@@ -2117,11 +2127,9 @@ PATCH
                     tvdir="$libroot/$pyver/$sitedir/torchvision.libs"
                     [ -d "$tvdir" ] || continue
                     for missing in "$tvdir"/libcudart.*.so.12; do
-                        # ALWAYS overwrite — we can't trust udocker tar; the
-                        # file may be a stale/corrupted leftover that vllm's
-                        # dlopen still rejects. Idempotent if file is good.
-                        cp -f "$REAL_CUDART" "$missing" 2>/dev/null && \
-                            echo "Patched libcudart: $missing <- $REAL_CUDART"
+                        cp -fL "$REAL_CUDART" "$missing"
+                        WSZ=$(stat -c %s "$missing" 2>/dev/null || echo 0)
+                        echo "Patched libcudart: $missing ($WSZ bytes) <- $REAL_CUDART"
                     done
                 done
             done
@@ -2137,6 +2145,24 @@ PATCH
         [ -d "$cdir" ] && export LD_LIBRARY_PATH="$cdir:${{LD_LIBRARY_PATH:-}}"
     done
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+    # Verify libcudart is actually visible from a separate process (not just bash).
+    # If our cp succeeded but vllm spawn child still can't see it, force-reinstall
+    # torchvision so its own extractor lays down the file via pip's own untarring.
+    BAD_TV=""
+    for tvlib in /usr/local/lib/python3.10/dist-packages/torchvision.libs/libcudart.*.so.12 \
+                 /usr/local/lib/python3.12/dist-packages/torchvision.libs/libcudart.*.so.12 \
+                 /opt/venv/lib/python3.12/site-packages/torchvision.libs/libcudart.*.so.12; do
+        [ -e "$tvlib" ] || continue
+        if ! $VLLM_PYTHON -c "import ctypes; ctypes.CDLL('$tvlib')" 2>/dev/null; then
+            BAD_TV="$tvlib"
+            break
+        fi
+    done
+    if [ -n "$BAD_TV" ]; then
+        echo "libcudart at $BAD_TV not loadable by Python — reinstalling torchvision"
+        $VLLM_PYTHON -m pip install --force-reinstall --no-deps torchvision -q 2>&1 | tail -3
+    fi
 
     # Start server using the Python that has vLLM (with PYTHONPATH for baseline)
     echo "=== Starting vLLM server for AGENT benchmark ==="
