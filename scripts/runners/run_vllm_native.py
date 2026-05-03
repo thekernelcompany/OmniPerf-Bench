@@ -201,7 +201,8 @@ def apply_patch(venv: Path, patch_path: Path, log) -> None:
     log(f"  patch result rc={r.returncode}: {r.stdout[-300:].strip()}")
 
 
-def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 4096) -> subprocess.Popen:
+def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 4096,
+                 extra_server_args: list = None) -> subprocess.Popen:
     py = venv / "bin/python"
     log(f"  Starting vllm.entrypoints.openai.api_server --model {model} --port {port} --max-model-len {max_model_len}")
     env = os.environ.copy()
@@ -224,8 +225,29 @@ def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 40
            "--disable-log-requests",
            "--enforce-eager",
            "--trust-remote-code"]
+    if extra_server_args:
+        cmd.extend(extra_server_args)
+        log(f"  Extra server args: {extra_server_args}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     return proc
+
+
+def extract_server_flags_from_perf(perf_command: str) -> list:
+    """When the perf_command implies server-side flags (e.g. --enable-prefix-caching,
+    --enable-chunked-prefill), pass those to start_server too. We strip them from
+    the bench client invocation already, but the SERVER needs them to actually
+    enable the feature being benchmarked.
+    """
+    args = []
+    if '--enable-prefix-caching' in perf_command:
+        args.append('--enable-prefix-caching')
+    if '--enable-chunked-prefill' in perf_command:
+        args.append('--enable-chunked-prefill')
+    m = re.search(r'--max-num-batched-tokens\s+(\d+)', perf_command)
+    if m: args += ['--max-num-batched-tokens', m.group(1)]
+    m = re.search(r'--quantization\s+(\S+)', perf_command)
+    if m: args += ['--quantization', m.group(1)]
+    return args
 
 
 def compute_max_model_len(perf_command: str) -> int:
@@ -558,7 +580,9 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
             mml = compute_max_model_len(perf)
-            proc = start_server(venv, model, port, log, max_model_len=mml)
+            extra = extract_server_flags_from_perf(perf)
+            proc = start_server(venv, model, port, log, max_model_len=mml,
+                                extra_server_args=extra)
             if not wait_for_server(port, proc, timeout=600, log=log):
                 stdout = ""
                 try:
