@@ -2146,29 +2146,57 @@ PATCH
     done
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
-    # Verify libcudart is actually visible from a separate process (not just bash).
-    # If our cp succeeded but vllm spawn child still can't see it, force-reinstall
-    # torchvision so its own extractor lays down the file via pip's own untarring.
-    BAD_TV=""
-    for tvlib in /usr/local/lib/python3.10/dist-packages/torchvision.libs/libcudart.*.so.12 \
-                 /usr/local/lib/python3.12/dist-packages/torchvision.libs/libcudart.*.so.12 \
-                 /opt/venv/lib/python3.12/site-packages/torchvision.libs/libcudart.*.so.12; do
-        [ -e "$tvlib" ] || continue
-        if ! $VLLM_PYTHON -c "import ctypes; ctypes.CDLL('$tvlib')" 2>/dev/null; then
-            BAD_TV="$tvlib"
-            break
+    # If the image's vLLM has cumem.py (0.6+) AND a wheel exists at wheels.vllm.ai
+    # for this exact parent commit, install the wheel fresh. This sidesteps the
+    # image's broken torchvision-bundled libcudart entirely — pip lays down
+    # clean torch + vllm + bundled libs from upstream.
+    WHEEL_INSTALLED=""
+    WHEEL_URL="https://wheels.vllm.ai/$PARENT_COMMIT/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
+    if [ -f /opt/vllm_baseline/vllm/device_allocator/cumem.py ] && \
+       curl -sfI "$WHEEL_URL" >/dev/null 2>&1; then
+        echo "=== Installing fresh vLLM wheel for parent $PARENT_COMMIT ==="
+        $VLLM_PYTHON -m pip uninstall -y vllm 2>&1 | tail -1
+        $VLLM_PYTHON -m pip install "$WHEEL_URL" \
+            --extra-index-url https://download.pytorch.org/whl/cu128 \
+            --upgrade 2>&1 | tail -8
+        # Hardcode-probe wheel-install path. Python `import vllm` may resolve to
+        # /opt/vllm_baseline even with PYTHONPATH unset (sticky via .pth or sys.path).
+        # pip install lays down the wheel at /usr/local/lib/pythonX.Y/dist-packages/vllm.
+        FRESH_VLLM=""
+        for cand in /usr/local/lib/python3.12/dist-packages/vllm \
+                    /usr/local/lib/python3.11/dist-packages/vllm \
+                    /usr/local/lib/python3.10/dist-packages/vllm \
+                    /opt/venv/lib/python3.12/site-packages/vllm \
+                    /opt/venv/lib/python3.10/site-packages/vllm; do
+            # Verify it's a fresh vllm (not /opt/vllm_baseline mirror) by checking
+            # for a recently-modified __init__.py and absence of patch markers.
+            if [ -f "$cand/__init__.py" ] && [ -f "$cand/_C.abi3.so" ]; then
+                FRESH_VLLM="$cand"; break
+            fi
+        done
+        echo "Fresh vLLM at: $FRESH_VLLM (was /opt/vllm_baseline/vllm)"
+        if [ -n "$FRESH_VLLM" ] && [ -d "$FRESH_VLLM" ] && [ "$FRESH_VLLM" != "/opt/vllm_baseline/vllm" ]; then
+            cd "$(dirname "$FRESH_VLLM")"
+            patch -p1 --force < /agent_patch.diff 2>&1 | tail -3
+            echo "AGENT_PATCH_REAPPLIED_TO_FRESH"
+            WHEEL_INSTALLED=1
         fi
-    done
-    if [ -n "$BAD_TV" ]; then
-        echo "libcudart at $BAD_TV not loadable by Python — reinstalling torchvision"
-        $VLLM_PYTHON -m pip install --force-reinstall --no-deps torchvision -q 2>&1 | tail -3
+        cd /tmp
     fi
 
-    # Start server using the Python that has vLLM (with PYTHONPATH for baseline)
+    # Start server. Use wheel-installed vLLM (no PYTHONPATH override) if pip install
+    # succeeded; otherwise use the image's /opt/vllm_baseline.
     echo "=== Starting vLLM server for AGENT benchmark ==="
     cd /tmp
-    PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
-        --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
+    if [ -n "$WHEEL_INSTALLED" ]; then
+        echo "Using wheel-installed vLLM (no PYTHONPATH override)"
+        unset PYTHONPATH
+        $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
+            --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
+    else
+        PYTHONPATH=/opt/vllm_baseline:$PYTHONPATH $VLLM_PYTHON -m vllm.entrypoints.openai.api_server \
+            --model $MODEL --port $VLLM_PORT --max-model-len 4096 --disable-log-requests 2>&1 &
+    fi
     SERVER_PID=$!
 
     # Wait for server

@@ -77,6 +77,7 @@ def parse_serving_metrics(output: str) -> dict:
     #   Output token throughput (tok/s):   3319.30
     #   Total token throughput (tok/s):    5210.50
     #   Request throughput (req/s):  53.80
+    # bench_serving format
     patterns = {
         'ttft_mean_ms':              r'Mean TTFT[^:]*:\s*([\d.]+)',
         'ttft_median_ms':            r'Median TTFT[^:]*:\s*([\d.]+)',
@@ -95,6 +96,25 @@ def parse_serving_metrics(output: str) -> dict:
         m = re.search(pat, output)
         if m:
             metrics[k] = float(m.group(1))
+    if metrics:
+        return metrics
+    # bench_one_batch format — pick the LAST occurrence of each (the post-warmup
+    # benchmark numbers, not the warmup pass).
+    one_batch_patterns = {
+        'prefill_latency_s':           r'Prefill\. latency:\s*([\d.]+)\s*s',
+        'prefill_throughput_tok_s':    r'Prefill\. .*?throughput:\s*([\d.]+)\s*token/s',
+        'decode_median_latency_s':     r'Decode\.\s+median latency:\s*([\d.]+)\s*s',
+        'decode_median_throughput_tok_s': r'Decode\.\s+median.*?throughput:\s*([\d.]+)\s*token/s',
+        'total_latency_s':             r'Total\. latency:\s*([\d.]+)\s*s',
+        'total_throughput_tok_s':      r'Total\. .*?throughput:\s*([\d.]+)\s*token/s',
+    }
+    for k, pat in one_batch_patterns.items():
+        all_m = re.findall(pat, output)
+        if all_m:
+            metrics[k] = float(all_m[-1])  # last (post-warmup) occurrence
+    # Map to canonical throughput field for aggregation
+    if 'total_throughput_tok_s' in metrics:
+        metrics['output_token_throughput_tok_s'] = metrics['total_throughput_tok_s']
     return metrics
 
 
