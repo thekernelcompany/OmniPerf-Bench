@@ -90,6 +90,70 @@ def kill_port(port: int, log) -> None:
         log(f"  kill_port({port}) error: {e}")
 
 
+SOURCE_ROOT = Path("/tmp/vllm_src")
+
+
+def setup_venv_from_source(commit_short: str, parent_full: str, log) -> Path:
+    """Source-build fallback for commits with no wheel at wheels.vllm.ai.
+
+    1. clone vllm-project/vllm to /tmp/vllm_src/<commit_short>
+    2. git checkout <parent_full>
+    3. install build deps (torch, cmake, ninja) into the venv
+    4. uv pip install -e . — this compiles CUDA kernels (~15-20 min)
+
+    Uses Python 3.11 because old vllm-flash-attn (2.5.x) only ships wheels
+    for cp38/cp39/cp310/cp311 and uv refuses to resolve without a matching
+    cp312 wheel.
+    """
+    venv = VENV_ROOT / commit_short
+    if venv.exists():
+        shutil.rmtree(venv, ignore_errors=True)
+    venv.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  Creating venv at {venv} (Python 3.11)")
+    subprocess.run([str(UV_BIN), "venv", "--python", "3.11", str(venv)],
+                   check=True, capture_output=True, text=True, timeout=120)
+    py = venv / "bin/python"
+
+    src = SOURCE_ROOT / commit_short
+    if not src.exists():
+        SOURCE_ROOT.mkdir(parents=True, exist_ok=True)
+        log(f"  Cloning vllm-project/vllm to {src}")
+        subprocess.run(["git", "clone", "https://github.com/vllm-project/vllm.git", str(src)],
+                       check=True, capture_output=True, text=True, timeout=300)
+    log(f"  Checking out {parent_full[:12]}")
+    subprocess.run(["git", "-C", str(src), "fetch", "--depth=1", "origin", parent_full],
+                   capture_output=True, text=True, timeout=120)
+    subprocess.run(["git", "-C", str(src), "checkout", parent_full],
+                   check=True, capture_output=True, text=True, timeout=60)
+
+    env = os.environ.copy()
+    env["UV_SKIP_WHEEL_FILENAME_CHECK"] = "1"
+    log(f"  Installing torch + build deps")
+    subprocess.run(
+        [str(UV_BIN), "pip", "install", "--python", str(py),
+         "torch>=2.1,<2.6", "cmake", "ninja", "packaging", "setuptools-scm",
+         "numpy<2", "wheel",
+         "--extra-index-url", "https://download.pytorch.org/whl/cu121",
+         "--index-strategy", "unsafe-best-match"],
+        check=True, capture_output=True, text=True, timeout=600, env=env,
+    )
+    log(f"  Building vllm from source (15-20 min)")
+    # MAX_JOBS keeps parallel compiles from saturating
+    env["MAX_JOBS"] = "8"
+    env["VLLM_TARGET_DEVICE"] = "cuda"
+    r = subprocess.run(
+        [str(UV_BIN), "pip", "install", "--python", str(py), "-e", str(src),
+         "--no-build-isolation",
+         "--extra-index-url", "https://download.pytorch.org/whl/cu121",
+         "--index-strategy", "unsafe-best-match"],
+        capture_output=True, text=True, timeout=2400, env=env,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"source build failed: {(r.stderr or r.stdout)[-600:]}")
+    log(f"  Source build done")
+    return venv
+
+
 def setup_venv(commit_short: str, parent_full: str, log) -> Path:
     """Create a uv venv and install vllm wheel + deps. Returns venv path."""
     venv = VENV_ROOT / commit_short
@@ -114,20 +178,6 @@ def setup_venv(commit_short: str, parent_full: str, log) -> Path:
     )
     if r.returncode != 0:
         raise RuntimeError(f"vllm install failed: {(r.stderr or r.stdout)[-400:]}")
-    # Transformers pin: most vLLM wheels need <4.47 (TokenizersBackend ABI
-    # break); newer wheels (Llama-4, Exaone4) need >=4.51 (layer_type_validation).
-    # Per-commit override comes from mapping's `transformers_pin` field; falls
-    # back to env TRANSFORMERS_PIN, then to default <4.47.
-    pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
-    # Caller can pre-set this via env before launching to override per-commit.
-    log(f"  Installing benchmark deps + transformers{pin}")
-    subprocess.run(
-        [str(UV_BIN), "pip", "install",
-         "--python", str(py),
-         "aiohttp", "pandas", "datasets", "pillow",
-         f"transformers{pin}"],
-        capture_output=True, text=True, timeout=300, env=env,
-    )
     return venv
 
 
@@ -452,9 +502,9 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         return {"status": "error", "error": f"patch not found at {patch_path}",
                 "duration_s": 0, "metrics": {}, "raw_output": ""}
 
-    if not wheel_exists(parent_full):
-        return {"status": "error", "error": f"no wheel at wheels.vllm.ai for {parent_full[:12]}",
-                "duration_s": 0, "metrics": {}, "raw_output": ""}
+    use_source = not wheel_exists(parent_full)
+    if use_source:
+        log(f"  No wheel for {parent_full[:12]} — will build from source")
 
     # Decide if benchmark needs a server (serving / prefix_caching) or is server-free (latency / throughput).
     needs_server = info.get("has_serving") or "benchmark_serving" in perf or "prefix_caching" in perf or "vllm bench serve" in perf
@@ -463,7 +513,20 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
     port = free_port()
     proc = None
     try:
-        venv = setup_venv(commit_short, parent_full, log)
+        if use_source:
+            venv = setup_venv_from_source(commit_short, parent_full, log)
+        else:
+            venv = setup_venv(commit_short, parent_full, log)
+        # Install bench deps (always needed; not pulled by vllm wheel)
+        env = os.environ.copy()
+        pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
+        log(f"  Installing benchmark deps + transformers{pin}")
+        subprocess.run(
+            [str(UV_BIN), "pip", "install", "--python", str(venv / "bin/python"),
+             "aiohttp", "pandas", "datasets", "pillow",
+             f"transformers{pin}"],
+            capture_output=True, text=True, timeout=300, env=env,
+        )
         apply_patch(venv, patch_path, log)
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
