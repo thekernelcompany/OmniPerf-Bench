@@ -116,8 +116,10 @@ def setup_venv(commit_short: str, parent_full: str, log) -> Path:
         raise RuntimeError(f"vllm install failed: {(r.stderr or r.stdout)[-400:]}")
     # Transformers pin: most vLLM wheels need <4.47 (TokenizersBackend ABI
     # break); newer wheels (Llama-4, Exaone4) need >=4.51 (layer_type_validation).
-    # Override per commit via env: TRANSFORMERS_PIN="<4.47" or ">=4.51,<4.55"
+    # Per-commit override comes from mapping's `transformers_pin` field; falls
+    # back to env TRANSFORMERS_PIN, then to default <4.47.
     pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
+    # Caller can pre-set this via env before launching to override per-commit.
     log(f"  Installing benchmark deps + transformers{pin}")
     subprocess.run(
         [str(UV_BIN), "pip", "install",
@@ -150,16 +152,22 @@ def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 40
     env["HUGGING_FACE_HUB_TOKEN"] = env["HF_TOKEN"]
     env["VLLM_USE_V1"] = "0"
     env["HF_HOME"] = str(HF_CACHE)
-    proc = subprocess.Popen(
-        [str(py), "-m", "vllm.entrypoints.openai.api_server",
-         "--model", model, "--port", str(port),
-         "--host", "127.0.0.1",
-         "--max-model-len", str(max_model_len),
-         "--disable-log-requests",
-         "--enforce-eager",
-         "--trust-remote-code"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
+    # Allow setting max-model-len > model's max_position_embeddings (e.g. opt-125m=2048).
+    # vLLM warns but proceeds; rope-scaling extends context beyond the trained window.
+    env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+    # If multiple GPUs are visible, run with --tensor-parallel-size=N so MoE
+    # / huge models can shard across them. Per-GPU runs default to tp=1.
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    num_gpus = max(1, len([x for x in cvd.split(",") if x.strip()]))
+    cmd = [str(py), "-m", "vllm.entrypoints.openai.api_server",
+           "--model", model, "--port", str(port),
+           "--host", "127.0.0.1",
+           "--max-model-len", str(max_model_len),
+           "--tensor-parallel-size", str(num_gpus),
+           "--disable-log-requests",
+           "--enforce-eager",
+           "--trust-remote-code"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     return proc
 
 
@@ -435,6 +443,10 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
     if model != info["model"]:
         log(f"  Model override: {info['model']} -> {model}")
     perf = info.get("perf_command") or ""
+    # Per-commit dep override applied via env so setup_venv picks it up
+    if info.get("transformers_pin"):
+        os.environ["TRANSFORMERS_PIN"] = info["transformers_pin"]
+        log(f"  Per-commit transformers pin: {info['transformers_pin']}")
     patch_path = Path(info.get("patch_path") or PATCHES_DIR / find_task_dir(commit_short) / "model_patch.diff")
     if not patch_path.exists():
         return {"status": "error", "error": f"patch not found at {patch_path}",
