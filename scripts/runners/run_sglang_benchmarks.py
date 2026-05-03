@@ -43,13 +43,23 @@ def resolve_image(full_hash: str) -> str:
     if full_hash in _resolved_cache:
         return _resolved_cache[full_hash]
     short12 = full_hash[:12]
+    # Check local cache first to avoid concurrent registry rate-limits.
+    cached = subprocess.run(["docker", "images"], capture_output=True, text=True)
+    cached_out = cached.stdout if cached.returncode == 0 else ""
+    for repo, tagtmpl in SGLANG_IMAGE_CANDIDATES:
+        tag = tagtmpl.format(full=full_hash, short12=short12)
+        image = f"{repo}:{tag}"
+        if image in cached_out:
+            print(f"    cached {full_hash[:8]} -> {image}")
+            _resolved_cache[full_hash] = image
+            return image
     for repo, tagtmpl in SGLANG_IMAGE_CANDIDATES:
         tag = tagtmpl.format(full=full_hash, short12=short12)
         image = f"{repo}:{tag}"
         r = subprocess.run(["docker", "pull", image],
                            capture_output=True, text=True, timeout=1800)
         if r.returncode == 0:
-            print(f"    resolved {full_hash[:8]} -> {image}")
+            print(f"    pulled {full_hash[:8]} -> {image}")
             _resolved_cache[full_hash] = image
             return image
         print(f"    pull miss: {image} -> {(r.stderr or r.stdout)[-160:].strip()}")
@@ -88,21 +98,54 @@ def parse_serving_metrics(output: str) -> dict:
     return metrics
 
 
-def build_docker_cmd(model: str, parent_commit: str, perf_command: str) -> str:
+def build_docker_cmd(model: str, parent_commit: str, perf_command: str, has_serving: bool = True) -> str:
     """Build the bash docker_cmd for an sglang agent benchmark.
 
-    Heredoc-style; embedded as a single bash script run via shim's
-    `docker run --rm --gpus all --entrypoint bash <image> -c <cmd>`.
+    Uses the AUTHORITATIVE perf_command from Lossfunk/ISO-Bench:
+    - If perf_command contains `bench_one_batch` (server-free): run it directly,
+      no launch_server.
+    - If perf_command has `launch_server` followed by `bench_serving`: split,
+      use server line for server start, bench line for client.
+    - If perf_command has only `bench_serving`: launch a default server, use
+      perf_command for client.
+    Adds `--host 127.0.0.1 --port $SGL_PORT` to client args.
     """
-    # Build a clean bench_serving command. Don't reuse the prior perf_command —
-    # it often references --lora-name lora (server isn't configured for it),
-    # custom datasets, etc. We just want a uniform serving benchmark.
-    bench_args = (
-        f'--backend sglang '
-        f'--host 127.0.0.1 --port $SGL_PORT '
-        f'--num-prompt 100 --request-rate inf '
-        f'--dataset-name random --random-input-len 256 --random-output-len 64'
-    )
+    pc = perf_command.strip()
+    # Detect server-free mode (bench_one_batch / bench_offline)
+    server_free = ('bench_one_batch' in pc or 'bench_offline' in pc) and 'bench_serving' not in pc
+
+    # Split into server line and bench line if both present
+    server_line = ""
+    bench_line = pc
+    if 'launch_server' in pc and 'bench_serving' in pc:
+        # Two-step: assume launch_server line comes first, bench_serving second
+        for ln in pc.split('\n'):
+            ln = ln.strip()
+            if not ln: continue
+            if 'launch_server' in ln:
+                server_line = ln
+            elif 'bench_serving' in ln or 'bench_one_batch' in ln or 'bench_offline' in ln:
+                bench_line = ln
+
+    # For server-based mode: ensure --host/--port in bench_line
+    if not server_free:
+        if '--host' not in bench_line:
+            bench_line += ' --host 127.0.0.1'
+        if '--port' not in bench_line:
+            bench_line += f' --port $SGL_PORT'
+        else:
+            bench_line = re.sub(r'--port\s+\S+', '--port $SGL_PORT', bench_line)
+    # Strip the leading `python -m sglang.<X>` from bench_line — we'll re-prefix with $SGL_PYTHON
+    bench_line = re.sub(r'^\s*(python3?|/\S+/python3?)\s+-m\s+', '', bench_line)
+    # Same for server_line
+    if server_line:
+        server_line = re.sub(r'^\s*(python3?|/\S+/python3?)\s+-m\s+', '', server_line)
+        if '--port' not in server_line:
+            server_line += f' --port $SGL_PORT'
+        else:
+            server_line = re.sub(r'--port\s+\S+', '--port $SGL_PORT', server_line)
+        if '--host' not in server_line:
+            server_line += ' --host 127.0.0.1'
 
     return f'''
     set -e
@@ -211,38 +254,49 @@ def build_docker_cmd(model: str, parent_commit: str, perf_command: str) -> str:
     done
     [ -z "$SGL_PYTHON" ] && SGL_PYTHON="python3"
 
-    # Start sglang server in background
-    echo "=== Starting sglang server ==="
-    cd /tmp
-    $SGL_PYTHON -m sglang.launch_server \\
-        --model-path "$MODEL" \\
-        --port $SGL_PORT \\
-        --host 127.0.0.1 \\
-        --disable-cuda-graph 2>&1 &
-    SERVER_PID=$!
+    SERVER_FREE={"true" if server_free else "false"}
+    # Double-quoted so $SGL_PORT/$MODEL expand at assignment time.
+    SERVER_LINE="{server_line}"
+    BENCH_LINE="{bench_line}"
 
-    # Wait for server (TCP-level health check; sglang exposes /health)
-    for i in $(seq 1 600); do
-        if $SGL_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $SGL_PORT)); s.close()" 2>/dev/null; then
-            echo "SERVER_READY_AFTER=${{i}}s"
-            break
+    if [ "$SERVER_FREE" = "true" ]; then
+        echo "=== Running server-free benchmark ==="
+        cd /tmp
+        eval "$SGL_PYTHON -m $BENCH_LINE" 2>&1 | tee /tmp/bench_output.txt
+    else
+        echo "=== Starting sglang server ==="
+        cd /tmp
+        if [ -n "$SERVER_LINE" ]; then
+            echo "Server line: $SERVER_LINE"
+            eval "$SGL_PYTHON -m $SERVER_LINE --disable-cuda-graph" 2>&1 &
+        else
+            $SGL_PYTHON -m sglang.launch_server \\
+                --model-path "$MODEL" --port $SGL_PORT --host 127.0.0.1 \\
+                --disable-cuda-graph 2>&1 &
         fi
-        if ! kill -0 $SERVER_PID 2>/dev/null; then
-            echo "SERVER_CRASHED"
-            exit 1
-        fi
-        sleep 1
-    done
+        SERVER_PID=$!
 
-    # Run the benchmark
-    echo "=== Running sglang.bench_serving ==="
-    $SGL_PYTHON -m sglang.bench_serving {bench_args} 2>&1 | tee /tmp/bench_output.txt
+        for i in $(seq 1 600); do
+            if $SGL_PYTHON -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', $SGL_PORT)); s.close()" 2>/dev/null; then
+                echo "SERVER_READY_AFTER=${{i}}s"
+                break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+                echo "SERVER_CRASHED"
+                exit 1
+            fi
+            sleep 1
+        done
+
+        echo "=== Running benchmark: $BENCH_LINE ==="
+        eval "$SGL_PYTHON -m $BENCH_LINE" 2>&1 | tee /tmp/bench_output.txt
+
+        kill $SERVER_PID 2>/dev/null || true
+    fi
 
     echo "============ SGLang Benchmark Result ============"
-    cat /tmp/bench_output.txt | grep -E "(TTFT|TPOT|ITL|throughput|Mean|Median|P99)" || true
+    cat /tmp/bench_output.txt | grep -E "(TTFT|TPOT|ITL|throughput|Mean|Median|P99|Decode|Prefill|Token)" || true
     echo "================================================="
-
-    kill $SERVER_PID 2>/dev/null || true
     echo "BENCHMARK_DONE"
     '''
 
@@ -260,7 +314,8 @@ def run_one(commit: str, info: dict, hf_token: str, timeout: int = 1800) -> dict
 
     image = resolve_image(parent_commit)
     print(f"  Image: {image}")
-    docker_cmd = build_docker_cmd(model, parent_commit, perf)
+    has_serving = info.get("has_serving", True)
+    docker_cmd = build_docker_cmd(model, parent_commit, perf, has_serving)
 
     try:
         r = subprocess.run(
