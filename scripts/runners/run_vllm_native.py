@@ -69,6 +69,27 @@ def free_port(start: int = 30000) -> int:
     return start + int(cvd) * 1000  # 30000, 31000, 32000, ...
 
 
+def kill_port(port: int, log) -> None:
+    """Kill anything currently listening on `port`. vLLM's multiprocessing
+    spawn-children sometimes outlive the parent server even after terminate(),
+    holding the bind port and breaking the next commit on this worker.
+    """
+    try:
+        r = subprocess.run(["ss", "-tlnp", f"sport = :{port}"],
+                           capture_output=True, text=True, timeout=10)
+        pids = set(re.findall(r'pid=(\d+)', r.stdout))
+        for pid in pids:
+            try:
+                os.kill(int(pid), 9)
+                log(f"  Killed leftover PID {pid} on port {port}")
+            except ProcessLookupError:
+                pass
+        if pids:
+            time.sleep(2)
+    except Exception as e:
+        log(f"  kill_port({port}) error: {e}")
+
+
 def setup_venv(commit_short: str, parent_full: str, log) -> Path:
     """Create a uv venv and install vllm wheel + deps. Returns venv path."""
     venv = VENV_ROOT / commit_short
@@ -93,7 +114,12 @@ def setup_venv(commit_short: str, parent_full: str, log) -> Path:
     )
     if r.returncode != 0:
         raise RuntimeError(f"vllm install failed: {(r.stderr or r.stdout)[-400:]}")
-    log(f"  Installing benchmark deps + pinning transformers (vLLM 0.6/0.7 needs <=4.46)")
+    log(f"  Installing benchmark deps + pinning transformers <4.47")
+    # Most vLLM wheels (0.6/0.7/0.8 era) hit a TokenizersBackend ABI break
+    # in transformers 4.47+: `AttributeError: TokenizersBackend has no
+    # attribute all_special_tokens_extended`. Pin to <4.47 to avoid it.
+    # A handful of newer wheels need 4.51+ (`layer_type_validation`); those
+    # commits are accepted as casualties of this trade.
     subprocess.run(
         [str(UV_BIN), "pip", "install",
          "--python", str(py),
@@ -283,7 +309,27 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
         bench_args = re.sub(r"--max-model-len\s+\d+", '', bench_args)
         bench_args = re.sub(r"--gpu-memory-utilization\s+[\d.]+", '', bench_args)
         bench_args = re.sub(r"--guided-decoding-ratio\s+[\d.]+", '', bench_args)
+        bench_args = re.sub(r"--guided-decoding-backend\s+\S+", '', bench_args)
+        bench_args = re.sub(r"--dtype\s+\S+", '', bench_args)
+        bench_args = re.sub(r"--seed\s+\d+", '', bench_args)
+        bench_args = re.sub(r"--quantization\s+\S+", '', bench_args)
+        bench_args = re.sub(r"--served-model-name\s+\S+", '', bench_args)
+        bench_args = re.sub(r"--tensor-parallel-size\s+\d+", '', bench_args)
+        bench_args = re.sub(r"-tp\s+\d+", '', bench_args)
         bench_args = re.sub(r"\s+", ' ', bench_args).strip()
+
+    # Cap --num-prompts to keep wall-clock manageable. Lossfunk specifies up to
+    # 2048 for some commits and the bench script defaults to 1000. 100 is
+    # enough for stable TTFT/TPOT distributions, and a busted agent patch
+    # that hangs tokens stays bounded by 100*per-token-timeout instead of 1000.
+    NUM_PROMPTS_CAP = 100
+    if "benchmark_serving" in bench_script.name:
+        m_np = re.search(r'--num-prompts\s+(\d+)', bench_args)
+        if m_np:
+            if int(m_np.group(1)) > NUM_PROMPTS_CAP:
+                bench_args = re.sub(r'--num-prompts\s+\d+', f'--num-prompts {NUM_PROMPTS_CAP}', bench_args)
+        else:
+            bench_args += f' --num-prompts {NUM_PROMPTS_CAP}'
 
     cmd_str = f"{py} {bench_script} {bench_args}"
     log(f"  Running: {bench_script.name} {bench_args[:120]}")
@@ -378,6 +424,7 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         venv = setup_venv(commit_short, parent_full, log)
         apply_patch(venv, patch_path, log)
         if needs_server:
+            kill_port(port, log)  # ensure prior commit's spawn-children are gone
             proc = start_server(venv, model, port, log)
             if not wait_for_server(port, proc, timeout=600, log=log):
                 stdout = ""
@@ -405,6 +452,7 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
             proc.terminate()
             try: proc.wait(timeout=10)
             except Exception: proc.kill()
+        kill_port(port, log)  # final sweep for spawn children that outlive parent
 
 
 def find_task_dir(commit_short: str) -> str:
