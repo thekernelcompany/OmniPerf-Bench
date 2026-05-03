@@ -2359,7 +2359,18 @@ def main():
                 print(f"  SKIP: No agent patch available for {commit}")
             else:
                 print(f"\n  --- Running AGENT benchmark ---")
-                agent_result = run_agent_benchmark(info, agent_patches[commit], hf_token, args.timeout)
+                try:
+                    agent_result = run_agent_benchmark(info, agent_patches[commit], hf_token, args.timeout)
+                except Exception as e:
+                    # Don't let one bad commit (e.g., unbuildable parent image)
+                    # kill the worker — record and move on.
+                    agent_result = {
+                        'status': 'error',
+                        'error': f'unhandled exception: {type(e).__name__}: {e}',
+                        'duration_s': 0,
+                        'metrics': {},
+                        'raw_output': '',
+                    }
                 save_result(agent_result, commit, 'agent', info)
                 results['agent'].append((commit, agent_result))
 
