@@ -114,17 +114,16 @@ def setup_venv(commit_short: str, parent_full: str, log) -> Path:
     )
     if r.returncode != 0:
         raise RuntimeError(f"vllm install failed: {(r.stderr or r.stdout)[-400:]}")
-    log(f"  Installing benchmark deps + pinning transformers <4.47")
-    # Most vLLM wheels (0.6/0.7/0.8 era) hit a TokenizersBackend ABI break
-    # in transformers 4.47+: `AttributeError: TokenizersBackend has no
-    # attribute all_special_tokens_extended`. Pin to <4.47 to avoid it.
-    # A handful of newer wheels need 4.51+ (`layer_type_validation`); those
-    # commits are accepted as casualties of this trade.
+    # Transformers pin: most vLLM wheels need <4.47 (TokenizersBackend ABI
+    # break); newer wheels (Llama-4, Exaone4) need >=4.51 (layer_type_validation).
+    # Override per commit via env: TRANSFORMERS_PIN="<4.47" or ">=4.51,<4.55"
+    pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
+    log(f"  Installing benchmark deps + transformers{pin}")
     subprocess.run(
         [str(UV_BIN), "pip", "install",
          "--python", str(py),
          "aiohttp", "pandas", "datasets", "pillow",
-         "transformers>=4.45,<4.47"],
+         f"transformers{pin}"],
         capture_output=True, text=True, timeout=300, env=env,
     )
     return venv
@@ -143,9 +142,9 @@ def apply_patch(venv: Path, patch_path: Path, log) -> None:
     log(f"  patch result rc={r.returncode}: {r.stdout[-300:].strip()}")
 
 
-def start_server(venv: Path, model: str, port: int, log) -> subprocess.Popen:
+def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 4096) -> subprocess.Popen:
     py = venv / "bin/python"
-    log(f"  Starting vllm.entrypoints.openai.api_server --model {model} --port {port}")
+    log(f"  Starting vllm.entrypoints.openai.api_server --model {model} --port {port} --max-model-len {max_model_len}")
     env = os.environ.copy()
     env["HF_TOKEN"] = get_hf_token()
     env["HUGGING_FACE_HUB_TOKEN"] = env["HF_TOKEN"]
@@ -155,13 +154,30 @@ def start_server(venv: Path, model: str, port: int, log) -> subprocess.Popen:
         [str(py), "-m", "vllm.entrypoints.openai.api_server",
          "--model", model, "--port", str(port),
          "--host", "127.0.0.1",
-         "--max-model-len", "4096",
+         "--max-model-len", str(max_model_len),
          "--disable-log-requests",
          "--enforce-eager",
          "--trust-remote-code"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     return proc
+
+
+def compute_max_model_len(perf_command: str) -> int:
+    """Compute max_model_len from perf_command's input+output lengths.
+    Defaults to 4096 if no length flags found.
+    """
+    in_len = 0
+    out_len = 0
+    for pat in [r'--random-input-len[\s=](\d+)', r'(?<!-random)--input-len[\s=](\d+)',
+                r'--sharegpt-output-len[\s=](\d+)']:
+        m = re.search(pat, perf_command)
+        if m: in_len = max(in_len, int(m.group(1)))
+    for pat in [r'--random-output-len[\s=](\d+)', r'(?<!-random)--output-len[\s=](\d+)']:
+        m = re.search(pat, perf_command)
+        if m: out_len = max(out_len, int(m.group(1)))
+    needed = in_len + out_len + 256  # padding for prompt overhead
+    return max(needed, 4096)
 
 
 def wait_for_server(port: int, proc: subprocess.Popen, timeout: int = 600, log=print) -> bool:
@@ -276,6 +292,20 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
     #     a different synthetic mode (very old style) — leave it alone.
     #   - If --dataset-name=sharegpt is set without path, inject local path.
     #   - Else if --dataset-name is missing entirely: inject sharegpt + path.
+    # Some Lossfunk perf_commands use the older `--input-len` / `--output-len`
+    # flags. Modern benchmark_serving.py renamed these to `--random-input-len`
+    # / `--random-output-len` (and requires `--dataset-name random`). Rewrite.
+    if "benchmark_serving" in bench_script.name:
+        # Match `--input-len N` but not `--random-input-len N`
+        bench_args = re.sub(r'(?<!-random)--input-len(\s+|=)(\d+)',
+                            r'--random-input-len\1\2', bench_args)
+        bench_args = re.sub(r'(?<!-random)--output-len(\s+|=)(\d+)',
+                            r'--random-output-len\1\2', bench_args)
+        # Default --random-range-ratio is 1.0 which spreads prompt lengths
+        # over [0, 2*N]. Force fixed length so max-model-len bound is tight.
+        if '--random-input-len' in bench_args and '--random-range-ratio' not in bench_args:
+            bench_args += ' --random-range-ratio 0'
+
     if "benchmark_serving" in bench_script.name:
         has_path = '--dataset-path' in bench_args
         has_synth_inlen = re.search(r'(?<!--random)--input-len\b', bench_args) is not None
@@ -425,7 +455,8 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         apply_patch(venv, patch_path, log)
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
-            proc = start_server(venv, model, port, log)
+            mml = compute_max_model_len(perf)
+            proc = start_server(venv, model, port, log, max_model_len=mml)
             if not wait_for_server(port, proc, timeout=600, log=log):
                 stdout = ""
                 try:
