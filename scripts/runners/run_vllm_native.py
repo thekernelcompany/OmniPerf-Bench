@@ -25,32 +25,179 @@ import time
 import urllib.request
 from pathlib import Path
 
-ROOT = Path("/root/OmniPerf-Bench")
-MAPPING_FILE = ROOT / "data/mappings/vllm_oh_mapping.json"  # Lossfunk-derived authoritative
-RESULTS_DIR = ROOT / "archive/results/2026-05/iso_bench_results_3way_openhands_sonnet45/results"
-PATCHES_DIR = ROOT / "ISO-Bench/state/runs/vllm/openhands_sonnet45/flat"
-VENV_ROOT = Path("/tmp/native_venvs")
-HF_CACHE = Path("/ephemeral/huggingface_cache")
-UV_BIN = Path("/root/.local/bin/uv")
+# Path resolution order (each can be overridden by CLI flag):
+#   1. CLI flag (e.g. --root)
+#   2. env var (e.g. OMNIPERF_ROOT)
+#   3. derived from this script's location (parent.parent.parent of scripts/runners/)
+#   4. legacy hardcode (/root/OmniPerf-Bench) — kept as last-resort default
+_DEFAULT_ROOT = Path(
+    os.environ.get("OMNIPERF_ROOT")
+    or os.environ.get("ISOBENCH_ROOT")
+    or str(Path(__file__).resolve().parent.parent.parent)
+)
+
+# These are populated in main() once flags are parsed; module-level placeholders
+# preserve symbol names used throughout the script.
+ROOT: Path = _DEFAULT_ROOT
+MAPPING_FILE: Path = ROOT / "data/mappings/vllm_oh_mapping.json"
+RESULTS_DIR: Path = ROOT / "archive/results/2026-05/iso_bench_results_3way_openhands_sonnet45/results"
+PATCHES_DIR: Path = ROOT / "ISO-Bench/state/runs/vllm/openhands_sonnet45/flat"
+
+VENV_ROOT = Path(os.environ.get("NATIVE_VENV_ROOT", "/tmp/native_venvs"))
+
+# HF_CACHE: prefer /ephemeral if it exists & is writable (Prime Intellect-style),
+# else use a project-local dir, else fall back to ~/.cache/huggingface.
+def _default_hf_cache() -> Path:
+    eph = Path("/ephemeral/huggingface_cache")
+    try:
+        eph.mkdir(parents=True, exist_ok=True)
+        return eph
+    except (PermissionError, OSError):
+        pass
+    home_cache = Path.home() / ".cache/huggingface"
+    return home_cache
+HF_CACHE: Path = Path(os.environ.get("HF_HOME", str(_default_hf_cache())))
+
+# uv binary: prefer $UV_BIN env var, else PATH, else /root/.local/bin/uv legacy.
+def _default_uv_bin() -> Path:
+    if env_uv := os.environ.get("UV_BIN"):
+        return Path(env_uv)
+    found = shutil.which("uv")
+    if found:
+        return Path(found)
+    return Path("/root/.local/bin/uv")
+UV_BIN: Path = _default_uv_bin()
 
 WHEEL_URL_TEMPLATE = "https://wheels.vllm.ai/{commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
 
 # benchmark_serving.py needs --dataset-path for sharegpt/sonnet. The local copy
 # avoids re-downloading per-commit (and some old versions accept no --dataset-name
 # default but still need a path).
-SHAREGPT_PATH = "/root/OmniPerf-Bench/data/archive/sharegpt_dataset.json"
+SHAREGPT_PATH = str(ROOT / "data/archive/sharegpt_dataset.json")
+
+# Agent-name → (patches_dir_relative, results_dir_relative). Add a new entry to
+# benchmark a new agent without touching the rest of the file. `--agent-name`
+# selects one of these at runtime.
+AGENT_PROFILES = {
+    "openhands_sonnet45": (
+        "ISO-Bench/state/runs/vllm/openhands_sonnet45/flat",
+        "archive/results/2026-05/iso_bench_results_3way_openhands_sonnet45/results",
+    ),
+    "openhands_gpt5": (
+        "ISO-Bench/state/runs/vllm/openhands_gpt5/flat",
+        "archive/results/2026-05/iso_bench_results_3way_openhands_gpt5/results",
+    ),
+}
 
 MODEL_OVERRIDES = {
     "meta-llama/Llama-3.1-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
     "meta-llama/Llama-3.1-70B-Instruct": "meta-llama/Meta-Llama-3-70B-Instruct",
     "ibm-ai-platform/Bamba-9B-v2": "meta-llama/Meta-Llama-3-8B-Instruct",
     "ibm-ai-platform/Bamba-9B": "meta-llama/Meta-Llama-3-8B-Instruct",
+    # ISO-Bench dataset has the (HF-nonexistent) typo `meta-llama/Llama-3-8B`;
+    # canonical repo is `meta-llama/Meta-Llama-3-8B`. Keep both forms mapped.
+    "meta-llama/Llama-3-8B": "meta-llama/Meta-Llama-3-8B",
+    "meta-llama/Llama-3-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+    # ISO-Bench typo: Qwen3-7B-Instruct doesn't exist on HF; canonical is
+    # Qwen2.5-7B-Instruct (which is what the dataset's `models` field says).
+    "Qwen/Qwen3-7B-Instruct": "Qwen/Qwen2.5-7B-Instruct",
 }
 
 
-def get_hf_token() -> str:
-    p = Path.home() / ".cache/huggingface/token"
-    return p.read_text().strip() if p.exists() else ""
+# ISO-Bench HF dataset (`ISO-Bench/ISO-Bench`) is the authoritative source of
+# perf_commands and target models per the upstream repository. We load it once
+# at first call and merge it over `vllm_oh_mapping.json` for these two fields.
+# The local mapping retains authority for runtime/dep overrides
+# (`transformers_pin`, `vllm_pypi_version`, `outlines_pin`, `tp`).
+_ISO_BENCH_CACHE = None
+
+
+def load_iso_bench_perf_overrides() -> dict:
+    """Returns {commit_short_8: {'perf_command': str, 'model': str, ...}}.
+    Falls back to empty dict if dataset is unavailable.
+    """
+    global _ISO_BENCH_CACHE
+    if _ISO_BENCH_CACHE is not None:
+        return _ISO_BENCH_CACHE
+    candidates = [
+        Path("/tmp/iso_bench_hf/data/vllm/train.parquet"),
+        ROOT / "data/iso_bench/vllm/train.parquet",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                import pandas as pd
+                df = pd.read_parquet(path)
+                cache = {}
+                for _, row in df.iterrows():
+                    h8 = str(row["commit_hash"])[:8]
+                    pc_raw = row["perf_command"]
+                    pc = str(pc_raw) if pc_raw is not None else ""
+                    models_raw = row["models"] if "models" in df.columns else None
+                    models = list(models_raw) if models_raw is not None else []
+                    cache[h8] = {"perf_command": pc, "models": models}
+                _ISO_BENCH_CACHE = cache
+                return cache
+            except Exception as e:
+                print(f"  warn: ISO-Bench parquet at {path} unreadable: {e}")
+    _ISO_BENCH_CACHE = {}
+    return _ISO_BENCH_CACHE
+
+
+def merge_with_iso_bench(commit_short: str, info: dict, log) -> dict:
+    """Return a copy of `info` with ISO-Bench's perf_command + model spliced in.
+
+    The model is extracted from `--model X` inside ISO's perf_command — that
+    field is the ground truth, since ISO-Bench's separate `models` column is
+    sometimes inconsistent with what perf_command actually passes (observed:
+    perf_command says Llama-3.1, models[0] says Llama-2 for the same row).
+    """
+    iso = load_iso_bench_perf_overrides().get(commit_short, {})
+    if not iso:
+        return info
+    merged = dict(info)
+    iso_pc = (iso.get("perf_command") or "").strip()
+    if iso_pc and iso_pc != (info.get("perf_command", "") or "").strip():
+        log(f"  ISO-Bench perf_command override: {iso_pc[:140]}")
+        merged["perf_command"] = iso_pc
+
+    # Extract --model from ISO perf_command (handles `--model X` and
+    # `--model-path X` for sglang-style commands too).
+    if iso_pc:
+        m = re.search(r'--model(?:-path)?(?:\s+|=)(\S+)', iso_pc)
+        if m:
+            iso_model = m.group(1)
+            if iso_model and iso_model != info.get("model", ""):
+                log(f"  ISO-Bench model override: {info.get('model', '')} -> {iso_model}")
+                merged["model"] = iso_model
+    return merged
+
+
+# Orgs whose models are gated and require the dedicated gated-access token.
+# Public/non-gated orgs (RedHatAI, neuralmagic, deepseek-ai, Qwen, ibm-ai-platform,
+# huggyllama, RedHatAI mirrors) work fine with the default token.
+GATED_ORGS = ("meta-llama/", "mistralai/")
+
+
+def _read_token_file(path: Path) -> str:
+    try:
+        return path.read_text().strip() if path.exists() else ""
+    except Exception:
+        return ""
+
+
+def get_hf_token(model: str = "") -> str:
+    """Return an HF access token. Uses the gated-access token (if present)
+    for models in GATED_ORGS, else the default cached HF token (shikhar's).
+    """
+    gated_path = Path.home() / ".config/omniperf/hf_token_gated"
+    default_path = Path.home() / ".cache/huggingface/token"
+    if any(model.startswith(org) for org in GATED_ORGS):
+        tok = _read_token_file(gated_path)
+        if tok:
+            return tok
+        # fallback if gated file missing — we still try the default
+    return _read_token_file(default_path)
 
 
 def wheel_exists(commit_full: str) -> bool:
@@ -67,6 +214,43 @@ def free_port(start: int = 30000) -> int:
     """Pick a port not currently bound. Per-worker pinning via CUDA_VISIBLE_DEVICES."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     return start + int(cvd) * 1000  # 30000, 31000, 32000, ...
+
+
+def kill_gpu_orphans(log) -> None:
+    """Kill stale python procs from previous /tmp/native_venvs runs that are
+    holding GPU memory after their parent (api_server / launch_server) exited.
+
+    vLLM uses multiprocessing.spawn for its tensor-parallel workers; if the
+    parent dies via SIGKILL (which pkill does), the spawn-children become
+    orphaned with PPID=1, keep their CUDA contexts open, and hold GiB of GPU
+    memory until manually killed. Run this before every commit to guarantee
+    a clean GPU state.
+    """
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",", 1)]
+            if len(parts) != 2:
+                continue
+            pid, name = parts
+            if "/tmp/native_venvs/" in name or "/tmp/native_sglang_venvs/" in name \
+               or "/ephemeral/native_venvs/" in name or "/ephemeral/native_sglang_venvs/" in name:
+                # Any /tmp/native_*venvs/<commit>/python compute app is stale by
+                # definition at the start of a new commit's run_one. The PPID=1
+                # check is too strict — some orphans are mid-reparent and still
+                # show their dead parent's PID for a few seconds. Kill them all.
+                log(f"  killing stale GPU compute app PID {pid} ({name})")
+                try: os.kill(int(pid), 9)
+                except ProcessLookupError: pass
+        time.sleep(1)
+    except Exception as e:
+        log(f"  kill_gpu_orphans error: {e}")
 
 
 def kill_port(port: int, log) -> None:
@@ -206,7 +390,7 @@ def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 40
     py = venv / "bin/python"
     log(f"  Starting vllm.entrypoints.openai.api_server --model {model} --port {port} --max-model-len {max_model_len}")
     env = os.environ.copy()
-    env["HF_TOKEN"] = get_hf_token()
+    env["HF_TOKEN"] = get_hf_token(model)
     env["HUGGING_FACE_HUB_TOKEN"] = env["HF_TOKEN"]
     env["VLLM_USE_V1"] = "0"
     env["HF_HOME"] = str(HF_CACHE)
@@ -228,7 +412,11 @@ def start_server(venv: Path, model: str, port: int, log, max_model_len: int = 40
     if extra_server_args:
         cmd.extend(extra_server_args)
         log(f"  Extra server args: {extra_server_args}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    # cwd=/tmp so an accidental `vllm/` directory at the project root (e.g. a
+    # leftover submodule clone) doesn't shadow the venv's installed package
+    # via namespace-package resolution (Python adds cwd to sys.path[0]).
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, env=env, cwd="/tmp")
     return proc
 
 
@@ -351,7 +539,22 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
         log(f"  WARN: {script_name} not at this commit; falling back to benchmark_serving.py")
         bench_script = bench_dir / "benchmarks/benchmark_serving.py"
 
-    is_serving = "benchmark_serving" in bench_script.name or "prefix_caching" in bench_script.name
+    # benchmark_prefix_caching.py is in-process (instantiates vllm.LLM directly,
+    # no --host/--port). Don't classify it as serving.
+    # Rewrite -tp N / --tensor-parallel-size N to match visible GPUs.
+    # ISO-Bench perf_commands sometimes specify -tp 4 (Llama-3-70B etc) but
+    # we may only have 2 GPUs; vllm.LLM would error with tp greater than
+    # device count. Match it down. (-tp does NOT apply to benchmark_serving
+    # bench client — that block strips it instead. For latency/throughput
+    # benches, the bench script reads tp and passes it to LLM(), so we
+    # have to keep a usable value.)
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    visible_gpus = max(1, len([x for x in cvd.split(",") if x.strip()]))
+    bench_args = re.sub(r'(-tp|--tensor-parallel-size)(\s+|=)\d+',
+                        lambda m: f'{m.group(1)}{m.group(2)}{visible_gpus}',
+                        bench_args)
+
+    is_serving = "benchmark_serving" in bench_script.name
     # Override --model in bench_args to match what the server is actually serving
     # (after MODEL_OVERRIDES). For server-free benches (latency/throughput) the
     # bench script loads the model itself, so the override applies there too.
@@ -469,12 +672,14 @@ def run_benchmark(venv: Path, model: str, port: int, perf_command: str, parent_f
     # Propagate HF token to bench subprocess; HF_HOME redirects token lookup
     # away from ~/.cache/huggingface so we have to set HF_TOKEN explicitly for
     # server-free benches that load gated models (Llama-3-70B etc).
-    tok = get_hf_token()
+    tok = get_hf_token(model)
     if tok:
         env["HF_TOKEN"] = tok
         env["HUGGING_FACE_HUB_TOKEN"] = tok
     env.update(env_overrides)
-    r = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=1500, env=env)
+    # cwd=/tmp to avoid project-root vllm/ directory shadowing the venv's vllm.
+    r = subprocess.run(cmd_str, shell=True, capture_output=True, text=True,
+                       timeout=1500, env=env, cwd="/tmp")
     return r.stdout + r.stderr
 
 
@@ -531,6 +736,9 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         out_lines.append(msg)
         print(msg, flush=True)
 
+    # ISO-Bench dataset is authoritative for perf_command + model. Merge before
+    # downstream lookups so overrides are captured in raw_output for audit.
+    info = merge_with_iso_bench(commit_short, info, log)
     parent_full = info.get("parent_commit") or info.get("human_commit_full", "")
     model = MODEL_OVERRIDES.get(info["model"], info["model"])
     if model != info["model"]:
@@ -540,9 +748,21 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
     if info.get("transformers_pin"):
         os.environ["TRANSFORMERS_PIN"] = info["transformers_pin"]
         log(f"  Per-commit transformers pin: {info['transformers_pin']}")
-    patch_path = Path(info.get("patch_path") or PATCHES_DIR / find_task_dir(commit_short) / "model_patch.diff")
+    # Always derive patch path from the active PATCHES_DIR. The `patch_path`
+    # field in vllm_oh_mapping.json is hardcoded to the sonnet45 layout (legacy
+    # convenience field) — using it would silently benchmark the wrong agent's
+    # patch when --agent-name is anything else.
+    task_dir = find_task_dir(commit_short)
+    if not task_dir:
+        return {"status": "error",
+                "error": f"no task dir in {PATCHES_DIR} matches commit_short={commit_short}",
+                "duration_s": 0, "metrics": {}, "raw_output": ""}
+    patch_path = PATCHES_DIR / task_dir / "model_patch.diff"
     if not patch_path.exists():
         return {"status": "error", "error": f"patch not found at {patch_path}",
+                "duration_s": 0, "metrics": {}, "raw_output": ""}
+    if patch_path.stat().st_size == 0:
+        return {"status": "error", "error": f"empty patch at {patch_path} (agent gave up)",
                 "duration_s": 0, "metrics": {}, "raw_output": ""}
 
     use_source = not wheel_exists(parent_full)
@@ -550,9 +770,21 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         log(f"  No wheel for {parent_full[:12]} — will build from source")
 
     # Decide if benchmark needs a server (serving / prefix_caching) or is server-free (latency / throughput).
-    needs_server = info.get("has_serving") or "benchmark_serving" in perf or "prefix_caching" in perf or "vllm bench serve" in perf
+    # prefix_caching is in-process (loads vllm.LLM directly); never start a
+    # server for it even if the mapping's stale `has_serving: True` says so.
+    # Only `benchmark_serving.py` and `vllm bench serve` need a server.
+    if "prefix_caching" in perf or "benchmark_latency" in perf or "benchmark_throughput" in perf:
+        needs_server = False
+    else:
+        needs_server = (info.get("has_serving") or
+                        "benchmark_serving" in perf or
+                        "vllm bench serve" in perf)
     log(f"  needs_server={needs_server} (perf_command first 80: {perf[:80]})")
 
+    # Always sweep GPU orphans before starting a new commit. Without this,
+    # the previous commit's spawn-children (now PPID=1) keep ~70 GiB of GPU
+    # memory and the next commit OOMs at model-load time.
+    kill_gpu_orphans(log)
     port = free_port()
     proc = None
     try:
@@ -627,7 +859,45 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--commits", nargs="+", required=True)
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--agent-name", default="openhands_sonnet45",
+                   choices=sorted(AGENT_PROFILES.keys()),
+                   help="Selects PATCHES_DIR and RESULTS_DIR (relative to project root).")
+    p.add_argument("--root", type=Path, default=None,
+                   help="Override project root (default: derived from script location).")
+    p.add_argument("--patches-dir", type=Path, default=None,
+                   help="Override patches dir (absolute). Overrides --agent-name's choice.")
+    p.add_argument("--results-dir", type=Path, default=None,
+                   help="Override results dir (absolute). Overrides --agent-name's choice.")
+    p.add_argument("--mapping-file", type=Path, default=None,
+                   help="Override path to vllm_oh_mapping.json.")
     args = p.parse_args()
+
+    # Resolve paths and rebind module globals so the rest of the script (which
+    # reads ROOT/PATCHES_DIR/RESULTS_DIR/MAPPING_FILE/SHAREGPT_PATH at the
+    # module level via name lookup) sees the chosen values.
+    global ROOT, MAPPING_FILE, RESULTS_DIR, PATCHES_DIR, SHAREGPT_PATH
+    if args.root:
+        ROOT = args.root.resolve()
+        SHAREGPT_PATH = str(ROOT / "data/archive/sharegpt_dataset.json")
+    patches_rel, results_rel = AGENT_PROFILES[args.agent_name]
+    PATCHES_DIR = (args.patches_dir or (ROOT / patches_rel)).resolve()
+    RESULTS_DIR = (args.results_dir or (ROOT / results_rel)).resolve()
+    MAPPING_FILE = (args.mapping_file or (ROOT / "data/mappings/vllm_oh_mapping.json")).resolve()
+
+    print(f"  ROOT          = {ROOT}")
+    print(f"  PATCHES_DIR   = {PATCHES_DIR}")
+    print(f"  RESULTS_DIR   = {RESULTS_DIR}")
+    print(f"  MAPPING_FILE  = {MAPPING_FILE}")
+    print(f"  HF_CACHE      = {HF_CACHE}")
+    print(f"  UV_BIN        = {UV_BIN}")
+    print(f"  SHAREGPT_PATH = {SHAREGPT_PATH}")
+
+    if not MAPPING_FILE.exists():
+        sys.exit(f"ERROR: mapping file not found at {MAPPING_FILE}")
+    if not PATCHES_DIR.exists():
+        sys.exit(f"ERROR: patches dir not found at {PATCHES_DIR}")
+    if not UV_BIN.exists():
+        sys.exit(f"ERROR: uv not found at {UV_BIN}; set UV_BIN env or install uv")
 
     mp = json.loads(MAPPING_FILE.read_text())
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -652,15 +922,20 @@ def main():
                       "duration_s": 0,
                       "metrics": {},
                       "raw_output": traceback.format_exc()}
+        # Re-merge for record-keeping so model + perf_command in the JSON
+        # match what was *actually* benchmarked (post-ISO override).
+        info_for_record = merge_with_iso_bench(c, dict(info), lambda _msg: None)
         record = {
             "human_commit": c,
-            "human_commit_full": info.get("commit_full", ""),
+            "human_commit_full": info.get("human_commit_full", info.get("commit_full", "")),
             "parent_commit": info.get("parent_commit", ""),
-            "model": MODEL_OVERRIDES.get(info["model"], info["model"]),
-            "perf_command": info.get("perf_command", ""),
+            "model": MODEL_OVERRIDES.get(info_for_record["model"], info_for_record["model"]),
+            "perf_command": info_for_record.get("perf_command", ""),
             **result,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "runner": "native",
+            "iso_bench_override_applied": (info_for_record.get("perf_command") != info.get("perf_command")
+                                            or info_for_record.get("model") != info.get("model")),
         }
         out_file.write_text(json.dumps(record, indent=2))
         s = result.get("status")

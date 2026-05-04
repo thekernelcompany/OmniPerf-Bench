@@ -1,0 +1,87 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8253a30..9e36fa2 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1417,9 +1417,7 @@ class Scheduler(
+             local_info,
+             group=self.tp_cpu_group,
+         )
+-        any_new_batch = any(
+-            global_info[:, 0, 0].tolist()
+-        )  # Any DP worker has forward batch
++        any_new_batch = bool(torch.any(global_info[:, 0, 0]))  # Any DP worker has forward batch
+         return any_new_batch
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+@@ -1579,9 +1577,8 @@ class Scheduler(
+             for req in can_run_list:
+                 req.queue_time_end = time.perf_counter()
+ 
+-        self.waiting_queue = [
+-            x for x in self.waiting_queue if x not in set(can_run_list)
+-        ]
++        can_run_set = set(can_run_list)
++        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+ 
+         if adder.new_chunked_req is not None:
+             assert self.chunked_req is None
+@@ -1867,9 +1864,9 @@ class Scheduler(
+             group=tp_cpu_group,
+         )
+         global_num_tokens = global_info[:, 0, 0].tolist()
+-        can_cuda_graph = min(global_info[:, 0, 1].tolist())
++        can_cuda_graph = int(torch.min(global_info[:, 0, 1]))
+         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+-        is_extend_in_batch = global_info[:, 0, 3].tolist()
++        is_extend_any = bool(torch.any(global_info[:, 0, 3]))
+ 
+         tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
+             global_info[:, :, 4:6]
+@@ -1888,7 +1885,7 @@ class Scheduler(
+                 local_batch.global_num_tokens_for_logprob = (
+                     global_num_tokens_for_logprob
+                 )
+-            local_batch.is_extend_in_batch = any(is_extend_in_batch)
++            local_batch.is_extend_in_batch = is_extend_any
+             local_batch.tbo_split_seq_index = tbo_split_seq_index
+             local_batch.global_forward_mode = global_forward_mode
+ 
+@@ -1897,7 +1894,7 @@ class Scheduler(
+                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
+ 
+         # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
+-        return local_batch, any(is_extend_in_batch)
++        return local_batch, is_extend_any
+ 
+     def get_idle_batch(self):
+         idle_batch = ScheduleBatch.init_new(
+@@ -2170,19 +2167,17 @@ class Scheduler(
+ 
+     def abort_request(self, recv_req: AbortReq):
+         # Delete requests in the waiting queue
+-        to_del = []
+-        for i, req in enumerate(self.waiting_queue):
++        # Efficiently filter the waiting queue without index tracking and repeated pops
++        new_waiting_queue = []
++        for req in self.waiting_queue:
+             if req.rid.startswith(recv_req.rid):
+-                to_del.append(i)
+-
+-        # Sort in reverse order to avoid index issues when deleting
+-        for i in reversed(to_del):
+-            # Abort method 1: directly pop from the queue
+-            # This only works for requests that have not started anything.
+-            # We still need to send something back to TokenizerManager to clean up the state.
+-            req = self.waiting_queue.pop(i)
+-            self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
+-            logger.debug(f"Abort queued request. {req.rid=}")
++                # Abort method 1: directly drop from the queue
++                # We still need to send something back to TokenizerManager to clean up the state.
++                self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
++                logger.debug(f"Abort queued request. {req.rid=}")
++            else:
++                new_waiting_queue.append(req)
++        self.waiting_queue = new_waiting_queue
+ 
+         # Delete the requests in the grammar queue
+         for req in self.grammar_queue:

@@ -1,0 +1,96 @@
+diff --git a/vllm/v1/sample/logits_processor.py b/vllm/v1/sample/logits_processor.py
+index 3a4c259..7fabc80 100644
+--- a/vllm/v1/sample/logits_processor.py
++++ b/vllm/v1/sample/logits_processor.py
+@@ -229,23 +229,37 @@ class MinPLogitsProcessor(LogitsProcessor):
+         super().__init__()
+         self.min_p_count: int = 0
+ 
+-        self.min_p_cpu_tensor = torch.zeros((max_num_reqs, ),
++        # Use uninitialized allocation to avoid an eager memset; contents
++        # will be set on demand during state updates for active requests.
++        self.min_p_cpu_tensor = torch.empty((max_num_reqs, ),
+                                             dtype=torch.float32,
+                                             device="cpu",
+                                             pin_memory=pin_memory)
++        # Initialize once to zeros for correctness; avoids repeated memset later.
++        self.min_p_cpu_tensor.zero_()
+         self.min_p_cpu = self.min_p_cpu_tensor.numpy()
+ 
+         self.use_double_tensor = torch.device("cpu") != torch.device(device)
+ 
+         if self.use_double_tensor:
+-            # Pre-allocated device tensor
++            # Pre-allocated device tensors on target device
+             self.min_p_device: torch.Tensor = torch.empty((max_num_reqs, ),
+                                                           dtype=torch.float32,
+                                                           device=device)
++            self.log_min_p_device: torch.Tensor = torch.empty((max_num_reqs, ),
++                                                               dtype=torch.float32,
++                                                               device=device)
+         else:
++            # When running on CPU, reuse CPU tensor for min_p and allocate a
++            # separate buffer for log(min_p)
+             self.min_p_device = self.min_p_cpu_tensor
+-        # Current slice of the device tensor
++            self.log_min_p_device = torch.empty((max_num_reqs, ),
++                                                dtype=torch.float32,
++                                                device="cpu",
++                                                pin_memory=pin_memory)
++        # Current slices of the device tensors
+         self.min_p: torch.Tensor = self.min_p_device[:0]
++        self.log_min_p: torch.Tensor = self.log_min_p_device[:0]
+ 
+     def is_argmax_invariant(self) -> bool:
+         """Min-p never impacts greedy sampling"""
+@@ -289,28 +303,36 @@ class MinPLogitsProcessor(LogitsProcessor):
+         # Update tensors if needed.
+         size = batch_update.batch_size
+         if self.min_p_count and (needs_update or self.min_p.shape[0] != size):
++            # Refresh slices
+             self.min_p = self.min_p_device[:size]
++            self.log_min_p = self.log_min_p_device[:size]
+             if self.use_double_tensor:
+-                self.min_p.copy_(self.min_p_cpu_tensor[:size],
+-                                 non_blocking=True)
++                src = self.min_p_cpu_tensor[:size]
++                self.min_p.copy_(src, non_blocking=True)
++                # Precompute log(min_p) on device to avoid recomputation in apply
++                # Preserve exact zeros as -inf threshold to avoid unintended masking
++                log_src = torch.where(src > 0,
++                                      src.log(),
++                                      torch.full_like(src, float('-inf')))
++                self.log_min_p.copy_(log_src, non_blocking=True)
++            else:
++                # CPU case: compute once into dedicated buffer; preserve zeros as -inf
++                log_src = torch.where(self.min_p > 0,
++                                      self.min_p.log(),
++                                      torch.full_like(self.min_p, float('-inf')))
++                self.log_min_p.copy_(log_src, non_blocking=False)
+             self.min_p.unsqueeze_(1)
++            self.log_min_p.unsqueeze_(1)
+ 
+     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+         if not self.min_p_count:
+             return logits
+ 
+-        # Convert logits to probability distribution
+-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+-        # Calculate maximum probabilities per sequence
+-        max_probabilities = torch.amax(probability_values,
+-                                       dim=-1,
+-                                       keepdim=True)
+-        # Adjust min_p
+-        adjusted_min_p = max_probabilities.mul_(self.min_p)
+-        # Identify valid tokens using threshold comparison
+-        invalid_token_mask = probability_values < adjusted_min_p
+-        # Apply mask using boolean indexing
+-        logits[invalid_token_mask] = -float('inf')
++        # Efficient min-p filtering without computing softmax.
++        # Condition: p_i < min_p * max_prob  <=>  l_i < l_max + log(min_p)
++        m, _ = logits.max(dim=-1, keepdim=True)
++        thresh = m + self.log_min_p  # broadcast over vocab dimension
++        logits.masked_fill_(logits < thresh, float('-inf'))
+         return logits
+ 
+ 

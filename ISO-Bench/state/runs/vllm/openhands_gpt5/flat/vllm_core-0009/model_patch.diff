@@ -1,0 +1,69 @@
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index a9ef973..35a67fe 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -10,16 +10,21 @@ def get_token_bin_counts_and_mask(
+     vocab_size: int,
+     num_seqs: int,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    # Compute the bin counts for the tokens.
+-    # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+-                             dtype=torch.long,
+-                             device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+-    bin_counts = bin_counts[:, :vocab_size]
+-    mask = bin_counts > 0
+-
+-    return bin_counts, mask
++    # Compute per-sequence token counts using a single bincount over an
++    # offset-augmented tensor. This avoids materializing large one-hot tensors
++    # and repeated scatter_add operations.
++    device = tokens.device
++    # Offsets ensure tokens from different sequences map to disjoint bins.
++    offsets = (torch.arange(num_seqs, device=device, dtype=tokens.dtype)
++               * (vocab_size + 1)).view(-1, 1)
++    flat_ids = (tokens + offsets).reshape(-1)
++    counts = torch.bincount(flat_ids,
++                            minlength=num_seqs * (vocab_size + 1))
++    bin_counts = counts.view(num_seqs, vocab_size + 1)
++    # Exclude the padding bin (index == vocab_size) from outputs.
++    trimmed = bin_counts[:, :vocab_size]
++    mask = trimmed > 0
++    return trimmed, mask
+ 
+ 
+ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+@@ -45,14 +50,22 @@ def apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+                                                    vocab_size, num_seqs)
+     output_bin_counts, output_mask = get_token_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+-    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+-        1, vocab_size)
+-    logits[logits > 0] /= torch.where(prompt_mask | output_mask,
+-                                      repetition_penalties, 1.0)[logits > 0]
+-    logits[logits <= 0] *= torch.where(prompt_mask | output_mask,
+-                                       repetition_penalties, 1.0)[logits <= 0]
+-    # We follow the definition in OpenAI API.
+-    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+-    logits -= frequency_penalties.unsqueeze(dim=1) * output_bin_counts
+-    logits -= presence_penalties.unsqueeze(dim=1) * output_mask
++    # Broadcast repetition penalties without allocating a full repeated tensor
++    # by using masked operations on the rows that require changes.
++    rep = repetition_penalties.view(-1, 1)
++    mask_any = (prompt_mask | output_mask)
++    if mask_any.any():
++        rows = mask_any.any(dim=1)
++        logits_rows = logits[rows]
++        mask_rows = mask_any[rows]
++        rep_rows = rep[rows]
++        pos = (logits_rows > 0) & mask_rows
++        neg = (logits_rows <= 0) & mask_rows
++        if pos.any():
++            logits_rows[pos] /= rep_rows.expand_as(logits_rows)[pos]
++        if neg.any():
++            logits_rows[neg] *= rep_rows.expand_as(logits_rows)[neg]
++    # Apply frequency and presence penalties in place with broadcasting
++    logits.sub_(frequency_penalties.view(-1, 1) * output_bin_counts)
++    logits.sub_(presence_penalties.view(-1, 1) * output_mask)
+     return logits

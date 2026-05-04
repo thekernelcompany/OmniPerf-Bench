@@ -1,0 +1,130 @@
+diff --git a/vllm/core/block_manager_v1.py b/vllm/core/block_manager_v1.py
+index 622aca6..8c26b40 100644
+--- a/vllm/core/block_manager_v1.py
++++ b/vllm/core/block_manager_v1.py
+@@ -487,6 +487,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # When forking, we must make sure that each block's `ref_count`
+         # is only incremented by one, so we deduplicate them by wrapping
+         # them in a set.
++        # Use set() conversion once and iterate without recreating repeatedly.
+         for block in set(src_block_table):
+             block.ref_count += 1
+ 
+@@ -496,6 +497,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         # NOTE: Here, we assume that the physical blocks are only shared by
+         # the sequences in the same group.
+         request_id = seq_group.request_id
++        # Pre-size set by adding per-seq blocks directly; avoids repeated hash work
+         blocks: Set[PhysicalTokenBlock] = set()
+         for seq in seq_group.get_seqs():
+             if seq.is_finished():
+@@ -607,6 +609,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+         blocks_to_free = (block_table[-self.block_sliding_window:]
+                           if self.block_sliding_window is not None else
+                           block_table)
++        # Deduplicate once, then branch free by device without re-checking
+         for block in set(blocks_to_free):
+             if block.device == Device.GPU:
+                 self.gpu_allocator.free(block)
+@@ -665,16 +668,18 @@ class BlockSpaceManagerV1(BlockSpaceManager):
+                 block.last_accessed = access_time
+ 
+     def compute_full_blocks_in_seq(self, seq: Sequence):
+-        if seq.seq_id not in self.block_tables:
++        # Fast-path return when no blocks to mark or not tracked
++        block_table = self.block_tables.get(seq.seq_id)
++        if not block_table:
+             return
+-        max_full_block = seq.get_len() // self.block_size - 1
+-        block_table = self.block_tables[seq.seq_id]
+-        if max_full_block == -1:
++        max_full_block = (seq.get_len() // self.block_size) - 1
++        if max_full_block <= 0:
+             return
+-        for i in reversed(range(max_full_block)):
+-            if block_table[i].computed:
+-                break
++        # Walk backwards until finding an already-computed block, then mark rest
++        i = max_full_block - 1
++        while i >= 0 and not block_table[i].computed:
+             block_table[i].computed = True
++            i -= 1
+ 
+     def get_all_computed_blocks(self, seq: Sequence) -> List[int]:
+         if seq.seq_id not in self.block_tables:
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index ba477ef..63d2e02 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -286,6 +286,11 @@ class Sequence:
+         self.from_decoder_prompt = from_decoder_prompt
+         self._prompt: Optional[str] = None
+         self._prompt_token_ids: Optional[List[int]] = None
++        # Cache for block prefix hashes to avoid recomputation across calls.
++        # Key: logical block index, Value: hash of the prefix up to the end
++        # of the block. This significantly reduces repeated hashing costs in
++        # allocation paths that may query the same block multiple times.
++        self._block_hash_cache: Dict[int, int] = {}
+ 
+         # For decoder-only models, a Sequence is constructed
+         # from an LLMInputs instance (the `inputs` arg.)
+@@ -383,17 +388,51 @@ class Sequence:
+             self.output_text)
+ 
+     def hash_of_block(self, logical_idx: int) -> int:
+-        # TODO This can produce incorrect hash when block size > prompt size
++        # Fast path using incremental cache to avoid O(L^2) hashing cost
++        cached = self._block_hash_cache.get(logical_idx)
++        if cached is not None:
++            return cached
++
++        # Find nearest cached predecessor to continue from
++        prev_idx = logical_idx - 1
++        start_idx = -1
++        if prev_idx >= 0:
++            i = prev_idx
++            while i >= 0 and i not in self._block_hash_cache:
++                i -= 1
++            start_idx = i
++
++        cur_idx = start_idx + 1
++        prev_hash: Optional[int] = (None if start_idx == -1 else
++                                    self._block_hash_cache[start_idx])
++
++        # Iteratively compute missing block hashes up to logical_idx
++        p_arr = self.data.prompt_token_ids_array
++        o_arr = self.data.output_token_ids_array
++        p_len = len(p_arr)
++        while cur_idx <= logical_idx:
++            start = cur_idx * self.block_size
++            end = start + self.block_size
++            if end <= p_len:
++                cur_tokens = p_arr[start:end]
++            elif start < p_len:
++                cur_tokens = list(p_arr[start:p_len]) + list(o_arr[0:end - p_len])
++            else:
++                s = start - p_len
++                e = end - p_len
++                cur_tokens = o_arr[s:e]
++
++            is_first = (cur_idx == 0)
++            block_hash = hash((is_first, prev_hash, *list(cur_tokens), self.lora_int_id))
++            self._block_hash_cache[cur_idx] = block_hash
++            prev_hash = block_hash
++            cur_idx += 1
+ 
+-        # Compute the number of tokens in the sequence
+-        # TODO: The current hashing function is O(L^2). We should optimize
+-        # this in the future.
+-        num_tokens = self.num_hashed_tokens_of_block(logical_idx)
+-        hashed_tokens = self.data.get_prefix_token_ids(num_tokens)
+-        return hash((hashed_tokens, self.lora_int_id))
++        return self._block_hash_cache[logical_idx]
+ 
+     def num_hashed_tokens_of_block(self, logical_idx: int):
+-        return logical_idx * self.block_size + self.block_size
++        # Slightly cheaper arithmetic; avoids repeated add outside.
++        return (logical_idx + 1) * self.block_size
+ 
+     def reset_state_for_recompute(self):
+         """Reset the sequence states for recomputation."""

@@ -1,0 +1,94 @@
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 0fbc3c8..3607f97 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -114,8 +114,9 @@ class TboDPAttentionPreparer:
+         return local_can_run_tbo, local_forward_mode
+ 
+     def compute_output(self, partial_global_info):
+-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0, 0].tolist())
+-        forward_modes = partial_global_info[:, 0, 1].tolist()
++        # Avoid Python list materialization; use tensor ops for reductions
++        local_can_run_tbo_aggregated = int(torch.min(partial_global_info[:, 0, 0]).item())
++        forward_modes = partial_global_info[:, 0, 1]
+ 
+         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
+             forward_modes
+@@ -139,17 +140,31 @@ class TboDPAttentionPreparer:
+ 
+     @staticmethod
+     def _compute_global_forward_mode(forward_modes):
+-        converted_forward_modes = [
+-            ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
+-            for x in forward_modes
+-        ]
+-        forward_mode_agree = TboDPAttentionPreparer._is_all_same(
+-            converted_forward_modes
+-        )
+-        global_forward_mode = (
+-            ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
+-        )
+-        return global_forward_mode, forward_mode_agree
++        # forward_modes is a 1D tensor; replace IDLE with DECODE without Python loops
++        if isinstance(forward_modes, torch.Tensor):
++            converted = torch.where(
++                forward_modes == ForwardMode.IDLE.value,
++                torch.tensor(ForwardMode.DECODE.value, device=forward_modes.device, dtype=forward_modes.dtype),
++                forward_modes,
++            )
++            # All-equal check via min==max
++            fm_min = int(torch.min(converted).item())
++            fm_max = int(torch.max(converted).item())
++            forward_mode_agree = (fm_min == fm_max)
++            global_forward_mode = ForwardMode(fm_min) if forward_mode_agree else None
++            return global_forward_mode, forward_mode_agree
++        else:
++            converted_forward_modes = [
++                ForwardMode.DECODE.value if x == ForwardMode.IDLE.value else x
++                for x in forward_modes
++            ]
++            forward_mode_agree = TboDPAttentionPreparer._is_all_same(
++                converted_forward_modes
++            )
++            global_forward_mode = (
++                ForwardMode(converted_forward_modes[0]) if forward_mode_agree else None
++            )
++            return global_forward_mode, forward_mode_agree
+ 
+     @staticmethod
+     def _is_all_same(x):
+@@ -268,7 +283,8 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            # Avoid zero-initialization; buffer will be fully written later
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,
+@@ -417,15 +433,15 @@ def _model_forward_filter_inputs(
+ 
+ 
+ def _model_forward_tbo_merge_outputs(output_a, output_b):
+-    def _handle_key(name):
+-        value_a = output_a[name]
+-        value_b = output_b[name]
+-        assert (value_a is None) == (value_b is None)
+-        if value_a is None:
+-            return None
+-        return torch.concat([value_a, value_b], dim=0)
+-
+-    return _handle_key("hidden_states"), _handle_key("residual")
++    # Fast path without inner closure, fewer lookups and branches
++    hs_a, rs_a = output_a.get("hidden_states"), output_a.get("residual")
++    hs_b, rs_b = output_b.get("hidden_states"), output_b.get("residual")
++    # Preserve original contract: both sides should be None or not None
++    assert (hs_a is None) == (hs_b is None)
++    assert (rs_a is None) == (rs_b is None)
++    hidden = None if hs_a is None else torch.cat((hs_a, hs_b), dim=0)
++    residual = None if rs_a is None else torch.cat((rs_a, rs_b), dim=0)
++    return hidden, residual
+ 
+ 
+ # -------------------------------- Utilities and wrappers ---------------------------------------

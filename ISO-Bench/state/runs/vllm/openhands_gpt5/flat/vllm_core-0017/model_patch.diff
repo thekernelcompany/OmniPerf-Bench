@@ -1,0 +1,130 @@
+diff --git a/vllm/core/block/naive_block.py b/vllm/core/block/naive_block.py
+index 50f27ba..e399781 100644
+--- a/vllm/core/block/naive_block.py
++++ b/vllm/core/block/naive_block.py
+@@ -142,9 +142,9 @@ class NaiveBlockAllocator(BlockAllocator):
+         if not self._free_block_indices:
+             raise BlockAllocator.NoFreeBlocksError()
+ 
+-        block_id = next(iter(self._free_block_indices))
++        # Use pop() to avoid an extra hashing round-trip from next(iter(...))
++        block_id = self._free_block_indices.pop()
+         self._refcounter.incr(block_id)
+-        self._free_block_indices.remove(block_id)
+         return block_id
+ 
+     def _free_block_id(self, block_id: BlockId) -> None:
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 2df7d74..22c0717 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -111,6 +111,29 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert device is None
+         assert_prefix_caching_block_or_none(prev_block)
+ 
++        # Fast-path: directly compute content hash without temporary block
++        # construction when we have a full block of tokens and the previous
++        # block's hash is known (or we are the first block).
++        if len(token_ids) == self._block_size:
++            is_first = prev_block is None
++            prev_hash = None if is_first else prev_block.content_hash  # type: ignore
++            if is_first or prev_hash is not None:
++                content_hash = PrefixCachingBlock.hash_block_tokens(
++                    is_first, prev_hash, token_ids)
++                cached_block_id = self._cached_blocks.get(content_hash)
++                if cached_block_id is not None:
++                    block = self._create_block(
++                        prev_block=prev_block,
++                        token_ids=token_ids,
++                        block_size=self._block_size,
++                        allocator=self,
++                        block_id=cached_block_id,
++                        computed=True,
++                    )
++                    self._incr_refcount_cached_block(block, cached_block_id)
++                    return block
++
++        # Fallback: construct a block to compute content hash and/or append.
+         block = self._create_block(
+             prev_block=prev_block,
+             token_ids=token_ids,
+@@ -384,6 +407,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         If the block is added into evictor, we need to update corresponding
+         info in evictor's metadata.
+         """
++        if not block_ids:
++            return
+ 
+         for block_id in block_ids:
+             if block_id in self._blocks:
+@@ -396,6 +421,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+         """Mark blocks as computed, used in prefix caching."""
++        if not block_ids:
++            return
+ 
+         for block_id in block_ids:
+             if block_id in self._blocks:
+@@ -607,16 +634,21 @@ class PrefixCachingBlock(Block):
+         if self._cached_num_tokens_total is not None:
+             return self._cached_num_tokens_total
+ 
+-        _block: Optional[Block] = self
+-        self._cached_num_tokens_total = 0
+-
+-        # TODO: current implement here take O(N^2), we expect future
+-        # we have O(1) here
+-        while _block is not None:
+-            self._cached_num_tokens_total += len(_block.token_ids)
+-            _block = _block.prev_block
+-
+-        return self._cached_num_tokens_total
++        # Fast path: accumulate token counts using cached totals on the chain.
++        total = 0
++        block: Optional[Block] = self
++        while block is not None:
++            # Prefer using cached value when available to avoid repeated list
++            # length computations along hot paths.
++            if isinstance(block, PrefixCachingBlock) and \
++               block._cached_num_tokens_total is not None:  # type: ignore[attr-defined]
++                total = block._cached_num_tokens_total + total
++                break
++            total += len(block.token_ids)
++            block = block.prev_block
++
++        self._cached_num_tokens_total = total
++        return total
+ 
+     @property
+     def block_size(self) -> int:
+@@ -647,21 +679,19 @@ class PrefixCachingBlock(Block):
+         if not self.is_full:
+             return None
+ 
+-        is_first_block = self._prev_block is None
+-        prev_block_hash = (
+-            None if is_first_block else
+-            self._prev_block.content_hash  # type: ignore
+-        )
++        # Fast-path if we are the first block.
++        if self._prev_block is None:
++            self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
++                True, None, cur_block_token_ids=self.token_ids)
++            return self._cached_content_hash
+ 
++        prev_block_hash = self._prev_block.content_hash  # type: ignore
+         # Previous block exists but does not yet have a hash.
+-        # Return no hash in this case.
+-        if prev_block_hash is None and not is_first_block:
++        if prev_block_hash is None:
+             return None
+ 
+         self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
+-            is_first_block,
+-            prev_block_hash,
+-            cur_block_token_ids=self.token_ids)
++            False, prev_block_hash, cur_block_token_ids=self.token_ids)
+         return self._cached_content_hash
+ 
+     @staticmethod

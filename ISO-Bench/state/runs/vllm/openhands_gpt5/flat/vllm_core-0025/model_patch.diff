@@ -1,0 +1,95 @@
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index 24ddd35..db78c1d 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -91,24 +91,29 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+     By default, transformers will recompute multiple tokenizer properties
+     each time they are called, leading to a significant slowdown.
+     This proxy caches these properties for faster access.
++
++    Optimizations:
++    - Idempotent: if the tokenizer is already cached, return it directly.
++    - Lazy caching: defer expensive get_vocab()/len() and max_token_id
++      computation until first access instead of at wrap time.
+     """
++    # If we've already wrapped this tokenizer, avoid creating another copy.
++    if getattr(tokenizer, "_vllm_is_cached_tokenizer", False):
++        return tokenizer
++
+     cached_tokenizer = copy.copy(tokenizer)
+ 
++    # Cheap properties can be captured immediately.
+     tokenizer_all_special_ids = tokenizer.all_special_ids
+     tokenizer_all_special_tokens = tokenizer.all_special_tokens
+     tokenizer_all_special_tokens_extended = (
+         tokenizer.all_special_tokens_extended)
+-    tokenizer_vocab = tokenizer.get_vocab()
+-    tokenizer_len = len(tokenizer)
+-
+-    max_token_id = max(tokenizer_vocab.values())
+-    # Some tokenizers (e.g., QwenTokenizer) have special tokens that
+-    # are added and included in the implementation of the vocab_size
+-    # property, but not in get_vocab(); if there is an implementation
+-    # of vocab size, we should take the greater value.
+-    if hasattr(tokenizer, "vocab_size"):
+-        with contextlib.suppress(NotImplementedError):
+-            max_token_id = max(max_token_id, tokenizer.vocab_size)
++
++    # Initialize lazy caches on the instance to avoid recomputation.
++    cached_tokenizer.__dict__.setdefault("_vllm_cached_vocab", None)
++    cached_tokenizer.__dict__.setdefault("_vllm_cached_len", None)
++    cached_tokenizer.__dict__.setdefault("_vllm_cached_max_token_id", None)
++    cached_tokenizer.__dict__.setdefault("_vllm_is_cached_tokenizer", True)
+ 
+     class CachedTokenizer(tokenizer.__class__):  # type: ignore
+ 
+@@ -126,13 +131,46 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+ 
+         @property
+         def max_token_id(self) -> int:
+-            return max_token_id
++            # Compute lazily, preferring tokenizer.vocab_size if available
++            m = self.__dict__.get("_vllm_cached_max_token_id", None)
++            if m is None:
++                # Try to use vocab_size without forcing get_vocab
++                vs = None
++                if hasattr(tokenizer, "vocab_size"):
++                    with contextlib.suppress(NotImplementedError):
++                        vs = int(tokenizer.vocab_size)
++                if vs is not None:
++                    m = vs
++                else:
++                    # Fall back to computing from vocab, cached lazily
++                    v = self.get_vocab()
++                    m = max(v.values()) if v else -1
++                self.__dict__["_vllm_cached_max_token_id"] = m
++            return m
+ 
+         def get_vocab(self) -> dict[str, int]:
+-            return tokenizer_vocab
++            v = self.__dict__.get("_vllm_cached_vocab", None)
++            if v is None:
++                v = tokenizer.get_vocab()
++                self.__dict__["_vllm_cached_vocab"] = v
++                # Update max_token_id if not set
++                if self.__dict__.get("_vllm_cached_max_token_id", None) is None:
++                    m = max(v.values()) if v else -1
++                    if hasattr(tokenizer, "vocab_size"):
++                        with contextlib.suppress(NotImplementedError):
++                            try:
++                                m = max(m, int(tokenizer.vocab_size))
++                            except Exception:
++                                m = max(m, tokenizer.vocab_size)
++                    self.__dict__["_vllm_cached_max_token_id"] = m
++            return v
+ 
+         def __len__(self) -> int:
+-            return tokenizer_len
++            l = self.__dict__.get("_vllm_cached_len", None)
++            if l is None:
++                l = len(tokenizer)
++                self.__dict__["_vllm_cached_len"] = l
++            return l
+ 
+         def __reduce__(self):
+             return get_cached_tokenizer, (tokenizer, )

@@ -1,0 +1,114 @@
+diff --git a/python/sglang/srt/managers/expert_location.py b/python/sglang/srt/managers/expert_location.py
+index 615e0a4..950ad32 100644
+--- a/python/sglang/srt/managers/expert_location.py
++++ b/python/sglang/srt/managers/expert_location.py
+@@ -89,7 +89,7 @@ class ExpertLocationMetadata:
+         num_logical_experts = model_config_for_expert_location.num_logical_experts
+ 
+         physical_to_logical_map = (
+-            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
++            torch.arange(0, num_physical_experts).unsqueeze(0).expand(num_layers, -1)
+             % num_logical_experts
+         )
+ 
+@@ -106,8 +106,9 @@ class ExpertLocationMetadata:
+         physical_to_logical_map,
+     ):
+         if not isinstance(physical_to_logical_map, torch.Tensor):
+-            physical_to_logical_map = torch.tensor(physical_to_logical_map)
+-        physical_to_logical_map = physical_to_logical_map.to(server_args.device)
++            physical_to_logical_map = torch.as_tensor(physical_to_logical_map, device=server_args.device)
++        else:
++            physical_to_logical_map = physical_to_logical_map.to(server_args.device, non_blocking=True)
+ 
+         common = ExpertLocationMetadata._init_common(server_args, model_config)
+         model_config_for_expert_location = common["model_config_for_expert_location"]
+@@ -127,10 +128,11 @@ class ExpertLocationMetadata:
+         server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
+     ):
+         if not isinstance(logical_count, torch.Tensor):
+-            logical_count = torch.tensor(logical_count)
++            logical_count = torch.as_tensor(logical_count, device=server_args.device)
++        else:
++            logical_count = logical_count.to(server_args.device, non_blocking=True)
+         if len(logical_count.shape) == 2:
+             logical_count = logical_count.unsqueeze(0)
+-        logical_count = logical_count.to(server_args.device)
+ 
+         common = ExpertLocationMetadata._init_common(server_args, model_config)
+         model_config_for_expert_location = common["model_config_for_expert_location"]
+@@ -155,9 +157,9 @@ class ExpertLocationMetadata:
+ 
+         return ExpertLocationMetadata._init_raw(
+             ep_size=common["ep_size"],
+-            physical_to_logical_map=physical_to_logical_map.to(server_args.device),
++            physical_to_logical_map=physical_to_logical_map.to(server_args.device, non_blocking=True),
+             logical_to_all_physical_map=logical_to_all_physical_map.to(
+-                server_args.device
++                server_args.device, non_blocking=True
+             ),
+         )
+ 
+@@ -283,7 +285,7 @@ def _compute_logical_to_all_physical_map(
+         logical_to_all_physical_map, pad_value=-1
+     )
+ 
+-    return torch.tensor(
++    return torch.as_tensor(
+         logical_to_all_physical_map, device=physical_to_logical_map.device
+     )
+ 
+@@ -311,11 +313,13 @@ def compute_logical_to_rank_dispatch_physical_map(
+     num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+     dtype = logical_to_all_physical_map.dtype
+ 
+-    logical_to_rank_dispatch_physical_map = torch.full(
+-        size=(num_gpus, num_layers, num_logical_experts),
+-        fill_value=-1,
++    device = logical_to_all_physical_map.device
++    logical_to_rank_dispatch_physical_map = torch.empty(
++        (num_gpus, num_layers, num_logical_experts),
+         dtype=dtype,
++        device=device,
+     )
++    logical_to_rank_dispatch_physical_map.fill_(-1)
+ 
+     for layer_id in range(num_layers):
+         for logical_expert_id in range(num_logical_experts):
+diff --git a/python/sglang/srt/managers/expert_location_dispatch.py b/python/sglang/srt/managers/expert_location_dispatch.py
+index 6880b01..e2c9eca 100644
+--- a/python/sglang/srt/managers/expert_location_dispatch.py
++++ b/python/sglang/srt/managers/expert_location_dispatch.py
+@@ -61,9 +61,12 @@ def transform_select_experts_inputs(
+     info: Optional[ExpertLocationDispatchInfo],
+ ):
+     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+-        router_logits = torch.randn_like(router_logits)
++        # Cheaper stateless randomization and avoid unnecessary zero fill
++        router_logits = torch.empty_like(router_logits)
++        router_logits.normal_()
+         if correction_bias is not None:
+-            correction_bias = torch.zeros_like(correction_bias)
++            correction_bias = torch.empty_like(correction_bias)
++            correction_bias.zero_()
+     return router_logits, correction_bias
+ 
+ 
+@@ -91,12 +94,12 @@ def _topk_ids_logical_to_physical_dynamic(
+ ) -> torch.Tensor:
+     topk_ids_original_shape = topk_ids.shape
+     device = topk_ids.device
+-    topk_ids = topk_ids.flatten()
++    topk_ids = topk_ids.reshape(-1)
+ 
+-    chosen_dispatch_index = (
+-        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+-    )
++    # Use rand with multiply to reduce large temporary and mod; also avoid extra dtype casts.
++    num_valid = info.partial_logical_to_all_physical_map_num_valid[topk_ids]
++    rand = torch.rand_like(topk_ids, dtype=torch.float32)
++    chosen_dispatch_index = (rand * num_valid.to(torch.float32)).to(torch.int64)
+     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+ 
+     topk_ids = topk_ids.view(topk_ids_original_shape)

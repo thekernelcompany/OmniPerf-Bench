@@ -1,0 +1,110 @@
+diff --git a/vllm/model_executor/layers/mamba/mamba_mixer2.py b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+index fec6d61..0bddf3e 100644
+--- a/vllm/model_executor/layers/mamba/mamba_mixer2.py
++++ b/vllm/model_executor/layers/mamba/mamba_mixer2.py
+@@ -73,14 +73,14 @@ class Mixer2RMSNormGated(CustomOp):
+         if self.n_groups == 1:
+             if self.tp_size > 1:
+                 # Compute local sum and then reduce to obtain global sum
+-                local_sums = x.pow(2).sum(dim=-1, keepdim=True)
++                local_sums = x.square().sum(dim=-1, keepdim=True)
+                 global_sums = tensor_model_parallel_all_reduce(local_sums)
+                 # Calculate the variance
+                 count = self.tp_size * x.shape[-1]
+                 variance = (global_sums / count)
+ 
+             else:
+-                variance = x.pow(2).mean(-1, keepdim=True)
++                variance = x.square().mean(-1, keepdim=True)
+             x = x * torch.rsqrt(variance + self.variance_epsilon)
+         else:
+             redundant_tp: bool = self.n_groups % self.tp_size != 0
+@@ -90,11 +90,14 @@ class Mixer2RMSNormGated(CustomOp):
+ 
+             *prefix_dims, hidden_dim = x.shape
+             group_count = hidden_dim // self.group_size
+-            x_grouped = x.view(*prefix_dims, group_count, self.group_size)
+-            variance = x_grouped.pow(2).mean(-1, keepdim=True)
++            # Use reshape instead of view to safely handle potential
++            # non-contiguous inputs without extra copies when possible.
++            # Prefer square() over pow(2) for better performance.
++            x_grouped = x.reshape(*prefix_dims, group_count, self.group_size)
++            variance = x_grouped.square().mean(-1, keepdim=True)
+             x_grouped = x_grouped * torch.rsqrt(variance +
+                                                 self.variance_epsilon)
+-            x = x_grouped.view(*prefix_dims, hidden_dim)
++            x = x_grouped.reshape(*prefix_dims, hidden_dim)
+ 
+             if redundant_tp:
+                 start = self.per_rank_hidden_size * self.tp_rank
+@@ -444,8 +447,7 @@ class MambaMixer2(CustomOp):
+                 query_start_loc=attn_metadata.query_start_loc).transpose(
+                     0, 1)[:seq_len]
+ 
+-            # TODO: Why is this needed?
+-            hidden_states_B_C = hidden_states_B_C.contiguous()
++            # Removed unnecessary contiguous() to avoid extra copy; use reshape() later to handle non-contiguous tensors.
+         else:
+             hidden_states_B_C = causal_conv1d_update(
+                 hidden_states_B_C,
+@@ -478,12 +480,12 @@ class MambaMixer2(CustomOp):
+                     mamba_cache_params.state_indices_tensor]
+ 
+             scan_output, varlen_state = mamba_chunk_scan_combined(
+-                hidden_states.view(1, seq_len, self.num_heads // self.tp_size,
++                hidden_states.reshape(1, seq_len, self.num_heads // self.tp_size,
+                                    self.head_dim),
+                 dt.unsqueeze(0),
+                 self.A,
+-                B.view(1, seq_len, self.n_groups // self.tp_size, -1),
+-                C.view(1, seq_len, self.n_groups // self.tp_size, -1),
++                B.reshape(1, seq_len, self.n_groups // self.tp_size, -1),
++                C.reshape(1, seq_len, self.n_groups // self.tp_size, -1),
+                 chunk_size=self.chunk_size,
+                 D=self.D,
+                 z=None,
+@@ -498,23 +500,27 @@ class MambaMixer2(CustomOp):
+             )
+ 
+             # update ssm states
+-            # - varlen state is a (batch, nheads, headdim, dstate) tensor
+-            for i, idx in enumerate(mamba_cache_params.state_indices_tensor):
+-                mamba_cache_params.ssm_state[idx].copy_(varlen_state[i])
++            # - varlen_state is (batch, nheads, headdim, dstate). Use advanced
++            #   indexing to update all valid destinations in a single op.
++            _dest = mamba_cache_params.state_indices_tensor
++            _mask = _dest >= 0
++            if _mask.any():
++                mamba_cache_params.ssm_state[_dest[_mask]] = varlen_state[_mask]
+ 
+             # - reshape
+-            hidden_states = scan_output.view(seq_len, -1)
++            hidden_states = scan_output.reshape(seq_len, -1)
+         else:
+ 
+             n_groups = self.n_groups // self.tp_size
++            # Avoid unnecessary dtype cast; rely on downstream kernels for casting if needed.
+             A = self.A[:, None, ...][:, :, None].expand(
+-                -1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
++                -1, self.head_dim, self.ssm_state_size)
+             dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+             D = self.D[:, None, ...].expand(-1, self.head_dim)
+-            B = B.view(-1, n_groups, B.shape[1] // n_groups)
+-            C = C.view(-1, n_groups, C.shape[1] // n_groups)
+-            hidden_states_reshaped = hidden_states.view(
++            B = B.reshape(-1, n_groups, B.shape[1] // n_groups)
++            C = C.reshape(-1, n_groups, C.shape[1] // n_groups)
++            hidden_states_reshaped = hidden_states.reshape(
+                 -1, self.num_heads // self.tp_size, self.head_dim)
+ 
+             # - the hidden is reshaped into number of current batches
+@@ -538,7 +544,7 @@ class MambaMixer2(CustomOp):
+                 dt_softplus=True,
+                 state_batch_indices=mamba_cache_params.state_indices_tensor,
+             )
+-            hidden_states = hidden_states.view(
++            hidden_states = hidden_states.reshape(
+                 -1, (self.num_heads // self.tp_size) * self.head_dim)
+ 
+         # # 4. gated MLP

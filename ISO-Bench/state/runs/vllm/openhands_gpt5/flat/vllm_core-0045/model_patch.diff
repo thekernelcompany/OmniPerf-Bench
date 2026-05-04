@@ -1,0 +1,66 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45a3b48..d8c387e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,46 @@ cmake_minimum_required(VERSION 3.26)
+ # cmake --build . --target _C
+ # cmake --install . --component _C
+ project(vllm_extensions LANGUAGES CXX)
++#
++# Build-type and compiler/linker optimization defaults
++#
++# Ensure an optimized build when CMAKE_BUILD_TYPE is not explicitly provided
++if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
++  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
++endif()
++message(STATUS "Effective CMake build type: ${CMAKE_BUILD_TYPE}")
++
++# Position-independent code for all targets (shared objects/loadable modules)
++set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++
++# Prefer aggressive optimization for Release-like configurations
++foreach(lang C CXX CUDA)
++  string(TOUPPER "${lang}" LANG_UP)
++  set(CMAKE_${LANG_UP}_FLAGS_RELEASE "${CMAKE_${LANG_UP}_FLAGS_RELEASE} -O3 -DNDEBUG" CACHE STRING "" FORCE)
++  set(CMAKE_${LANG_UP}_FLAGS_RELWITHDEBINFO "${CMAKE_${LANG_UP}_FLAGS_RELWITHDEBINFO} -O3 -DNDEBUG" CACHE STRING "" FORCE)
++endforeach()
++
++# Enable interprocedural optimization (IPO/LTO) where supported
++if (POLICY CMP0069)
++  cmake_policy(SET CMP0069 NEW)
++endif()
++include(CheckIPOSupported)
++check_ipo_supported(RESULT ipo_supported OUTPUT ipo_msg)
++if (ipo_supported)
++  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
++  message(STATUS "IPO/LTO enabled")
++else()
++  message(STATUS "IPO/LTO not supported: ${ipo_msg}")
++endif()
++
++# Optimize host code for native CPU when available
++if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
++  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=native>)
++endif()
++
++# Reduce exported symbol visibility to speed up dynamic linking
++add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fvisibility=hidden> $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>)
++
+ 
+ # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
+ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+@@ -126,6 +166,14 @@ else()
+ endif()
+ 
+ 
++# Additional CUDA-specific performance flags
++if(VLLM_GPU_LANG STREQUAL "CUDA")
++  # Use fast-math and restrict pointers where safe for our kernels
++  list(APPEND VLLM_GPU_FLAGS "-use_fast_math" "-Xptxas" "-O3")
++  # Reduce register pressure heuristically when appropriate
++  # list(APPEND VLLM_GPU_FLAGS "-Xptxas" "-maxrregcount=128")
++endif()
++
+ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   #
+   # For cuda we want to be able to control which architectures we compile for on

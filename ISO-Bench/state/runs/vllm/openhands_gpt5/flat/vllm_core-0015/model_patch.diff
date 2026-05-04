@@ -1,0 +1,91 @@
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index fda4d00..a07cfaf 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -97,8 +97,8 @@ class PyNcclCommunicator:
+                 self.world_size, self.unique_id, self.rank)
+ 
+             stream = torch.cuda.current_stream()
+-            # A small all_reduce for warmup.
+-            data = torch.zeros(1, device=device)
++            # A small all_reduce for warmup. No need to zero-initialize.
++            data = torch.empty(1, device=device)
+             self.all_reduce(data)
+             stream.synchronize()
+             del data
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index a837c1d..6be916e 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -1209,7 +1209,9 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
+         ranks = list(range(world_size))
+ 
+     # local tensor in each process to store the result
+-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
++    # Avoid initializing memory to zero; use empty then set required entries
++    is_in_the_same_node = torch.empty(world_size, dtype=torch.int32)
++    is_in_the_same_node.zero_()
+ 
+     magic_message = b"magic_message"
+     shm = None
+@@ -1263,7 +1265,8 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
+         torch.distributed.all_reduce(is_in_the_same_node, group=pg)
+         aggregated_data = is_in_the_same_node
+     else:
+-        aggregated_data = torch.zeros_like(is_in_the_same_node)
++        aggregated_data = torch.empty_like(is_in_the_same_node)
++        aggregated_data.zero_()
+         for i in range(world_size):
+             rank_data = pg.broadcast_obj(is_in_the_same_node, src=i)
+             aggregated_data += rank_data
+diff --git a/vllm/utils.py b/vllm/utils.py
+index a92b77e..d057051 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -787,9 +787,24 @@ def async_tensor_h2d(
+     target_device: Union[str, torch.device],
+     pin_memory: bool,
+ ) -> torch.Tensor:
+-    """Asynchronously create a tensor and copy it from host to device."""
+-    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+-    return t.to(device=target_device, non_blocking=True)
++    """Asynchronously create a tensor and copy it from host to device.
++
++    Optimizations:
++    - Fast-path if `data` is already a CPU tensor to avoid redundant allocation
++    - Prefer `as_tensor` to reduce copies for array-like inputs
++    - Defer pinning to a separate step to avoid allocator zero-fill
++    """
++    if isinstance(data, torch.Tensor):
++        t_cpu = data.to(dtype=dtype, device="cpu", copy=False)
++        if pin_memory and not t_cpu.is_pinned():
++            with contextlib.suppress(RuntimeError):
++                t_cpu = t_cpu.pin_memory()
++    else:
++        t_cpu = torch.as_tensor(data, dtype=dtype, device="cpu")
++        if pin_memory:
++            with contextlib.suppress(RuntimeError):
++                t_cpu = t_cpu.pin_memory()
++    return t_cpu.to(device=target_device, non_blocking=True)
+ 
+ 
+ def get_dtype_size(dtype: torch.dtype) -> int:
+diff --git a/vllm/worker/multi_step_model_runner.py b/vllm/worker/multi_step_model_runner.py
+index a2c2ceb..856919c 100644
+--- a/vllm/worker/multi_step_model_runner.py
++++ b/vllm/worker/multi_step_model_runner.py
+@@ -480,11 +480,13 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
+         # if CPU is ahead.
+         if self.is_driver_worker and get_pp_group().is_last_rank:
+             if self.pinned_sampled_token_ids is None:
+-                self.pinned_sampled_token_ids = torch.zeros(
++                # Use empty + zero_ to avoid unnecessary memory clearing by allocator
++                self.pinned_sampled_token_ids = torch.empty(
+                     (self.scheduler_config.max_num_seqs, 1),
+                     dtype=torch.long,
+                     device="cpu",
+                     pin_memory=True)
++                self.pinned_sampled_token_ids.zero_()
+ 
+             self._base_model_runner.model.sampler.include_gpu_probs_tensor = (
+                 True)

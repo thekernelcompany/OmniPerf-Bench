@@ -1,0 +1,144 @@
+diff --git a/model_patch.diff b/model_patch.diff
+new file mode 100644
+index 0000000..e69de29
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 29e861e..82bdaf5 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -34,7 +34,9 @@ from sglang.srt.disaggregation.common.utils import (
+ )
+ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+-from sglang.srt.server_args import ServerArgs
++from typing import TYPE_CHECKING
++if TYPE_CHECKING:
++    from sglang.srt.server_args import ServerArgs
+ from sglang.srt.utils import get_free_port, get_int_env_var, get_ip, get_local_ip_auto
+ 
+ logger = logging.getLogger(__name__)
+@@ -51,7 +53,7 @@ class KVTransferError(Exception):
+ 
+ 
+ # prefill
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferKVChunk:
+     room: int
+     prefill_kv_indices: npt.NDArray[np.int32]
+@@ -61,7 +63,7 @@ class TransferKVChunk:
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferInfo:
+     room: int
+     endpoint: str
+@@ -95,7 +97,7 @@ class TransferInfo:
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class KVArgsRegisterInfo:
+     room: str
+     endpoint: str
+@@ -304,7 +306,7 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
+-        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
++        self._connect(f"tcp://{remote}:{dst_port}").send_multipart(
+             [
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+@@ -352,9 +354,10 @@ class MooncakeKVManager(BaseKVManager):
+                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                 : len(chunked_dst_kv_indice)
+                             ]
+-                            logger.warning(
+-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+-                            )
++                            if logger.isEnabledFor(logging.WARNING):
++                                logger.warning(
++                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
++                                )
+ 
+                         ret = self.send_kvcache(
+                             req.mooncake_session_id,
+@@ -394,19 +397,15 @@ class MooncakeKVManager(BaseKVManager):
+                                 ].dst_aux_ptrs,
+                                 req.dst_aux_index,
+                             )
+-                            polls.append(True if ret == 0 else False)
+-                            dst_ranks_infos.append(
+-                                (req.endpoint, req.dst_port, req.room)
+-                            )
++                            polls.append(ret == 0)
++                            dst_ranks_infos.append((req.endpoint, req.dst_port, req.room))
+ 
+                             # Only sync status when all the dst ranks have received the kvcache
+                             if len(polls) == req.required_dst_info_num:
+                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                 self.update_status(req.room, status)
+                                 for endpoint, dst_port, room in dst_ranks_infos:
+-                                    self.sync_status_to_decode_endpoint(
+-                                        endpoint, dst_port, room, status
+-                                    )
++                                    self.sync_status_to_decode_endpoint(endpoint, dst_port, room, status)
+                     else:
+                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
+                         # Dummy request does not need to sync status to decode endpoint
+diff --git a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+index 5643af7..293982c 100644
+--- a/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
++++ b/python/sglang/srt/disaggregation/mooncake/transfer_engine.py
+@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ class MooncakeTransferEngine:
++    __slots__ = ("engine", "hostname", "gpu_id", "ib_device", "session_id")
+ 
+     def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
+         try:
+@@ -37,7 +38,8 @@ class MooncakeTransferEngine:
+             ret_value = -1
+ 
+         if ret_value != 0:
+-            logger.debug("Mooncake memory registration %s failed.", ptr)
++            if logger.isEnabledFor(logging.DEBUG):
++                logger.debug("Mooncake memory registration %s failed.", ptr)
+ 
+     def deregister(self, ptr):
+         try:
+@@ -47,7 +49,8 @@ class MooncakeTransferEngine:
+             ret_value = -1
+ 
+         if ret_value != 0:
+-            logger.debug("Mooncake memory deregistration %s failed.", ptr)
++            if logger.isEnabledFor(logging.DEBUG):
++                logger.debug("Mooncake memory deregistration %s failed.", ptr)
+ 
+     def initialize(
+         self,
+@@ -70,8 +73,7 @@ class MooncakeTransferEngine:
+     ) -> int:
+         """Synchronously transfer data to the specified address."""
+         try:
+-            # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
+-            # later: based on the cached queue pair to send data
++            # Construct/cached queue pair based on session_id then transfer
+             ret = self.engine.transfer_sync_write(
+                 session_id, buffer, peer_buffer_address, length
+             )
+@@ -79,8 +81,8 @@ class MooncakeTransferEngine:
+             # Mark transfer request as failed
+             ret = -1
+ 
+-        if ret < 0:
+-            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
++        if ret < 0 and logger.isEnabledFor(logging.DEBUG):
++            # Keep logs cheap when DEBUG disabled
+             logger.debug(
+                 "Failed to transfer data from %s to %s - %s.",
+                 buffer,

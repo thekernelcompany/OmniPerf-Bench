@@ -1,0 +1,95 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index 432a665..d96bcea 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -94,7 +94,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+             block_pool=self._block_pool,  # Share block pool here
+         )
+ 
+-        # Evitor used to maintain how we want to handle those computed blocks
++        # Fast mapping for physical ids used by get_physical_block_id
++        all_ids_sorted = sorted(self.all_block_ids)
++        self._abs_to_phys_id = {bid: i for i, bid in enumerate(all_ids_sorted)}
++
++        # Evictor used to maintain how we want to handle those computed blocks
+         # if we find memory pressure is high.
+         self.evictor: Evictor = make_evictor(eviction_policy)
+ 
+@@ -106,7 +110,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         self._cow_tracker = CopyOnWriteTracker(
+             refcounter=self._refcounter.as_readonly())
+ 
+-        self.metric_data = CacheMetricData()
++        # Ensure metric_data uses the actual block size for accurate bucketing
++        self.metric_data = CacheMetricData(block_size=block_size)
+ 
+     # Implements Block.Factory.
+     def _create_block(
+@@ -391,17 +396,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         return self._hashless_allocator.get_num_total_blocks()
+ 
+     def get_physical_block_id(self, absolute_id: int) -> int:
+-        """Returns the zero-offset block id on certain block allocator
+-        given the absolute block id.
+-
+-        Args:
+-            absolute_id (int): The absolute block id for the block 
+-                in whole allocator.
+-
+-        Returns:
+-            int: The rzero-offset block id on certain device.
++        """Returns the zero-offset block id for this allocator given an absolute id.
++        Uses an O(1) precomputed mapping instead of sorting on every call.
+         """
+-        return sorted(self.all_block_ids).index(absolute_id)
++        return self._abs_to_phys_id[absolute_id]
+ 
+     @property
+     def all_block_ids(self) -> FrozenSet[int]:
+@@ -412,9 +410,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+ 
+     def is_block_cached(self, block: Block) -> bool:
+         assert block.content_hash is not None
+-        if block.content_hash in self._cached_blocks:
+-            return True
+-        return False
++        return block.content_hash in self._cached_blocks
+ 
+     def promote_to_immutable_block(self, block: Block) -> BlockId:
+         """Once a mutable block is full, it can be promoted to an immutable
+@@ -498,8 +494,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         """
+ 
+         for block_id in block_ids:
+-            if self._block_tracker[block_id].active:
+-                self._block_tracker[block_id].last_accessed = now
++            tracker = self._block_tracker.get(block_id)
++            if tracker is not None and tracker.active:
++                tracker.last_accessed = now
+             elif block_id in self.evictor:
+                 self.evictor.update(block_id, now)
+             else:
+@@ -507,7 +504,22 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        """Mark a set of blocks as computed.
++
++        Optimized for the common case where there is nothing to mark (empty
++        input). Otherwise only touch the requested block ids without scanning
++        allocator state.
++        """
++        if not block_ids:
++            return
++        for block_id in block_ids:
++            tracker = self._block_tracker.get(block_id)
++            if tracker is None:
++                continue
++            if tracker.active:
++                tracker.computed = True
++            # If the block id is in the evictor, it is already a cached,
++            # computed immutable block. No action needed.
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:

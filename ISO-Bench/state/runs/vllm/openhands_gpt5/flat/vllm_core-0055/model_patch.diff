@@ -1,0 +1,118 @@
+diff --git a/vllm/core/block/block_table.py b/vllm/core/block/block_table.py
+index 49e63c2..27d909f 100644
+--- a/vllm/core/block/block_table.py
++++ b/vllm/core/block/block_table.py
+@@ -351,6 +351,15 @@ class BlockTable:
+         """
+         first_chunk_size = self._block_size - (self._num_full_slots %
+                                                self._block_size)
+-        token_blocks = [token_ids[:first_chunk_size]] + chunk_list(
+-            token_ids[first_chunk_size:], self._block_size)
+-        return token_blocks
++        # Fast-path: reduce temporary list constructions and slicing.
++        n = len(token_ids)
++        if n == 0:
++            return []
++        if first_chunk_size == self._block_size:
++            # Already aligned; split into equal chunks.
++            return chunk_list(token_ids, self._block_size)
++        out: List[List[int]] = []
++        out.append(token_ids[:first_chunk_size])
++        if n > first_chunk_size:
++            out.extend(chunk_list(token_ids[first_chunk_size:], self._block_size))
++        return out
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index f272e23..ac59bf0 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -147,18 +147,26 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+         assert_prefix_caching_block_or_none(prev_block)
+ 
+         # First, try to create a block that points to cached data
+-        block = self._block_pool.init_block(prev_block=prev_block,
+-                                            token_ids=token_ids,
+-                                            block_size=self._block_size,
+-                                            physical_block_id=None)
+-        assert block.content_hash is not None
+-
+-        cached_block_id = self._cached_blocks.get(block.content_hash, None)
+-        if cached_block_id is not None:
+-            block.block_id = cached_block_id
+-            self._incr_refcount_cached_block(block)
+-            return block
+-        self._block_pool.free_block(block)
++        # Fast-path: compute content hash without creating a temporary block
++        is_first_block = prev_block is None
++        prev_hash = None if is_first_block else prev_block.content_hash  # type: ignore
++        content_hash = None
++        if (is_first_block or prev_hash is not None) and len(token_ids) == self._block_size:
++            content_hash = PrefixCachingBlock.hash_block_tokens(
++                is_first_block, prev_hash, token_ids)
++
++        if content_hash is not None:
++            cached_block_id = self._cached_blocks.get(content_hash)
++            if cached_block_id is not None:
++                # Create a block directly bound to the cached physical id
++                block = self._block_pool.init_block(prev_block=prev_block,
++                                                    token_ids=token_ids,
++                                                    block_size=self._block_size,
++                                                    physical_block_id=cached_block_id)
++                # Cache the hash to avoid recomputation
++                block._cached_content_hash = content_hash  # type: ignore[attr-defined]
++                self._incr_refcount_cached_block(block)
++                return block
+ 
+         # No cached block => Allocate a new block
+         block = self.allocate_mutable_block(prev_block)
+@@ -501,7 +509,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        raise NotImplementedError("Marking as computed is incremental")
++        # Minimal implementation: mark active tracked blocks as computed.
++        # This is a no-op for empty input and evicted blocks.
++        for block_id in block_ids:
++            tracker = self._block_tracker.get(block_id)
++            if tracker is not None and tracker.active:
++                tracker.computed = True
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+                         computed: bool) -> None:
+@@ -828,7 +841,9 @@ class PrefixCachingBlock(Block):
+         - int: The computed hash value for the block.
+         """
+         assert (prev_block_hash is None) == is_first_block
+-        return hash((is_first_block, prev_block_hash, *cur_block_token_ids))
++        # Avoid tuple argument expansion which copies the list; hash a small tuple
++        # with the tokens as a nested tuple for lower overhead.
++        return hash((is_first_block, prev_block_hash, tuple(cur_block_token_ids)))
+ 
+ 
+ class ComputedBlocksTracker:
+diff --git a/vllm/utils.py b/vllm/utils.py
+index f3025a6..fd213e9 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -628,11 +628,19 @@ def make_tensor_with_pad(
+     The padding is applied to the end of each inner list until it reaches
+     `max_len`.
+     """
+-    padded_x = np.zeros([len(x), max_len], dtype=np.int32) + pad
++    # Optimize: avoid NumPy allocation and extra copy; build once on CPU
++    # then transfer to the target device in a single step.
++    rows = len(x)
++    padded_cpu = torch.full((rows, max_len), pad, dtype=dtype, device="cpu")
+     for ind, blocktb in enumerate(x):
+         assert len(blocktb) <= max_len
+-        padded_x[ind, :len(blocktb)] = blocktb
+-    return torch.tensor(padded_x, dtype=dtype, device=device)
++        if blocktb:
++            # Use as_tensor to avoid unnecessary copy when possible.
++            row_tensor = torch.as_tensor(blocktb, dtype=dtype, device="cpu")
++            padded_cpu[ind, :len(blocktb)] = row_tensor
++    if device is None or str(device) == "cpu":
++        return padded_cpu
++    return padded_cpu.to(device=device)
+ 
+ 
+ def async_tensor_h2d(

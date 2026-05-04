@@ -1,0 +1,266 @@
+diff --git a/vllm/v1/sample/rejection_sampler.py b/vllm/v1/sample/rejection_sampler.py
+index 5601c62..c03418a 100644
+--- a/vllm/v1/sample/rejection_sampler.py
++++ b/vllm/v1/sample/rejection_sampler.py
+@@ -3,11 +3,12 @@ from typing import Optional
+ 
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ from torch.nn.utils.rnn import pad_sequence
+ 
+ from vllm.logger import init_logger
+ from vllm.v1.sample.metadata import SamplingMetadata
+-from vllm.v1.spec_decode.utils import random_sample
++from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+ 
+ logger = init_logger(__name__)
+ INVALID_TOKEN_ID = -1
+@@ -84,16 +85,17 @@ class RejectionSampler(nn.Module):
+         # NOTE: The following input preparationg can be moved
+         # to the model runner with a persistent manner for better
+         # performance.
+-        # Convert draft token IDs to a tensor, split by sample_lens, then pad.
++        # Convert draft token IDs to tensors directly on the target device to
++        # avoid an extra CPU->device synchronization and copy.
+         draft_token_ids = [
+-            torch.tensor(x, dtype=int, device='cpu') for x in draft_token_ids
++            torch.as_tensor(x, dtype=torch.int64, device=target_probs.device)
++            for x in draft_token_ids
+         ]
+-        draft_token_ids_tensor = pad_sequence(draft_token_ids,
+-                                              batch_first=True,
+-                                              padding_value=INVALID_TOKEN_ID)
+-
+-        # NOTE: CPU <-> GPU synchronization happens here.
+-        draft_token_ids_tensor = draft_token_ids_tensor.to(target_probs.device)
++        draft_token_ids_tensor = pad_sequence(
++            draft_token_ids,
++            batch_first=True,
++            padding_value=INVALID_TOKEN_ID,
++        )
+ 
+         # Create one-hot tensor for draft token ids.
+         # This is used for ngram where we don't have draft_probs.
+@@ -131,11 +133,9 @@ class RejectionSampler(nn.Module):
+             # Identify valid positions (non-padding).
+             valid_mask = target_token_ids_tensor != INVALID_TOKEN_ID
+             # Generate mask with bonus token.
+-            generate_mask = torch.cat([
+-                accept_mask,
+-                torch.zeros(accept_mask.size(0), 1, device=accept_mask.device)
+-            ],
+-                                      dim=1).to(torch.bool) & valid_mask
++            generate_mask = torch.cat(
++                [accept_mask, torch.zeros_like(accept_mask[:, :1])], dim=1
++            ).to(torch.bool) & valid_mask
+             zeros_mask = (generate_mask == 0)
+             first_zero_idx = zeros_mask.float().argmax(dim=1)
+             # Figure out which rows actually contain at least one zero.
+@@ -143,8 +143,11 @@ class RejectionSampler(nn.Module):
+             # Use indexing to set the first zero in each of those rows to 1.
+             generate_mask[rows_with_zero, first_zero_idx[rows_with_zero]] = 1
+ 
+-            output_token_ids = target_token_ids_tensor
+-            output_token_ids[~generate_mask] = INVALID_TOKEN_ID
++            output_token_ids = torch.where(
++                generate_mask, target_token_ids_tensor,
++                torch.as_tensor(INVALID_TOKEN_ID,
++                                device=target_token_ids_tensor.device,
++                                dtype=target_token_ids_tensor.dtype))
+         else:
+             # Reference: https://arxiv.org/pdf/2211.17192
+             # 1. Extract the probabilities of the draft tokens.
+@@ -182,43 +185,51 @@ class RejectionSampler(nn.Module):
+             accepted_token_ids = (draft_token_ids_tensor * accept_mask +
+                                   INVALID_TOKEN_ID * (1 - accept_mask))
+ 
+-            # 4. Adjust the distribution for the recovered tokens.
+-            # Clamp the bonus probabilities to the smallest positive normal
+-            # value representable by float32.
+-            bonus_prob = torch.clamp(target_probs[:, :-1, :] - draft_probs,
+-                                     min=torch.finfo(torch.float32).tiny)
+-            normalized_bonus_prob = bonus_prob / bonus_prob.sum(dim=-1,
+-                                                                keepdim=True)
+-
+-            # 5. Sample recovered token ids.
+-            recovered_token_ids = random_sample(
+-                normalized_bonus_prob,
+-                sampling_metadata.generators).reshape(batch_size, max_spec_len)
+-
+-            # 6. Get the final output token ids.
+-            # output_token_ids = accepted_token_ids +
+-            #                    recovered_token_ids +
+-            #                    bonus_token_id
+-            recovered_bonus_token_ids = torch.cat(
+-                [recovered_token_ids, bonus_token_ids_tensor], dim=1)
+-            # Generate mask with bonus tokens.
+-            generate_mask = torch.cat([
+-                accept_mask,
+-                torch.zeros(batch_size, 1, device=accept_mask.device)
+-            ],
+-                                      dim=1).to(torch.bool)
++            # 4. Only compute recovered tokens for the first rejection per row.
++            # Generate mask with bonus tokens appended as the last column.
++            generate_mask = torch.cat(
++                [accept_mask, torch.zeros_like(accept_mask[:, :1])], dim=1
++            ).to(torch.bool)
+             zeros_mask = (generate_mask == 0)
+             first_zero_idx = zeros_mask.float().argmax(dim=1)
+-            output_token_ids = torch.cat([
+-                accepted_token_ids,
+-                torch.full((batch_size, 1),
+-                           fill_value=INVALID_TOKEN_ID,
+-                           device=accept_mask.device)
+-            ],
+-                                         dim=1)
+-            output_token_ids[torch.arange(batch_size),
+-                             first_zero_idx] = recovered_bonus_token_ids[
+-                                 torch.arange(batch_size), first_zero_idx]
++
++            # Rows that require recovery (i.e., first_zero_idx < max_spec_len).
++            rows_recover = first_zero_idx < max_spec_len
++            recovered_or_bonus = torch.empty(batch_size,
++                                             dtype=accepted_token_ids.dtype,
++                                             device=accept_mask.device)
++            if rows_recover.any():
++                b_idx = torch.nonzero(rows_recover, as_tuple=False).squeeze(1)
++                t_idx = first_zero_idx[rows_recover].to(torch.long)
++                # Clamp the bonus probabilities to the smallest positive normal
++                # value representable by float32.
++                bonus_prob = torch.clamp(
++                    target_probs[b_idx, t_idx, :] - draft_probs[b_idx, t_idx, :],
++                    min=torch.finfo(torch.float32).tiny,
++                )
++                normalized_bonus_prob = bonus_prob / bonus_prob.sum(
++                    dim=-1, keepdim=True)
++                recovered_ids = random_sample(normalized_bonus_prob,
++                                              sampling_metadata.generators)
++                recovered_or_bonus[rows_recover] = recovered_ids.to(
++                    accepted_token_ids.dtype)
++            # Rows with all accepted tokens use the provided bonus token.
++            if (~rows_recover).any():
++                recovered_or_bonus[~rows_recover] = bonus_token_ids_tensor[
++                    ~rows_recover, 0]
++
++            # 5. Get the final output token ids.
++            output_token_ids = torch.cat(
++                [
++                    accepted_token_ids,
++                    torch.full((batch_size, 1), INVALID_TOKEN_ID,
++                               device=accept_mask.device,
++                               dtype=accepted_token_ids.dtype),
++                ],
++                dim=1,
++            )
++            output_token_ids[torch.arange(batch_size), first_zero_idx] = (
++                recovered_or_bonus)
+ 
+         return output_token_ids
+ 
+@@ -264,24 +275,16 @@ def _create_greedy_token_probs(
+     vocab_size: int,
+     out_device: torch.device,
+ ) -> torch.Tensor:
+-    batch_size, num_tokens = token_ids.shape
+-
+-    token_probs = torch.zeros(batch_size,
+-                              num_tokens,
+-                              vocab_size,
+-                              dtype=torch.float,
+-                              device=out_device)
+-
+-    # Ignore INVALID_TOKEN_ID.
++    # Build one-hot probabilities directly without materializing a
++    # zero-initialized tensor and scatter. This reduces memory writes.
+     valid_mask = (token_ids != INVALID_TOKEN_ID)
+-    valid_indices = token_ids.clone()
+-    valid_indices[~valid_mask] = 0
+-
+-    token_probs.scatter_(dim=2,
+-                         index=valid_indices.unsqueeze(-1),
+-                         src=valid_mask.unsqueeze(-1).float())
+-
+-    return token_probs
++    safe_indices = torch.where(valid_mask, token_ids, torch.zeros_like(token_ids))
++    token_probs = torch.nn.functional.one_hot(
++        safe_indices.to(torch.int64), num_classes=vocab_size
++    ).to(torch.float32)
++    # Zero out positions that are invalid.
++    token_probs = token_probs * valid_mask.unsqueeze(-1).to(token_probs.dtype)
++    return token_probs.to(out_device)
+ 
+ 
+ def _convert_2d_probs(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 6601538..f344a2e 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -191,10 +191,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        # Use empty to avoid unnecessary zero-initialization; values are overwritten
++        # before use in each step.
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+         # None in the first PP rank. The rest are set after load_model.
+@@ -212,16 +214,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # identical position IDs, making M-RoPE functionally equivalent to
+             # 1D-RoPE.
+             # See page 5 of https://arxiv.org/abs/2409.12191
+-            self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
++            self.mrope_positions = torch.empty((3, self.max_num_tokens + 1),
+                                                dtype=torch.int64,
+                                                device=self.device)
+-            self.mrope_positions_cpu = torch.zeros(
++            self.mrope_positions_cpu = torch.empty(
+                 (3, self.max_num_tokens + 1),
+                 dtype=torch.int64,
+                 device="cpu",
+                 pin_memory=self.pin_memory)
+ 
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -234,27 +236,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_lens_cpu = torch.zeros(self.max_num_reqs,
++        self.seq_lens_cpu = torch.empty(self.max_num_reqs,
+                                         dtype=torch.int32,
+                                         device="cpu",
+                                         pin_memory=self.pin_memory)

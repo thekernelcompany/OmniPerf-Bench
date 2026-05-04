@@ -1,0 +1,50 @@
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index cf2f1c6..1172f38 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -1444,8 +1444,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
+                                       dtype=torch.long,
+                                       device=self.device)
+         if self.model_config.uses_mrope:
+-            input_positions = torch.tile(input_positions,
+-                                         (3, 1)).cuda(device=self.device)
++            # Avoid extra device transfer; input_positions already on device
++            input_positions = input_positions.repeat(3, 1)
+         # Prepare dummy previous_hidden_states only if needed by the model.
+         # This is used by draft models such as EAGLE.
+         previous_hidden_states = None
+@@ -1568,10 +1568,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
+         """
+         # During the decode phase encoder_input_ids and encoder_positions are
+         # unset. Do the same thing for graph capture.
+-        capture_inputs["encoder_input_ids"] = torch.tensor([],
++        capture_inputs["encoder_input_ids"] = torch.empty(0,
+                                                            dtype=torch.long,
+                                                            device=self.device)
+-        capture_inputs["encoder_positions"] = torch.tensor([],
++        capture_inputs["encoder_positions"] = torch.empty(0,
+                                                            dtype=torch.long,
+                                                            device=self.device)
+ 
+@@ -1751,7 +1751,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
+                 orig_model_forward_time = 0.0
+                 if intermediate_tensors is not None:
+                     orig_model_forward_time = intermediate_tensors.tensors.get(
+-                        "model_forward_time", torch.tensor(0.0)).item()
++                        "model_forward_time", 0.0)
++                    if isinstance(orig_model_forward_time, torch.Tensor):
++                        orig_model_forward_time = orig_model_forward_time.item()
+                 hidden_or_intermediate_states.tensors["model_forward_time"] = (
+                     torch.tensor(model_forward_time + orig_model_forward_time))
+             return hidden_or_intermediate_states
+@@ -1779,7 +1781,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
+             orig_model_forward_time = 0.0
+             if intermediate_tensors is not None:
+                 orig_model_forward_time = intermediate_tensors.tensors.get(
+-                    "model_forward_time", torch.tensor(0.0)).item()
++                    "model_forward_time", 0.0)
++                if isinstance(orig_model_forward_time, torch.Tensor):
++                    orig_model_forward_time = orig_model_forward_time.item()
+             # If there are multiple workers, we are still tracking the latency
+             # from the start time of the driver worker to the end time of the
+             # driver worker. The model forward time will then end up covering

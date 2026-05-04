@@ -1,0 +1,115 @@
+diff --git a/vllm/attention/ops/prefix_prefill.py b/vllm/attention/ops/prefix_prefill.py
+index e0478c2..beb1301 100644
+--- a/vllm/attention/ops/prefix_prefill.py
++++ b/vllm/attention/ops/prefix_prefill.py
+@@ -145,8 +145,8 @@ if triton.__version__ >= "2.1.0":
+             else:
+                 k = k_load
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)  # [M,N]
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+@@ -219,8 +219,8 @@ if triton.__version__ >= "2.1.0":
+                         ((start_n + offs_n[None, :]) < cur_batch_query_len),
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk *= sm_scale
+             # apply causal mask
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+@@ -363,8 +363,8 @@ if triton.__version__ >= "2.1.0":
+             k = tl.load(K_cache + off_k,
+                         mask=(start_n + offs_n[None, :]) < cur_batch_ctx_len,
+                         other=0.0)
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk += tl.dot(q, k)
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+@@ -414,8 +414,8 @@ if triton.__version__ >= "2.1.0":
+                         < cur_batch_seq_len - cur_batch_ctx_len,
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk += tl.dot(q, k)
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k)
+             qk *= sm_scale
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+                           float("-inf"))
+@@ -582,14 +582,14 @@ if triton.__version__ >= "2.1.0":
+             else:
+                 k = k_load
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision=IN_PRECISION)
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k, input_precision=IN_PRECISION)
+             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
+                           float("-inf"))
+             qk *= sm_scale
+ 
+             # load alibi
+-            alibi = (tl.arange(0, BLOCK_N)[None, :] + alibi_start_k -
++            alibi = (offs_n[None, :] + alibi_start_k -
+                      alibi_start_q[:, None]) * alibi_slope
+             alibi = tl.where(
+                 (alibi <= 0) & (alibi_start_q[:, None] < cur_batch_seq_len),
+@@ -657,14 +657,14 @@ if triton.__version__ >= "2.1.0":
+                          < cur_batch_seq_len - cur_batch_ctx_len),
+                         other=0.0)
+ 
+-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+-            qk = tl.dot(q, k, acc=qk, input_precision='ieee')
++            # Avoid zero-initialization by computing dot directly
++            qk = tl.dot(q, k, input_precision='ieee')
+             qk *= sm_scale
+             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+                           float("-inf"))
+ 
+             # load alibi
+-            alibi = (tl.arange(0, BLOCK_N)[None, :] + alibi_start_k -
++            alibi = (offs_n[None, :] + alibi_start_k -
+                      alibi_start_q[:, None]) * alibi_slope
+             alibi = tl.where(
+                 (alibi <= 0) & (alibi_start_q[:, None] < cur_batch_seq_len),
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 07d51ac..1ac546a 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -109,12 +109,14 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts, )
+-    tokens_cnts = torch.zeros((num_experts + 1, num_experts),
++    tokens_cnts = torch.empty((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    tokens_cnts.zero_()
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
++    cumsum.zero_()
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -204,7 +206,8 @@ def moe_align_block_size(
+     sorted_ids = torch.empty((max_num_tokens_padded, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
++    # Preinitialize to max value only once; avoids extra fill on hot path
++    sorted_ids[:] = topk_ids.numel()
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.

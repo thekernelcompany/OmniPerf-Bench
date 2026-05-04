@@ -1,0 +1,149 @@
+diff --git a/vllm/core/block_manager.py b/vllm/core/block_manager.py
+index 8b089a5..1a045fe 100644
+--- a/vllm/core/block_manager.py
++++ b/vllm/core/block_manager.py
+@@ -237,8 +237,9 @@ class BlockSpaceManager:
+         self,
+         seq: Sequence,
+     ) -> bool:
+-        token_ids_len = len(seq.data.get_token_ids())
+-        return token_ids_len > 0 and token_ids_len % seq.block_size == 0
++        # Avoid constructing a concatenated token list; use O(1) length query.
++        token_ids_len = seq.get_len()
++        return token_ids_len != 0 and (token_ids_len % seq.block_size) == 0
+ 
+     def _maybe_promote_last_block(
+         self,
+@@ -460,13 +461,18 @@ class BlockSpaceManager:
+         if seq.seq_id not in self.block_tables:
+             return []
+         block_table = self.block_tables[seq.seq_id]
+-        # NOTE We exclude the last block to avoid the case where the entire
+-        # prompt is cached. This would cause erroneous behavior in model
+-        # runner.
+-        return [
+-            b.block_number
+-            for b in takewhile(lambda b: b.computed, block_table[:-1])
+-        ]
++        # Exclude the last block to avoid the case where the entire prompt is
++        # cached, which would cause erroneous behavior in model runner.
++        if not block_table:
++            return []
++        limit = len(block_table) - 1
++        result: List[int] = []
++        for i in range(limit):
++            b = block_table[i]
++            if not b.computed:
++                break
++            result.append(b.block_number)
++        return result
+ 
+     def get_common_computed_block_ids(self,
+                                       seq_group: SequenceGroup) -> List[int]:
+@@ -474,11 +480,15 @@ class BlockSpaceManager:
+         if not self.enable_caching:
+             return []
+ 
+-        ids_list = [
+-            self.get_all_computed_blocks(seq)
+-            for seq in iter(seq_group.seqs_dict.values())
+-        ]
+-        return commonprefix([ids for ids in ids_list if ids != []])
++        # Gather computed block id prefixes from all sequences; stop early if any
++        # is empty.
++        ids_list: List[List[int]] = []
++        for seq in seq_group.seqs_dict.values():
++            ids = self.get_all_computed_blocks(seq)
++            if not ids:
++                return []
++            ids_list.append(ids)
++        return commonprefix(ids_list)
+ 
+     def mark_blocks_as_computed(self, seq_group: SequenceGroup):
+         if self.enable_caching:
+diff --git a/vllm/core/evictor.py b/vllm/core/evictor.py
+index 1d81f5a..056cd0c 100644
+--- a/vllm/core/evictor.py
++++ b/vllm/core/evictor.py
+@@ -52,10 +52,9 @@ class Evictor(ABC):
+ 
+ class LRUEvictor(Evictor):
+     """Evicts in a least-recently-used order using the last_accessed timestamp
+-    that's recorded in the PhysicalTokenBlock. If there are multiple blocks with
+-    the same last_accessed time, then the one with the largest num_hashed_tokens
+-    will be evicted. If two blocks each have the lowest last_accessed time and
+-    highest num_hashed_tokens value, then one will be chose arbitrarily
++    recorded in the PhysicalTokenBlock. Ties are broken by evicting the block
++    with the largest ``num_hashed_tokens``. Implemented in a single pass over
++    the free set to minimize overhead.
+     """
+ 
+     def __init__(self):
+@@ -64,44 +63,32 @@ class LRUEvictor(Evictor):
+     def __contains__(self, block_hash: int) -> bool:
+         return block_hash in self.free_table
+ 
+-    # TODO: The performance of this evict function can be optimized further.
+     def evict(self) -> PhysicalTokenBlock:
+-        free_blocks: List[PhysicalTokenBlock] = list(self.free_table.values())
+-        if len(free_blocks) == 0:
++        # Single-pass selection of the best victim block.
++        if not self.free_table:
+             raise ValueError("No usable cache memory left")
+ 
+-        # Find lowest timestamp
+-        lowest_timestamp = free_blocks[0].last_accessed
+-        for block in free_blocks:
+-            if block.last_accessed < lowest_timestamp:
+-                lowest_timestamp = block.last_accessed
+-
+-        # Find all blocks with the lowest timestamp
+-        least_recent: List[PhysicalTokenBlock] = []
+-        for block in free_blocks:
+-            if block.last_accessed == lowest_timestamp:
+-                least_recent.append(block)
+-
+-        # Find highest prefix count per block
+-        highest_num_hashed_tokens = 0
+-        for block in least_recent:
+-            if block.num_hashed_tokens > highest_num_hashed_tokens:
+-                highest_num_hashed_tokens = block.num_hashed_tokens
+-
+-        evicted_block: Optional[PhysicalTokenBlock] = None
+-
+-        # Find the first block with the lowest timestamp
+-        for block in least_recent:
+-            if block.num_hashed_tokens == highest_num_hashed_tokens:
+-                evicted_block = block
+-                break
+-
+-        assert evicted_block is not None
+-
+-        del self.free_table[evicted_block.block_hash]
+-
+-        evicted_block.computed = False
+-        return evicted_block
++        # Initialize with an arbitrary element (dict preserves insertion order
++        # but we only need one element here).
++        it = iter(self.free_table.values())
++        best = next(it)
++        best_ts = best.last_accessed
++        best_h = best.num_hashed_tokens
++
++        for blk in it:
++            ts = blk.last_accessed
++            if ts < best_ts:
++                best = blk
++                best_ts = ts
++                best_h = blk.num_hashed_tokens
++            elif ts == best_ts and blk.num_hashed_tokens > best_h:
++                best = blk
++                best_h = blk.num_hashed_tokens
++
++        # Remove and return the chosen block.
++        del self.free_table[best.block_hash]
++        best.computed = False
++        return best
+ 
+     def add(self, block: PhysicalTokenBlock):
+         self.free_table[block.block_hash] = block

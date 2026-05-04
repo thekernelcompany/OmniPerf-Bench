@@ -1,0 +1,83 @@
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 29f18f0..d05477d 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -984,8 +984,17 @@ class DeepseekV2AttentionMLA(nn.Module):
+                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
+             )
+         else:
+-            q = torch.cat([q_nope_out, q_pe], dim=-1)
+-            k = torch.cat([k_nope, k_pe], dim=-1)
++            # Preallocate and copy instead of torch.cat to reduce intermediate allocations
++            q = q_nope_out.new_empty(
++                (q_nope_out.shape[0], q_nope_out.shape[1], q_nope_out.shape[2] + q_pe.shape[2])
++            )
++            q[..., : q_nope_out.shape[2]] = q_nope_out
++            q[..., q_nope_out.shape[2] :] = q_pe
++            k = k_nope.new_empty(
++                (k_nope.shape[0], k_nope.shape[1], k_nope.shape[2] + k_pe.shape[2])
++            )
++            k[..., : k_nope.shape[2]] = k_nope
++            k[..., k_nope.shape[2] :] = k_pe
+             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+ 
+@@ -1026,7 +1035,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             )
+         else:
+             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
++        attn_output = attn_bmm_output.transpose(0, 1).reshape(-1, self.num_local_heads * self.v_head_dim)
+         output, _ = self.o_proj(attn_output)
+ 
+         return output
+@@ -1213,7 +1222,7 @@ class DeepseekV2AttentionMLA(nn.Module):
+             )
+         else:
+             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
++        attn_output = attn_bmm_output.transpose(0, 1).reshape(-1, self.num_local_heads * self.v_head_dim)
+         output, _ = self.o_proj(attn_output)
+ 
+         return output
+diff --git a/python/sglang/srt/two_batch_overlap.py b/python/sglang/srt/two_batch_overlap.py
+index 6b0241f..24173c9 100644
+--- a/python/sglang/srt/two_batch_overlap.py
++++ b/python/sglang/srt/two_batch_overlap.py
+@@ -324,7 +324,8 @@ class TboForwardBatchPreparer:
+         # TODO improve, e.g. unify w/ `init_raw`
+         if global_server_args_dict["moe_dense_tp_size"] == 1:
+             sum_len = end_token_index - start_token_index
+-            gathered_buffer = torch.zeros(
++            # Use empty to avoid unnecessary zero-initialization; buffer will be fully written by comm ops
++            gathered_buffer = torch.empty(
+                 (sum_len, batch.gathered_buffer.shape[1]),
+                 dtype=batch.gathered_buffer.dtype,
+                 device=batch.gathered_buffer.device,
+@@ -540,15 +541,19 @@ def _model_forward_filter_inputs(
+ 
+ 
+ def _model_forward_tbo_merge_outputs(output_a, output_b):
+-    def _handle_key(name):
+-        value_a = output_a[name]
+-        value_b = output_b[name]
+-        assert (value_a is None) == (value_b is None)
+-        if value_a is None:
++    def merge(name):
++        a = output_a[name]
++        b = output_b[name]
++        assert (a is None) == (b is None)
++        if a is None:
+             return None
+-        return torch.concat([value_a, value_b], dim=0)
++        if a.numel() == 0:
++            return b
++        if b.numel() == 0:
++            return a
++        return torch.cat((a, b), dim=0)
+ 
+-    return _handle_key("hidden_states"), _handle_key("residual")
++    return merge("hidden_states"), merge("residual")
+ 
+ 
+ # -------------------------------- Utilities and wrappers ---------------------------------------

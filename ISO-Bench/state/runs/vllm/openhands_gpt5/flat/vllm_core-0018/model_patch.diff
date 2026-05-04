@@ -1,0 +1,127 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 1dea711..d783133 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -117,9 +117,9 @@ class TopKTopPSampler(nn.Module):
+         if k is not None and p is None:
+             topk_values, topk_indices = torch.topk(logits, k, dim=-1)
+ 
+-            mask = torch.ones_like(logits, dtype=torch.bool)
+-            mask.scatter_(-1, topk_indices, False)
+-            logits.masked_fill_(mask, float('-inf'))
++            # Faster: write selected values directly and fill others with -inf
++            logits.fill_(float('-inf'))
++            logits.scatter_(-1, topk_indices, topk_values)
+         else:
+             # TODO Placeholder for TPU optimized topp kernel
+             # logits = apply_top_k_top_p(logits, k, p)
+@@ -140,6 +140,15 @@ def apply_top_k_top_p(
+     """
+     if k is None and p is None:
+         return logits
++
++    # Fast path for top-k only: avoid full sort when p is None.
++    if k is not None and p is None:
++        topk_values, topk_indices = torch.topk(logits, k, dim=-1)
++        logits.fill_(-float("inf"))
++        logits.scatter_(-1, topk_indices, topk_values)
++        return logits
++
++    # General path: sort then apply masks.
+     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+ 
+     if k is not None:
+@@ -159,9 +168,10 @@ def apply_top_k_top_p(
+         top_p_mask[:, -1] = False
+         logits_sort.masked_fill_(top_p_mask, -float("inf"))
+ 
+-    # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+-    return logits
++    # Re-sort the logits back to the original order efficiently.
++    out = torch.empty_like(logits)
++    out.scatter_(-1, logits_idx, logits_sort)
++    return out
+ 
+ 
+ def random_sample(
+@@ -173,16 +183,13 @@ def random_sample(
+     We use this function instead of torch.multinomial because torch.multinomial
+     causes CPU-GPU synchronization.
+     """
++    # Use empty to avoid zero-initialization; fill only when needed below.
+     q = torch.empty_like(probs)
+-    # NOTE(woosuk): To batch-process the requests without their own seeds,
+-    # which is the common case, we first assume that every request does
+-    # not have its own seed. Then, we overwrite the values for the requests
+-    # that have their own seeds.
++    # Batch-generate exponentials when not all requests have their own seeds.
+     if len(generators) != probs.shape[0]:
+         q.exponential_()
+     if generators:
+-        # TODO(woosuk): This can be slow because we handle each request
+-        # one by one. Optimize this.
++        # Generate per-request exponentials only for seeded requests.
+         for i, generator in generators.items():
+             q[i].exponential_(generator=generator)
+     return probs.div_(q).argmax(dim=-1).view(-1)
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 397a049..e4e4029 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -35,8 +35,9 @@ class Sampler(nn.Module):
+         if num_logprobs is not None:
+             raw_logprobs = self.compute_logprobs(logits)
+ 
+-        # Use float32 for the logits.
+-        logits = logits.to(torch.float32)
++        # Use float32 for the logits only if needed to avoid redundant casts.
++        if logits.dtype is not torch.float32:
++            logits = logits.to(torch.float32)
+         # Apply allowed token ids.
+         logits = self.apply_allowed_token_ids(logits, sampling_metadata)
+         # Apply bad words exclusion.
+@@ -54,18 +55,16 @@ class Sampler(nn.Module):
+         sampled = sampled.long()
+ 
+         # Gather the logprobs of the topk and sampled token (if requested).
+-        # Get logprobs and rank tensors (if requested)
+-        logprobs_tensors = None if num_logprobs is None else \
+-            self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
++        logprobs_tensors = None
++        if num_logprobs is not None:
++            # Avoid extra cast by using already-computed raw_logprobs
++            logprobs_tensors = self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
+ 
+-        # Use int32 to reduce the tensor size.
++        # Use int32 to reduce the tensor size without reallocating when possible.
+         sampled = sampled.to(torch.int32)
+ 
+-        # These are GPU tensors.
++        # Construct output without intermediate copies.
+         sampler_output = SamplerOutput(
+-            # The sampled tokens are expanded to 2D tensor with shape
+-            # [num_requests, 1], where each row represents one generated
+-            # token per request.
+             sampled_token_ids=sampled.unsqueeze(-1),
+             logprobs_tensors=logprobs_tensors,
+         )
+@@ -225,9 +224,15 @@ class Sampler(nn.Module):
+         # One idea is implement this as a PyTorch C++ op, and we may
+         # even optimize the logit_bias layout.
+         for i, logit_bias in enumerate(sampling_metadata.logit_bias):
+-            if logit_bias:
+-                for token_id, bias in logit_bias.items():
+-                    logits[i, token_id] += bias
++            if not logit_bias:
++                continue
++            idx = torch.tensor(list(logit_bias.keys()),
++                               device=logits.device,
++                               dtype=torch.long)
++            vals = torch.tensor(list(logit_bias.values()),
++                                device=logits.device,
++                                dtype=logits.dtype)
++            logits[i].index_add_(0, idx, vals)
+         return logits
+ 
+     def apply_allowed_token_ids(

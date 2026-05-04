@@ -1,0 +1,145 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 0026031..a94c87b 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -534,12 +534,15 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts, )
+-    tokens_cnts = torch.zeros((num_experts + 1, num_experts),
+-                              dtype=torch.int32,
+-                              device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
+-                         dtype=torch.int32,
+-                         device=topk_ids.device)
++    tokens_cnts = torch.empty((num_experts + 1, num_experts),
++                             dtype=torch.int32,
++                             device=topk_ids.device)
++    # Only rows 1..E are used for counting and must start from 0
++    tokens_cnts[1:, :].zero_()
++    cumsum = torch.empty((num_experts + 1, ),
++                        dtype=torch.int32,
++                        device=topk_ids.device)
++    cumsum[0] = 0
+     tokens_per_thread = ceil_div(numel, num_experts)
+ 
+     moe_align_block_size_stage1[grid](
+@@ -621,42 +624,74 @@ def moe_align_block_size(
+         by block_size for proper block matrix operations.
+     """
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+-    sorted_ids = torch.empty((max_num_tokens_padded, ),
+-                             dtype=torch.int32,
+-                             device=topk_ids.device)
+-    sorted_ids.fill_(topk_ids.numel())
++    sorted_ids = torch.full((max_num_tokens_padded, ),
++                            topk_ids.numel(),
++                            dtype=torch.int32,
++                            device=topk_ids.device)
+     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+     # Expert ids must be zeroed out to prevent index out of bounds error while
+     # mapping global expert ids to local expert ids in expert parallelism.
+-    expert_ids = torch.zeros((max_num_m_blocks, ),
++    expert_ids = torch.empty((max_num_m_blocks, ),
+                              dtype=torch.int32,
+                              device=topk_ids.device)
++    expert_ids.zero_()
+     num_tokens_post_pad = torch.empty((1),
+                                       dtype=torch.int32,
+                                       device=topk_ids.device)
+-    if num_experts >= 224:
+-        if envs.VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON or num_experts != 256:
+-            moe_align_block_size_triton(
+-                topk_ids,
+-                num_experts,
+-                block_size,
+-                sorted_ids,
+-                expert_ids,
+-                num_tokens_post_pad,
+-            )
+-        else:
+-            # Currently requires num_experts=256
+-            ops.sgl_moe_align_block_size(
+-                topk_ids,
+-                num_experts,
+-                block_size,
+-                sorted_ids,
+-                expert_ids,
+-                num_tokens_post_pad,
+-            )
++    # CPU fallback to enable functionality without GPU/triton kernels
++    if not topk_ids.is_cuda:
++        N = topk_ids.numel()
++        cnt = torch.bincount(topk_ids.to(torch.int64), minlength=num_experts).to(torch.int32)
++        padded_cnt = ((cnt + (block_size - 1)) // block_size) * block_size
++        cumsum = torch.empty((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
++        cumsum[0] = 0
++        torch.cumsum(padded_cnt, 0, out=cumsum[1:])
++        total = int(cumsum[-1].item())
++        # Place real token indices into the front of sorted_ids; rest remain as padding sentinel
++        order = torch.argsort(topk_ids)
++        experts_sorted = topk_ids[order]
++        if order.numel() > 0:
++            # Compute index within each expert bucket without Python loops
++            _, counts = torch.unique_consecutive(experts_sorted, return_counts=True)
++            group_starts = torch.cumsum(counts, dim=0) - counts  # int64
++            starts_expanded = torch.repeat_interleave(group_starts, counts)
++            idx_in_group = (torch.arange(experts_sorted.numel(), dtype=torch.int64, device=topk_ids.device)
++                            - starts_expanded).to(torch.int32)
++            dest = cumsum[experts_sorted] + idx_in_group
++            sorted_ids[dest] = order.to(torch.int32)
++        # Fill expert_ids per block
++        max_num_m_blocks = ceil_div(total, block_size)
++        # Only first max_num_m_blocks entries are used; remaining keep zero
++        for e in range(num_experts):
++            start_e = int(cumsum[e].item())
++            end_e = int(cumsum[e + 1].item())
++            for i in range(start_e, end_e, block_size):
++                expert_ids[i // block_size] = e
++        num_tokens_post_pad[0] = total
+     else:
+-        ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+-                                 expert_ids, num_tokens_post_pad)
++        if num_experts >= 224:
++            if envs.VLLM_ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON or num_experts != 256:
++                moe_align_block_size_triton(
++                    topk_ids,
++                    num_experts,
++                    block_size,
++                    sorted_ids,
++                    expert_ids,
++                    num_tokens_post_pad,
++                )
++            else:
++                # Currently requires num_experts=256
++                ops.sgl_moe_align_block_size(
++                    topk_ids,
++                    num_experts,
++                    block_size,
++                    sorted_ids,
++                    expert_ids,
++                    num_tokens_post_pad,
++                )
++        else:
++            ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
++                                     expert_ids, num_tokens_post_pad)
+     if expert_map is not None:
+         expert_ids = expert_map[expert_ids]
+ 
+@@ -994,13 +1029,12 @@ def grouped_topk(hidden_states: torch.Tensor,
+                                    -1).max(dim=-1).values  # [n, n_group]
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
+                            sorted=False)[1]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = group_mask.unsqueeze(-1).expand(
+         num_token, num_expert_group,
+         scores.shape[-1] // num_expert_group).reshape(num_token, -1)  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(),
+-                                    float("-inf"))  # [n, e]
++    tmp_scores = scores.masked_fill(~score_mask, float("-inf"))  # [n, e]
+ 
+     if e_score_correction_bias is not None:
+         topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)[1]

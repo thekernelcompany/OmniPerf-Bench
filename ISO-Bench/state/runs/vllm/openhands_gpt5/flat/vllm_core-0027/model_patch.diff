@@ -1,0 +1,98 @@
+diff --git a/vllm/core/evictor_v2.py b/vllm/core/evictor_v2.py
+index 3dd12e2..0219dd6 100644
+--- a/vllm/core/evictor_v2.py
++++ b/vllm/core/evictor_v2.py
+@@ -52,14 +52,19 @@ class Evictor(ABC):
+         pass
+ 
+ 
+-class BlockMetaData():
+-    """Data structure for storing key data describe cached block, so that
+-    evitor could use to make its decision which one to choose for eviction
++class BlockMetaData:
++    """Lightweight metadata for cached blocks used by the evictor.
+ 
+-    Here we use physical block id as the dict key, as there maybe several
+-    blocks with the same content hash, but their physical id is unique.
++    Using __slots__ reduces per-instance memory overhead and speeds up
++    attribute access compared to a plain Python object with __dict__.
++
++    We use physical block id as the dict key in the evictor, since there may
++    be several blocks with the same content hash while their physical ids are
++    unique.
+     """
+ 
++    __slots__ = ("content_hash", "num_hashed_tokens", "last_accessed")
++
+     def __init__(self, content_hash: int, num_hashed_tokens: int,
+                  last_accessed: float):
+         self.content_hash = content_hash
+@@ -82,23 +87,33 @@ class LRUEvictor(Evictor):
+         return block_id in self.free_table
+ 
+     def evict(self) -> Tuple[int, int]:
+-        if len(self.free_table) == 0:
++        # Fast path: avoid function call and exception construction when empty.
++        if not self.free_table:
+             raise ValueError("No usable cache memory left")
+ 
+-        evicted_block = next(iter(self.free_table.values()))
+-        evicted_block_id = next(iter(self.free_table.keys()))
+-        # The blocks with the lowest timestamps should be placed consecutively
+-        # at the start of OrderedDict. Loop through all these blocks to
+-        # find the one with maximum number of hashed tokens.
+-        for _id, block in self.free_table.items():
+-            if evicted_block.last_accessed > block.last_accessed or (
+-                    evicted_block.last_accessed == block.last_accessed and
+-                    evicted_block.num_hashed_tokens < block.num_hashed_tokens):
++        # Initialize candidate using first item without creating two separate
++        # iterators and attribute lookups.
++        it = iter(self.free_table.items())
++        evicted_block_id, evicted_block = next(it)
++
++        # Prebind attributes/functions for speed in the hot loop.
++        best_la = evicted_block.last_accessed
++        best_nht = evicted_block.num_hashed_tokens
++        for _id, block in it:
++            la = block.last_accessed
++            if la < best_la:
++                best_la = la
++                best_nht = block.num_hashed_tokens
+                 evicted_block = block
+                 evicted_block_id = _id
++            elif la == best_la:
++                nht = block.num_hashed_tokens
++                if nht > best_nht:
++                    best_nht = nht
++                    evicted_block = block
++                    evicted_block_id = _id
+ 
+         self.free_table.pop(evicted_block_id)
+-
+         return evicted_block_id, evicted_block.content_hash
+ 
+     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
+@@ -108,13 +123,18 @@ class LRUEvictor(Evictor):
+                                                   last_accessed)
+ 
+     def update(self, block_id: int, last_accessed: float):
+-        self.free_table[block_id].last_accessed = last_accessed
++        # Local reference to avoid repeated attribute lookups in hot path.
++        block = self.free_table.get(block_id)
++        if block is None:
++            # Maintain original behavior (KeyError) if not present
++            raise KeyError(block_id)
++        block.last_accessed = last_accessed
+ 
+     def remove(self, block_id: int):
+-        if block_id not in self.free_table:
+-            raise ValueError(
+-                "Attempting to remove block that's not in the evictor")
+-        self.free_table.pop(block_id)
++        # Use pop with default to avoid double lookup and keep error behavior.
++        block = self.free_table.pop(block_id, None)
++        if block is None:
++            raise ValueError("Attempting to remove block that's not in the evictor")
+ 
+     @property
+     def num_blocks(self) -> int:

@@ -1,0 +1,109 @@
+diff --git a/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py b/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
+index a6b4240..bb8a2bd 100644
+--- a/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
++++ b/benchmarks/kernels/benchmark_grouped_gemm_cutlass.py
+@@ -67,6 +67,7 @@ def bench_run(
+         (num_experts, 2 * n, k), device="cuda", dtype=torch.float8_e4m3fn
+     )
+     w2_q = torch.empty((num_experts, k, n), device="cuda", dtype=torch.float8_e4m3fn)
++    # Allocate scales with the minimal required size; they are fully written below
+     w1_scale = torch.empty((num_experts, 1, 1), device="cuda", dtype=torch.float32)
+     w2_scale = torch.empty((num_experts, 1, 1), device="cuda", dtype=torch.float32)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+index ff49d7b..316ffa2 100644
+--- a/vllm/model_executor/layers/fused_moe/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/cutlass_moe.py
+@@ -140,9 +140,12 @@ def run_cutlass_moe_fp8(
+         # a result not all of a_map and c2 tensors are filled. We fill it
+         # zeros for correctness.
+         if expert_map is not None:
+-            a_map = torch.zeros((local_topk_ids.numel()),
++            # Only zeros are required for entries corresponding to non-local experts.
++            # Initialize on device; kernel will overwrite used entries.
++            a_map = torch.empty((local_topk_ids.numel()),
+                                 dtype=torch.int32,
+                                 device=device)
++            a_map.fill_(0)
+         else:
+             a_map = torch.empty((local_topk_ids.numel()),
+                                 dtype=torch.int32,
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 2c9ad50..4f9f647 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -23,6 +23,10 @@ def moe_align_block_size_stage1(
+ 
+     off_c = (pid + 1) * num_experts
+ 
++    # Zero-initialize the row for this program id to avoid host-side zeroing
++    for j in range(num_experts):
++        tl.store(tokens_cnts_ptr + off_c + j, 0)
++
+     for i in range(tokens_per_thread):
+         if start_idx + i < numel:
+             idx = tl.load(topk_ids_ptr + start_idx + i)
+@@ -52,6 +56,8 @@ def moe_align_block_size_stage3(
+     num_experts: tl.constexpr,
+     block_size: tl.constexpr,
+ ):
++    # Initialize cumsum[0] on device to avoid host-side zero initialization
++    tl.store(cumsum_ptr + 0, 0)
+     last_cumsum = 0
+     off_cnt = num_experts * num_experts
+     for i in range(1, num_experts + 1):
+@@ -80,6 +86,10 @@ def moe_align_block_size_stage4(
+     for i in range(start_idx, end_idx, block_size):
+         tl.store(expert_ids_ptr + i // block_size, pid)
+ 
++    # Prefill the padded region for this expert with the pad token id (numel)
++    for i in range(start_idx, end_idx):
++        tl.store(sorted_token_ids_ptr + i, numel)
++
+     start_idx = pid * tokens_per_thread
+     off_t = pid * num_experts
+ 
+@@ -104,15 +114,16 @@ def moe_align_block_size_triton(
+ ) -> None:
+     numel = topk_ids.numel()
+     grid = (num_experts, )
+-    tokens_cnts = torch.zeros((num_experts + 1, num_experts),
++    # Use uninitialized allocations and initialize only what is required on device
++    tokens_cnts = torch.empty((num_experts + 1, num_experts),
+                               dtype=torch.int32,
+                               device=topk_ids.device)
+-    cumsum = torch.zeros((num_experts + 1, ),
++    cumsum = torch.empty((num_experts + 1, ),
+                          dtype=torch.int32,
+                          device=topk_ids.device)
+     tokens_per_thread = cdiv(numel, num_experts)
+-    sorted_token_ids.fill_(numel)
+-    expert_ids.zero_()
++    # sorted_token_ids and expert_ids are set in stage4; no need to prefill entire buffers
++    # Initialize expert_ids directly via stage4 block loop; avoid zero_ here
+ 
+     moe_align_block_size_stage1[grid](
+         topk_ids,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+index 1a31410..4ce8c3f 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+@@ -203,8 +203,17 @@ class CompressedTensorsW4A4MoeMethod(CompressedTensorsMoEMethod):
+         round_up_multiple = lambda x, m: (x + m - 1) // m * m
+         M_padded = round_up_multiple(M, 128)
+         K_padded = round_up_multiple(K, 4)
+-        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
++        # Allocate on the same device as input and avoid full-tensor zero init
++        padded_scale = torch.empty((B, M_padded, K_padded),
++                                   dtype=scale.dtype,
++                                   device=scale.device)
++        # Copy valid region
+         padded_scale[:B, :M, :K] = scale
++        # Zero only the padded areas to minimize work
++        if M_padded > M:
++            padded_scale[:, M:, :] = 0
++        if K_padded > K:
++            padded_scale[:, :, K:] = 0
+         batches, rows, cols = padded_scale.shape
+         assert rows % 128 == 0
+         assert cols % 4 == 0

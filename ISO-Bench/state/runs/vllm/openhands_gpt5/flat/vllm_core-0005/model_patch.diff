@@ -1,0 +1,53 @@
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 7978730..3845959 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -804,8 +804,12 @@ def make_tensor_with_pad(
+     np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[dtype]
+     padded_x = make_ndarray_with_pad(x, pad, np_dtype, max_len=max_len)
+ 
+-    tensor = torch.from_numpy(padded_x).to(device)
+-    if pin_memory:
++    # Avoid unnecessary device transfer when targeting CPU/None
++    tensor = torch.from_numpy(padded_x)
++    if device is not None and str(device) != 'cpu':
++        tensor = tensor.to(device)
++    # Only pin CPU tensors, since pinning non-CPU is invalid and slower
++    if pin_memory and tensor.device.type == 'cpu':
+         tensor = tensor.pin_memory()
+ 
+     return tensor
+@@ -817,14 +821,29 @@ def async_tensor_h2d(
+     target_device: Union[str, torch.device],
+     pin_memory: bool,
+ ) -> torch.Tensor:
+-    """Asynchronously create a tensor and copy it from host to device."""
+-    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
++    """Asynchronously create a tensor on host and optionally copy to device.
++
++    Optimizations:
++    - Avoid unnecessary device transfer when target is CPU.
++    - Avoid pinning when target is CPU (pinning benefits only H2D copies).
++    """
++    pin = bool(pin_memory) and str(target_device) != 'cpu'
++    t = torch.tensor(data, dtype=dtype, pin_memory=pin, device="cpu")
++    if str(target_device) == 'cpu':
++        return t
+     return t.to(device=target_device, non_blocking=True)
+ 
+ 
+ def get_dtype_size(dtype: torch.dtype) -> int:
+-    """Get the size of the data type in bytes."""
+-    return torch.tensor([], dtype=dtype).element_size()
++    """Get the size of the data type in bytes.
++
++    Avoids creating a temporary tensor by consulting TORCH_DTYPE_TO_NUMPY_DTYPE.
++    Falls back to tensor.element_size() if dtype is not in the map.
++    """
++    np_dtype = TORCH_DTYPE_TO_NUMPY_DTYPE.get(dtype)
++    if np_dtype is not None:
++        return int(np.dtype(np_dtype).itemsize)
++    return torch.empty((), dtype=dtype).element_size()
+ 
+ 
+ # `collections` helpers

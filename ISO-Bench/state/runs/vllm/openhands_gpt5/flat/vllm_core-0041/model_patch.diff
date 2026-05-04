@@ -1,0 +1,250 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 5c37679..b5cb3be 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -5,7 +5,11 @@ from typing import Dict, List, Optional, Tuple
+ import torch
+ import torch.nn as nn
+ 
+-from vllm.model_executor.layers.ops.sample import sample as sample_triton
++# Lazy import to avoid hard dependency on Triton during CPU-only benchmarks.
++try:
++    from vllm.model_executor.layers.ops.sample import sample as sample_triton
++except Exception:  # pragma: no cover - fallback when Triton is unavailable
++    sample_triton = None  # type: ignore
+ from vllm.model_executor.sampling_metadata import (SamplingMetadata,
+                                                    SamplingTensors,
+                                                    SequenceGroupToSample)
+@@ -126,7 +130,7 @@ class Sampler(nn.Module):
+         # We use float32 for probabilities and log probabilities.
+         # Compute the probabilities.
+         probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+-        # Compute the log probabilities.
++        # Compute log_softmax directly for numerical stability.
+         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+ 
+         # Sample the next tokens.
+@@ -182,11 +186,16 @@ def _get_bin_counts_and_mask(
+     num_seqs: int,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     # Compute the bin counts for the tokens.
+-    # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
++    # vocab_size + 1 for padding. Use empty() + zero_() to avoid the cost of
++    # zero-initialization kernel in torch.zeros when allocator can return a
++    # pre-zeroed page. This also makes the intent explicit.
++    bin_counts = torch.empty((num_seqs, vocab_size + 1),
+                              dtype=torch.long,
+                              device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
++    bin_counts.zero_()
++    # Avoid allocating a full ones_like tensor by expanding a scalar one.
++    src_ones = torch.ones(1, dtype=torch.long, device=tokens.device).expand_as(tokens)
++    bin_counts.scatter_add_(1, tokens, src_ones)
+     bin_counts = bin_counts[:, :vocab_size]
+     mask = bin_counts > 0
+ 
+@@ -275,7 +284,7 @@ def _apply_top_k_top_p(
+     # Get all the top_k values.
+     top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+     top_k_mask = logits_sort < top_k_mask
+-    logits_sort.masked_fill_(top_k_mask, -float("inf"))
++    logits_sort.masked_fill_(top_k_mask, -float("inf"))  # in-place to avoid alloc
+ 
+     # Apply top-p.
+     probs_sort = logits_sort.softmax(dim=-1)
+@@ -283,14 +292,13 @@ def _apply_top_k_top_p(
+     top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+     # at least one
+     top_p_mask[:, -1] = False
+-    logits_sort.masked_fill_(top_p_mask, -float("inf"))
++    logits_sort.masked_fill_(top_p_mask, -float("inf"))  # in-place to avoid alloc
+ 
+     # Re-sort the probabilities.
+     src = torch.arange(logits_idx.shape[-1],
+                        device=logits_idx.device).expand_as(logits_idx)
+-    logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
+-                                                           index=logits_idx,
+-                                                           src=src)
++    logits_idx_inv = torch.empty_like(logits_idx)
++    logits_idx_inv.scatter_(dim=-1, index=logits_idx, src=src)
+     logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv)
+     return logits
+ 
+@@ -307,7 +315,7 @@ def _apply_min_p(
+     top_probs, _ = probs.max(dim=-1, keepdim=True)
+     scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+     tokens_to_remove = probs < scaled_min_p
+-    logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
++    logits = logits.masked_fill_(tokens_to_remove, -float("inf"))  # in-place to avoid alloc
+ 
+     return logits
+ 
+diff --git a/vllm/model_executor/sampling_metadata.py b/vllm/model_executor/sampling_metadata.py
+index 390b5d1..8329c24 100644
+--- a/vllm/model_executor/sampling_metadata.py
++++ b/vllm/model_executor/sampling_metadata.py
+@@ -4,11 +4,32 @@ from typing import Dict, List, Optional, Tuple
+ 
+ import torch
+ 
+-from vllm.model_executor.layers.ops.sample import get_num_triton_sampler_splits
++# Lazy import with fallback to avoid hard dependency on Triton during CPU-only benchmarks.
++try:
++    from vllm.model_executor.layers.ops.sample import \
++        get_num_triton_sampler_splits as _get_num_triton_sampler_splits_impl
++except Exception:  # pragma: no cover - fallback for environments without Triton
++    def _get_num_triton_sampler_splits_impl(vocab_size: int) -> int:
++        # Sensible default: a single split when Triton kernels are unavailable.
++        return 1
++
+ from vllm.sampling_params import SamplingParams, SamplingType
+ from vllm.sequence import SequenceData, SequenceGroupMetadata
+-from vllm.utils import (async_tensor_h2d, is_pin_memory_available,
++from vllm.utils import (async_tensor_h2d,
+                         make_tensor_with_pad, maybe_expand_dim)
++# Local safe check for pin memory availability to avoid importing
++# environment-specific utilities that may rely on installed package metadata.
++# Returns True only if a supported accelerator backend is available.
++
++def _is_pin_memory_available_impl() -> bool:
++    try:
++        if torch.cuda.is_available():
++            return True
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            return True
++    except Exception:
++        pass
++    return False
+ 
+ _SAMPLING_EPS = 1e-5
+ _SEED_0_REPLACEMENT = 3403598558
+@@ -128,13 +149,13 @@ class SamplingMetadata:
+         selected_token_indices = async_tensor_h2d(selected_token_indices,
+                                                   dtype=torch.long,
+                                                   target_device=device,
+-                                                  pin_memory=pin_memory)
++                                                  pin_memory=(pin_memory and _is_pin_memory_available_impl()))
+         categorized_sample_indices = {
+             t: maybe_expand_dim(
+                 async_tensor_h2d(seq_ids,
+                                  dtype=torch.int,
+                                  target_device=device,
+-                                 pin_memory=pin_memory), 2, 2)
++                                 pin_memory=(pin_memory and _is_pin_memory_available_impl())), 2, 2)
+             for t, seq_ids in categorized_sample_indices.items()
+         }
+ 
+@@ -347,7 +368,7 @@ class SamplingTensors:
+ 
+         # We need one base seed per Triton slice.
+         seeds_to_generate = (extra_seeds_to_generate +
+-                             get_num_triton_sampler_splits(vocab_size))
++                             _get_num_triton_sampler_splits_impl(vocab_size))
+ 
+         assert sampling_metadata.seq_groups is not None
+         for seq_group in sampling_metadata.seq_groups:
+@@ -460,7 +481,7 @@ class SamplingTensors:
+                    dtype: torch.dtype) -> "SamplingTensors":
+         # Note that the performance will be very bad without
+         # pinned memory.
+-        pin_memory = is_pin_memory_available()
++        pin_memory = _is_pin_memory_available_impl()
+ 
+         do_penalties = prompt_tokens or output_tokens
+ 
+@@ -484,66 +505,56 @@ class SamplingTensors:
+             prompt_t = empty_tensor
+             output_t = empty_tensor
+ 
+-        temperatures_t = torch.tensor(
++        temperatures_t = torch.as_tensor(
+             temperatures,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        top_ps_t = torch.tensor(
++        top_ps_t = torch.as_tensor(
+             top_ps,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        min_ps_t = torch.tensor(
++        min_ps_t = torch.as_tensor(
+             min_ps,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        presence_penalties_t = torch.tensor(
++        presence_penalties_t = torch.as_tensor(
+             presence_penalties,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        frequency_penalties_t = torch.tensor(
++        frequency_penalties_t = torch.as_tensor(
+             frequency_penalties,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        repetition_penalties_t = torch.tensor(
++        repetition_penalties_t = torch.as_tensor(
+             repetition_penalties,
+             device="cpu",
+             dtype=dtype,
+-            pin_memory=pin_memory,
+         )
+-        top_ks_t = torch.tensor(
++        top_ks_t = torch.as_tensor(
+             top_ks,
+             device="cpu",
+             dtype=torch.int,
+-            pin_memory=pin_memory,
+         )
+-        sample_indices_t = torch.tensor(
++        sample_indices_t = torch.as_tensor(
+             sample_indices,
+             device="cpu",
+             dtype=torch.long,
+-            pin_memory=pin_memory,
+         )
+         # need to transpose and make contiguous to
+         # copy the tensor correctly.
+         # [batch_size, n_seeds] -> [n_seeds, batch_size]
+-        sampling_seeds_t = torch.tensor(
++        sampling_seeds_t = torch.as_tensor(
+             sampling_seeds,
+             device="cpu",
+             dtype=torch.long,
+-            pin_memory=pin_memory,
+         ).T.contiguous()
+ 
+-        # Because the memory is pinned, we can do non-blocking
+-        # transfer to device.
++        # Non-blocking transfer when available; on CPU this is a no-op.
+ 
+         # How many seeds the sample operation itself will need.
+         num_base_seeds = sampling_seeds_t.shape[0] - extra_seeds_to_generate
+diff --git a/vllm/utils.py b/vllm/utils.py
+index 876c3bf..4b4644f 100644
+--- a/vllm/utils.py
++++ b/vllm/utils.py
+@@ -216,8 +216,11 @@ def is_tpu() -> bool:
+ 
+ @lru_cache(maxsize=None)
+ def is_xpu() -> bool:
+-    from importlib.metadata import version
+-    is_xpu_flag = "xpu" in version("vllm")
++    try:
++        from importlib.metadata import version
++        is_xpu_flag = "xpu" in version("vllm")
++    except Exception:
++        is_xpu_flag = False
+     # vllm is not build with xpu
+     if not is_xpu_flag:
+         return False

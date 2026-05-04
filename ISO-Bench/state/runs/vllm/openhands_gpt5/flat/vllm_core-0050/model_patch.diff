@@ -1,0 +1,104 @@
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 5f8535e..827f3dc 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -8,7 +8,16 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+                                               AttentionMetadata, AttentionType)
+ from vllm.forward_context import get_forward_context
+ from vllm.utils import direct_register_custom_op
+-from vllm.vllm_flash_attn import flash_attn_varlen_func
++try:
++    from vllm.vllm_flash_attn import flash_attn_varlen_func
++except Exception:  # pragma: no cover - fallback for environments without CUDA extensions
++    def flash_attn_varlen_func(*args, **kwargs):  # type: ignore
++        raise ImportError(
++            "flash_attn_varlen_func is unavailable; build vLLM with CUDA extensions to enable FlashAttention.")
++
++
++SUPPORTED_HEAD_SIZES = (32, 64, 96, 128, 160, 192, 224, 256)
++_SUPPORTED_HEAD_SIZES_SET = set(SUPPORTED_HEAD_SIZES)
+ 
+ 
+ class FlashAttentionBackend(AttentionBackend):
+@@ -82,8 +91,10 @@ class FlashAttentionImpl(AttentionImpl):
+         self.scale = float(scale)
+         self.num_kv_heads = num_kv_heads
+         if alibi_slopes is not None:
+-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
++            # Avoid unnecessary copy and allow zero-copy when a tensor is provided
++            alibi_slopes = torch.as_tensor(alibi_slopes, dtype=torch.float32)
+         self.alibi_slopes = alibi_slopes
++        self._alibi_cache: Dict[torch.device, torch.Tensor] = {}
+         if sliding_window is None:
+             self.sliding_window = (-1, -1)
+         else:
+@@ -97,11 +108,10 @@ class FlashAttentionImpl(AttentionImpl):
+         assert self.num_heads % self.num_kv_heads == 0
+         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+ 
+-        support_head_sizes = FlashAttentionBackend.get_supported_head_sizes()
+-        if head_size not in support_head_sizes:
++        if head_size not in _SUPPORTED_HEAD_SIZES_SET:
+             raise ValueError(
+                 f"Head size {head_size} is not supported by FlashAttention. "
+-                f"Supported head sizes are: {support_head_sizes}.")
++                f"Supported head sizes are: {list(SUPPORTED_HEAD_SIZES)}.")
+ 
+     def forward(
+         self,
+@@ -135,7 +145,17 @@ class FlashAttentionImpl(AttentionImpl):
+         assert k_scale == 1.0 and v_scale == 1.0, (
+             "key/v_scale is not supported in FlashAttention.")
+ 
++        # Preallocate output without zeroing for performance
+         output = torch.empty_like(query)
++        # Ensure alibi slopes are on the same device and cached to avoid repeated transfers
++        alibi = None
++        if self.alibi_slopes is not None:
++            dev = query.device
++            cached = self._alibi_cache.get(dev)
++            if cached is None or cached.shape != self.alibi_slopes.shape:
++                cached = self.alibi_slopes.to(dev, non_blocking=True)
++                self._alibi_cache[dev] = cached
++            alibi = cached
+         torch.ops.vllm.unified_v1_flash_attention(
+             output,
+             query,
+@@ -150,7 +170,7 @@ class FlashAttentionImpl(AttentionImpl):
+             v_scale,
+             self.scale,
+             self.sliding_window,
+-            self.alibi_slopes,
++            alibi,
+             self.logits_soft_cap,
+         )
+         return output
+@@ -185,9 +205,10 @@ def unified_v1_flash_attention(
+     num_actual_tokens = attn_metadata.num_actual_tokens
+ 
+     # Reshape the query, key, and value tensors.
+-    query = query.view(-1, num_heads, head_size)
+-    key = key.view(-1, num_kv_heads, head_size)
+-    value = value.view(-1, num_kv_heads, head_size)
++    # Use reshape to avoid potential copies when possible
++    query = query.reshape(-1, num_heads, head_size)
++    key = key.reshape(-1, num_kv_heads, head_size)
++    value = value.reshape(-1, num_kv_heads, head_size)
+ 
+     # Reshape the input keys and values and store them in the cache.
+     key_cache = kv_cache[0]
+@@ -218,9 +239,11 @@ def unified_v1_flash_attention(
+         block_table=attn_metadata.block_table,
+         softcap=logits_soft_cap,
+     )
+-    attn_output = attn_output.view(num_actual_tokens, -1)
+-    # TODO(woosuk): Optimize this.
+-    output[:num_actual_tokens].copy_(attn_output)
++    # Avoid unnecessary memory initialization and use in-place copy via .copy_ on the slice
++    attn_output = attn_output.reshape(num_actual_tokens, -1)
++    out_view = output[:num_actual_tokens]
++    if out_view.data_ptr() != attn_output.data_ptr():
++        out_view.copy_(attn_output)
+ 
+ 
+ def unified_v1_flash_attention_fake(

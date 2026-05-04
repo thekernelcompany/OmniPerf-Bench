@@ -1,0 +1,115 @@
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+index 1be806b..23e9712 100644
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -15,6 +15,7 @@
+ #include <cassert>
+ #include <map>
+ #include <vector>
++#include <cstring>
+ 
+ #ifdef USE_ROCM
+   #include <hip/hip_bf16.h>
+@@ -85,10 +86,6 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
+     int64_t src_offset = src_block_offset + i;
+     int64_t dst_offset = dst_block_offset + i;
+     key_cache[dst_offset] = key_cache[src_offset];
+-  }
+-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
+-    int64_t src_offset = src_block_offset + i;
+-    int64_t dst_offset = dst_block_offset + i;
+     value_cache[dst_offset] = value_cache[src_offset];
+   }
+ }
+@@ -123,21 +120,21 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
+   // block_mapping is a 2D tensor with shape (num_pairs, 2).
+   int num_pairs = block_mapping.size(0);
+ 
+-  // Move the data structures to the GPU.
+-  // NOTE: This synchronizes the CPU and GPU.
+-  torch::Tensor key_cache_ptrs_tensor =
+-      torch::from_blob(key_cache_ptrs, {num_layers}, torch::kInt64)
+-          .to(cache_device);
+-  torch::Tensor value_cache_ptrs_tensor =
+-      torch::from_blob(value_cache_ptrs, {num_layers}, torch::kInt64)
+-          .to(cache_device);
++  // Move the data structures to the GPU without synchronizing via .to()
++  const at::cuda::OptionalCUDAGuard device_guard(cache_device);
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++  auto opts = torch::TensorOptions().dtype(torch::kInt64).device(cache_device);
++  torch::Tensor key_cache_ptrs_tensor = torch::empty({num_layers}, opts);
++  torch::Tensor value_cache_ptrs_tensor = torch::empty({num_layers}, opts);
++  cudaMemcpyAsync(key_cache_ptrs_tensor.data_ptr<int64_t>(), key_cache_ptrs,
++                  sizeof(int64_t) * num_layers, cudaMemcpyHostToDevice, stream);
++  cudaMemcpyAsync(value_cache_ptrs_tensor.data_ptr<int64_t>(), value_cache_ptrs,
++                  sizeof(int64_t) * num_layers, cudaMemcpyHostToDevice, stream);
+ 
+   // Launch the kernel.
+   const int numel_per_block = key_caches[0][0].numel();
+   dim3 grid(num_layers, num_pairs);
+   dim3 block(std::min(1024, numel_per_block));
+-  const at::cuda::OptionalCUDAGuard device_guard(cache_device);
+-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+   VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(
+       key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
+         vllm::copy_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index d379890..b7b2770 100644
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -11,9 +11,12 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
+ 
+ class FlashAttentionBackend(AttentionBackend):
+ 
++    _SUPPORTED_HEAD_SIZES = (32, 64, 96, 128, 160, 192, 224, 256)
++    _SUPPORTED_HEAD_SIZES_SET = set(_SUPPORTED_HEAD_SIZES)
++
+     @staticmethod
+     def get_supported_head_sizes() -> List[int]:
+-        return [32, 64, 96, 128, 160, 192, 224, 256]
++        return FlashAttentionBackend._SUPPORTED_HEAD_SIZES
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -39,7 +42,7 @@ class FlashAttentionBackend(AttentionBackend):
+         return (2, num_blocks, block_size, num_kv_heads, head_size)
+ 
+ 
+-@dataclass
++@dataclass(slots=True)
+ class FlashAttentionMetadata:
+     # NOTE(sang): Definition of context_len, query_len, and seq_len.
+     # |---------- N-1 iteration --------|
+@@ -80,7 +83,8 @@ class FlashAttentionImpl(AttentionImpl):
+         self.scale = float(scale)
+         self.num_kv_heads = num_kv_heads
+         if alibi_slopes is not None:
+-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
++            # Avoid unnecessary copy if already a tensor
++            alibi_slopes = torch.as_tensor(alibi_slopes, dtype=torch.float32)
+         self.alibi_slopes = alibi_slopes
+         if sliding_window is None:
+             self.sliding_window = (-1, -1)
+@@ -95,11 +99,10 @@ class FlashAttentionImpl(AttentionImpl):
+         assert self.num_heads % self.num_kv_heads == 0
+         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+ 
+-        support_head_sizes = FlashAttentionBackend.get_supported_head_sizes()
+-        if head_size not in support_head_sizes:
++        if head_size not in FlashAttentionBackend._SUPPORTED_HEAD_SIZES_SET:
+             raise ValueError(
+                 f"Head size {head_size} is not supported by FlashAttention. "
+-                f"Supported head sizes are: {support_head_sizes}.")
++                f"Supported head sizes are: {FlashAttentionBackend._SUPPORTED_HEAD_SIZES}.")
+ 
+     def forward(
+         self,
+@@ -139,6 +142,8 @@ class FlashAttentionImpl(AttentionImpl):
+             return output
+ 
+         num_actual_tokens = attn_metadata.num_actual_tokens
++        if num_actual_tokens == 0:
++            return output
+ 
+         # Reshape the input keys and values and store them in the cache.
+         key_cache = kv_cache[0]

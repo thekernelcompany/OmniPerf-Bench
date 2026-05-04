@@ -1,0 +1,90 @@
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index f5dceac..1ab1dd6 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -49,13 +49,9 @@ def fused_topk_native(
+     assert (
+         hidden_states.shape[0] == gating_output.shape[0]
+     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+-    M, _ = hidden_states.shape
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+-    topk_weights = F.softmax(gating_output.float(), dim=-1)
+-    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
++    # Compute softmax and select top-k directly without redundant preallocations
++    topk_scores = F.softmax(gating_output.float(), dim=-1)
++    topk_weights, topk_ids = torch.topk(topk_scores, topk, dim=-1)
+     if renormalize:
+         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+     return topk_weights, topk_ids
+@@ -107,7 +103,8 @@ def _fused_topk_postprocess(
+     num_token_non_padded,
+ ):
+     if renormalize:
+-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++        denom = topk_weights.sum(dim=-1, keepdim=True)
++        topk_weights.div_(denom)
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+     return topk_weights, topk_ids
+@@ -138,14 +135,14 @@ def grouped_topk(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    group_mask = torch.zeros(group_scores.shape, dtype=torch.bool, device=group_scores.device)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
++    tmp_scores = scores.masked_fill(~score_mask, 0.0)  # [n, e]
+     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     if num_fused_shared_experts:
+         topk_ids[:, -1] = torch.randint(
+@@ -163,7 +160,7 @@ def grouped_topk(
+             if num_fused_shared_experts == 0
+             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+         )
+-        topk_weights = topk_weights / topk_weights_sum
++        topk_weights.div_(topk_weights_sum)
+ 
+     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+@@ -198,16 +195,14 @@ def biased_grouped_topk_impl(
+     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+         1
+     ]  # [n, top_k_group]
+-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
++    group_mask = torch.zeros(group_scores.shape, dtype=torch.bool, device=group_scores.device)  # [n, n_group]
++    group_mask.scatter_(1, group_idx, True)  # [n, n_group]
+     score_mask = (
+         group_mask.unsqueeze(-1)
+         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+         .reshape(num_token, -1)
+     )  # [n, e]
+-    tmp_scores = scores_for_choice.masked_fill(
+-        ~score_mask.bool(), float("-inf")
+-    )  # [n, e]
++    tmp_scores = scores_for_choice.masked_fill(~score_mask, float("-inf"))  # [n, e]
+     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+     topk_weights = scores.gather(1, topk_ids)
+ 
+@@ -245,6 +240,11 @@ def _mask_topk_ids_padded_region(
+ ):
+     if num_token_non_padded is None:
+         return
++    if isinstance(num_token_non_padded, torch.Tensor) and num_token_non_padded.numel() == 1:
++        n = int(num_token_non_padded.item())
++        if n < topk_ids.shape[0]:
++            topk_ids[n:, :].fill_(-1)
++        return
+     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+     topk_ids[indices >= num_token_non_padded, :] = -1
+ 

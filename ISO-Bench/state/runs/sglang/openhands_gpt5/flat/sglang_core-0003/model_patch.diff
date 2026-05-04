@@ -1,0 +1,144 @@
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 824f767..82130f5 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -11,7 +11,7 @@ import struct
+ import threading
+ import time
+ from collections import defaultdict
+-from functools import cache
++from functools import cache, lru_cache
+ from typing import Dict, List, Optional, Tuple, Union
+ 
+ import numpy as np
+@@ -56,7 +56,7 @@ class KVTransferError(Exception):
+ 
+ 
+ # prefill
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferKVChunk:
+     room: int
+     prefill_kv_indices: npt.NDArray[np.int64]
+@@ -66,7 +66,7 @@ class TransferKVChunk:
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferInfo:
+     room: int
+     endpoint: str
+@@ -81,26 +81,26 @@ class TransferInfo:
+     def from_zmq(cls, msg: List[bytes]):
+         if msg[4] == b"" and msg[5] == b"":
+             is_dummy = True
+-            dst_kv_indices = np.array([], dtype=np.int64)
++            dst_kv_indices = np.empty((0,), dtype=np.int64)
+             dst_aux_index = None
+         else:
+             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+-            dst_aux_index = int(msg[5].decode("ascii"))
++            dst_aux_index = int(msg[5])
+             is_dummy = False
+         return cls(
+-            room=int(msg[0].decode("ascii")),
++            room=int(msg[0]),
+             endpoint=msg[1].decode("ascii"),
+-            dst_port=int(msg[2].decode("ascii")),
++            dst_port=int(msg[2]),
+             mooncake_session_id=msg[3].decode("ascii"),
+             dst_kv_indices=dst_kv_indices,
+             dst_aux_index=dst_aux_index,
+-            required_dst_info_num=int(msg[6].decode("ascii")),
++            required_dst_info_num=int(msg[6]),
+             is_dummy=is_dummy,
+         )
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class KVArgsRegisterInfo:
+     room: str
+     endpoint: str
+@@ -111,13 +111,15 @@ class KVArgsRegisterInfo:
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
++        kv_ptrs = np.frombuffer(msg[4], dtype=np.uint64).tolist()
++        aux_ptrs = np.frombuffer(msg[5], dtype=np.uint64).tolist()
+         return cls(
+-            room=str(msg[0].decode("ascii")),
++            room=msg[0].decode("ascii"),
+             endpoint=msg[1].decode("ascii"),
+-            dst_port=int(msg[2].decode("ascii")),
++            dst_port=int(msg[2]),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
+-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
++            dst_kv_ptrs=kv_ptrs,
++            dst_aux_ptrs=aux_ptrs,
+         )
+ 
+ 
+@@ -226,7 +228,9 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     @cache
+     def _connect(self, endpoint: str):
+-        socket = zmq.Context().socket(zmq.PUSH)
++        # Use a shared ZMQ context to avoid repeated context creations
++        ctx = zmq.Context.instance()
++        socket = ctx.socket(zmq.PUSH)
+         socket.connect(endpoint)
+         return socket
+ 
+@@ -246,11 +250,11 @@ class MooncakeKVManager(BaseKVManager):
+         num_layers = len(self.kv_args.kv_data_ptrs)
+         layers_params = [
+             (
+-                self.kv_args.kv_data_ptrs[layer_id],
+-                dst_kv_ptrs[layer_id],
+-                self.kv_args.kv_item_lens[layer_id],
++                self.kv_args.kv_data_ptrs[i],
++                dst_kv_ptrs[i],
++                self.kv_args.kv_item_lens[i],
+             )
+-            for layer_id in range(num_layers)
++            for i in range(num_layers)
+         ]
+ 
+         # Worker function for processing a single layer
+@@ -258,7 +262,7 @@ class MooncakeKVManager(BaseKVManager):
+             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                 src_addr = src_ptr + int(prefill_index[0]) * item_len
+                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
+-                length = item_len * len(prefill_index)
++                length = item_len * (len(prefill_index))
+ 
+                 status = self.engine.transfer_sync(
+                     mooncake_session_id, src_addr, dst_addr, length
+@@ -308,11 +312,12 @@ class MooncakeKVManager(BaseKVManager):
+     ):
+         if ":" in remote:
+             remote = remote.split(":")[0]
++        # Avoid recreating temporary lists repeatedly by using a tuple which zmq accepts
+         self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
+-            [
++            (
+                 str(room).encode("ascii"),
+                 str(status).encode("ascii"),
+-            ]
++            )
+         )
+ 
+     def transfer_worker(
+@@ -750,7 +755,7 @@ class MooncakeKVSender(BaseKVSender):
+ 
+ 
+ class MooncakeKVReceiver(BaseKVReceiver):
+-    _ctx = zmq.Context()
++    _ctx = zmq.Context.instance()
+     _socket_cache = {}
+     _socket_locks = {}
+     _global_lock = threading.Lock()

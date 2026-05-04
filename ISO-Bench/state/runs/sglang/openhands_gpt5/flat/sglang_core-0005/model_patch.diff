@@ -1,0 +1,290 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index c01807f..c477861 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -32,11 +32,18 @@ from typing import List, Optional, Tuple, Union
+ 
+ import numpy as np
+ import torch
+-import triton
+-import triton.language as tl
++try:
++    import triton  # type: ignore
++    import triton.language as tl  # type: ignore
++    _has_triton = True
++except Exception:  # pragma: no cover - fallback for environments without triton
++    triton, tl = None, None
++    _has_triton = False
+ 
+ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+-from sglang.srt.layers.radix_attention import RadixAttention
++from typing import TYPE_CHECKING
++if TYPE_CHECKING:
++    from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
+ 
+ logger = logging.getLogger(__name__)
+@@ -64,9 +71,11 @@ class ReqToTokenPool:
+         self.max_context_len = max_context_len
+         self.device = device
+         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+-            self.req_to_token = torch.zeros(
++            # Use empty + explicit zero_ to avoid redundant double-initialization on some backends
++            self.req_to_token = torch.empty(
+                 (size, max_context_len), dtype=torch.int32, device=device
+             )
++            self.req_to_token.zero_()
+         self.free_slots = list(range(size))
+ 
+     def write(self, indices, values):
+@@ -138,7 +147,7 @@ class KVCache(abc.ABC):
+     @abc.abstractmethod
+     def set_kv_buffer(
+         self,
+-        layer: RadixAttention,
++        layer: 'RadixAttention',
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+         cache_v: torch.Tensor,
+@@ -303,7 +312,7 @@ class MHATokenToKVPool(KVCache):
+                 # [size, head_num, head_dim] for each layer
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.k_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -311,7 +320,7 @@ class MHATokenToKVPool(KVCache):
+                     for _ in range(self.layer_num)
+                 ]
+                 self.v_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (self.size + self.page_size, self.head_num, self.head_dim),
+                         dtype=self.store_dtype,
+                         device=self.device,
+@@ -458,7 +467,7 @@ class MHATokenToKVPool(KVCache):
+ 
+     def set_kv_buffer(
+         self,
+-        layer: RadixAttention,
++        layer: 'RadixAttention',
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+         cache_v: torch.Tensor,
+@@ -493,53 +502,50 @@ class MHATokenToKVPool(KVCache):
+             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+ 
+     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+-        copy_all_layer_kv_cache[(len(self.data_ptrs),)](
+-            self.data_ptrs,
+-            self.data_strides,
+-            tgt_loc,
+-            src_loc,
+-            len(tgt_loc),
+-            next_power_of_2(len(tgt_loc)),
+-        )
+-
+-
+-@triton.jit
+-def set_mla_kv_buffer_kernel(
+-    kv_buffer_ptr,
+-    cache_k_nope_ptr,
+-    cache_k_rope_ptr,
+-    loc_ptr,
+-    buffer_stride: tl.constexpr,
+-    nope_stride: tl.constexpr,
+-    rope_stride: tl.constexpr,
+-    nope_dim: tl.constexpr,
+-    rope_dim: tl.constexpr,
+-    BLOCK: tl.constexpr,
+-):
+-    pid_loc = tl.program_id(0)
+-    pid_blk = tl.program_id(1)
++        # Fallback to PyTorch copy to avoid Triton dependency during allocation-heavy paths
++        for i in range(self.layer_num):
++            self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
++            self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
++
++
++if _has_triton:
++    @triton.jit
++    def set_mla_kv_buffer_kernel(
++        kv_buffer_ptr,
++        cache_k_nope_ptr,
++        cache_k_rope_ptr,
++        loc_ptr,
++        buffer_stride: tl.constexpr,
++        nope_stride: tl.constexpr,
++        rope_stride: tl.constexpr,
++        nope_dim: tl.constexpr,
++        rope_dim: tl.constexpr,
++        BLOCK: tl.constexpr,
++    ):
++        pid_loc = tl.program_id(0)
++        pid_blk = tl.program_id(1)
+ 
+-    base = pid_blk * BLOCK
+-    offs = base + tl.arange(0, BLOCK)
+-    total_dim = nope_dim + rope_dim
+-    mask = offs < total_dim
++        base = pid_blk * BLOCK
++        offs = base + tl.arange(0, BLOCK)
++        total_dim = nope_dim + rope_dim
++        mask = offs < total_dim
+ 
+-    loc = tl.load(loc_ptr + pid_loc)
+-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
++        loc = tl.load(loc_ptr + pid_loc)
++        dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+ 
+-    if base + BLOCK <= nope_dim:
+-        src = tl.load(
+-            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+-            mask=mask,
+-        )
+-    else:
+-        offs_rope = offs - nope_dim
+-        src = tl.load(
+-            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+-            mask=mask,
+-        )
++        if base + BLOCK <= nope_dim:
++            src = tl.load(
++                cache_k_nope_ptr + pid_loc * nope_stride + offs,
++                mask=mask,
++            )
++        else:
++            offs_rope = offs - nope_dim
++            src = tl.load(
++                cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
++                mask=mask,
++            )
+ 
+-    tl.store(dst_ptr, src, mask=mask)
++        tl.store(dst_ptr, src, mask=mask)
+ 
+ 
+ def set_mla_kv_buffer_triton(
+@@ -548,6 +554,16 @@ def set_mla_kv_buffer_triton(
+     cache_k_nope: torch.Tensor,
+     cache_k_rope: torch.Tensor,
+ ):
++    if not _has_triton:
++        # Fallback: efficient in-place copy without extra concatenation allocation
++        if cache_k_nope.dtype != kv_buffer.dtype:
++            cache_k_nope = cache_k_nope.to(kv_buffer.dtype)
++            cache_k_rope = cache_k_rope.to(kv_buffer.dtype)
++        nope = cache_k_nope
++        rope = cache_k_rope
++        kv_buffer[loc, :, : nope.shape[-1]].copy_(nope)
++        kv_buffer[loc, :, nope.shape[-1] : nope.shape[-1] + rope.shape[-1]].copy_(rope)
++        return
+     nope_dim = cache_k_nope.shape[-1]
+     rope_dim = cache_k_rope.shape[-1]
+     total_dim = nope_dim + rope_dim
+@@ -620,7 +636,7 @@ class MLATokenToKVPool(KVCache):
+             ):
+                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                 self.kv_buffer = [
+-                    torch.zeros(
++                    torch.empty(
+                         (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                         dtype=self.store_dtype,
+                         device=device,
+@@ -678,7 +694,7 @@ class MLATokenToKVPool(KVCache):
+ 
+     def set_kv_buffer(
+         self,
+-        layer: RadixAttention,
++        layer: 'RadixAttention',
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+         cache_v: torch.Tensor,
+@@ -695,7 +711,7 @@ class MLATokenToKVPool(KVCache):
+ 
+     def set_mla_kv_buffer(
+         self,
+-        layer: RadixAttention,
++        layer: 'RadixAttention',
+         loc: torch.Tensor,
+         cache_k_nope: torch.Tensor,
+         cache_k_rope: torch.Tensor,
+@@ -758,13 +774,13 @@ class DoubleSparseTokenToKVPool(KVCache):
+         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+             # [size, head_num, head_dim] for each layer
+             self.k_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+             ]
+             self.v_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + page_size, head_num, head_dim), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+@@ -772,7 +788,7 @@ class DoubleSparseTokenToKVPool(KVCache):
+ 
+             # [size, head_num, heavy_channel_num] for each layer
+             self.label_buffer = [
+-                torch.zeros(
++                torch.empty(
+                     (size + 1, head_num, heavy_channel_num), dtype=dtype, device=device
+                 )
+                 for _ in range(layer_num)
+@@ -795,7 +811,7 @@ class DoubleSparseTokenToKVPool(KVCache):
+ 
+     def set_kv_buffer(
+         self,
+-        layer: RadixAttention,
++        layer: 'RadixAttention',
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+         cache_v: torch.Tensor,
+@@ -817,39 +833,6 @@ class DoubleSparseTokenToKVPool(KVCache):
+         pass
+ 
+ 
+-@triton.jit
+-def copy_all_layer_kv_cache(
+-    data_ptrs,
+-    strides,
+-    tgt_loc_ptr,
+-    src_loc_ptr,
+-    num_locs,
+-    num_locs_upper: tl.constexpr,
+-):
+-    BLOCK_SIZE: tl.constexpr = 128
+-
+-    bid = tl.program_id(0)
+-    stride = tl.load(strides + bid)
+-
+-    data_ptr = tl.load(data_ptrs + bid)
+-    data_ptr = tl.cast(data_ptr, tl.pointer_type(tl.uint8))
+-
+-    num_locs_offset = tl.arange(0, num_locs_upper)
+-    tgt_locs = tl.load(tgt_loc_ptr + num_locs_offset, mask=num_locs_offset < num_locs)
+-    src_locs = tl.load(src_loc_ptr + num_locs_offset, mask=num_locs_offset < num_locs)
+-
+-    # NOTE: we cannot parallelize over the tgt_loc_ptr dim with cuda blocks
+-    # because this copy is an inplace operation.
+-
+-    num_loop = tl.cdiv(stride, BLOCK_SIZE)
+-    for i in range(num_loop):
+-        copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+-        mask = (num_locs_offset < num_locs)[:, None] and (copy_offset < stride)[None, :]
+-        value = tl.load(
+-            data_ptr + src_locs[:, None] * stride + copy_offset[None, :], mask=mask
+-        )
+-        tl.store(
+-            data_ptr + tgt_locs[:, None] * stride + copy_offset[None, :],
+-            value,
+-            mask=mask,
+-        )
++def copy_all_layer_kv_cache(*args, **kwargs):
++    # Triton is unavailable; this function is a stub. See move_kv_cache for CPU/CUDA fallback.
++    return

@@ -1,0 +1,60 @@
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 1f19d20..93de681 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -86,11 +86,18 @@ class Sampler(nn.Module):
+             logits = _apply_min_p(logits, sampling_tensors.min_ps)
+ 
+         # We use float32 for probabilities and log probabilities.
+-        # Compute the probabilities.
+-        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+-        # Compute the log probabilities.
++        # Compute log probabilities once; derive probabilities only if needed.
+         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+ 
++        # Only compute probabilities tensor when required.
++        need_probs = (self.include_gpu_probs_tensor or any(
++            sg.sampling_params.sampling_type in (SamplingType.RANDOM, SamplingType.RANDOM_SEED)
++            for sg in sampling_metadata.seq_groups))
++        if need_probs:
++            probs = logprobs.exp()
++        else:
++            probs = None
++
+         # Sample the next tokens.
+         sample_results, maybe_sampled_tokens_tensor = _sample(
+             probs,
+@@ -137,13 +144,12 @@ def _get_bin_counts_and_mask(
+     vocab_size: int,
+     num_seqs: int,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    # Compute the bin counts for the tokens.
++    # Compute the bin counts for the tokens using a single bincount per batch.
+     # vocab_size + 1 for padding.
+-    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+-                             dtype=torch.long,
+-                             device=tokens.device)
+-    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+-    bin_counts = bin_counts[:, :vocab_size]
++    offset = torch.arange(num_seqs, device=tokens.device, dtype=tokens.dtype).unsqueeze(1) * (vocab_size + 1)
++    flat = (tokens + offset).reshape(-1)
++    bc = torch.bincount(flat, minlength=num_seqs * (vocab_size + 1)).reshape(num_seqs, vocab_size + 1)
++    bin_counts = bc[:, :vocab_size]
+     mask = bin_counts > 0
+ 
+     return bin_counts, mask
+@@ -207,10 +213,10 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+     output_bin_counts, output_mask = _get_bin_counts_and_mask(
+         output_tokens_tensor, vocab_size, num_seqs)
+ 
+-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
+-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+-    logits = torch.where(logits > 0, logits / repetition_penalties,
+-                         logits * repetition_penalties)
++    rep = repetition_penalties.unsqueeze(1)
++    mask = (prompt_mask | output_mask)
++    eff_rep = torch.where(mask, rep, torch.tensor(1.0, dtype=rep.dtype, device=rep.device))
++    logits = torch.where(logits > 0, logits / eff_rep, logits * eff_rep)
+ 
+     # We follow the definition in OpenAI API.
+     # Refer to https://platform.openai.com/docs/api-reference/parameter-details

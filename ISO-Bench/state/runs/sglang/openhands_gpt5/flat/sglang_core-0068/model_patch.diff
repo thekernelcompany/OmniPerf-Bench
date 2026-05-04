@@ -1,0 +1,125 @@
+diff --git a/docs/backend/pd_disaggregation.md b/docs/backend/pd_disaggregation.md
+index 9dbc270..6b7cd8c 100644
+--- a/docs/backend/pd_disaggregation.md
++++ b/docs/backend/pd_disaggregation.md
+@@ -54,7 +54,7 @@ PD Disaggregation with Mooncake supports the following environment variables for
+ #### Prefill Server Configuration
+ | Variable | Description | Default |
+ |:--------:|:-----------:|:--------:
+-| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
++| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8`, then clipped to the range [4, 12] to ensure efficiency and prevent thread race conditions |
+ | **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the maximum pending tasks in the parallel transfer queue | `4` |
+ | **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `30` |
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 940a25d..1a2f195 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -56,7 +56,7 @@ class KVTransferError(Exception):
+ 
+ 
+ # prefill
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferKVChunk:
+     room: int
+     prefill_kv_indices: npt.NDArray[np.int64]
+@@ -66,41 +66,46 @@ class TransferKVChunk:
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class TransferInfo:
+     room: int
+     endpoint: str
+     dst_port: int
+     mooncake_session_id: str
+     dst_kv_indices: npt.NDArray[np.int64]
+-    dst_aux_index: int
++    dst_aux_index: Optional[int]
+     required_dst_info_num: int
+     is_dummy: bool
+ 
+     @classmethod
+     def from_zmq(cls, msg: List[bytes]):
+-        if msg[4] == b"" and msg[5] == b"":
+-            is_dummy = True
+-            dst_kv_indices = np.array([], dtype=np.int64)
+-            dst_aux_index = None
+-        else:
+-            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+-            dst_aux_index = int(msg[5].decode("ascii"))
+-            is_dummy = False
++        # Fast path for dummy messages without allocations and decoding
++        if not msg[4] and not msg[5]:
++            return cls(
++                room=int(msg[0]),
++                endpoint=msg[1].decode("ascii"),
++                dst_port=int(msg[2]),
++                mooncake_session_id=msg[3].decode("ascii"),
++                dst_kv_indices=np.empty(0, dtype=np.int64),
++                dst_aux_index=None,
++                required_dst_info_num=int(msg[6]),
++                is_dummy=True,
++            )
++        # Decode minimally; avoid unnecessary string conversions
+         return cls(
+-            room=int(msg[0].decode("ascii")),
++            room=int(msg[0]),
+             endpoint=msg[1].decode("ascii"),
+-            dst_port=int(msg[2].decode("ascii")),
++            dst_port=int(msg[2]),
+             mooncake_session_id=msg[3].decode("ascii"),
+-            dst_kv_indices=dst_kv_indices,
+-            dst_aux_index=dst_aux_index,
+-            required_dst_info_num=int(msg[6].decode("ascii")),
+-            is_dummy=is_dummy,
++            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
++            dst_aux_index=int(msg[5]),
++            required_dst_info_num=int(msg[6]),
++            is_dummy=False,
+         )
+ 
+ 
+ # decode
+-@dataclasses.dataclass
++@dataclasses.dataclass(slots=True)
+ class KVArgsRegisterInfo:
+     room: str
+     endpoint: str
+@@ -149,7 +154,8 @@ class MooncakeKVManager(BaseKVManager):
+             )
+         self.request_status: Dict[int, KVPoll] = {}
+         self.rank_port = None
+-        self.server_socket = zmq.Context().socket(zmq.PULL)
++        # Reuse singleton ZMQ context to minimize overhead
++        self.server_socket = zmq.Context.instance().socket(zmq.PULL)
+         self.register_buffer_to_engine()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+@@ -226,9 +232,11 @@ class MooncakeKVManager(BaseKVManager):
+ 
+     @cache
+     def _connect(self, endpoint: str):
+-        socket = zmq.Context().socket(zmq.PUSH)
+-        socket.connect(endpoint)
+-        return socket
++        # Use a singleton ZMQ context to avoid repeatedly creating contexts.
++        ctx = zmq.Context.instance()
++        sock = ctx.socket(zmq.PUSH)
++        sock.connect(endpoint)
++        return sock
+ 
+     def send_kvcache(
+         self,
+@@ -748,7 +756,8 @@ class MooncakeKVSender(BaseKVSender):
+ 
+ 
+ class MooncakeKVReceiver(BaseKVReceiver):
+-    _ctx = zmq.Context()
++    # Use a singleton ZMQ context to avoid per-class Context creation overhead
++    _ctx = zmq.Context.instance()
+     _socket_cache = {}
+     _socket_locks = {}
+     _global_lock = threading.Lock()

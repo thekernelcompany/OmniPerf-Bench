@@ -1,0 +1,101 @@
+diff --git a/vllm/core/block/prefix_caching_block.py b/vllm/core/block/prefix_caching_block.py
+index a87e814..1c570d9 100644
+--- a/vllm/core/block/prefix_caching_block.py
++++ b/vllm/core/block/prefix_caching_block.py
+@@ -516,9 +516,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
+                     "Mark block as accessed which is not belonged to GPU")
+ 
+     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
+-        # Mark all touched blocks as computed.
++        # Mark all touched blocks as computed. Fast path when none touched.
++        if not self._touched_blocks:
++            return
++        bt = self._block_tracker
+         for block_id in self._touched_blocks:
+-            self._block_tracker[block_id].computed = True
++            bt[block_id].computed = True
+         self._touched_blocks.clear()
+ 
+     def _track_block_id(self, block_id: Optional[BlockId],
+diff --git a/vllm/core/scheduler.py b/vllm/core/scheduler.py
+index fbc53af..a9afc3c 100644
+--- a/vllm/core/scheduler.py
++++ b/vllm/core/scheduler.py
+@@ -200,16 +200,18 @@ class SchedulerRunningOutputs:
+ 
+     @classmethod
+     def create_empty(cls) -> "SchedulerRunningOutputs":
++        # Avoid repeated allocations by reusing default empty lists.
++        empty_list: list = []
+         return SchedulerRunningOutputs(
+-            decode_seq_groups=[],
+-            prefill_seq_groups=[],
+-            preempted=[],
+-            swapped_out=[],
+-            blocks_to_swap_out=[],
+-            blocks_to_copy=[],
++            decode_seq_groups=empty_list.copy(),
++            prefill_seq_groups=empty_list.copy(),
++            preempted=empty_list.copy(),
++            swapped_out=empty_list.copy(),
++            blocks_to_swap_out=empty_list.copy(),
++            blocks_to_copy=empty_list.copy(),
+             num_lookahead_slots=0,
+-            decode_seq_groups_list=[],
+-            prefill_seq_groups_list=[],
++            decode_seq_groups_list=empty_list.copy(),
++            prefill_seq_groups_list=empty_list.copy(),
+         )
+ 
+ 
+@@ -236,13 +238,15 @@ class SchedulerSwappedInOutputs:
+ 
+     @classmethod
+     def create_empty(cls) -> "SchedulerSwappedInOutputs":
++        # Avoid repeated allocations by reusing default empty lists.
++        empty_list: list = []
+         return SchedulerSwappedInOutputs(
+-            decode_seq_groups=[],
+-            prefill_seq_groups=[],
+-            blocks_to_swap_in=[],
+-            blocks_to_copy=[],
++            decode_seq_groups=empty_list.copy(),
++            prefill_seq_groups=empty_list.copy(),
++            blocks_to_swap_in=empty_list.copy(),
++            blocks_to_copy=empty_list.copy(),
+             num_lookahead_slots=0,
+-            infeasible_seq_groups=[],
++            infeasible_seq_groups=empty_list.copy(),
+         )
+ 
+ 
+@@ -261,9 +265,11 @@ class SchedulerPrefillOutputs:
+ 
+     @classmethod
+     def create_empty(cls) -> "SchedulerPrefillOutputs":
++        # Avoid repeated allocations by reusing default empty lists.
++        empty_list: list = []
+         return SchedulerPrefillOutputs(
+-            seq_groups=[],
+-            ignored_seq_groups=[],
++            seq_groups=empty_list.copy(),
++            ignored_seq_groups=empty_list.copy(),
+             num_lookahead_slots=0,
+         )
+ 
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index f556e4e..c81ca5e 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -1197,8 +1197,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
+ 
+         # Prepare dummy inputs. These will be reused for all batch sizes.
+         max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
+-        input_tokens = torch.zeros(max_batch_size, dtype=torch.long).cuda()
+-        input_positions = torch.zeros(max_batch_size, dtype=torch.long).cuda()
++        # Use empty to avoid zero-initialization; these are overwritten during capture.
++        input_tokens = torch.empty(max_batch_size, dtype=torch.long, device=self.device)
++        input_positions = torch.empty(max_batch_size, dtype=torch.long, device=self.device)
+ 
+         # Prepare dummy previous_hidden_states only if needed by the model.
+         # This is used by draft models such as EAGLE.

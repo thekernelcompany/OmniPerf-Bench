@@ -1,0 +1,112 @@
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e791453..d7605a0 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -59,7 +59,7 @@ class InputBatch:
+         # Find a way to reduce the CPU memory usage.
+         # This buffer is not directly transferred to the GPU, so it does not
+         # need to be pinned.
+-        self.token_ids_cpu_tensor = torch.zeros(
++        self.token_ids_cpu_tensor = torch.empty(
+             (max_num_reqs, max_model_len),
+             device="cpu",
+             dtype=torch.int32,
+@@ -70,12 +70,12 @@ class InputBatch:
+         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+-        self.block_table = torch.zeros(
++        self.block_table = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device=self.device,
+             dtype=torch.int32,
+         )
+-        self.block_table_cpu_tensor = torch.zeros(
++        self.block_table_cpu_tensor = torch.empty(
+             (max_num_reqs, max_num_blocks_per_req),
+             device="cpu",
+             dtype=torch.int32,
+@@ -391,12 +391,15 @@ class InputBatch:
+             dtype=torch.int64,
+             pin_memory=self.pin_memory)
+         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
+-        prompt_token_ids[:] = (
+-            self.token_ids_cpu[:self.num_reqs, :max_prompt_len])
+-        # Use the value of vocab_size as a pad since we don't have a
+-        # token_id of this value.
+-        for i in range(self.num_reqs):
+-            prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
++        # Initialize all positions with pad token id (vocab_size) in a vectorized way
++        prompt_token_ids.fill(self.vocab_size)
++        # Vectorized copy of variable-length prefixes from token_ids_cpu
++        src = self.token_ids_cpu[:self.num_reqs, :max_prompt_len]
++        lens = self.num_prompt_tokens[:self.num_reqs]
++        if max_prompt_len > 0 and self.num_reqs > 0:
++            ar = np.arange(max_prompt_len, dtype=np.int64)
++            mask = ar < lens[:, None]
++            np.copyto(prompt_token_ids, src, where=mask)
+         return prompt_token_ids_cpu_tensor.to(device=self.device,
+                                               non_blocking=True)
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54..d81a97c 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -125,13 +125,13 @@ class GPUModelRunner:
+         self.num_sms = self.device_properties.multi_processor_count
+ 
+         # Persistent buffers for CUDA graphs.
+-        self.input_ids = torch.zeros(self.max_num_tokens,
++        self.input_ids = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int32,
+                                      device=self.device)
+-        self.positions = torch.zeros(self.max_num_tokens,
++        self.positions = torch.empty(self.max_num_tokens,
+                                      dtype=torch.int64,
+                                      device=self.device)
+-        self.inputs_embeds = torch.zeros(
++        self.inputs_embeds = torch.empty(
+             (self.max_num_tokens, self.hidden_size),
+             dtype=self.dtype,
+             device=self.device)
+@@ -143,27 +143,27 @@ class GPUModelRunner:
+         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
+         # a faster version of creating a new tensor every time. Thus, we should
+         # not make any assumptions about the values in these tensors.
+-        self.input_ids_cpu = torch.zeros(self.max_num_tokens,
++        self.input_ids_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.input_ids_np = self.input_ids_cpu.numpy()
+-        self.positions_cpu = torch.zeros(self.max_num_tokens,
++        self.positions_cpu = torch.empty(self.max_num_tokens,
+                                          dtype=torch.int64,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+         self.positions_np = self.positions_cpu.numpy()
+-        self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
++        self.slot_mapping_cpu = torch.empty(self.max_num_tokens,
+                                             dtype=torch.int32,
+                                             device="cpu",
+                                             pin_memory=self.pin_memory)
+         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
+-        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.query_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                                dtype=torch.int32,
+                                                device="cpu",
+                                                pin_memory=self.pin_memory)
+         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+-        self.seq_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
++        self.seq_start_loc_cpu = torch.empty(self.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device="cpu",
+                                              pin_memory=self.pin_memory)
+@@ -856,6 +856,6 @@ class GPUModelRunner:
+             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+         for _ in range(self.num_attn_layers):
+             self.kv_caches.append(
+-                torch.zeros(kv_cache_shape,
++                torch.empty(kv_cache_shape,
+                             dtype=self.kv_cache_dtype,
+                             device=self.device))
