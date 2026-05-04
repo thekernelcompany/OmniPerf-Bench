@@ -789,6 +789,10 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 codex_repo_path = str(project_root)
                 py_paths = [trae_repo_path, codex_repo_path, env.get("PYTHONPATH", "")]
                 env["PYTHONPATH"] = os.pathsep.join([p for p in py_paths if p]).rstrip(os.pathsep)
+                # Tell OpenHands to save its trajectory into the run dir.
+                # OH's load_from_env picks up SAVE_TRAJECTORY_PATH for the
+                # top-level OpenHandsConfig field (core/main.py:300).
+                env["SAVE_TRAJECTORY_PATH"] = str((jw.dir / "trajectory.json").resolve())
                 # Prefer non-interactive behavior and disable auto-continue loops (best-effort)
                 env["OPENHANDS_AUTO_CONTINUE"] = "false"
                 env["AUTO_CONTINUE"] = "false"
@@ -829,7 +833,12 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                             logger.debug(f"  {var}: {'*' * 20}...{env[var][-4:] if len(env[var]) > 4 else '****'}")
                         else:
                             logger.debug(f"  {var}: {env[var]}")
-                
+
+                # Initialize before the three-way agent dispatch so the
+                # post-block status logic can read it regardless of branch.
+                # Only the trae/codex/claude_code branch reassigns it.
+                exceeded_step_limit = False
+
                 if default_agent == "openhands" and not use_python_api:
                     logger.info("Executing OpenHands command with real-time output")
                     # Use Popen for real-time output streaming
@@ -1282,13 +1291,28 @@ print(f"Cache hit rate: {allocator.get_prefix_cache_hit_rate():.3f}")
                 except Exception:
                     _tomllib = None
                 if default_agent == "openhands":
-                    try:
-                        # Compute unified diff against base (pre) commit, excluding scratch artifacts
-                        diff_text = subprocess.check_output([
-                            "git", "diff", f"{pre}", "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"
-                        ], cwd=wt_dir).decode()
-                    except Exception:
-                        diff_text = ""
+                    # Prefer the patch file the agent wrote in the worktree
+                    # (robust in detached-history mode where `pre` SHA isn't
+                    # reachable). Copy to run dir for artifact preservation.
+                    patch_path_wt = wt_dir / "model_patch.diff"
+                    patch_path_run = jw.dir / "model_patch.diff"
+                    diff_text = ""
+                    if patch_path_wt.exists() and patch_path_wt.stat().st_size > 0:
+                        diff_text = patch_path_wt.read_text()
+                        try:
+                            patch_path_run.write_text(diff_text)
+                            logger.debug("Copied patch from worktree to run directory")
+                        except Exception as e:
+                            logger.warning(f"Failed to copy patch file: {e}")
+                    else:
+                        # Fallback: regenerate via git diff (works only when
+                        # pre is reachable, i.e., non-detached worktrees).
+                        try:
+                            diff_text = subprocess.check_output([
+                                "git", "diff", f"{pre}", "HEAD", "--", ".", f":(exclude){scratch_rel_dir}"
+                            ], cwd=wt_dir).decode()
+                        except Exception:
+                            diff_text = ""
                 else:
                     # Use Trae/Codex patch from worktree (primary) or run directory (fallback)
                     patch_path_wt = wt_dir / "model_patch.diff"

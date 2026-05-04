@@ -48,7 +48,20 @@ def resolve_precommit(
 
 
 def get_changed_files(repo_dir: Path, from_ref: str, to_ref: str) -> list[str]:
+    # When the worktree is created with detach_from_history=True, repo_manager
+    # does `git init` + a fresh "Initial state" commit, so `from_ref` (the
+    # original `pre` SHA from the main repo) won't exist in this objectdb.
+    # Fall back to the worktree's root commit, which holds pre's tree.
+    cat_t = subprocess.run(
+        ["git", "cat-file", "-t", from_ref],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    if cat_t.returncode != 0:
+        from_ref = subprocess.check_output(
+            ["git", "rev-list", "--max-parents=0", to_ref], cwd=repo_dir,
+        ).decode().strip()
+
     out = subprocess.check_output(
-        ["git", "diff", "--name-only", from_ref, to_ref], cwd=repo_dir
+        ["git", "diff", "--name-only", from_ref, to_ref], cwd=repo_dir,
     ).decode().splitlines()
     return out

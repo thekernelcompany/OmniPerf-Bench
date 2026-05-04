@@ -36,6 +36,15 @@ export LLM_MODEL="openai/gpt-5"
 export LLM_API_KEY="${OPENROUTER_API_KEY}"
 export LLM_BASE_URL="https://openrouter.ai/api/v1"
 
+# Push GPT-5 to its real OpenRouter ceiling. OH's LLM_* env vars override
+# LLMConfig at runtime (see openhands/core/config/utils.py:set_attr_from_env).
+# - LLM_MAX_OUTPUT_TOKENS is sent to the LLM (real effect — was 4096 default).
+# - LLM_MAX_INPUT_TOKENS is documented as "currently unused" in OH 0.62
+#   (the actual input cap is provider-side: 272K for openai/gpt-5 on OpenRouter).
+#   Set anyway to make intent explicit in the runtime config dump.
+export LLM_MAX_OUTPUT_TOKENS=128000
+export LLM_MAX_INPUT_TOKENS=272000
+
 # OpenHands also reads OPENAI_API_KEY in some paths (custom_llm_provider="openai" path)
 export OPENAI_API_KEY="${OPENROUTER_API_KEY}"
 export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
@@ -85,14 +94,14 @@ JSON
         $PY -m bench.cli prepare tasks/vllm.yaml \
             --from-plan state/runs/oh54_hf_configs/plans/plan_iso.json \
             --bench-cfg tmp_openhands_gpt5_or_vllm_bench.yaml \
-            --max-workers 4 --resume "$@"
+            --max-workers 8 --resume "$@"
         ;;
     sglang)
         # Full 15-task sglang fanout — 4 parallel workers (same memory budget as vllm)
         $PY -m bench.cli prepare tasks/sglang.yaml \
             --from-plan state/runs/oh54_hf_configs/plans/sglang_plan_iso.json \
             --bench-cfg tmp_openhands_gpt5_or_sglang_bench.yaml \
-            --max-workers 4 --resume "$@"
+            --max-workers 8 --resume "$@"
         ;;
     *)
         echo "Unknown mode: $mode (use smoke|vllm|sglang)" >&2
