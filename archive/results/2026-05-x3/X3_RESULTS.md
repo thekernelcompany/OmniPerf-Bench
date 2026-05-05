@@ -106,6 +106,18 @@ archive/results/2026-05-x3/
 
 Reproduce: `bash scripts/runners/run_x3_batch.sh all` (with `UV_BIN` and `HF_HOME` set).
 
+### Where this lives
+
+**Git** (`thekernelcompany/OmniPerf-Bench`, branch `icml/rebuttal-hard-metrics-oh`):
+- `2f06a8843` — X3 batch (runner mods, driver, mapping, 14 result JSONs, X3_RESULTS.md)
+- `f9c2bcfd4` — `scripts/runners/push_x3_to_hf.py` (the upload helper that appended to the HF repos below)
+
+**HuggingFace** (private, `Inferencebench` org — append-only under `x3_2026-05-05/`, May 5 fanout artifacts not touched):
+- `Inferencebench/iso-bench-openhands-sonnet45-hard-metrics/x3_2026-05-05/`
+- `Inferencebench/iso-bench-openhands-gpt5-hard-metrics/x3_2026-05-05/`
+
+Each repo holds the full picture (results + this doc + `_repro/` runner + driver + mapping + 14 run logs).
+
 ---
 
 ## 5. What to do with these numbers
