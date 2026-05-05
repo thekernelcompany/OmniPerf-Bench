@@ -748,6 +748,16 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
     if info.get("transformers_pin"):
         os.environ["TRANSFORMERS_PIN"] = info["transformers_pin"]
         log(f"  Per-commit transformers pin: {info['transformers_pin']}")
+    if info.get("pyarrow_pin"):
+        os.environ["PYARROW_PIN"] = info["pyarrow_pin"]
+        log(f"  Per-commit pyarrow pin: {info['pyarrow_pin']}")
+    else:
+        os.environ.pop("PYARROW_PIN", None)
+    if info.get("datasets_pin"):
+        os.environ["DATASETS_PIN"] = info["datasets_pin"]
+        log(f"  Per-commit datasets pin: {info['datasets_pin']}")
+    else:
+        os.environ.pop("DATASETS_PIN", None)
     # Always derive patch path from the active PATCHES_DIR. The `patch_path`
     # field in vllm_oh_mapping.json is hardcoded to the sonnet45 layout (legacy
     # convenience field) — using it would silently benchmark the wrong agent's
@@ -801,13 +811,19 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
             # Install bench deps (always needed; not pulled by vllm wheel)
             env = os.environ.copy()
             pin = os.environ.get("TRANSFORMERS_PIN", ">=4.45,<4.47")
-            log(f"  Installing benchmark deps + transformers{pin}")
-            subprocess.run(
-                [str(UV_BIN), "pip", "install", "--python", str(venv / "bin/python"),
-                 "aiohttp", "pandas", "datasets", "pillow",
-                 f"transformers{pin}"],
-                capture_output=True, text=True, timeout=300, env=env,
-            )
+            pa_pin = os.environ.get("PYARROW_PIN", "")
+            ds_pin = os.environ.get("DATASETS_PIN", "")
+            datasets_spec = f"datasets{ds_pin}" if ds_pin else "datasets"
+            pyarrow_spec = f"pyarrow{pa_pin}" if pa_pin else None
+            log(f"  Installing benchmark deps + transformers{pin}"
+                + (f" + pyarrow{pa_pin}" if pa_pin else "")
+                + (f" + {datasets_spec}" if ds_pin else ""))
+            install_cmd = [str(UV_BIN), "pip", "install", "--python", str(venv / "bin/python"),
+                           "aiohttp", "pandas", datasets_spec, "pillow",
+                           f"transformers{pin}"]
+            if pyarrow_spec:
+                install_cmd.append(pyarrow_spec)
+            subprocess.run(install_cmd, capture_output=True, text=True, timeout=300, env=env)
         apply_patch(venv, patch_path, log)
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
