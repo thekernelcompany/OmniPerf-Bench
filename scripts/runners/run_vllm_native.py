@@ -725,10 +725,32 @@ def parse_metrics(output: str) -> dict:
             m = re.search(pat, output)
             if m:
                 metrics[k] = float(m.group(1))
+    # vLLM engine iter-level metrics logger (always emitted by metrics.py:456 during
+    # benchmark_latency.py runs that exercise the LLMEngine). For spec-decode commits,
+    # generation_throughput counts ACCEPTED tokens only — this is the canonical
+    # "throughput" reported in the legacy 4-agent hard_metrics for 4c822298 etc.
+    gen_tps = re.findall(r'Avg generation throughput:\s*([\d.]+)\s*tokens/s', output)
+    if gen_tps:
+        vals = [float(v) for v in gen_tps if float(v) > 0]
+        if vals:
+            metrics['gen_throughput_tok_s_max']  = max(vals)
+            metrics['gen_throughput_tok_s_mean'] = sum(vals) / len(vals)
+            metrics['gen_throughput_tok_s_last'] = vals[-1]
+    prompt_tps = re.findall(r'Avg prompt throughput:\s*([\d.]+)\s*tokens/s', output)
+    if prompt_tps:
+        vals = [float(v) for v in prompt_tps if float(v) > 0]
+        if vals:
+            metrics['prompt_throughput_tok_s_max']  = max(vals)
+            metrics['prompt_throughput_tok_s_mean'] = sum(vals) / len(vals)
+    spec = re.search(r'Speculative metrics:.*Draft acceptance rate:\s*([\d.]+).*System efficiency:\s*([\d.]+)', output)
+    if spec:
+        metrics['spec_draft_acceptance_rate'] = float(spec.group(1))
+        metrics['spec_system_efficiency']     = float(spec.group(2))
     return metrics
 
 
-def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
+def run_one(commit_short: str, info: dict, timeout: int = 1800,
+            skip_patch: bool = False, skip_iso_override: bool = False) -> dict:
     start = time.time()
     out_lines = []
 
@@ -738,7 +760,10 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
 
     # ISO-Bench dataset is authoritative for perf_command + model. Merge before
     # downstream lookups so overrides are captured in raw_output for audit.
-    info = merge_with_iso_bench(commit_short, info, log)
+    if skip_iso_override:
+        log("  ISO-Bench HF override DISABLED (--no-iso-override)")
+    else:
+        info = merge_with_iso_bench(commit_short, info, log)
     parent_full = info.get("parent_commit") or info.get("human_commit_full", "")
     model = MODEL_OVERRIDES.get(info["model"], info["model"])
     if model != info["model"]:
@@ -758,22 +783,26 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
         log(f"  Per-commit datasets pin: {info['datasets_pin']}")
     else:
         os.environ.pop("DATASETS_PIN", None)
-    # Always derive patch path from the active PATCHES_DIR. The `patch_path`
-    # field in vllm_oh_mapping.json is hardcoded to the sonnet45 layout (legacy
-    # convenience field) — using it would silently benchmark the wrong agent's
-    # patch when --agent-name is anything else.
-    task_dir = find_task_dir(commit_short)
-    if not task_dir:
-        return {"status": "error",
-                "error": f"no task dir in {PATCHES_DIR} matches commit_short={commit_short}",
-                "duration_s": 0, "metrics": {}, "raw_output": ""}
-    patch_path = PATCHES_DIR / task_dir / "model_patch.diff"
-    if not patch_path.exists():
-        return {"status": "error", "error": f"patch not found at {patch_path}",
-                "duration_s": 0, "metrics": {}, "raw_output": ""}
-    if patch_path.stat().st_size == 0:
-        return {"status": "error", "error": f"empty patch at {patch_path} (agent gave up)",
-                "duration_s": 0, "metrics": {}, "raw_output": ""}
+    if skip_patch:
+        log("  --skip-patch: BASELINE mode, no agent patch will be applied")
+        patch_path = None
+    else:
+        # Always derive patch path from the active PATCHES_DIR. The `patch_path`
+        # field in vllm_oh_mapping.json is hardcoded to the sonnet45 layout (legacy
+        # convenience field) — using it would silently benchmark the wrong agent's
+        # patch when --agent-name is anything else.
+        task_dir = find_task_dir(commit_short)
+        if not task_dir:
+            return {"status": "error",
+                    "error": f"no task dir in {PATCHES_DIR} matches commit_short={commit_short}",
+                    "duration_s": 0, "metrics": {}, "raw_output": ""}
+        patch_path = PATCHES_DIR / task_dir / "model_patch.diff"
+        if not patch_path.exists():
+            return {"status": "error", "error": f"patch not found at {patch_path}",
+                    "duration_s": 0, "metrics": {}, "raw_output": ""}
+        if patch_path.stat().st_size == 0:
+            return {"status": "error", "error": f"empty patch at {patch_path} (agent gave up)",
+                    "duration_s": 0, "metrics": {}, "raw_output": ""}
 
     use_source = not wheel_exists(parent_full)
     if use_source:
@@ -824,7 +853,10 @@ def run_one(commit_short: str, info: dict, timeout: int = 1800) -> dict:
             if pyarrow_spec:
                 install_cmd.append(pyarrow_spec)
             subprocess.run(install_cmd, capture_output=True, text=True, timeout=300, env=env)
-        apply_patch(venv, patch_path, log)
+        if skip_patch:
+            log("  Skipping apply_patch (baseline mode)")
+        else:
+            apply_patch(venv, patch_path, log)
         if needs_server:
             kill_port(port, log)  # ensure prior commit's spawn-children are gone
             mml = compute_max_model_len(perf)
@@ -886,6 +918,10 @@ def main():
                    help="Override results dir (absolute). Overrides --agent-name's choice.")
     p.add_argument("--mapping-file", type=Path, default=None,
                    help="Override path to vllm_oh_mapping.json.")
+    p.add_argument("--skip-patch", action="store_true",
+                   help="Baseline mode: install vllm at parent and bench without applying any agent patch.")
+    p.add_argument("--no-iso-override", action="store_true",
+                   help="Use mapping's perf_command/model as-is; do not let ISO-Bench HF parquet override them.")
     args = p.parse_args()
 
     # Resolve paths and rebind module globals so the rest of the script (which
@@ -910,7 +946,7 @@ def main():
 
     if not MAPPING_FILE.exists():
         sys.exit(f"ERROR: mapping file not found at {MAPPING_FILE}")
-    if not PATCHES_DIR.exists():
+    if not PATCHES_DIR.exists() and not args.skip_patch:
         sys.exit(f"ERROR: patches dir not found at {PATCHES_DIR}")
     if not UV_BIN.exists():
         sys.exit(f"ERROR: uv not found at {UV_BIN}; set UV_BIN env or install uv")
@@ -930,7 +966,9 @@ def main():
             print(f"  SKIP: result already exists")
             continue
         try:
-            result = run_one(c, info, args.timeout)
+            result = run_one(c, info, args.timeout,
+                             skip_patch=args.skip_patch,
+                             skip_iso_override=args.no_iso_override)
         except Exception as e:
             import traceback
             result = {"status": "error",
@@ -940,7 +978,10 @@ def main():
                       "raw_output": traceback.format_exc()}
         # Re-merge for record-keeping so model + perf_command in the JSON
         # match what was *actually* benchmarked (post-ISO override).
-        info_for_record = merge_with_iso_bench(c, dict(info), lambda _msg: None)
+        if args.no_iso_override:
+            info_for_record = dict(info)
+        else:
+            info_for_record = merge_with_iso_bench(c, dict(info), lambda _msg: None)
         record = {
             "human_commit": c,
             "human_commit_full": info.get("human_commit_full", info.get("commit_full", "")),
