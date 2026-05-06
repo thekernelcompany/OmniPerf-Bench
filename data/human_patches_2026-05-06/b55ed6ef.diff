@@ -1,0 +1,63 @@
+commit b55ed6ef8ab0dce7fb0f79ff292dafdb4d22610c
+Author: Woosuk Kwon <woosuk.kwon@berkeley.edu>
+Date:   Fri Jan 3 04:04:58 2025 +0900
+
+    [V1][Minor] Optimize token_ids_cpu copy (#11692)
+    
+    Signed-off-by: Woosuk Kwon <woosuk.kwon@berkeley.edu>
+
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index e79145300..f8a1427c6 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -66,8 +66,9 @@ class InputBatch:
+             pin_memory=False,
+         )
+         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+-        self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
++        self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
++        self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
+ 
+         # Attention-related.
+         self.block_table = torch.zeros(
+@@ -189,6 +190,7 @@ class InputBatch:
+         end_idx = start_idx + len(request.output_token_ids)
+         self.token_ids_cpu[req_index,
+                            start_idx:end_idx] = request.output_token_ids
++        self.num_tokens[req_index] = request.num_tokens
+ 
+         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+         num_blocks = len(request.block_ids)
+@@ -290,14 +292,15 @@ class InputBatch:
+             self.req_ids[last_req_index] = None
+             self.req_id_to_index[req_id] = empty_index
+ 
+-            # TODO(woosuk): Optimize the copy of token_ids_cpu and
+-            # block_table_cpu.
+-            self.token_ids_cpu[empty_index] = self.token_ids_cpu[
+-                last_req_index]
++            num_tokens = self.num_tokens[last_req_index]
++            self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
++                last_req_index, :num_tokens]
++            self.num_tokens[empty_index] = num_tokens
+             self.num_prompt_tokens[empty_index] = \
+                 self.num_prompt_tokens[last_req_index]
+             self.num_computed_tokens_cpu[
+                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
++            # TODO(woosuk): Optimize the copy of block_table_cpu.
+             self.block_table_cpu[empty_index] = self.block_table_cpu[
+                 last_req_index]
+             self.temperature_cpu[empty_index] = self.temperature_cpu[
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 995de54e8..75098b033 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -644,6 +644,7 @@ class GPUModelRunner:
+                 # Append the sampled token to the output token ids.
+                 token_id = sampled_token_ids[i]
+                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
++                self.input_batch.num_tokens[i] += 1
+                 req_state.output_token_ids.append(token_id)
+             else:
+                 # Ignore the sampled token from the partial request.
