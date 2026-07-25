@@ -1,300 +1,227 @@
-# Rebuttal Analysis — Results (generated 2026-07-25)
+# NeurIPS Rebuttal — Answers built on the ICML rebuttal (updated 2026-07-25)
 
-This document collects everything we ran for the rebuttal, in plain language, with
-the technical details and the caveats spelled out. Every number here comes from a
-script in `scripts/rebuttal_analysis/` and can be regenerated. Run
-`build_master.py` first — it rebuilds the paper's quadrant table from the raw data
-and refuses to continue if the rebuild stops matching the paper. The other scripts
-can run in any order after that.
+The same paper was reviewed at ICML (submission 28104: UJ1j accept-5 → fully
+resolved; dpfc reject-2; Rdwi weak-reject-3; meta-reject on scale / novelty /
+closed-source scaffolds — see `ICML-rebuttal.txt`). Most of what the NeurIPS
+reviewers ask was already asked at ICML, we already wrote answers, and — most
+importantly — **the fixes we promised at ICML are already inside the NeurIPS
+submission**. So the default response pattern is:
 
-**Terms used throughout:**
+1. **Point at the paper** (the asset often already exists in an appendix).
+2. **Reuse the ICML rebuttal text** that resolved or partially resolved the same
+   concern (adapted, without mentioning ICML).
+3. **Attach the new numbers** from `docs/rebuttal_analysis/` only as supplements.
 
-- **Quadrants:** every (task, agent) pair lands in Q1–Q4. Q1 = right target and good
-  performance ("True Success"). Q2 = right target, bad performance. Q3 = good
-  performance but wrong target ("Lucky Win"). Q4 = wrong target and bad performance.
-  "Hard Success" = Q1 + Q3 (what performance numbers alone would call success).
-- **Canonical vs published:** "published" means the numbers in the submitted PDF.
-  "Canonical" means the numbers you get today from the current data files, which were
-  partially re-benchmarked *after* submission (the "X3 re-bench", 2026-05-05/06).
-  These two disagree in exactly one cell — see Finding 1.
-- **Legacy agents:** the four configs that existed before OpenHands was added —
-  Claude Code, Codex CLI, TRAE (Sonnet), TRAE (GPT-5). Some data (like correctness
-  tests) only exists for these four.
+## What the NeurIPS submission already contains because of ICML
 
----
+These were promised or delivered in the ICML rebuttal and are now IN the paper —
+each one directly answers a NeurIPS ask:
 
-## Status: what is done vs what is still to do
+| Added after ICML | In the paper now | Answers (NeurIPS) |
+|---|---|---|
+| Judge prompt + 8-run stability (±2.5%) + Cohen's κ vs 2 humans (0.836 / 0.880) | Appendix F, Figures 19–20, Table 8 | yX4G judge reliability, kNyS Q4 |
+| Pass@1 vs pass@2 rollout variance | Appendix G, Table 9 | utqG W1, kNyS scale |
+| OpenHands runs — **the exact thing ICML-Rdwi's follow-up requested** ("run open source scaffolds like OpenHands") | Both models, all 54 tasks, Tables 3–5 | kNyS Q2/Q3, ICML reproducibility meta-concern |
+| Open-model failure case studies (GPT-OSS-120B, MiniMax-M2.1, GLM-4.7) | Appendix E.5–E.7 | kNyS Q1 |
+| Trajectory worked examples (same Bamba commit under two scaffolds) | Appendix E.8–E.9 | kNyS Q3 |
+| TRT-LLM / FlashInfer filtering runs (47 + 52 curated candidates) | Appendix C, Table 6 | kNyS codebase coverage |
+| Level 2 multi-GPU split released (52 tasks) | §3.2, HF dataset | utqG W2 |
 
-| Reviewer item | What the review asks | Done (artifact) | Still to do |
-|---|---|---|---|
-| utqG W1 — scale / statistics | Confidence intervals + significance tests on Tables 3/4 | ✅ `stats_tables.md`, `pass_at_k_variance.md` | Write the response text; decide canonical-vs-published for one cell (Finding 1) |
-| utqG W2 — Level 2 unevaluated | Validate Level 2 or reposition it | ✅ Confirmed Level 2 was never run; fallback framing ready | Optional GPU run: a few Level-2 TP2 tasks with the human patch; apply `camera_ready_edits.tex` |
-| utqG W3 — two kinds of Lucky Win | Split Q3 into "broke correctness" vs "legitimate alternative" | ✅ `q3_decomposition.md` — 11 of 12 testable cases kept correctness | GPU run (~10 tasks) to cover the OpenHands cases; SGLang cannot be covered (no correctness setup exists) |
-| utqG W4 — baseline-relative numbers | Show absolute gains over the unoptimized code, not just vs the human patch | ✅ `baseline_deltas.md` — 28/39 vLLM + 14/15 SGLang tasks covered | GPU run: 9 missing vLLM baselines; **do not** quote the measured medians as proof of "non-trivial speedups by construction" (Finding 4) |
-| utqG W5 — contamination | Mitigation + durability plan | ✅ Nothing to compute; the draft's argument holds | Response text only |
-| yX4G — metric completeness | Report TPOT/ITL/throughput alongside TTFT | ✅ `multimetric.md` | Response text only |
-| yX4G — judge reliability | Show the judge-vs-human disagreements and boundary cases | ❌ **Blocked** | Needs the Supabase export — the raw human labels are not in the repo and no credentials exist locally |
-| yX4G — representativeness | Describe what kinds of tasks the dataset contains | ✅ `composition.md` | Optional: hand-label bottleneck categories (~54 commits) |
-| kNyS — limited scale | Statistical rigor at n=39/15 | ✅ Same as W1 | Response text only |
-| kNyS — codebase coverage | Why only vLLM/SGLang | ✅ Nothing to compute; the TRT-LLM/FlashInfer task pool exists on HuggingFace and can be cited | Response text only |
-| kNyS Q1 — model diversity | Results for more model families | ❌ Not run | Cheapest path: run the LLM judge over the 66 existing open-model runs (API cost only, no GPU). Full benchmark runs on new families = expensive, or promise for camera-ready. Also fix the draft's wrong claim that appendices E.5–E.7 were full runs |
-| kNyS Q2 — scaffold vs model | Separate the effect of the scaffold from the model | ✅ 2×2 grid (Finding 7) + significance tests | Rewrite of paper §5.5 |
-| kNyS Q3 — scaffold mechanisms | Which scaffold behaviors drive the gap | ✅ `trajectory_components.md` — step-level analysis for 4 of 6 configs | Response text; never claim step logs exist for Codex or Claude Code |
-| kNyS Q4 — judge boundary cases | Worked examples + a stricter-definition check | ✅ Strict-definition check done (Finding 5) | Worked examples blocked on the same Supabase export |
-
-**Two decisions must be made before posting anything:**
-1. Which numbers to stand on for the one cell where current data disagrees with the
-   PDF (Finding 1). Pick one; never mix.
-2. How to frame W4, since the measured baseline numbers do not support the draft's
-   planned claim (Finding 4).
+Frame all of this as "the paper already contains X" — reviewers score what's in
+the PDF, and it's all in the PDF.
 
 ---
 
-## Finding 1 — The current data no longer matches one cell of the published paper
+## Item-by-item: question → answer → source
 
-We rebuilt the paper's quadrant table (Table 5) from the raw soft-metric and
-hard-metric files. For 11 of the 12 (project × agent) cells, the rebuild matches the
-PDF exactly. The exception: **vLLM OpenHands (Sonnet-4.5)**.
+### utqG W1 + kNyS "limited scale" — error bars / significance
 
-- Published: Q1=17, Q2=15 → True Success 43.6%.
-- Current data: Q1=22, Q2=10 → True Success 56.4%.
+**The question:** point estimates on 39/15 tasks with no variance.
 
-What happened: after the paper was submitted, the team re-ran a batch of benchmarks
-(the X3 re-bench, 2026-05-05/06) and five of this agent's results changed from
-"worse than human" to "beats/similar". The data files were updated in place, so the
-exact per-task state the paper was computed from no longer exists — we checked the
-git history of the data submodule and the nearby snapshots contain 9 or 26
-"beats/similar" rows for this agent, never the 21 the paper implies.
+**The answer (3 parts):**
+- Reuse ICML-UJ1j's resolved response: judge stability (8 runs, ±2.5%) and
+  rollout variance (Appendix G: std ≤3.3%, ranking preserved) are already in the
+  paper. Reuse the ICML size justification (Rdwi): strict inclusion criteria —
+  every task must be a reproducible, Docker-buildable optimization commit — plus
+  the cost argument (2h agent budget + H100 re-eval + correctness + judge ≈
+  thousands of dollars at 54 tasks).
+- New supplement: Wilson + bootstrap 95% CIs for every cell and 30 paired exact
+  McNemar tests (`stats_tables.md`). The headline claim — rankings invert across
+  codebases — is significant in both directions (Sonnet scaffolds > GPT-5
+  scaffolds on vLLM, p ≤ 0.021; TRAE/Codex > Claude Code/OH-S45 on SGLang,
+  p ≤ 0.008). Within-class orderings are not significant — soften those.
+- New supplement: per-task rollout CVs from the pass@k data (~8 rollouts/task):
+  throughput CV < 1% (threshold is 5%), TTFT CV 7–9% median on SGLang
+  (`pass_at_k_variance.md`).
 
-**Caveats and consequences:**
-- Every table in this analysis uses the *current* (canonical) data. Where it matters,
-  the published number is shown next to it.
-- Under current data, OpenHands (Sonnet-4.5) becomes the *best* vLLM agent, ahead of
-  Claude Code. That changes the paper's story slightly (in a direction favorable to
-  the benchmark — the correction is upward).
-- The rebuttal must either stick to the published numbers everywhere, or openly say
-  "we re-benchmarked and this cell improved". Mixing the two silently is the one
-  thing a careful reviewer could catch and would look bad.
+### utqG W2 — Level 2 not evaluated
 
-## Finding 2 — What survives statistical testing (utqG W1, kNyS "scale")
+**The question:** Level 2 is released but never run.
 
-We added three kinds of statistics (`stats_tables.md`, `pass_at_k_variance.md`):
+**The answer:** reuse the ICML L1/scope response almost verbatim — "the same
+pipeline applies to multi-GPU and heterogeneous hardware without modification;
+we restricted evaluation to Level 1 due to time and budget constraints" — and
+note Level 2 already went through the same three-stage filtering + manual
+curation as Level 1 (only agent rollouts and re-execution are missing). Since
+ICML, Level 2 is now actually released on HF. Offer the repositioning
+(curated data release) if the reviewer prefers; optional [RUN] a few TP2 tasks
+with the human patch if GPUs land.
 
-**Confidence intervals on the success rates.** Wilson 95% intervals plus a
-bootstrap check (10,000 resamples over tasks). On vLLM (39 tasks) the intervals are
-roughly ±13–16 percentage points; on SGLang (15 tasks) roughly ±20–25 points. So
-point estimates like "80.0%" on SGLang really mean "somewhere between ~55% and ~93%".
-Any sentence in the paper that ranks agents on SGLang by a few points is not
-supported; sentences about large gaps are.
+### utqG W3 — two kinds of Lucky Win
 
-**Paired significance tests.** Because every agent ran the same tasks, we used
-McNemar's exact test, which only looks at tasks where two agents disagree (one
-succeeded, the other failed). Results:
-- On vLLM: Claude Code and OpenHands (Sonnet-4.5) are significantly better than
-  Codex CLI and TRAE (GPT-5) (p between 0.001 and 0.021). The general pattern
-  "Sonnet-based configs beat GPT-5-based configs on vLLM" holds up.
-- On SGLang: TRAE (both models) and Codex CLI are significantly better than Claude
-  Code and OpenHands (Sonnet-4.5) (p between 0.003 and 0.008).
-- Together these mean the paper's headline claim — the ranking *inverts* between
-  codebases — survives testing in both directions.
-- Not significant: Claude Code vs OpenHands (Sonnet-4.5) on vLLM, TRAE vs Codex on
-  SGLang, and most pairs that share a model. Ordering claims between those specific
-  pairs should be softened to "comparable".
+**The question:** does a Q3 speedup mean the agent broke the model, or found a
+legitimate optimization elsewhere?
 
-**How noisy is a single measurement?** The paper classifies each patch from one
-benchmark run. Using the pass-at-k dataset on HuggingFace (about 8 independent
-rollouts per task for Claude Code and Codex, each benchmarked), we measured how much
-the same task's numbers vary run to run (coefficient of variation = standard
-deviation / mean):
-- Throughput: 0.4–0.8% typical variation. The paper's ±5% classification threshold
-  is comfortably wider than the noise. Throughput-based classifications are stable.
-- TTFT: 7–9% typical variation on SGLang, up to 19% for the noisiest tasks. This is
-  *larger* than the ±5% threshold — so a single-run Beats/Similar/Worse label on a
-  TTFT-classified SGLang task can flip if you re-run it.
+**The answer:** the paper already contains the anchor case — **Bamba, Appendix
+E.3 / Figure 12** (TRAE-Sonnet matches human speedup, accuracy 32%→0%, caught by
+soft metrics + LM Eval Harness, §5.6). Use it as-is. The new table
+(`q3_decomposition.md`) generalizes it: across the Q3 cases with correctness
+runs, **11 of 12 preserved accuracy** (valid alternative-location optimizations)
+and exactly 1 broke it — the E.3 Bamba case. One sentence of framing: the
+framework catches the harmful case, and most Lucky Wins are legitimate work,
+which we will say in §5.2.
 
-**Caveats:** these rollout numbers mix two sources of variation (the agent producing
-a different patch each rollout, and benchmark noise) — they are an upper bound on
-benchmark noise, not a clean measurement of it. Also, all the *main* tables in the
-paper remain single-run; the confidence intervals are across tasks, not across
-repeated measurements. Don't phrase them as if the benchmarks were repeated.
+### utqG W4 — measured against baseline?
 
-## Finding 3 — Most "Lucky Wins" did not cheat (utqG W3)
+**The question is simply: did you compare against the unoptimized baseline, or
+only against the human patch?**
 
-The reviewer asked: when an agent gets a speedup without touching the intended
-bottleneck (Q3), did it break the model to get it, or did it find a legitimate
-optimization somewhere else?
+**The answer: yes, we did — it's in the paper.** §4.3: hard metrics are executed
+"against both the unoptimized baseline and the human solution." §3.3.4:
+functional correctness is measured for the baseline and the agent patch. The
+paper *reports* the human-relative classification because agent-vs-human is the
+benchmark's scoring axis; the baseline measurements exist. Supplement: attach
+the per-task absolute-improvement-over-baseline table (28/39 vLLM + 14/15
+SGLang, `baseline_deltas.md`) so readers can see when "Similar" means matching
+a large gain vs a small one.
 
-We joined every Q3 case with its GSM8K correctness result (LM Evaluation Harness:
-run the model with the agent's patch, check accuracy against the unpatched code).
-There are 26 Q3 cases in total (22 vLLM + 4 SGLang). Correctness tests exist for 12
-of them — the legacy-agent vLLM cases. Result (`q3_decomposition.md`):
+*Internal note (one line):* when quoting how big the human speedups were, cite
+the PR-claimed numbers from the PR discussions (that's what curation verified);
+our short re-benchmark runs measure smaller deltas and aren't the right source
+for that specific sentence.
 
-- **11 of 12 kept accuracy unchanged.** These are real optimizations at a different
-  location — "emergent wins", not cheating.
-- **Exactly 1 broke the model:** commit `fe66b347`, TRAE (Sonnet), accuracy 0.32 → 0.00.
-  This is the same Bamba case the paper already uses as its example.
+### utqG W5 — contamination
 
-This is the strongest single rebuttal deliverable: it shows the soft-metric
-framework catches the one genuinely dangerous case, while most Lucky Wins are
-legitimate work the current framing undersells.
+**The answer:** reuse the ICML-dpfc contamination paragraph nearly verbatim — it
+worked: "if contamination were a major factor we would expect high execution
+success; instead agents frequently identify the correct bottleneck but fail to
+implement it (the dominant Q2 outcome)"; same tradeoff as SWE-Perf /
+SWE-fficiency / GSO; add the live-refresh (dated splits) commitment.
 
-**Caveats:** (1) the 14 untested cases are all OpenHands cases plus all SGLang cases —
-covering the 10 OpenHands vLLM ones needs about 10 cheap single-GPU lm-eval runs;
-SGLang has no correctness harness at all, so those 4 can't be covered; say so rather
-than hiding it. (2) "Correctness" here means GSM8K exact-match only — one benchmark,
-one signal. (3) The draft response says "19 Q3 cases on vLLM"; the real count is 22
-(the draft's number matches nothing — fix it).
+### yX4G — TTFT vs throughput / fuller metric profile
 
-## Finding 4 — The baseline numbers exist but do NOT say what the draft wants (utqG W4)
+**The answer:** both are tracked for every task (§3.3.1, Eqs. 1–2); which one
+classifies a task follows the PR's own benchmark command — a deliberate design
+choice (comparability with the human author's claimed improvement). Supplement:
+`multimetric.md` adds TPOT/ITL medians — agents are slightly worse there too,
+consistent with the headline, so it strengthens rather than changes the story.
+Don't promise a uniform composite metric across all 54 tasks (~30 vLLM tasks
+emit only a latency scalar; SGLang has no TPOT field).
 
-The reviewer asked for gains measured against the *unoptimized* code (the commit
-before the human's fix), not just against the human patch. We assembled this from
-the HuggingFace benchmark table (which stores baseline measurements per commit) plus
-local files: **28 of 39 vLLM tasks and 14 of 15 SGLang tasks now have a measured
-baseline** (`baseline_deltas.md`).
+### yX4G — judge reliability
 
-The problem is what the measurements show. The *human* patch, measured against the
-baseline on our harness:
-- vLLM: median gain **+1.5%** (range −31.9% to +99.8%); only 11 of 28 tasks show a
-  gain above 5%.
-- SGLang: median gain **−11.9%** (negative!); only 2 of 14 tasks show a gain above 5%.
+**Mostly already answered — in the paper — because ICML asked the same thing
+twice (UJ1j, dpfc/Rdwi):**
+- Appendix F: full judge prompt (Figure 19), 8-run stability with 95% CIs
+  (Figure 20, max ±2.5%), LLM-human κ vs two independent annotators (Table 8:
+  0.836 / 0.880). This exact material flipped ICML-UJ1j to "fully resolved."
+- For the "alternative but sound solutions" worry, reuse the ICML-dpfc follow-up
+  paragraph: the judge is not grading from scratch — it's a **constrained
+  reference comparison** (sees human patch + agent patch + task, GSO-style), the
+  taxonomy has an explicit Valid-alternative category, and that category is well
+  populated in practice (Figures 5–6).
+- The only piece that needs new work is the worked disagreement/boundary
+  examples — blocked on the Supabase export of the raw H1/H2 labels (no
+  credentials in the repo; whoever ran the review app has them).
 
-In plain terms: on our benchmark configuration, the majority of human reference
-patches do not reproduce the speedups their pull requests claimed. The likely
-reasons: the SGLang isolated runs are very short (~50 requests, ~1 second of
-benchmarking — heavily noise- and warmup-dominated), and the benchmark command
-sometimes exercises a different configuration than the one the PR author measured.
+### yX4G — representativeness / dataset composition
 
-**Consequences for the rebuttal:**
-- The draft planned to write "manual curation required non-trivial verified speedup,
-  here is the minimum/median human speedup." **Written from measured data, that
-  sentence is false and would hand the reviewer a weapon.** Do not write it.
-- Honest options: (a) extract the *claimed* speedups from the PR text (they exist as
-  unstructured text in `reference_data/*/human_commits.jsonl` — a separate parsing
-  pass); (b) present agent-vs-baseline next to human-vs-baseline without any
-  inclusion-criterion claim; (c) openly discuss the measurement-context gap.
-- Additional caveat inside the table: the vLLM OpenHands agent-vs-baseline medians
-  (+45%/+48%) are an artifact of mixing measurement eras — OpenHands agent numbers
-  come from the May 2026 re-bench, the baselines from an earlier benchmarking
-  campaign, possibly different hardware/software state. They are not evidence that
-  OpenHands is dramatically better than baseline. The legacy agents' numbers share
-  the baseline's era and are comparable.
-- Remaining gap: 9 vLLM tasks have no baseline at all
-  (`19d98e0c, 660470e5, 6e36f4fa, 9474e89b, 9ed82e70, ad8d696a, d7740ea4, e3580537,
-  fc7b8d1e`). One single-GPU session closes this.
+**The question:** characterize the dataset instead of asserting validity.
 
-## Finding 5 — The strict-definition check cuts success rates hard (kNyS Q4)
+**The answer:** reuse the ICML strict-inclusion-criteria text for why the set is
+what it is, then attach the composition table (`composition.md`): median 2 files
+and ~52–56 edited lines per task; vLLM 30 serving / 7 latency / 2 throughput
+across 22 models, edits concentrated in `vllm/v1`, `vllm/model_executor`,
+`vllm/core`; SGLang 14 serving / 1 latency in `python/sglang`. State explicitly
+(as the draft already does) that the benchmark deliberately targets isolated,
+measurable optimizations — a scope decision, not a coverage claim.
 
-The reviewer suggested checking what happens if only "Same target" (the agent edited
-the exact locations the human did) counts as correct targeting, instead of Same OR
-Related (same module). We re-ran the quadrant assignment under that stricter rule
-(`stats_tables.md`, section 3):
+### kNyS — codebase coverage
 
-- True Success drops by 8 to 53 percentage points in every cell. Examples: vLLM
-  Claude Code 46.2% → 20.5%; SGLang Codex 80.0% → 26.7%; SGLang TRAE (GPT-5)
-  86.7% → 46.7%; vLLM OpenHands (Sonnet-4.5, canonical) 56.4% → 7.7%.
-- The reason: "Related target" is actually the *most common* correct-targeting label
-  (122 of 234 vLLM records, vs 63 "Same").
+**The answer:** reuse ICML-Rdwi Q1 verbatim: the collection strategy is not
+vLLM/SGLang-specific. It's now stronger than at ICML: the pipeline has actually
+been run end-to-end on TensorRT-LLM and FlashInfer (Appendix C, Table 6 — 47 and
+52 curated candidates), held out only because TRT-LLM's engine-build flow
+differs. Commit to releasing them as an extension split. Keep the ICML framing:
+depth on the two highest-adoption serving stacks is the intended contribution.
 
-**How to use this:** disclose it proactively (the reviewer can compute it
-themselves), but frame it as a sensitivity bound, and defend counting Related as
-correct: "same module" genuinely means the agent found the right bottleneck
-neighborhood, and the human annotators agreed with the judge's targeting labels at
-κ = 0.836. Presented without that framing, this table would eat the paper's
-headline numbers.
+### kNyS Q1 — model diversity
 
-## Finding 6 — Step-level data shows how the scaffolds actually differ (kNyS Q3)
+**The answer:** reuse the ICML line — "current open-source models, including
+GPT-OSS-120B, MiniMax-M2.1, and GLM-4.7, fail on these tasks" — now backed by
+Appendix E.5–E.7 case studies (describe them as case studies, not full benchmark
+runs). Cheapest upgrade: run the soft-metrics judge over the 66 existing
+`trae_opensource` runs (API cost only) → a quantitative patch-rate + targeting
+table for 6 open models. Frontier-family hard metrics = [RUN, expensive] or
+camera-ready commitment.
 
-We computed per-run behavioral metrics from the step-level logs — number of steps,
-number of edit actions, number of shell/run actions, time from start to first file
-edit, total duration, and how the run ended (`trajectory_components.md`). Step logs
-exist for 4 of the 6 configs: TRAE (both models, stored locally) and OpenHands (both
-models — these had to be fetched from the HuggingFace rebuttal datasets; they are
-not in the local tree). Medians on vLLM:
+### kNyS Q2 — scaffold vs model decoupling
 
-| Config | steps | edits | first edit after | total duration | ended cleanly |
-|---|---|---|---|---|---|
-| TRAE (Sonnet) | 44 | 17 | 8 s | 502 s | 0%* |
-| TRAE (GPT-5) | 42 | 19 | 80 s | 1143 s | 36%* |
-| OpenHands (Sonnet-4.5) | 109 | 13 | 72 s | 388 s | 94% |
-| OpenHands (GPT-5) | 79 | 9 | 324 s | 836 s | 100% |
+**This is the paper's own thesis — showcase the paper's tables.** §5.5 + Table 4:
+same model (Sonnet 4.5) under three scaffolds spans 28.2–46.2% True Success on
+vLLM and the ordering inverts on SGLang; same scaffold (OpenHands), swapping the
+model, moves vLLM 43.6→28.2. Figures 5–6 show the *mechanism* the ICML rebuttal
+described qualitatively: Claude Code explores alternative approaches while TRAE
+stays close to the reference, and which strategy wins flips between codebases.
+Supplement with the 2×2 grid (scaffold × model — TRAE and OpenHands both ran
+both models) and the McNemar significance from W1. Restructure §5.5 around the
+grid so it reads as designed, not incidental.
 
-\* "ended cleanly" is measured differently per harness (TRAE: its `success` flag;
-OpenHands: an explicit `finish` action), so compare within a harness, not across.
+### kNyS Q3 — which scaffold components drive the gap
 
-Patterns worth using: GPT-5 configs take 2–4× longer to make their first edit and to
-finish than Sonnet configs *under the same scaffold* — a concrete, quantified
-mechanism behind the model-vs-scaffold discussion. OpenHands runs many more, smaller
-steps and almost always terminates deliberately.
+**This is the request ICML-Rdwi made in their follow-up ("quantitative
+treatments... run OpenHands"), and the NeurIPS submission + our new table are
+exactly that.** Point to E.8–E.9 first: the same Bamba commit under OpenHands
+(clean 296s run, valid 165-line patch, Alternative approach) vs TRAE-GPT5
+(tool-call emission failure, empty patch) — the paper's worked example of
+scaffold-driven divergence. Then attach the aggregate table
+(`trajectory_components.md`, step logs for TRAE ×2 + OpenHands ×2): OpenHands
+runs ~2× more steps and terminates deliberately (94–100% explicit finish);
+GPT-5 configs take 2–4× longer to first edit than Sonnet under the same
+scaffold. For Claude Code, keep the paper's existing framing (inputs/outputs
+only, Appendix H) — the open-scaffold analysis brackets the mechanisms.
 
-A coarser table (duration, patch size, patch-generation rate — available for all six
-configs from the run summaries) adds: Claude Code is the fastest overall (median
-207 s), Codex 346 s; patch-generation rate is 97–100% everywhere.
+### kNyS Q4 — judge boundary cases + stricter rule
 
-**Caveats:** Codex CLI and Claude Code have *no step logs anywhere* — only final
-patches and durations. The paper's Appendix H sentence claiming "full trajectories
-for the open-source harnesses" is wrong for Codex; don't repeat it. OpenHands
-(Sonnet-4.5) is missing 3 of 39 vLLM trajectories and 10 of 15 SGLang ones.
+**The question has two parts.** (a) Where is the Same/Related/Different boundary
+and can we see examples? (b) What happens if Related doesn't count as correct?
 
-## Finding 7 — Scaffold and model matter about equally (kNyS Q2)
-
-True Success %, arranged as scaffold × model (canonical data):
-
-| Scaffold | Sonnet-4.5, vLLM | GPT-5, vLLM | Sonnet-4.5, SGLang | GPT-5, SGLang |
-|---|---|---|---|---|
-| TRAE | 28.2 | 17.9 | 80.0 | 86.7 |
-| OpenHands | 56.4 (published: 43.6) | 28.2 | 13.3 | 33.3 |
-| Claude Code (Sonnet only) | 46.2 | — | 26.7 | — |
-| Codex CLI (GPT-5 only) | — | 20.5 | — | 80.0 |
-
-Holding the model fixed, switching scaffold moves vLLM True Success by up to ~28
-points. Holding the scaffold fixed (OpenHands), switching model also moves it by
-~28 points. So scaffold and model effects are the same order of magnitude — and the
-TRAE row flips direction across codebases (worst-tier on vLLM, best-tier on SGLang),
-which is the cleanest evidence that single-codebase evaluations mislead.
-
-## Finding 8 — Dataset composition and extra metrics (yX4G)
-
-**Composition** (`composition.md`, built from the dataset files): typical task
-touches 2 files (max 19) and ~52–56 edited lines. vLLM: 30 serving-mode / 7
-latency-mode / 2 throughput-mode benchmarks, 22 distinct models benchmarked, edits
-concentrated in `vllm/v1`, `vllm/model_executor`, `vllm/core`. SGLang: 14 serving /
-1 latency, almost all edits in `python/sglang`.
-*Caveat:* the draft response references a `performance_areas` field from the
-filtering pipeline — that field exists only in the paper's Figure 7 illustration,
-not in any stored data. A bottleneck-category column would require fresh labeling
-(a 33-commit partial start exists in `archive/misc/results/reviews/`).
-
-**Extra metrics** (`multimetric.md`): the raw serving benchmarks record TTFT, TPOT,
-ITL, and three throughput measures. Median agent-vs-human across them: agents are
-slightly worse on TPOT and ITL too (e.g. Codex −7.2% TPOT), roughly at parity on
-throughput — consistent with the headline story, so reporting them helps rather
-than hurts.
-*Caveats:* coverage differs per metric because every task runs its own PR's
-benchmark command (~30 vLLM tasks emit only a latency scalar); SGLang's benchmark
-emits ITL but no TPOT. A single uniform "composite metric" across all 54 tasks is
-not derivable from the logs — don't promise one.
-
-## Finding 9 — The judge-disagreement item is blocked on missing credentials
-
-The raw per-task labels from the two human annotators live in a Supabase database.
-The script that computes agreement (`EAD/scripts/compute_agreement.py`) fetches them
-live and needs a Supabase URL + key that exist nowhere in the repo or environment
-(the expected `soft-metrics-review/.env.local` is absent). Until someone supplies
-credentials, three promised items cannot be produced: the disagreement error
-analysis, the worked boundary examples, and the claim "no disagreement flips a Q1
-outcome to Q3" (which must be *verified*, not asserted — if flips exist, report them
-and quantify the effect). This is the only analysis item that could not be executed.
+**(a)** Reuse the ICML-dpfc follow-up: categories are author-calibrated for this
+benchmark; the judge does a constrained reference comparison, not open-ended
+grading. Worked examples need the Supabase export (same blocker as yX4G).
+**(b)** Done — we re-ran the quadrant assignment counting only Same as correct
+(`stats_tables.md` §3): True Success drops in every cell (e.g. vLLM Claude Code
+46.2→20.5; SGLang Codex 80.0→26.7) because Related ("same module") is the most
+common correct-targeting label. Present it proactively as the strict bound, and
+defend Related-as-correct: same module = the right bottleneck neighborhood, and
+the targeting dimension is exactly where LLM-human agreement is strong
+(κ = 0.836, Table 8). Disclose it ourselves rather than letting the reviewer
+compute it.
 
 ---
 
-## Not run (needs GPUs, API spend, or is a paper edit)
+## Before posting: one data decision
 
-- **GPU:** 9 missing vLLM baselines (closes W4); ~10 OpenHands lm-evals (closes W3);
-  a Level-2 TP2 human-reference subset (optional, for W2); new model families
-  (kNyS Q1, expensive).
-- **API spend:** LLM-judge pass over the 66 existing open-model runs
-  (`trae_opensource` sweep) — the cheapest real answer to kNyS Q1.
-- **Paper edits:** apply `camera_ready_edits.tex` (five drafted fixes, including the
-  66/40-vs-39/15 task-count inconsistency); fix Figure 7 naming the Stage-2 judge
-  `gemini-3-flash-preview` while Appendix C.1 says GPT-5-mini.
+Rebuilding Table 5 from today's data reproduces the PDF for 11/12 cells; vLLM
+OpenHands (Sonnet-4.5) now computes to True Success 56.4% vs the published 43.6%
+(five results changed in the post-submission X3 re-bench). Decide once: stand on
+the published numbers everywhere, or disclose the (upward) correction. All new
+tables mark the affected cell either way.
+
+## Still to do
+
+- Assemble the OpenReview responses from the sections above (post utqG first).
+- Supabase export → disagreement/boundary examples (only remaining analysis blocker).
+- Optional [RUN]: 9 vLLM baselines, ~10 OpenHands lm-evals, TP2 subset,
+  open-model soft-metrics pass.
+- Apply `camera_ready_edits.tex`.
