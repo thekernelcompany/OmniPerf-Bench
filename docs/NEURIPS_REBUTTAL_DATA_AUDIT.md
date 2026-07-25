@@ -9,13 +9,14 @@ Paths below abbreviate `third-party/everything_analysis_data/` as `EAD/`.
 
 ---
 
-## TL;DR
+## TL;DR (post-HF check, 2026-07-25)
 
-- **utqG W4 (baseline deltas) is the trap.** Clean 3-way baseline/human/agent data exists **only for SGLang (15/15)**. vLLM has real serving baselines for **19 of 39 commits**, the canonical vLLM aggregate has **no baseline field**, and all OpenHands cells have **no baseline at all**. §4.3's sentence ("against both the unoptimized baseline and the human solution") overstates coverage as written — do not restate it at full strength.
-- **kNyS Q3 (trajectory analysis): only TRAE has full trajectories.** OpenHands main sets saved none (5 smoke runs only); Claude Code / Codex have no step logs. Cross-harness time-to-first-edit cannot be promised.
-- **`performance_areas` does not exist** as a dataset field (nor does `difficulty`). The composition table must be built from the fields that do exist (see yX4G below).
-- **E.5–E.7 are single-task anecdotes**, not full benchmark runs on open models. That fallback sentence for kNyS Q1 must not be written as-is. A no-GPU middle path exists (soft-metrics over the existing `trae_opensource` sweep).
-- Everything else in the analysis-only list is **confirmed**, and W3 (Lucky Win decomposition) is even more turnkey than assumed — the cross-tab files already exist.
+- **utqG W4 (baseline deltas): mostly recoverable.** SGLang 15/15 3-way locally; vLLM baselines cover **30/39** after merging HF `claude-code-vllm-benchmarks` (29) with local raw files (+`89a84b0b`); human measurements **39/39** on HF. Remaining [RUN]: 9 vLLM baselines. §4.3's sentence is still ahead of the canonical table (no baseline field) — merge before citing it.
+- **kNyS Q3 (trajectory analysis): feasible for 4/6 configs.** TRAE × 2 locally; OpenHands × 2 on HF (GPT-5 54/54; Sonnet-4.5 36/39 vLLM + 5/15 SGLang). Codex CLI and Claude Code have no step logs anywhere — Appendix H's blanket claim still needs softening for Codex.
+- **utqG W1: real rollout-variance data exists** — HF pass-at-k results: ~8 benchmarked rollouts/task, full serving metrics, Claude Code + Codex on both repos. Appendix G undersells its own data.
+- **W3 count mismatch:** draft says 19 vLLM Q3 cases; Table 5 says 22 (+4 SGLang); lm-eval correctness covers only the 12 legacy-agent cases. OpenHands/SGLang Q3 correctness = small [RUN] or scope honestly.
+- **`performance_areas` does not exist** as a stored field (only in Figure 7's illustration; nor does `difficulty`). Composition table must use dataset JSONL fields.
+- **E.5–E.7 are single-task anecdotes**, not full benchmark runs. Middle path: soft-metrics over the existing 6-model `trae_opensource` sweep (66 runs, no GPU needed).
 
 ---
 
@@ -26,8 +27,9 @@ Paths below abbreviate `third-party/everything_analysis_data/` as `EAD/`.
 Tables 3/4 are success **rates** (True Success = Q1; Hard Success = Q1+Q3) over N=39 vLLM / 15 SGLang tasks, single rollout, no variance reported anywhere in the main tables. Variance appears only in Appendix G (Table 9), for 2 of 6 agents on a 30-task subset.
 
 - Per-task classifications exist for all 6 agent configs in `EAD/hard_metrics/{vllm,sglang}/hard_metrics.json` and `EAD/soft_metrics/{vllm,sglang}/soft_metrics.json` → Wilson/bootstrap CIs on rates + McNemar paired tests between agents are pure scripting.
-- **Caveat (a):** every benchmark measurement is a **single run** — zero repeat/std fields anywhere in `EAD/benchmark_results/`. CIs must bootstrap across the task axis; never imply within-task replication.
-- **Caveat (b):** for speedup *magnitudes* the effective paired n collapses: non-null `primary_pct` per vLLM cell is 19–40 (of 99 rows / 39 tasks), paired human+agent throughput as low as 14. Stick to rates.
+- **Caveat (a):** in the main result set, every benchmark measurement is a **single run** — zero repeat/std fields anywhere in `EAD/benchmark_results/`. Main-table CIs must bootstrap across the task axis; never imply within-task replication there.
+- **HF UPGRADE (2026-07-25):** `Inferencebench/iso-bench-pass-at-k-results` (public) holds **618 all-success benchmark rows with full serving metrics** (TTFT/TPOT/ITL mean/median/p99 + throughputs) at up to **8 rollouts per task**: Claude Code 30 vLLM + 10 SGLang tasks, Codex 29 vLLM + 10 SGLang. This is real per-task rollout-variance data (agent stochasticity + benchmark noise) that Appendix G massively undersells (it reports only pass@1 vs pass@2 for 2 agents on 30 vLLM tasks). The W1 response can report per-task rollout distributions and rollout-level significance for those 2 agents × 2 repos. The sample pool (`pass-at-k-samples`, 49 vLLM/19 SGLang tasks × up to 8 seeds) is even larger than the benchmarked subset.
+- **Caveat (b):** for speedup *magnitudes* the effective paired n collapses: non-null `primary_pct` per vLLM cell is 19–40 (of 99 rows / 39 tasks), paired human+agent throughput as low as 14. Stick to rates for the main tables.
 - **Preempt:** Table 9 pass@1 = 50.0% vs Table 3's 46.2% is a 30-task-subset artifact — say so explicitly.
 
 ### utqG W2 — Level 2 validation — FALLBACK IS THE ONLY HONEST OPTION
@@ -63,11 +65,12 @@ The cross-tab for the covered cases is pre-built:
 
 | Slice | Baseline status |
 |---|---|
-| SGLang (15 tasks) | **Complete.** `EAD/benchmark_results/sglang/*_isolated.json` has `variants.{baseline, human, <agent>}` for all 6 configs, identical hardware, full serving metrics. |
-| vLLM (39 tasks) | **19 commits** with usable serving baselines (`*_baseline_result.json`); 42 baseline files empty/failed; canonical aggregate has **no baseline field**; human numbers largely HF-imported, not freshly benchmarked. |
-| OpenHands cells | **No baseline anywhere.** Agent-only runs; human reference = merged HF number. |
+| SGLang (15 tasks) | **Complete.** `EAD/benchmark_results/sglang/*_isolated.json` has `variants.{baseline, human, <agent>}` for all 6 configs, identical hardware, full serving metrics. (The HF `claude-code-sglang-benchmarks` baseline columns are empty — the local isolated files are the source of truth.) |
+| vLLM (39 tasks) | **30 of 39 covered after HF check (2026-07-25):** `Inferencebench/claude-code-vllm-benchmarks` parquet (99-commit pool) has `baseline_{ttft,tpot,itl}_{mean,median,p99}` + `baseline_throughput` + `baseline_latency_avg` for **29 of the final 39**; local raw files add `89a84b0b` → union 30/39. Truly missing: `19d98e0c, 660470e5, 6e36f4fa, 9474e89b, 9ed82e70, ad8d696a, d7740ea4, e3580537, fc7b8d1e`. Canonical aggregate still has no baseline field — needs a merge script. |
+| Human reference (vLLM) | **39/39 measured** in the same HF parquet (`human_*` columns) — the "HF-imported" numbers are real measurements with full metric families, just imported rather than re-run. Provenance note stands; "not benchmarked" does not. |
+| OpenHands cells | No OpenHands-specific baseline runs, but baseline is patch-independent — the per-commit baselines above serve all six configs. X3 audit added 13 fresh baseline re-measurements (`x3_2026-05-05/baseline/` in both OH hard-metrics HF repos). |
 
-**Framing:** present the complete SGLang table + the 19-commit vLLM subset now. The one cheap [RUN] item worth compute: re-run the ~20 missing vLLM baselines (1×H100, single runs each) — far cheaper than Level 2 or new models.
+**Framing:** absolute-vs-baseline deltas are now reportable for 15/15 SGLang + 30/39 vLLM. The [RUN] item shrinks to **9 vLLM baseline runs** (1×H100, single runs each) — trivial compared to Level 2 or new models; land it during the window and W4 is fully closed.
 
 ### yX4G — Dataset composition table — FEASIBLE, but not from the fields named
 
@@ -94,18 +97,19 @@ One predicate change in `EAD/scripts/generate_quadrant_findings.py` (line 88: `c
 
 Table 7 is only the agent-config table; the scaffold argument is textual in §5.5 off Table 4. Stronger reframing available from existing data: a **2×2 factorial** — TRAE and OpenHands each ran with both Sonnet-4.5 and GPT-5 — plus Claude Code (Sonnet-only) and Codex (GPT-5-only) as scaffold-locked points. Present scaffold × model as crossed factors.
 
-### kNyS Q3 — Trajectory component analysis — ORIGINAL CLAIM WRONG; TRAE-only
+### kNyS Q3 — Trajectory component analysis — FEASIBLE FOR 4 OF 6 CONFIGS after HF check
 
-Verified state of step-level trajectories:
+Local-only audit said TRAE-only; the HF rebuttal datasets overturn that. Verified state:
 
 | Harness | Trajectories | What's computable |
 |---|---|---|
-| TRAE (GPT-5 + Sonnet) | **39/39 vLLM each**, per-step ISO timestamps, `str_replace_based_edit_tool` vs `bash` tool names, per-step token usage | time-to-first-edit, edit counts, tool mix, steps, tokens — all clean |
-| OpenHands (both models, main sets) | **None** (only ~5 smoke-run trajectories); `journal.metrics.time_to_first_edit_s` null in 0/39 | `duration_s`, patch stats only |
-| Claude Code | No step logs; heuristic `time_to_first_edit_s` in journal (unverifiable) | duration, patch stats |
-| Codex CLI | No step logs; TTFE null | duration, patch stats |
+| TRAE (GPT-5 + Sonnet) | **39/39 vLLM each** locally (+ `Inferencebench/trae-{sonnet45,gpt5}-trajectories` on HF), per-step ISO timestamps, tool names, token usage | time-to-first-edit, edit counts, tool mix, steps, tokens — all clean |
+| OpenHands (GPT-5) | **54/54 on HF** (`Inferencebench/iso-bench-openhands-gpt5-rebuttal`, public): 39 vLLM + 15 SGLang event-log trajectories with per-event timestamps, action types, token metrics | full component analysis |
+| OpenHands (Sonnet-4.5) | **36/39 vLLM + 5/15 SGLang on HF** (`…-sonnet45-rebuttal`, private; + 54 stderr logs). Missing vLLM: `vllm_core-0000/0003/0005` | near-full component analysis |
+| Claude Code | No step logs anywhere (HF `Claude_code_dump` is May-2025 profile traces, not step logs); heuristic `time_to_first_edit_s` in journal | duration, patch stats |
+| Codex CLI | No step logs anywhere; TTFE null | duration, patch stats |
 
-**Honest offering:** full component table for TRAE × 2 models; coarse table (duration_s, patch LOC, files changed, patch-generation rate — all in `journal.json`/`run_summary.json`) for all six configs; explicit statement that step logging wasn't enabled for the other harnesses. Do **not** promise cross-harness time-to-first-edit.
+**Honest offering (upgraded):** cross-scaffold trajectory-feature analysis on shared tasks for **TRAE × 2 models and OpenHands × 2 models** (4 of 6 configs — this covers the exact TRAE-vs-OpenHands scaffold contrast the reviewer asks about), plus coarse table (duration_s, patch LOC, files changed, patch-generation rate) for all six. Still do **not** claim "full trajectories for the three open-source harnesses" — Codex CLI has none, and Appendix H's blanket claim remains falsifiable as written. Pull the OH trajectories from HF before scripting (they are not in the local tree).
 
 ### kNyS Q1 — New model families — EXPENSIVE; fallback wording must change
 
@@ -146,8 +150,30 @@ A multi-metric table for the serving subset is free; a uniform composite across 
 
 - **HF-import artifacts:** some vLLM rows have agent and human numbers both HF-imported with identical values (0% delta artifacts). The 2026-05-05 audit + X3 re-bench cleaned exactly this — build every rebuttal table from the **post-X3 canonical** `hard_metrics.json`, not pre-audit copies. Reviewers may later diff against the released data.
 - **Provenance asymmetry:** OpenHands (both models) was added for the paper on top of the 4-agent legacy analysis set; lm-eval correctness and trajectories don't cover it. Keep per-table coverage statements exact.
-- **Single-run measurements everywhere** — never phrase CIs as measurement-level.
+- **Single-run measurements in the main result set** — never phrase main-table CIs as measurement-level. (The pass-at-k HF datasets are the exception: ~8 rollouts/task for Claude Code + Codex.)
 - `camera_ready_edits.tex` is drafted but **unapplied** — the compiled PDF still contains the 66/40 vs 39/15 inconsistency a reviewer can flag.
+
+---
+
+## HuggingFace inventory (checked 2026-07-25, authenticated)
+
+Orgs: `Inferencebench` (25 datasets) and `ISO-Bench` (1). Rebuttal-relevant:
+
+| HF dataset | Vis | What it adds |
+|---|---|---|
+| `Inferencebench/iso-bench-openhands-gpt5-rebuttal` | public | **54/54 OpenHands GPT-5 trajectories** (39 vLLM + 15 SGLang), event logs with timestamps/actions/tokens |
+| `Inferencebench/iso-bench-openhands-sonnet45-rebuttal` | private | **36/39 vLLM + 5/15 SGLang OH Sonnet-4.5 trajectories** + 54 stderr logs (missing vllm_core-0000/0003/0005) |
+| `Inferencebench/claude-code-vllm-benchmarks` | private | 99-commit × 4-agent benchmark table, 76 cols: `baseline_*` for **29/39 final tasks**, `human_*` for **39/39**, full TTFT/TPOT/ITL/throughput families |
+| `Inferencebench/claude-code-sglang-benchmarks` | private | 41-commit table; baseline cols empty (SGLang truth = local `*_isolated.json`) |
+| `Inferencebench/iso-bench-pass-at-k-results` | public | **618 benchmark rows, all success**: Claude Code (30 vLLM + 10 SGLang tasks) + Codex (29 + 10), up to 8 rollouts/task, full serving metrics |
+| `Inferencebench/pass-at-k-samples` | public | rollout sample pool: 49 vLLM + 19 SGLang tasks × up to 8 seeds |
+| `Inferencebench/iso-bench-openhands-{gpt5,sonnet45}-hard-metrics` | private | mirrors of local EAD dirs + `x3_2026-05-05/baseline/` (13 fresh baseline re-measurements each) |
+| `Inferencebench/trae-{sonnet45,gpt5}-trajectories` | private | TRAE trajectory mirrors |
+| `Inferencebench/iso-bench-trtllm-flashinfer-perf-commits` | private | the 47+52 extension-pool commits (kNyS "limited codebase coverage" response can cite a real artifact) |
+| `ISO-Bench/ISO-Bench` | public | released dataset: `data/level{1,2}/{vllm,sglang}/train.parquet` — Level 2 genuinely is released |
+| `Inferencebench/Claude_code_dump` | private | May-2025 profile traces; **not** step logs — no help for Claude Code trajectories |
+
+Access: local token at `~/.cache/huggingface/token` reads all of the above.
 
 ---
 
@@ -178,7 +204,7 @@ Read of `iso-bench-rebuttal-drafts.md.pdf` and the submitted PDF surfaced these 
 
 1. **W3 count is wrong in the draft.** "19 Q3 cases on vLLM" — Table 5 says 22 (+4 SGLang); correctness data covers only the 12 legacy-agent cases. See the W3 section above. Either run the ~10 missing OpenHands lm-evals or scope the table honestly.
 
-2. **kNyS Q3 draft doubles down on a paper claim the artifacts don't support.** Appendix H ("Scaffolding transparency") claims "for the open-source harnesses we record full trajectories," and the draft repeats it for "the three open-source harnesses." Reality: TRAE full (39/39 × 2 models); OpenHands = E.8's single Bamba run (79 events; the run in `openhands-run.md`) plus ~4 smoke runs — the main 39+15 sets have **no trajectories** (verified: flat dirs hold only journal/patch/run_summary, no stderr, no reconstruction path); Codex CLI none (D.3 itself concedes Codex is hard to instrument — H overstates D.3). Rewrite the draft sentence to: full trajectory-feature analysis for TRAE (both models) on shared tasks, E.8-vs-E.9 as the worked cross-scaffold case, coarse duration/patch metrics for all six configs. Do not promise "comparing scaffolds on shared tasks" at trajectory granularity.
+2. **kNyS Q3 draft — REVISED after HF check.** Appendix H's blanket "for the open-source harnesses we record full trajectories" is still wrong for **Codex CLI** (no step logs anywhere, and D.3 itself concedes Codex is hard to instrument). But the OpenHands trajectories DO exist — on HF, not locally: `iso-bench-openhands-gpt5-rebuttal` has 54/54, `…-sonnet45-rebuttal` has 36/39 vLLM + 5/15 SGLang. So the draft's promised trajectory-feature analysis "comparing scaffolds on shared tasks" IS deliverable for TRAE × 2 + OpenHands × 2 (4 of 6 configs) — download from HF first. Only the Codex part of the claim needs softening.
 
 3. **`performance_areas` exists only inside Figure 7's illustration.** Repo-wide grep (src, data, configs, scripts, tools, bench, state, EAD): zero hits for `performance_areas` / `performance_score` / `is_performance_related`. The Stage-2 raw judge outputs were not persisted. The yX4G composition table must be built from dataset JSONL fields (`stats`, `files_changed`, `has_serving/latency/throughput`, `uses_lm_eval`, `affected_paths`); bottleneck-category labels require a fresh labeling pass (partial start: `archive/misc/results/reviews/vllm_classification_review.csv`, 33 commits). Also note an internal paper inconsistency to fix at camera-ready: Figure 7 labels the Stage-2 judge `gemini-3-flash-preview`, Appendix C.1 text says GPT-5-mini.
 
