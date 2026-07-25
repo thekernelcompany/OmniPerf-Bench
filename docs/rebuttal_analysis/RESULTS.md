@@ -1,5 +1,28 @@
 # Rebuttal Analysis — Results (generated 2026-07-25)
 
+## Reviewer-item status: done vs still to do
+
+| Reviewer item | What the review asks | Done (artifact) | Still to do |
+|---|---|---|---|
+| utqG W1 — scale / statistics | CIs + significance on Tables 3/4 | ✅ Wilson + bootstrap CIs, 30 exact McNemar pairs (`stats_tables.md`); rollout CVs (`pass_at_k_variance.md`) | Write prose; decide canonical-vs-published basis for OH-S45 vLLM |
+| utqG W2 — Level 2 unevaluated | Validate or reposition Level 2 | ✅ Verified data-only status; fallback framing ready (audit) | Optional [RUN GPU]: TP2 human-reference subset; apply `camera_ready_edits.tex` |
+| utqG W3 — Lucky Win kinds | Split Q3 into hacking vs emergent wins | ✅ 12/12 evaluated cases decomposed: 11 preserved, 1 broken (`q3_decomposition.md`) | [RUN GPU] ~10 OpenHands vLLM lm-evals to cover all 26; SGLang has no lm-eval flow — scope honestly |
+| utqG W4 — baseline-relative view | Absolute deltas vs unoptimized baseline | ✅ 28/39 vLLM + 14/15 SGLang measured (`baseline_deltas.md`) | [RUN GPU] 9 missing vLLM baselines; PR-claims speedup extraction (text, no GPU) — measured medians (+1.5 / −11.9%) must NOT be used for the "non-trivial speedup by construction" sentence |
+| utqG W5 — contamination | Mitigation + durability plan | ✅ Nothing to run; draft argument stands (Q2 rate, non-ceiling success) | Prose only (live-refresh commitment) |
+| yX4G — metric completeness | Throughput + TPOT/ITL alongside TTFT | ✅ Multi-metric medians, both repos (`multimetric.md`) | Prose only (explain per-PR benchmark-command heterogeneity) |
+| yX4G — judge reliability | Disagreement analysis, boundary cases | ❌ BLOCKED | Supabase export (no credentials in repo/env); then disagreement table, boundary examples, flips-check, human–human κ |
+| yX4G — representativeness | Dataset composition table | ✅ Files/lines/hunks, modes, models, code areas (`composition.md`) | Optional: bottleneck-category labeling pass (~54 commits, new labeling) |
+| kNyS — limited scale | Statistical rigor at n=39/15 | ✅ Same as W1 | Prose only |
+| kNyS — codebase coverage | Why only vLLM/SGLang | ✅ Nothing to run; TRT-LLM/FlashInfer pool exists on HF to cite | Prose only |
+| kNyS Q1 — model diversity | Results for more model families | ❌ Not run | Cheapest: soft-metrics judge over existing 66-run `trae_opensource` sweep (LLM cost, no GPU); full hard-metrics on new families = [RUN, expensive] or camera-ready commitment; fix "E.5–E.7 were full runs" wording |
+| kNyS Q2 — scaffold vs model | Decouple scaffold from model | ✅ 2×2 grid + McNemar significance (`RESULTS.md` §7, `stats_tables.md`) | §5.5 rewrite prose |
+| kNyS Q3 — scaffold mechanisms | Which components drive the gap | ✅ Trajectory components for 4/6 configs + coarse 6-config table (`trajectory_components.md`) | Prose only; never claim Codex/Claude-Code trajectories |
+| kNyS Q4 — judge boundary cases | Worked examples + stricter-rule check | ✅ Same-only sensitivity (`stats_tables.md` §3) | Boundary examples BLOCKED on the same Supabase export |
+
+**Cross-cutting decisions pending:** (1) publish on published vs canonical numbers for
+the OH-S45 vLLM cell (56.4 vs 43.6 True Success) — never mix; (2) W4 framing choice
+(PR-claims extraction vs dropping the inclusion-criterion quantification).
+
 All analysis-only items from `docs/NEURIPS_REBUTTAL_DATA_AUDIT.md` executed.
 Scripts in `scripts/rebuttal_analysis/`; every table regenerable from canonical data.
 Run order: `build_master.py` first (verification gate), then the rest in any order.
