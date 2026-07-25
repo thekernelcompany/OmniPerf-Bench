@@ -50,11 +50,21 @@ Pairs that are not significant (e.g., agents sharing the same model class) will 
 described as comparable, and we soften cross-codebase ranking prose wherever the
 n=15 SGLang intervals overlap.
 
-On measurement noise specifically: beyond the rollout variance already in Appendix G
-(pass@1 vs pass@2, std ≤3.3%, ranking preserved), we analyzed per-task variability
-across ~8 independent rollouts (Claude Code and Codex, 30 vLLM + 10 SGLang tasks,
-each rollout benchmarked). Throughput varies by under 1% per task — well inside the
-±5% classification threshold — while TTFT varies by 7–9% (median) on SGLang. We will
+On measurement noise specifically, two lines of evidence. First, rollout variance
+(Appendix G): we conducted additional independent rollouts for Claude Code and
+Codex CLI on 30 vLLM tasks:
+
+| Agent | Pass@1 | Pass@2 (mean ± std) |
+|---|---|---|
+| Claude Code | 50.0% | 46.7% ± 3.3% |
+| Codex CLI | 23.3% | 25.5% ± 2.2% |
+
+(rates are on the 30-task subset, which is why pass@1 differs from Table 3's
+39-task figures). Variance across rollouts is moderate (std 2–3%) and the relative
+ranking is preserved. Second, per-task benchmark variability: across ~8 independent
+rollouts per task (same two agents, 30 vLLM + 10 SGLang tasks, each rollout
+benchmarked), throughput varies by under 1% per task — well inside the ±5%
+classification threshold — while TTFT varies by 7–9% (median) on SGLang. We will
 report this and note that TTFT-classified SGLang tasks carry higher single-run
 uncertainty, which the confidence intervals above absorb.
 
