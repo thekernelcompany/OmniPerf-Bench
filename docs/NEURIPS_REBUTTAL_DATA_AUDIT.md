@@ -1,8 +1,9 @@
-# Rebuttal Data Audit — ISO-Bench (submission 2841)
+# Rebuttal Data Audit — ISO-Bench (submission 2841, NeurIPS 2026 ED track)
 
 **Date:** 2026-07-25
-**Reviewers:** utqG (W1–W4), kNyS (Q1–Q4), yX4G
+**Reviewers:** utqG (W1–W5, rating 2), kNyS (Q1–Q4, rating 3), yX4G (rating 4)
 **Purpose:** fact-check every "analysis-only" rebuttal item against what actually exists in the repo before committing to anything in the response.
+**Inputs:** repo artifacts + submitted PDF (`2841_ISO_Bench_Can_Coding_Agen.pdf`, 32 pp) + draft responses (`iso-bench-rebuttal-drafts.md.pdf`). See the reconciliation section at the end for draft-specific corrections.
 
 Paths below abbreviate `third-party/everything_analysis_data/` as `EAD/`.
 
@@ -36,15 +37,25 @@ Exactly **one** multi-GPU datapoint exists in the entire tree: commit `310aca88`
 - Reposition Level 2 explicitly as a curated data release (the paper already says "all experiments are on Level 1").
 - `EAD/paper/camera_ready_edits.tex` contains **five unapplied edits** that reconcile the 66/40 vs 39/15 task-count inconsistency and demote TensorRT-LLM/FlashInfer to an extension pool. Apply them; cite them in the rebuttal as already-drafted camera-ready fixes.
 
-### utqG W3 — Q3 "Lucky Win" decomposition — CONFIRMED, turnkey (strongest item)
+### utqG W3 — Q3 "Lucky Win" decomposition — CONFIRMED for the legacy 4-agent set; OpenHands/SGLang cases lack correctness data
 
-The cross-tab is essentially pre-built:
+**Count reconciliation (three different numbers in play):**
 
-- `third-party/vllm-lm-eval/consolidated/q3_commit_vllm.jsonl` — the 12 Lucky-Win (commit, agent) pairs with hard/target/approach labels.
+| Source | vLLM Q3 | SGLang Q3 |
+|---|---|---|
+| Draft response ("19 Q3 cases total … on vLLM") | 19 | "a handful" |
+| Paper Table 5 (authoritative) | **22** (CC 4, OH-S45 4, TRAE-S 2, OH-GPT5 6, Codex 5, TRAE-GPT5 1) | **4** (CC 3, OH-GPT5 1) |
+| `q3_commit_vllm.jsonl` (correctness cross-tab) | **12** = exactly the 4 legacy agents (4+2+5+1) | — |
+
+The draft's "19" matches nothing — fix before posting. The consolidated lm-eval files cover exactly the legacy-agent quadrant membership (q1=44, q2=82, q3=12 all match Table 5 sums for CC/TRAE-S/Codex/TRAE-GPT5), confirming **no correctness results exist for the 10 OpenHands vLLM Q3 cases or the 4 SGLang Q3 cases**.
+
+The cross-tab for the covered cases is pre-built:
+
+- `third-party/vllm-lm-eval/consolidated/q3_commit_vllm.jsonl` — 12 Lucky-Win (commit, agent) pairs with hard/target/approach labels.
 - `q3_agent_eval_summary.jsonl` + `q2_accuracy_comparison.jsonl` — GSM8K lm-eval accuracies with MATCH/REGRESSION status; join on (commit, agent).
 - The headline `fe66b347` 32%→0% accuracy collapse is already in there.
 
-**Scope caveats for the text:** correctness coverage is vLLM-only and the 4-agent legacy set (no OpenHands, no SGLang lm-eval); correctness = GSM8K exact-match. Half a day including prose.
+**To present the decomposition over ALL Q3 cases** (which is what the draft promises): needs ~10 GSM8K lm-eval runs for the OpenHands vLLM cases (small, 1×H100) and an SGLang lm-eval flow that currently does not exist. Otherwise scope the table to the 12 covered cases and say so explicitly. Note §3.3.4's claim of validating "all Hard Success cases" is itself only artifact-backed for the legacy agents.
 
 ### utqG W4 — Absolute-vs-baseline deltas — PARTIALLY EXISTS (the critical check)
 
@@ -158,3 +169,25 @@ A multi-metric table for the serving subset is free; a uniform composite across 
 | Open-model sweep summary | `EAD/analysis/opensource_summary.json` |
 | Camera-ready fixes (unapplied) | `EAD/paper/camera_ready_edits.tex` |
 | Multi-GPU caveat (310aca88, TP2-vs-TP4) | `docs/HARD_METRICS_OH_GPT5_FINAL.md` |
+
+---
+
+## Reconciliation: rebuttal drafts + submitted PDF vs artifacts (2026-07-25)
+
+Read of `iso-bench-rebuttal-drafts.md.pdf` and the submitted PDF surfaced these corrections to the drafts **before posting**:
+
+1. **W3 count is wrong in the draft.** "19 Q3 cases on vLLM" — Table 5 says 22 (+4 SGLang); correctness data covers only the 12 legacy-agent cases. See the W3 section above. Either run the ~10 missing OpenHands lm-evals or scope the table honestly.
+
+2. **kNyS Q3 draft doubles down on a paper claim the artifacts don't support.** Appendix H ("Scaffolding transparency") claims "for the open-source harnesses we record full trajectories," and the draft repeats it for "the three open-source harnesses." Reality: TRAE full (39/39 × 2 models); OpenHands = E.8's single Bamba run (79 events; the run in `openhands-run.md`) plus ~4 smoke runs — the main 39+15 sets have **no trajectories** (verified: flat dirs hold only journal/patch/run_summary, no stderr, no reconstruction path); Codex CLI none (D.3 itself concedes Codex is hard to instrument — H overstates D.3). Rewrite the draft sentence to: full trajectory-feature analysis for TRAE (both models) on shared tasks, E.8-vs-E.9 as the worked cross-scaffold case, coarse duration/patch metrics for all six configs. Do not promise "comparing scaffolds on shared tasks" at trajectory granularity.
+
+3. **`performance_areas` exists only inside Figure 7's illustration.** Repo-wide grep (src, data, configs, scripts, tools, bench, state, EAD): zero hits for `performance_areas` / `performance_score` / `is_performance_related`. The Stage-2 raw judge outputs were not persisted. The yX4G composition table must be built from dataset JSONL fields (`stats`, `files_changed`, `has_serving/latency/throughput`, `uses_lm_eval`, `affected_paths`); bottleneck-category labels require a fresh labeling pass (partial start: `archive/misc/results/reviews/vllm_classification_review.csv`, 33 commits). Also note an internal paper inconsistency to fix at camera-ready: Figure 7 labels the Stage-2 judge `gemini-3-flash-preview`, Appendix C.1 text says GPT-5-mini.
+
+4. **W4 draft's "minimum/median human speedup — you have this from the PR performance claims":** PR claims are unstructured timeline text in `EAD/reference_data/{vllm,sglang}/human_commits.jsonl` (99+15 records) — extracting a min/median needs a parsing pass over 54 PRs (feasible, small, but it is work, not a lookup). Measured human-vs-baseline exists only for SGLang 15/15 and the 19-commit vLLM subset.
+
+5. **yX4G reliability draft's "none of the disagreements flip a Q1 outcome" [verify]:** cannot be verified from the repo — raw H1/H2 labels live in Supabase only. The Supabase export is a hard prerequisite for this sentence and for the boundary examples (kNyS Q4). If the export shows flips, follow the draft's own instruction: report honestly and quantify the Table 3 effect.
+
+6. **W1 test choice:** the draft says Fisher's exact for cross-agent comparisons. Agents share the same 39/15 tasks — paired McNemar is the appropriate cross-agent test; keep Fisher for unpaired contrasts (e.g., vLLM vs SGLang within an agent). The checklist (Q7) already concedes error bars exist only for judge reliability + Appendix G, so W1 is a straight gap-fill.
+
+7. **Posting notes in the draft are sound** (utqG first; disclose Same-only sensitivity proactively; no bracketed placeholders left; don't cite TRT-LLM/FlashInfer to utqG). Add one: don't repeat Appendix H's "full trajectories" phrasing anywhere in the responses — it's the one claim a reviewer can falsify by asking for the artifact.
+
+8. **kNyS Q2 grid numbers in the draft check out** against Table 4 (Sonnet scaffolds 46.2/43.6/28.2 vLLM; OpenHands model swap 43.6→28.2). Safe to post as-is.
