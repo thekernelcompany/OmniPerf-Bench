@@ -38,21 +38,48 @@ the PDF, and it's all in the PDF.
 
 **The question:** point estimates on 39/15 tasks with no variance.
 
-**The answer (3 parts):**
-- Reuse ICML-UJ1j's resolved response: judge stability (8 runs, ±2.5%) and
-  rollout variance (Appendix G: std ≤3.3%, ranking preserved) are already in the
-  paper. Reuse the ICML size justification (Rdwi): strict inclusion criteria —
-  every task must be a reproducible, Docker-buildable optimization commit — plus
-  the cost argument (2h agent budget + H100 re-eval + correctness + judge ≈
-  thousands of dollars at 54 tasks).
-- New supplement: Wilson + bootstrap 95% CIs for every cell and 30 paired exact
-  McNemar tests (`stats_tables.md`). The headline claim — rankings invert across
-  codebases — is significant in both directions (Sonnet scaffolds > GPT-5
-  scaffolds on vLLM, p ≤ 0.021; TRAE/Codex > Claude Code/OH-S45 on SGLang,
-  p ≤ 0.008). Within-class orderings are not significant — soften those.
-- New supplement: per-task rollout CVs from the pass@k data (~8 rollouts/task):
-  throughput CV < 1% (threshold is 5%), TTFT CV 7–9% median on SGLang
-  (`pass_at_k_variance.md`).
+**The answer — lead with the ICML rollout & variance answer, put CIs around it:**
+- **Lead:** the ICML "Q4: Rollouts and variance" answer, which is already Appendix G
+  and which Rdwi marked *addressed*. Inline the table rather than citing it, with
+  95% CIs added to the rates: Claude Code pass@1 50.0% (33.2–66.8) vs 46.7% ± 3.3%
+  across rollouts; Codex CLI 23.3% (11.8–40.9) vs 25.5% ± 2.2%. Quote the std as
+  "≤3.3 points" (ICML's text said "3-4%", an earlier draft here said "2–3%"; the
+  table's values are 3.3 and 2.2).
+- **The argument the CIs unlock:** rollout spread ≤3.3 points vs a task-sample
+  interval of ~±17 points at n=30. So re-running an agent is not what limits the
+  tables — the size of the task set is. That concedes the reviewer's real point
+  while showing the single-rollout protocol is sound, and it makes reporting CIs on
+  every cell the natural next step rather than a bolt-on.
+- **Then, one sentence:** Wilson 95% intervals have been added to every cell of
+  Tables 3/4, and cross-codebase ranking claims are softened where intervals overlap.
+  The 12-row CI table and the McNemar results stay in `stats_tables.md` — **not** in
+  the response (team decision: rollout variance + CIs answer W1; significance tests
+  add length and were entangled with the OH-S45 cell divergence).
+- Reuse the ICML size justification (Rdwi): strict inclusion criteria — every task
+  must be a reproducible, Docker-buildable optimization commit — plus the cost
+  argument (2h agent budget + H100 re-eval + correctness + judge ≈ thousands of
+  dollars at 54 tasks). ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) stays
+  in the yX4G response where it belongs — it is variance of the labeler, not of the
+  benchmark results.
+- Note on the "pass@2" label: it is the authors' shorthand for the rate across
+  repeated rollouts, not best-of-k sampling — the text above Table 9 says "to
+  quantify variance", and 15/14/13 successes over 30 tasks reproduce 46.7% ± 3.3%
+  exactly. Leave it as-is in the rebuttal; clarify the Table 9 caption at camera-ready.
+
+**Held back deliberately** (`pass_at_k_variance.md`, internal): the same campaign
+actually has up to 8 isolated rollouts per task, 618 benchmarked patches, and
+measured on the metric that classifies each task, 82% of task-agent cells have
+every rollout inside the ±5% band (throughput-classified 1.0% median; the tail is
+TTFT-classified vLLM tasks). It is *not* in the response because it is
+cross-campaign (agent patches only, no human reference in that context, 12 of 40
+tasks ran a modified command), a reviewer cannot verify it, and citing 8 rollouts
+invites "then report pass@8". Bring it out only if a reviewer challenges whether
+the ±5% band sits above the measurement noise floor. Also: an earlier CV-only
+summary said "TTFT CV 7–9% on SGLang" — that measured TTFT on SGLang tasks, which
+are classified on throughput; SGLang cells are in fact the stable ones.
+Optional [RUN] if the team ever wants real pass@k: one human-patch benchmark per
+task in that context (~40 runs, 1×H100) unlocks Hard Success pass@k up to k=8;
+True Success pass@k additionally needs a judge pass over the 618 patches (API only).
 
 ### utqG W2 — Level 2 not evaluated
 
@@ -61,25 +88,79 @@ the PDF, and it's all in the PDF.
 **The answer:** reuse the ICML L1/scope response almost verbatim — "the same
 pipeline applies to multi-GPU and heterogeneous hardware without modification;
 we restricted evaluation to Level 1 due to time and budget constraints" — and
-note Level 2 already went through the same three-stage filtering + manual
-curation as Level 1 (only agent rollouts and re-execution are missing). Since
-ICML, Level 2 is now actually released on HF. Offer the repositioning
-(curated data release) if the reviewer prefers; optional [RUN] a few TP2 tasks
-with the human patch if GPUs land.
+make the key point that Level 2 is not a lesser collection: it is the *same*
+pipeline split by hardware requirement, and it received the same three-stage
+filtering and the same four-purpose manual curation (verified in §3.2 and
+Appendix C.2 — the 66 vLLM / 40 SGLang curated counts are L1 ∪ L2). Only execution
+is missing. Since ICML, Level 2 is actually released on HF, so "released" is
+defensible. Offer the repositioning (curated data release), and volunteer the
+count reconciliation ourselves — Table 6's 66/40 vs §3.2's 39/15 is the L1∪L2 vs
+L1 distinction, already drafted as EDIT 2 in `camera_ready_edits.tex`.
+
+**TP2 demo — back in, hedged.** utqG's W2 asks specifically for "confirmation the
+code runs or that agents can operate under the benchmark", which nothing in the
+existing artifacts answers. The OpenHands re-bench ran on 2xH100, so a small Level-2
+TP2 subset (environment build + human patch + one agent) is landable; the response
+offers it with an explicit "if compute allows / we do not want to promise runs we
+cannot land". The one existing multi-GPU datapoint (`310aca88`, TP2 against a TP4
+spec) is flagged not-comparable in `docs/HARD_METRICS_OH_GPT5_FINAL.md` and is not
+cited.
+
+**Internal, camera-ready:** the *released* Level-1 parquet sets `hardware` to "H100"
+for all 54 tasks, so the released data is self-consistent with the paper's
+single-GPU claim. The local provenance copy (`EAD/dataset/*.jsonl`) disagrees for 15
+of them — vLLM `310aca88` (H100-TP4), two L4, one AMD-MI300X, one AWS-Neuron, and 10
+of 15 SGLang tasks (TP8, TP16-DP16, PD/DP/EP) — i.e. the field means "hardware we
+evaluated on" in the release and "hardware the PR author used" locally. Worth
+reconciling before the data release so the two copies do not tell different stories.
+
+Also checked, because W2 invites it: on the released data the L1/L2 boundary is
+directionally clean but not crisp — 70-72% of Level 2 is multi-GPU, heterogeneous
+hardware, or an oversized model, versus 23-27% of Level 1. That is why the response
+describes the split as strict vs relaxed *inclusion criteria* (the ICML framing)
+rather than as "Level 2 = multi-GPU", which a reviewer checking the parquet would
+falsify.
 
 ### utqG W3 — two kinds of Lucky Win
 
-**The question:** does a Q3 speedup mean the agent broke the model, or found a
-legitimate optimization elsewhere?
+**The question (verbatim, and read it carefully):** the reviewer *grants* that the
+benchmark correctly catches "hacking the win" and cites Bamba E.3 approvingly. Their
+concern is the other half — "a genuinely valid alternative optimization may be
+labeled Lucky Win purely for editing a different location than the human, which
+seems to penalize correct work" — and they want to see how Q3 splits between the two.
+So this is **not** a request for a reward-hacking count. Answering it with "11 of 12
+Q3 cases preserved accuracy" answers a question they did not ask.
 
-**The answer:** the paper already contains the anchor case — **Bamba, Appendix
-E.3 / Figure 12** (TRAE-Sonnet matches human speedup, accuracy 32%→0%, caught by
-soft metrics + LM Eval Harness, §5.6). Use it as-is. The new table
-(`q3_decomposition.md`) generalizes it: across the Q3 cases with correctness
-runs, **11 of 12 preserved accuracy** (valid alternative-location optimizations)
-and exactly 1 broke it — the E.3 Bamba case. One sentence of framing: the
-framework catches the harmful case, and most Lucky Wins are legitimate work,
-which we will say in §5.2.
+**The answer (decided): Bamba E.3 + the ICML Cohen's κ table. Nothing else.**
+1. **Bamba E.3 as-is** for the kind they already credit (Aman: use the appendix case,
+   no hedging).
+2. **The κ table verbatim from the ICML rebuttal** — LLM vs H1 0.881 / H2 0.791
+   (targeting), 0.949 / 0.810 (approach), means 0.836 / 0.880, plus the ±2.5%
+   eight-run stability. This is what answers their actual worry: "is the
+   different-location label just the judge being harsh?" No — two human experts read
+   these cases the same way. Pair it with the taxonomy point (Table 2 has an explicit
+   *Valid alternative — different but sound* category, and the judge labels approach
+   independently of targeting), so a sound alternative is recorded as sound.
+3. One commitment sentence: report the Implementation Approach breakdown of Q3
+   alongside the Q3 rate, and say in §5.2 that Valid-alternative Q3 is legitimate
+   work a single "Lucky Win" label undersells.
+
+**Deliberately not in the response** (available in `q3_decomposition.md` if wanted):
+the actual Q3 split — 8 Valid alternative / 18 Ineffective over 26 cases, clustered
+on 4 commits — and the generous-direction sensitivity (crediting those 8: vLLM CC
+46.2→48.7, OH-S45 43.6→46.2, OH-GPT5 28.2→33.3, TRAE-GPT5 17.9→20.5; SGLang CC
+26.7→40.0, OH-GPT5 33.3→40.0; ≤5.1pp vLLM / ≤13.3pp SGLang, top tier unchanged).
+Held back to keep W3 short and to avoid putting an alternative scoring of the
+headline tables in writing. Note the reviewer did literally ask to "see how Q3
+splits", so if they push, the 8/18 line is the answer and needs no new runs.
+
+**Also left out on purpose:** the "11 of 12 preserved accuracy" framing from the
+earlier draft — that answers a reward-hacking question this reviewer never asked and
+9 of those 11 are judged *Ineffective* ("misses bottleneck"), so it would have
+claimed legitimacy our own labels deny. And no promise to extend correctness runs:
+§3.3.4/§5 already claim validation of *all* Hard Success cases, so raising coverage
+invites a comparison with the 12 artifact-backed cases. Fix that wording at
+camera-ready instead.
 
 ### utqG W4 — measured against baseline?
 
@@ -88,12 +169,26 @@ only against the human patch?**
 
 **The answer: yes, we did — it's in the paper.** §4.3: hard metrics are executed
 "against both the unoptimized baseline and the human solution." §3.3.4:
-functional correctness is measured for the baseline and the agent patch. The
-paper *reports* the human-relative classification because agent-vs-human is the
-benchmark's scoring axis; the baseline measurements exist. Supplement: attach
-the per-task absolute-improvement-over-baseline table (28/39 vLLM + 14/15
-SGLang, `baseline_deltas.md`) so readers can see when "Similar" means matching
-a large gain vs a small one.
+functional correctness is measured for the baseline and the agent patch. Then
+*defend the reporting choice* rather than just conceding it: "faster than
+unoptimized code" is a weak bar an agent clears by touching anything on a hot path
+— that is the Q3 behaviour the benchmark exists to expose — while "matches the fix
+the maintainers merged" is the capability under test. Close with the curation
+criterion (Appendix C.2 required a documented performance claim in the PR), which
+rules out certifying "Similar" against a human patch that achieved nothing.
+
+**Do NOT attach the per-task baseline table** (`baseline_deltas.md`), which the
+earlier draft promised. Measured human-vs-baseline is median **+1.5% on vLLM and
+−11.9% on SGLang** (only 11/28 and 2/14 tasks above +5%) — the short isolated runs
+do not reproduce the PR-claimed speedups, so publishing that table next to the
+"non-trivial verified speedup by construction" sentence would refute our own
+inclusion criterion in the same response. The response instead offers baseline /
+human / agent measurements in the **released per-task data**, which is honest,
+useful, and does not put a self-contradicting median in the rebuttal text. If anyone
+insists on quantifying human speedups, use the PR-*claimed* numbers from
+`reference_data/*/human_commits.jsonl` (a text-extraction pass), never our measured
+medians. Coverage if it ever matters: 28/39 vLLM + 14/15 SGLang have a baseline;
+vLLM OpenHands baseline deltas are cross-context artifacts.
 
 *Internal note (one line):* when quoting how big the human speedups were, cite
 the PR-claimed numbers from the PR discussions (that's what curation verified);
@@ -105,8 +200,19 @@ for that specific sentence.
 **The answer:** reuse the ICML-dpfc contamination paragraph nearly verbatim — it
 worked: "if contamination were a major factor we would expect high execution
 success; instead agents frequently identify the correct bottleneck but fail to
-implement it (the dominant Q2 outcome)"; same tradeoff as SWE-Perf /
-SWE-fficiency / GSO; add the live-refresh (dated splits) commitment.
+implement it (the dominant Q2 outcome)"; and keep the sentence the earlier draft
+dropped — the concern is not specific to us, since SWE-Perf, SWE-fficiency and GSO
+are all built from public repositories and face the same realism/contamination
+tradeoff. Paper backing: Appendix H already states both mitigations (Q1–Q4 not at
+ceiling; Q2/Q3 at non-trivial rates).
+
+**On difficulty decay,** the live-refresh commitment (dated, versioned splits after
+SWE-bench-Goes-Live) needs one supporting fact or it reads aspirational: the
+collection pipeline is automated end to end (§3.2) — mining, LLM filtering,
+benchmark-command extraction — so a refresh is running it against a later cutoff,
+not rebuilding it. ICML-Rdwi independently praised exactly this ("collection schema
+seems quite automatic and could scale"), so it is a claim a reviewer has already
+found credible.
 
 ### yX4G — TTFT vs throughput / fuller metric profile
 
@@ -218,10 +324,27 @@ OpenHands (Sonnet-4.5) now computes to True Success 56.4% vs the published 43.6%
 the published numbers everywhere, or disclose the (upward) correction. All new
 tables mark the affected cell either way.
 
+## Internal only — 14 "failed" cells that measured fine in the pass@k campaign
+
+Not for any reviewer response. 17 (task, agent) cells have no agent measurement in
+the canonical table (`primary_metric = agent_failed`) and are therefore scored as
+Worse — i.e. as failures in Tables 3–5. 14 of them ran the *identical* benchmark
+command in the pass@k campaign and produced 7–8 successfully benchmarked patches
+there (`pass_at_k_variance.md` §4; 11 are Claude Code cells). Either the single
+canonical rollout failed and that failure is not reproducible, or the aggregate is
+missing a measurement that was never persisted — for the vLLM cells `failure_reason`
+is null and no `*_agent_result.json` exists under `benchmark_results/vllm/claude_code/`
+while the same commits have agent results for other tools. Both readings mean the
+published rates for those agents are conservative. Resolve before the data release,
+since a reader with the released artifacts can reconstruct this.
+
 ## Still to do
 
 - Assemble the OpenReview responses from the sections above (post utqG first).
 - Supabase export → disagreement/boundary examples (only remaining analysis blocker).
 - Optional [RUN]: 9 vLLM baselines, ~10 OpenHands lm-evals, TP2 subset,
   open-model soft-metrics pass.
+- Optional [RUN], highest value per GPU-hour for W1: ~40 human-patch benchmarks in
+  the pass@k measurement context → turns Appendix G's pass@2-on-30-tasks into
+  Hard Success pass@k up to k=8 on 40 tasks × 2 agents from rollouts already run.
 - Apply `camera_ready_edits.tex`.

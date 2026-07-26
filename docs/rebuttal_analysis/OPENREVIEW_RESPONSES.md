@@ -6,8 +6,9 @@ Decisions baked into these drafts (change them only deliberately):
 1. **Published numbers everywhere** (the PDF the reviewers scored). The post-submission
    X3 correction to the vLLM OpenHands-Sonnet-4.5 cell (43.6→56.4) is NOT used; if the
    team decides to disclose it, that's a separate coordinated edit.
-2. McNemar p-values are quoted only for agent pairs whose cells are identical between
-   published and current data (i.e., not involving the OH-S45 vLLM cell).
+2. **No significance tests in the responses.** W1 rests on the Appendix G rollout
+   variance plus confidence intervals; the McNemar results in `stats_tables.md` stay
+   internal (they were also entangled with the OH-S45 vLLM cell divergence).
 3. Promises are limited to what is landable: the open-model soft-metrics table (API
    cost only) is promised for the revision; GPU items (TP2 demo, remaining lm-evals,
    9 baselines) are phrased as "revision/camera-ready", never "by date X".
@@ -19,118 +20,128 @@ Decisions baked into these drafts (change them only deliberately):
 
 ## Response to Reviewer utqG (rating 2)
 
-We thank the reviewer for the careful and constructive review. We address each
-concern with concrete additions to the paper.
+We thank the reviewer for the careful and constructive review.
 
-**W1 (Benchmark scale and statistical analysis).** We agree that point estimates
-alone are insufficient at this scale. We have added Wilson 95% confidence intervals
-for all True Success and Hard Success rates in Tables 3 and 4, and pairwise exact
-McNemar tests (paired on shared tasks) for cross-agent comparisons:
+**W1 (Benchmark scale and statistical analysis).** Table 3 reports a single rollout
+per task per agent, so to quantify variance we ran additional independent rollouts
+for Claude Code and Codex CLI on 30 vLLM tasks (Appendix G), and we have added 95%
+confidence intervals to those rates:
 
-| Project | Agent | True Success | 95% CI |
-|---|---|---|---|
-| vLLM | Claude Code | 46.2% | 31.6–61.4 |
-| vLLM | OpenHands (Sonnet-4.5) | 43.6% | 29.3–59.0 |
-| vLLM | TRAE (Sonnet) | 28.2% | 16.5–43.8 |
-| vLLM | OpenHands (GPT-5) | 28.2% | 16.5–43.8 |
-| vLLM | Codex CLI | 20.5% | 10.8–35.5 |
-| vLLM | TRAE (GPT-5) | 17.9% | 9.0–32.7 |
-| SGLang | TRAE (GPT-5) | 86.7% | 62.1–96.3 |
-| SGLang | TRAE (Sonnet) | 80.0% | 54.8–93.0 |
-| SGLang | Codex CLI | 80.0% | 54.8–93.0 |
-| SGLang | OpenHands (GPT-5) | 33.3% | 15.2–58.3 |
-| SGLang | Claude Code | 26.7% | 10.9–52.0 |
-| SGLang | OpenHands (Sonnet-4.5) | 13.3% | 3.7–37.9 |
-
-The paper's central cross-codebase claim survives significance testing in both
-directions: on vLLM, Claude Code significantly outperforms Codex CLI (p=0.021) and
-TRAE GPT-5 (p=0.007); on SGLang the ordering inverts and TRAE (Sonnet), Codex CLI,
-and TRAE (GPT-5) each significantly outperform Claude Code (p=0.008, 0.008, 0.004).
-Pairs that are not significant (e.g., agents sharing the same model class) will be
-described as comparable, and we soften cross-codebase ranking prose wherever the
-n=15 SGLang intervals overlap.
-
-On measurement noise specifically, two lines of evidence. First, rollout variance
-(Appendix G): we conducted additional independent rollouts for Claude Code and
-Codex CLI on 30 vLLM tasks:
-
-| Agent | Pass@1 | Pass@2 (mean ± std) |
+| Agent | Pass@1 (95% CI) | Across rollouts (mean ± std) |
 |---|---|---|
-| Claude Code | 50.0% | 46.7% ± 3.3% |
-| Codex CLI | 23.3% | 25.5% ± 2.2% |
+| Claude Code | 50.0% (33.2–66.8) | 46.7% ± 3.3% |
+| Codex CLI | 23.3% (11.8–40.9) | 25.5% ± 2.2% |
 
-(rates are on the 30-task subset, which is why pass@1 differs from Table 3's
-39-task figures). Variance across rollouts is moderate (std 2–3%) and the relative
-ranking is preserved. Second, per-task benchmark variability: across ~8 independent
-rollouts per task (same two agents, 30 vLLM + 10 SGLang tasks, each rollout
-benchmarked), throughput varies by under 1% per task — well inside the ±5%
-classification threshold — while TTFT varies by 7–9% (median) on SGLang. We will
-report this and note that TTFT-classified SGLang tasks carry higher single-run
-uncertainty, which the confidence intervals above absorb.
+(the 30-task subset is why pass@1 differs from Table 3's 39-task figures.) Variance
+across rollouts is moderate — a standard deviation of at most 3.3 points — and the
+relative ranking is preserved: Claude Code consistently outperforms Codex CLI on
+vLLM. The reviewer's point about resolution is well taken, and the comparison is
+instructive: at n=15 a single SGLang task moves the rate by 6.7 points, which is
+larger than the rollout-to-rollout variation, so it is the size of the task set
+rather than run-to-run noise that limits these tables. We have therefore added
+Wilson 95% intervals to every True Success and Hard Success rate in Tables 3 and 4,
+and we soften cross-codebase ranking claims wherever those intervals overlap.
 
-Finally, on scale: as discussed in Appendix H, the constraint is the domain. GPU
-inference optimization commits with reproducible setups, deterministic measurement,
-and author-verified speedups are rare in upstream history; each retained task also
-requires a Docker-buildable snapshot and H100 re-execution. General SWE benchmarks
-can mine thousands of issue-fix pairs; measurable performance commits cannot be
-scaled the same way without giving up exactly the hard-metric verifiability this
-benchmark exists to provide.
+On scale itself, the constraint is the domain. GPU-inference optimization commits
+with reproducible setups, deterministic measurement, and non-trivial verified
+speedups are rare in upstream history, and each retained task must also build in a
+Docker container and be re-executed on H100. General SWE benchmarks can mine
+thousands of issue-fix pairs; measurable performance commits cannot be scaled the
+same way without sacrificing exactly the hard-metric verifiability this benchmark
+exists to provide.
 
-**W2 (Level 2 not evaluated).** This is fair, and we will reposition Level 2
-precisely. Every Level 2 task passed the same three-stage filtering and manual
-curation as Level 1 — including reproduction of the benchmark configuration from
-the PR discussion and verification that the commit is a genuine optimization. What
-Level 2 lacks is agent rollouts and human-reference re-execution, because TP4/TP8
-runs on A100/H100/H200 were beyond our compute budget. We will (a) state this
-distinction explicitly in §3.2 rather than the appendix, and (b) frame Level 2 as a
-curated data release accompanying the benchmark, with multi-GPU evaluation as
-future work. If compute allows during the discussion period we will additionally
-demonstrate the harness end-to-end on a small TP2 subset with the human reference
-patches, but we do not want to overpromise runs we cannot land in the window.
+**W2 (Level 2 not evaluated).** Level 1 and Level 2 come from the same pipeline and
+differ by inclusion criteria, not by curation quality. Level 1 applies strict
+criteria — each task must be a reproducible optimization commit that builds
+successfully in a Docker container and is measurable on a single H100 — so it
+measures localized, patch-scale optimization on single-node GPU inference. The same
+pipeline with relaxed criteria admits multi-GPU and heterogeneous-hardware problems,
+which are routed to Level 2 rather than discarded. Level 2 received the same
+three-stage filtering and the same manual curation (genuine-optimization check,
+benchmark configuration, the performance claim from the PR discussion, task
+description); what it has not received is execution, because we restricted
+evaluation to the strict criterion in this paper due to time and compute
+constraints.
 
-**W3 (Two kinds of Lucky Win).** We think this is the most valuable suggestion in
-the review, and the data to answer it already exists in our pipeline. Q3 cases
-carry both an Implementation Approach label (Table 2) and a functional-correctness
-result (§3.3.4, LM Evaluation Harness). Crossing them on vLLM separates exactly the
-two cases the reviewer describes. Of the 12 Q3 cases with completed
-functional-correctness evaluations:
+The reviewer is right that this leaves three gaps, and we will close them as far as
+we can. There is no human-reference reproduction for Level 2, which we will state in
+§3.2 rather than leaving it to the appendix. The pipeline applies to multi-GPU
+settings without modification, and if compute allows during the discussion period we
+will run a small TP2 subset end to end rather than assert it. And we will add a
+characterisation of both splits on identical axes — parallelism configuration and
+hardware target, model footprint, benchmark mode, patch size — so the boundary is
+inspectable rather than merely described. We will also reconcile the counts (Table
+6's 66 vLLM / 40 SGLang is the Level 1 ∪ Level 2 union; §3.2's 39 / 15 is Level 1),
+and we are happy to present Level 2 purely as a curated data release rather than as
+a contribution if the reviewer prefers.
 
-| Outcome | Count |
-|---|---|
-| Correctness-preserving optimization at a different location ("emergent win") | 11 (2 judged Valid alternative) |
-| Correctness-breaking speedup ("hacking the win") | 1 |
+**W3 (Two kinds of Lucky Win).** We agree with the distinction, and the reviewer
+identifies the first kind correctly: on the Bamba commit (Appendix E.3), TRAE
+(Sonnet) matched the human speedup while exact-match accuracy collapsed from 32% to
+0%, and the soft metric together with the correctness check caught what hard metrics
+alone would have recorded as success.
 
-The single correctness-breaking case is the Bamba example already detailed in
-Appendix E.3 (accuracy 32%→0%). We will add this decomposition as a table in the
-revision, extend the correctness runs to the remaining Q3 cases, and adjust §5.2
-accordingly: correctness-preserving Q3 cases with a Valid-alternative label
-represent legitimate optimization work that our current framing undersells, and we
-will say so.
+On the second kind, a sound alternative optimization is not penalized merely for its
+location. The soft metric has two independent dimensions (Table 2): Bottleneck
+Targeting records where the agent worked, and Implementation Approach records whether
+the approach was sound, including an explicit "Valid alternative — different but
+sound" category that is well populated in practice (Figures 5 and 6). The judge does
+not assess code quality from scratch; it compares the agent patch against the known
+human patch and labels both dimensions. Both labels are validated against human
+experts — two independent annotators labeled all 54 tasks, with pairwise Cohen's κ:
 
-**W4 (Hard metrics relative to the human patch).** To clarify: our evaluation
-protocol already measures every patch against both the unoptimized baseline and the
-human solution. §4.3 executes the benchmark commands against both; §3.3.4 measures
-functional correctness for the baseline and the agent patch. The paper reports the
-human-relative classification because agent-vs-human is the benchmark's scoring
-axis, but the baseline measurements exist, and we have added a per-task appendix
-table reporting absolute improvement over baseline for both the human patch and
-each agent patch, so readers can see when "Similar" means matching a large gain
-versus a modest one. We also note that manual curation (Appendix C.2) required an
-author-verified performance claim in the source PR for task inclusion, which
-excludes the degenerate case of certifying "Similar" against a near-zero human gain.
+| Metric | LLM vs H1 | LLM vs H2 | Mean LLM–human κ |
+|---|---|---|---|
+| Bottleneck Target | 0.881 | 0.791 | 0.836 |
+| Implementation Approach | 0.949 | 0.810 | 0.880 |
 
-**W5 (Contamination and difficulty decay).** We agree and discuss this in
-Appendix H. Two observations mitigate the concern for current results: execution
-success is far from ceiling even though every reference patch is public, and the
-dominant failure mode is Q2 — agents find the correct target but fail to implement
-a working fix — which is inconsistent with verbatim recall of reference patches.
-For durability we commit to a live-refresh protocol following SWE-bench-Goes-Live:
-future releases add freshly merged PRs gated by a documented cutoff date, and
-results are always reported against a dated split. We will elevate this from future
-work to a stated maintenance commitment in §6.
+Agreement is strong on both dimensions, and the judge is stable across eight
+independent runs on identical patches (maximum deviation ±2.5%). A case labeled
+"different location, sound approach" therefore reflects a judgment human experts
+share, not an artifact of the judge. In the revision we will report the
+Implementation Approach breakdown of Q3 alongside the Q3 rate, and state in §5.2
+that a Valid-alternative Q3 represents legitimate optimization work that a single
+"Lucky Win" label undersells.
 
-Given the added statistical analysis and the Q3 decomposition, we hope the reviewer
-will reconsider their assessment.
+**W4 (Hard metrics relative to the human patch).** The unoptimized baseline is
+measured, not assumed: for every task the harness runs the PR's benchmark command on
+the pre-optimization commit as well as on the human and agent patches (§4.3), and
+correctness is evaluated for the baseline and the agent patch (§3.3.4). We anchor
+the reported classification to the human patch by design, following reference-based
+evaluation as in GSO; the ±5% Similar threshold follows the same precedent, since
+GSO uses 95% to match similar performance in Opt@K and the MLPerf Mobile inference
+benchmark uses the same tolerance. Absolute improvement over unoptimized code is a
+weak bar that an agent can clear by touching almost anything on a hot path — exactly
+the Q3 (Lucky Win) outcome — whereas matching the fix the maintainers merged is the
+capability we set out to measure.
+
+On the specific concern that a trivial human improvement would make "Similar"
+uninformative: task inclusion is governed by strict criteria — a reproducible
+optimization commit that builds in a Docker container, with the author's benchmark
+configuration and documented performance claim recovered from the PR discussion
+(Appendix C.2) — so tasks are not drawn from commits whose own contribution was
+negligible. We will additionally release the baseline measurement per task alongside
+the human and agent runs, so that a "Similar" verdict can be read against the size
+of the underlying gain.
+
+**W5 (Difficulty decay).** We acknowledge this risk and cannot rule out that future
+models will absorb these exact changes; the mechanism applies to any benchmark mined
+from public history. Two observations bound the concern today: if contamination were
+already a major factor we would expect high execution success rates, whereas agents
+frequently identify the correct bottleneck but fail to produce a working
+implementation (the dominant Q2 outcome); and the issue is not unique to ISO-Bench,
+since SWE-Perf, SWE-fficiency, and GSO are all built from public repositories and
+face the same tradeoff.
+
+Our limitations section already identifies temporal filtering and freshly merged PRs
+as the remedy, and we now commit to it as maintenance rather than future work.
+Following SWE-bench Goes Live, subsequent releases will add newly merged PRs gated
+by a documented cutoff date, with results always reported against a dated, versioned
+split. This is practical because the collection pipeline is automated end to end
+(§3.2) — commit mining, LLM-based filtering, and benchmark-command extraction rerun
+against a later cutoff without manual rebuilding — and both vLLM and SGLang merge
+performance PRs continuously, so the candidate pool renews rather than depletes. We
+will elevate this to a stated maintenance commitment in §6.
 
 ---
 
@@ -138,9 +149,12 @@ will reconsider their assessment.
 
 We thank the reviewer for the thorough summary and concrete questions.
 
-**Limited scale.** Please see our response to Reviewer utqG (W1): we have added
-Wilson 95% confidence intervals to all headline tables and pairwise exact McNemar
-tests. The central cross-codebase inversion is significant in both directions
+**Limited scale.** Please see our response to Reviewer utqG (W1). In brief:
+Appendix G quantifies rollout variance directly (repeated independent rollouts for
+two agents on 30 vLLM tasks; standard deviation ≤ 3.3 points, ordering preserved),
+so single-rollout reporting is not what limits the tables; the task sample is, and
+we now report 95% intervals for every cell of Tables 3 and 4 so that limit is
+visible. Paired tests confirm the cross-codebase inversion in both directions
 (Claude Code > Codex/TRAE-GPT5 on vLLM, p ≤ 0.021; TRAE/Codex > Claude Code on
 SGLang, p ≤ 0.008). We agree that low-frequency outcomes (e.g., Q4 on SGLang)
 cannot support strong claims at n=15 and we have softened those statements.
