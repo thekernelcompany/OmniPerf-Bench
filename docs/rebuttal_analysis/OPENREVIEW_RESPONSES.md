@@ -6,10 +6,11 @@ Decisions baked into these drafts (change them only deliberately):
 1. **Published numbers everywhere** (the PDF the reviewers scored). The post-submission
    X3 correction to the vLLM OpenHands-Sonnet-4.5 cell (43.6→56.4) is NOT used; if the
    team decides to disclose it, that's a separate coordinated edit.
-2. **The only CIs in the responses are the rollout-based ones in W1**, computed from
-   the Appendix G spread (t, df=2). The Wilson per-cell intervals and the McNemar
-   results in `stats_tables.md` stay internal (both were entangled with the OH-S45
-   vLLM cell divergence).
+2. **No CIs and no significance tests in the responses.** W1 uses the Appendix G
+   rollout-variance table as published (mean +/- std). A t-interval derived from it
+   would be +/-8 points on 3 rollouts, which reflects the sample size rather than the
+   benchmark's precision, so it is not reported. Wilson per-cell intervals and the
+   McNemar results stay internal in `stats_tables.md`.
 3. Promises are limited to what is landable: the open-model soft-metrics table (API
    cost only) is promised for the revision; GPU items (TP2 demo, remaining lm-evals,
    9 baselines) are phrased as "revision/camera-ready", never "by date X".
@@ -23,40 +24,68 @@ Decisions baked into these drafts (change them only deliberately):
 
 We thank the reviewer for the careful and constructive review.
 
-**W1 (Benchmark scale and statistical analysis).** Table 3 reports a single rollout
-(pass@1) per task instance per agent. To quantify variance, we conducted additional
-independent rollouts for Claude Code and Codex CLI on 30 vLLM tasks (Appendix G):
+**W1 (Benchmark scale and statistical analysis).** The reviewer is right about the
+resolution: at 15 SGLang tasks one task is worth 6.7 points, and no conclusion should
+rest on a difference that small. We therefore report what our claims actually rest
+on, in tasks rather than in percentages.
 
-| Agent | Pass@1 | Pass@2 (mean ± std) | 95% CI |
-|---|---|---|---|
-| Claude Code | 50.0% | 46.7% ± 3.3% | 38.5–54.9 |
-| Codex CLI | 23.3% | 25.5% ± 2.2% | 20.0–31.0 |
+Every agent runs the same tasks, so the comparisons are paired and can be read task
+by task. For the pair that carries the cross-codebase claim (counts from Table 5):
 
-True Success rate under pass@1 vs pass@2, on 30 vLLM tasks. These rates are on that
-subset, which is why pass@1 differs from Table 3's 39-task figures. The intervals
-are computed from the rollout spread (Student's t, two degrees of freedom) and cover
-the mean True Success rate across rollouts.
+| Comparison, same tasks | Both solve | Neither | Only A | Only B |
+|---|---|---|---|---|
+| vLLM: Claude Code (A) vs TRAE GPT-5 (B) | 5 | 19 | 13 | 2 |
+| SGLang: TRAE GPT-5 (A) vs Claude Code (B) | 4 | 2 | 9 | 0 |
 
-Variance across rollouts is moderate, with a standard deviation of at most 3.3
-points, and the relative ranking is preserved: the two intervals do not overlap, so
-Claude Code outperforming Codex CLI on vLLM is not an artifact of which rollout is
-scored. Due to GPU compute budget constraints, pass@k evaluation was limited to 2
+On vLLM the two agents disagree on 15 tasks and 13 of those favour Claude Code; on
+SGLang they disagree on 9 and all 9 favour TRAE (GPT-5). The inversion rests on
+13 and 9 task-level disagreements in opposite directions, so it is not a difference
+one task could produce. Pairing also makes the comparison less sensitive to which
+tasks were sampled than either rate on its own, because a task that is hard for one
+agent is usually hard for the other.
+
+Where the reviewer's concern binds, we withdraw the claim. On SGLang, Codex CLI and
+TRAE (Sonnet) both reach 12/15 and produce identical outcomes on all 15 tasks, and
+OpenHands (GPT-5) at 5/15 differs from Claude Code at 4/15 on 4 tasks against 3. We
+now describe such pairs as indistinguishable at this scale instead of ranking them.
+We will also add the per-task outcome table (task by agent by quadrant) to the
+released evaluation data so that any comparison of this kind can be checked
+directly. Relatedly, the absolute rates should not be read as precise estimates of
+agent ability: 15 curated tasks are not a random sample, and our claims concern
+ordering rather than the point values.
+
+On run-to-run variance, Table 3 reports a single rollout (pass@1) per task instance
+per agent. To quantify it we conducted additional independent rollouts for Claude
+Code and Codex CLI on 30 vLLM tasks (Appendix G):
+
+| Agent | Pass@1 | Pass@2 (mean ± std) |
+|---|---|---|
+| Claude Code | 50.0% | 46.7% ± 3.3% |
+| Codex CLI | 23.3% | 25.5% ± 2.2% |
+
+True Success rate under pass@1 vs pass@2, on 30 vLLM tasks; these rates are on that
+subset, which is why pass@1 differs from Table 3's 39-task figures. Variance across
+rollouts is moderate, with a standard deviation of at most 3.3 points, and the
+relative ranking is preserved: Claude Code consistently outperforms Codex CLI on
+vLLM. Due to GPU compute budget constraints, pass@k evaluation was limited to 2
 agents on 30 vLLM tasks.
 
-The reviewer's point about resolution is well taken. At n=15 a single SGLang task
-moves the rate by 6.7 points, which is larger than the rollout-to-rollout variation
-above, so what limits these tables is the size of the task set rather than run-to-run
-noise, and the intervals above cover run-to-run variability rather than that
-second effect. We soften cross-codebase ranking claims wherever two agents differ by
-less than the resolution the task set can support.
+On the size of the SGLang split specifically, 15 is the result of two stacked
+filters rather than a shortage of upstream work. SGLang's performance PRs are
+disproportionately multi-GPU, covering DeepSeek-V3 at TP8 and TP16, prefill-decode
+disaggregation, and expert and data parallelism, so of the 40 curated SGLang tasks
+25 require configurations beyond a single H100 and are released as Level 2; two
+further candidates were excluded because of an sgl_kernel ABI incompatibility.
+Growing the SGLang Level 1 split therefore depends on multi-GPU evaluation capacity
+rather than on mining more commits, and we will revisit the curated SGLang pool for
+the camera-ready.
 
-The scale itself is constrained by the domain. GPU-inference optimization commits
-with reproducible setups, deterministic measurement, and non-trivial verified
-speedups are rare in upstream history, and each retained task must also build in a
-Docker container and be re-executed on H100. General SWE benchmarks can mine
-thousands of issue-fix pairs; measurable performance commits cannot be scaled the
-same way without giving up the hard-metric verifiability the benchmark exists to
-provide.
+The same constraint sets the overall scale. GPU-inference optimization commits with
+reproducible setups, deterministic measurement, and non-trivial verified speedups
+are rare in upstream history, and each retained task must also build in a Docker
+container and be re-executed on H100. General SWE benchmarks can mine thousands of
+issue-fix pairs; measurable performance commits cannot be scaled the same way
+without giving up the hard-metric verifiability the benchmark exists to provide.
 
 **W2 (Level 2 not evaluated).** Level 1 and Level 2 come from the same pipeline and
 differ by inclusion criteria, not by curation quality. Level 1 applies strict

@@ -34,51 +34,62 @@ the PDF, and it's all in the PDF.
 
 ## Item-by-item: question → answer → source
 
-### utqG W1 + kNyS "limited scale" — error bars / significance
+### utqG W1 + kNyS "limited scale" — task count first, variance second
 
-**The question:** point estimates on 39/15 tasks with no variance.
+**The question (verbatim):** "the number of tasks is very small ... SGLang's task is
+virtually only 15, so one correct task is essentially 6.7% improvement. It would also
+be helpful to report CIs or any statistical analysis ... especially for the
+cross-codebase ranking claims." The CI request is **downstream** of the task-count
+complaint, so answer the task count first.
 
-**The answer (final): the ICML "Q4: Rollouts and variance" answer, used as-is.**
-- Inline the Appendix G pass@1/pass@2 table exactly as ICML posted it (Rdwi marked
-  that answer *addressed*), including ICML's closing line that pass@k was limited to
-  2 agents on 30 vLLM tasks by GPU budget. One correction to ICML's own text: it said
-  "std of 3-4%" while the table shows 3.3 and 2.2, so quote "at most 3.3 points".
-- Add the subset note ICML lacked: pass@1 = 50.0% here vs Table 3's 46.2% because
-  these rates are on the 30-task subset.
-- Answer the reviewer's resolution example in the same terms, without statistics: at
-  n=15 one SGLang task moves the rate 6.7 points, which is larger than the rollout
-  variation, so the task-set size is the binding constraint. Ranking claims are
-  softened where two agents differ by less than that.
-- Reuse the ICML size justification (Rdwi): strict inclusion criteria (reproducible,
-  Docker-buildable optimization commit) plus the cost argument (2h agent budget +
-  H100 re-eval + correctness + judge ~ thousands of dollars at 54 tasks).
-- **CIs come from the rollout table itself, not from the headline tables.** utqG asked
-  for CIs, so we compute them from the Appendix G spread: SE = sd/sqrt(3), Student's t
-  with df=2, giving Claude Code 38.5-54.9 and Codex CLI 20.0-31.0. They do not
-  overlap, which is a quantitative version of ICML's "relative ranking is preserved".
-  State plainly that these cover run-to-run variability, not task sampling.
-  Wilson per-cell intervals and the 30 McNemar pairs stay in `stats_tables.md` for
-  internal use only; both were entangled with the OH-S45 vLLM cell divergence. ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) belongs in the
-  yX4G response, since it is variance of the labeler, not of the benchmark results.
-- Note on the "pass@2" label: it is the authors' shorthand for the rate across
-  repeated rollouts, not best-of-k sampling. The text above Table 9 says "to quantify
-  variance", and 15/14/13 successes over 30 tasks reproduce 46.7% ± 3.3% exactly.
-  Leave it as-is in the rebuttal; clarify the Table 9 caption at camera-ready.
+**1. Paired task-level counts, not intervals.** All agents run the same tasks, so
+report disagreements task by task. Verified against `master.json` and reconciling
+exactly with Table 5:
 
-**Held back deliberately** (`pass_at_k_variance.md`, internal): the same campaign
-actually has up to 8 isolated rollouts per task, 618 benchmarked patches, and
-measured on the metric that classifies each task, 82% of task-agent cells have
-every rollout inside the ±5% band (throughput-classified 1.0% median; the tail is
-TTFT-classified vLLM tasks). It is *not* in the response because it is
-cross-campaign (agent patches only, no human reference in that context, 12 of 40
-tasks ran a modified command), a reviewer cannot verify it, and citing 8 rollouts
-invites "then report pass@8". Bring it out only if a reviewer challenges whether
-the ±5% band sits above the measurement noise floor. Also: an earlier CV-only
-summary said "TTFT CV 7–9% on SGLang" — that measured TTFT on SGLang tasks, which
-are classified on throughput; SGLang cells are in fact the stable ones.
-Optional [RUN] if the team ever wants real pass@k: one human-patch benchmark per
-task in that context (~40 runs, 1×H100) unlocks Hard Success pass@k up to k=8;
-True Success pass@k additionally needs a judge pass over the 618 patches (API only).
+| Comparison | Both | Neither | Only A | Only B |
+|---|---|---|---|---|
+| vLLM: Claude Code vs TRAE GPT-5 | 5 | 19 | 13 | 2 |
+| SGLang: TRAE GPT-5 vs Claude Code | 4 | 2 | 9 | 0 |
+| SGLang: Codex vs TRAE Sonnet | 12 | 3 | 0 | 0 |
+| SGLang: OpenHands GPT-5 vs Claude Code | 1 | 7 | 4 | 3 |
+
+The inversion rests on 13-2 one way and 9-0 the other, which no single task can
+produce; that is the 6.7-point argument answered in the reviewer's own unit. Pairing
+also absorbs task-difficulty variation, which is the part a marginal rate cannot.
+
+**2. Concede the fragile pairs by name.** Codex and TRAE (Sonnet) on SGLang are 0-0:
+identical outcomes on all 15 tasks, not merely tied at 80%. OpenHands (GPT-5) vs
+Claude Code is 4-3. Both are now described as indistinguishable rather than ranked.
+Also state that absolute rates are not precise ability estimates (15 curated tasks
+are not a random sample); claims are about ordering.
+
+**3. Commit to releasing the per-task outcome table.** Confirmed: no public artifact
+contains per-task outcomes. The released `ISO-Bench/ISO-Bench` parquets are task
+metadata only, the public GitHub repo has no results, and every hard/soft-metrics
+dataset on HF is private. Without that release the 9-0 / 13-2 numbers are unverifiable
+by a reviewer, and the release is cheap.
+
+**4. Why SGLang is 15, with the real reason.** Two stacked filters, not a shortage of
+commits: SGLang perf PRs skew multi-GPU (DeepSeek-V3 TP8/TP16, PD disaggregation,
+EP/DP), so 25 of the 40 curated SGLang tasks are Level 2, and two more were dropped
+for an sgl_kernel ABI incompatibility (`EAD/CLAUDE.md`). Growth depends on multi-GPU
+capacity, not on mining.
+  *Internal:* `Inferencebench/omniperf_v1` holds 72 SGLang and 95 vLLM commits at full
+  task schema against 40/66 released, so 33 SGLang commits reached that stage without
+  being released, 27 of which look single-GPU with a benchmark command. Nothing
+  records *why* each was dropped (manual curation is the likely filter), so do **not**
+  promise a task count. "Revisit the curated SGLang pool for camera-ready" is the
+  defensible phrasing.
+
+**5. Variance second, using the ICML answer as-is.** Appendix G pass@1/pass@2 table
+verbatim, std quoted as "at most 3.3 points" (ICML's own text said "3-4%" while its
+table shows 3.3 and 2.2), plus ICML's closing note that pass@k was limited to 2
+agents on 30 vLLM tasks by GPU budget.
+
+**No CIs and no significance tests.** A t-interval from the Appendix G spread
+(SE = sd/sqrt(3), t(df=2) = 4.303) gives Claude Code 38.5-54.9, i.e. +/-8 points that
+advertise the sample size rather than the benchmark's precision. Wilson per-cell
+intervals and the 30 McNemar pairs stay in `stats_tables.md`, internal only.
 
 ### utqG W2 — Level 2 not evaluated
 
