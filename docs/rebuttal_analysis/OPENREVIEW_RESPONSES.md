@@ -25,9 +25,9 @@ Decisions baked into these drafts (change them only deliberately):
 We thank the reviewer for the careful and constructive review.
 
 **W1 (Benchmark scale and statistical analysis).** The reviewer is right about the
-resolution: at 15 SGLang tasks one task is worth 6.7 points, and no conclusion should
-rest on a difference that small. We therefore report what our claims actually rest
-on, in tasks rather than in percentages.
+resolution: with 15 SGLang tasks, one task is worth 6.7 points, and no conclusion
+should rest on a difference that small. We therefore report what our claims rest on
+in tasks rather than in percentages.
 
 Every agent runs the same tasks, so the comparisons are paired and can be read task
 by task. For the pair that carries the cross-codebase claim (counts from Table 5):
@@ -44,14 +44,13 @@ one task could produce. Pairing also makes the comparison less sensitive to whic
 tasks were sampled than either rate on its own, because a task that is hard for one
 agent is usually hard for the other.
 
-Where the reviewer's concern binds, we withdraw the claim. On SGLang, Codex CLI and
+Where the reviewer's concern does bite, we withdraw the claim. On SGLang, Codex CLI and
 TRAE (Sonnet) both reach 12/15 and produce identical outcomes on all 15 tasks, and
 OpenHands (GPT-5) at 5/15 differs from Claude Code at 4/15 on 4 tasks against 3. We
 now describe such pairs as indistinguishable at this scale instead of ranking them.
 We will also add the per-task outcome table (task by agent by quadrant) to the
 released evaluation data so that any comparison of this kind can be checked
-directly. Relatedly, the absolute rates should not be read as precise estimates of
-agent ability: 15 curated tasks are not a random sample, and our claims concern
+directly. The absolute rates are also not precise estimates of agent ability: 15 curated tasks are not a random sample, and our claims concern
 ordering rather than the point values.
 
 On run-to-run variance, Table 3 reports a single rollout (pass@1) per task instance
@@ -70,15 +69,15 @@ relative ranking is preserved: Claude Code consistently outperforms Codex CLI on
 vLLM. Due to GPU compute budget constraints, pass@k evaluation was limited to 2
 agents on 30 vLLM tasks.
 
-On the size of the SGLang split specifically, 15 is the result of two stacked
-filters rather than a shortage of upstream work. SGLang's performance PRs are
+The SGLang split is 15 because of two filters stacked on each other, not because
+upstream work ran out. SGLang's performance PRs are
 disproportionately multi-GPU, covering DeepSeek-V3 at TP8 and TP16, prefill-decode
 disaggregation, and expert and data parallelism, so of the 40 curated SGLang tasks
 25 require configurations beyond a single H100 and are released as Level 2; two
 further candidates were excluded because of an sgl_kernel ABI incompatibility.
-Growing the SGLang Level 1 split therefore depends on multi-GPU evaluation capacity
-rather than on mining more commits, and we will revisit the curated SGLang pool for
-the camera-ready.
+Growing the SGLang Level 1 split therefore depends on multi-GPU evaluation capacity,
+not on mining more commits. We will revisit the curated SGLang pool for the
+camera-ready.
 
 The same constraint sets the overall scale. GPU-inference optimization commits with
 reproducible setups, deterministic measurement, and non-trivial verified speedups
@@ -240,7 +239,7 @@ TRAE and OpenHands under both models (per-task medians on vLLM):
 | OpenHands (Sonnet-4.5) | 109 | 13 | 72 s | 388 s |
 | OpenHands (GPT-5) | 79 | 9 | 324 s | 836 s |
 
-Two mechanisms stand out. Holding the scaffold fixed, GPT-5 configurations take 2 to
+Two mechanisms are visible in this table. Holding the scaffold fixed, GPT-5 configurations take 2 to
 4 times longer to reach a first edit and to finish than Sonnet configurations. And
 OpenHands decomposes work into roughly twice as many, smaller steps and terminates
 deliberately (94% to 100% of runs end with an explicit finish action), whereas TRAE
@@ -301,14 +300,64 @@ penalized for them. To address the false-negative concern directly, we will add 
 error analysis of the LLM–human disagreement cases to Appendix F in the revision,
 categorized by which label boundary each falls on.
 
-**Task selection and representativeness.** We agree the paper should characterize
-the dataset rather than assert its validity, and we have added a composition
-analysis to the appendix: the median task touches 2 files (max 19) with ~50 edited
-lines; vLLM tasks split into 30 serving / 7 latency / 2 throughput benchmark modes
-across 22 distinct models, with edits concentrated in `vllm/v1`,
-`vllm/model_executor`, and `vllm/core`; SGLang tasks are 14 serving / 1 latency,
-concentrated in `python/sglang`. This makes the sparse-signal concern inspectable,
-since readers can see which areas are well covered and which are thin. We will also
-state explicitly that the benchmark deliberately targets isolated, measurable
-optimizations (<10 files, reproducible single-command benchmarks): a scope
-decision, not a claim of covering the full bottleneck spectrum.
+**Task selection and representativeness.** We agree the paper should characterize the
+dataset rather than assert its validity, and we take the point that "filtering of
+LLM-identified PRs" reads as ad hoc. The selection is a three-stage pipeline with
+objective gates rather than a judgment call: commit mining over the two
+repositories, LLM classification for performance relevance, and manual curation
+that verifies each commit is a genuine optimization rather than a refactor, extracts
+the author's benchmark configuration, records the performance claim from the PR
+discussion, and writes the task description (Appendix C, Table 6 reports the full
+funnel). A candidate is retained only if it also builds in a Docker container and
+its benchmark is reproducible on our hardware, so the final set is determined by
+measurability rather than by preference.
+
+On coverage, we have now labeled every Level 1 task with the bottleneck family it
+targets, which the paper did not previously report:
+
+| Bottleneck family | vLLM | SGLang | Total |
+|---|---|---|---|
+| Sampling and logits | 6 | 1 | 7 |
+| Attention kernels and backends | 5 | 2 | 7 |
+| Scheduling and batching | 4 | 3 | 7 |
+| General CPU overhead | 6 | | 6 |
+| Host-device memory traffic | 6 | | 6 |
+| Prefill-decode disaggregation | | 5 | 5 |
+| KV cache and block management | 4 | | 4 |
+| MoE and expert parallelism | 2 | 2 | 4 |
+| Tokenization and frontend | 3 | | 3 |
+| Structured output | 2 | | 2 |
+| Quantization | | 1 | 1 |
+| Speculative decoding | 1 | | 1 |
+| LoRA | | 1 | 1 |
+| **Total** | **39** | **15** | **54** |
+
+Thirteen families are represented; vLLM spans ten and SGLang seven. The two
+codebases concentrate differently, and that reflects the projects rather than our
+sampling: merged vLLM performance work is dominated by host-device traffic,
+sampling and logits, KV cache and block management, and general CPU overhead, while
+SGLang's is dominated by prefill-decode disaggregation and overlap scheduling.
+Level 2 adds the multi-GPU families (tensor, data, and expert parallelism at scale).
+We will include this table and the per-task labels in the appendix and in the
+released data, and we will say plainly that the coverage is broad but uneven:
+quantization, LoRA, and speculative decoding have one or two tasks each, so the
+benchmark should not be read as covering the full bottleneck spectrum evenly.
+
+On the concern that small patches yield sparse signals and make the scores
+sensitive: this is why classification uses a tolerance band rather than a ranking of
+raw deltas. A patch is only Beats or Worse when it moves the primary metric by more
+than 5%, following GSO and the MLPerf Mobile inference benchmark, and smaller
+effects fall into Similar rather than being amplified. Empirically the tasks do
+separate agents: 46 of the 54 tasks distinguish at least one pair of agents (31 of
+39 on vLLM, and all 15 on SGLang, where no task is solved by every agent or by
+none). If the measured effects were mostly noise, outcomes would not separate
+agents this consistently.
+
+The dataset composition is also reported: the median task touches 2 files (max 19)
+with roughly 50 edited lines; vLLM tasks split into 30 serving, 7 latency, and 2
+throughput benchmark modes across 22 distinct models, with edits concentrated in
+`vllm/v1`, `vllm/model_executor`, and `vllm/core`; SGLang tasks are 14 serving and 1
+latency, concentrated in `python/sglang`. We will also state explicitly that the
+benchmark deliberately targets isolated, measurable optimizations (under 10 files,
+reproducible single-command benchmarks), which is a scope decision rather than a
+claim of completeness.

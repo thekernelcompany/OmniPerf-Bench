@@ -250,17 +250,36 @@ twice (UJ1j, dpfc/Rdwi):**
   examples — blocked on the Supabase export of the raw H1/H2 labels (no
   credentials in the repo; whoever ran the review app has them).
 
-### yX4G — representativeness / dataset composition
+### yX4G — task selection and representativeness
 
-**The question:** characterize the dataset instead of asserting validity.
+**The question (verbatim):** selection is "ad-hoc ... stemming from filtering of
+LLM-identified PRs"; do ~100 tasks "represent the full spectrum of inference
+bottlenecks"; the changes "may produce sparse signals", raising score sensitivity;
+they want "a more rigorous process ... or at least a more comprehensive statistical
+characterization of the dataset's diversity". Three separate asks; the old answer
+addressed only the third.
 
-**The answer:** reuse the ICML strict-inclusion-criteria text for why the set is
-what it is, then attach the composition table (`composition.md`): median 2 files
-and ~52–56 edited lines per task; vLLM 30 serving / 7 latency / 2 throughput
-across 22 models, edits concentrated in `vllm/v1`, `vllm/model_executor`,
-`vllm/core`; SGLang 14 serving / 1 latency in `python/sglang`. State explicitly
-(as the draft already does) that the benchmark deliberately targets isolated,
-measurable optimizations — a scope decision, not a coverage claim.
+**1. Not ad hoc.** Describe the three-stage pipeline and the four documented curation
+purposes (Appendix C, Table 6 has the funnel), plus the objective gates: Docker build
+and reproducible benchmark. Selection is decided by measurability, not preference.
+
+**2. Spectrum — new labeling pass** (`bottleneck_categories.py` →
+`bottleneck_categories.md`). The pipeline never stored a bottleneck-area field, so
+all 54 Level-1 commits were hand-labeled with one primary family from subject and
+touched paths: **13 families, vLLM spans 10, SGLang 7.** Largest: sampling/logits 7,
+attention kernels 7, scheduling/batching 7, CPU overhead 6, host-device traffic 6,
+PD disaggregation 5. The repos concentrate differently (vLLM host-device/sampling/KV
+cache; SGLang PD disaggregation and overlap scheduling), which is a property of the
+projects, not of our sampling. Labels are per-commit and auditable in the script.
+
+**3. Sparse signals** — answered two ways: the +/-5% tolerance band means small effects
+land in Similar instead of being amplified into a ranking; and empirically **46 of 54
+tasks separate at least one agent pair** (31/39 vLLM, 15/15 SGLang, where no task is
+solved by all six or by none). Noise would not discriminate that consistently.
+
+**4. Concede the unevenness** by name: quantization, LoRA, speculative decoding have
+one or two tasks each. Commit to publishing the family table and per-task labels.
+
 
 ### kNyS — codebase coverage
 
