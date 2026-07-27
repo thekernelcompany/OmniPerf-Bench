@@ -52,10 +52,13 @@ the PDF, and it's all in the PDF.
 - Reuse the ICML size justification (Rdwi): strict inclusion criteria (reproducible,
   Docker-buildable optimization commit) plus the cost argument (2h agent budget +
   H100 re-eval + correctness + judge ~ thousands of dollars at 54 tasks).
-- **No CIs and no significance tests in any response** (team decision, stated three
-  times). Wilson intervals and the 30 McNemar pairs stay in `stats_tables.md` for
-  internal use only; the intervals were also entangled with the OH-S45 vLLM cell
-  divergence. ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) belongs in the
+- **CIs come from the rollout table itself, not from the headline tables.** utqG asked
+  for CIs, so we compute them from the Appendix G spread: SE = sd/sqrt(3), Student's t
+  with df=2, giving Claude Code 38.5-54.9 and Codex CLI 20.0-31.0. They do not
+  overlap, which is a quantitative version of ICML's "relative ranking is preserved".
+  State plainly that these cover run-to-run variability, not task sampling.
+  Wilson per-cell intervals and the 30 McNemar pairs stay in `stats_tables.md` for
+  internal use only; both were entangled with the OH-S45 vLLM cell divergence. ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) belongs in the
   yX4G response, since it is variance of the labeler, not of the benchmark results.
 - Note on the "pass@2" label: it is the authors' shorthand for the rate across
   repeated rollouts, not best-of-k sampling. The text above Table 9 says "to quantify
