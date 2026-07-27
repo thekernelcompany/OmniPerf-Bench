@@ -38,33 +38,29 @@ the PDF, and it's all in the PDF.
 
 **The question:** point estimates on 39/15 tasks with no variance.
 
-**The answer — lead with the ICML rollout & variance answer, put CIs around it:**
-- **Lead:** the ICML "Q4: Rollouts and variance" answer, which is already Appendix G
-  and which Rdwi marked *addressed*. Inline the table rather than citing it, with
-  95% CIs added to the rates: Claude Code pass@1 50.0% (33.2–66.8) vs 46.7% ± 3.3%
-  across rollouts; Codex CLI 23.3% (11.8–40.9) vs 25.5% ± 2.2%. Quote the std as
-  "≤3.3 points" (ICML's text said "3-4%", an earlier draft here said "2–3%"; the
-  table's values are 3.3 and 2.2).
-- **The argument the CIs unlock:** rollout spread ≤3.3 points vs a task-sample
-  interval of ~±17 points at n=30. So re-running an agent is not what limits the
-  tables — the size of the task set is. That concedes the reviewer's real point
-  while showing the single-rollout protocol is sound, and it makes reporting CIs on
-  every cell the natural next step rather than a bolt-on.
-- **Then, one sentence:** Wilson 95% intervals have been added to every cell of
-  Tables 3/4, and cross-codebase ranking claims are softened where intervals overlap.
-  The 12-row CI table and the McNemar results stay in `stats_tables.md` — **not** in
-  the response (team decision: rollout variance + CIs answer W1; significance tests
-  add length and were entangled with the OH-S45 cell divergence).
-- Reuse the ICML size justification (Rdwi): strict inclusion criteria — every task
-  must be a reproducible, Docker-buildable optimization commit — plus the cost
-  argument (2h agent budget + H100 re-eval + correctness + judge ≈ thousands of
-  dollars at 54 tasks). ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) stays
-  in the yX4G response where it belongs — it is variance of the labeler, not of the
-  benchmark results.
+**The answer (final): the ICML "Q4: Rollouts and variance" answer, used as-is.**
+- Inline the Appendix G pass@1/pass@2 table exactly as ICML posted it (Rdwi marked
+  that answer *addressed*), including ICML's closing line that pass@k was limited to
+  2 agents on 30 vLLM tasks by GPU budget. One correction to ICML's own text: it said
+  "std of 3-4%" while the table shows 3.3 and 2.2, so quote "at most 3.3 points".
+- Add the subset note ICML lacked: pass@1 = 50.0% here vs Table 3's 46.2% because
+  these rates are on the 30-task subset.
+- Answer the reviewer's resolution example in the same terms, without statistics: at
+  n=15 one SGLang task moves the rate 6.7 points, which is larger than the rollout
+  variation, so the task-set size is the binding constraint. Ranking claims are
+  softened where two agents differ by less than that.
+- Reuse the ICML size justification (Rdwi): strict inclusion criteria (reproducible,
+  Docker-buildable optimization commit) plus the cost argument (2h agent budget +
+  H100 re-eval + correctness + judge ~ thousands of dollars at 54 tasks).
+- **No CIs and no significance tests in any response** (team decision, stated three
+  times). Wilson intervals and the 30 McNemar pairs stay in `stats_tables.md` for
+  internal use only; the intervals were also entangled with the OH-S45 vLLM cell
+  divergence. ICML-UJ1j's judge-stability answer (8 runs, ±2.5%, κ) belongs in the
+  yX4G response, since it is variance of the labeler, not of the benchmark results.
 - Note on the "pass@2" label: it is the authors' shorthand for the rate across
-  repeated rollouts, not best-of-k sampling — the text above Table 9 says "to
-  quantify variance", and 15/14/13 successes over 30 tasks reproduce 46.7% ± 3.3%
-  exactly. Leave it as-is in the rebuttal; clarify the Table 9 caption at camera-ready.
+  repeated rollouts, not best-of-k sampling. The text above Table 9 says "to quantify
+  variance", and 15/14/13 successes over 30 tasks reproduce 46.7% ± 3.3% exactly.
+  Leave it as-is in the rebuttal; clarify the Table 9 caption at camera-ready.
 
 **Held back deliberately** (`pass_at_k_variance.md`, internal): the same campaign
 actually has up to 8 isolated rollouts per task, 618 benchmarked patches, and

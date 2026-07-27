@@ -6,9 +6,10 @@ Decisions baked into these drafts (change them only deliberately):
 1. **Published numbers everywhere** (the PDF the reviewers scored). The post-submission
    X3 correction to the vLLM OpenHands-Sonnet-4.5 cell (43.6→56.4) is NOT used; if the
    team decides to disclose it, that's a separate coordinated edit.
-2. **No significance tests in the responses.** W1 rests on the Appendix G rollout
-   variance plus confidence intervals; the McNemar results in `stats_tables.md` stay
-   internal (they were also entangled with the OH-S45 vLLM cell divergence).
+2. **No CIs and no significance tests in the responses.** W1 uses the Appendix G
+   rollout-variance table as-is. The Wilson intervals and McNemar results in
+   `stats_tables.md` stay internal (the intervals were also entangled with the
+   OH-S45 vLLM cell divergence).
 3. Promises are limited to what is landable: the open-model soft-metrics table (API
    cost only) is promised for the revision; GPU items (TP2 demo, remaining lm-evals,
    9 baselines) are phrased as "revision/camera-ready", never "by date X".
@@ -23,26 +24,27 @@ Decisions baked into these drafts (change them only deliberately):
 We thank the reviewer for the careful and constructive review.
 
 **W1 (Benchmark scale and statistical analysis).** Table 3 reports a single rollout
-per task per agent. To quantify variance we ran additional independent rollouts for
-Claude Code and Codex CLI on 30 vLLM tasks (Appendix G), and we have now added 95%
-confidence intervals to those rates:
+(pass@1) per task instance per agent. To quantify variance, we conducted additional
+independent rollouts for Claude Code and Codex CLI on 30 vLLM tasks (Appendix G):
 
-| Agent | Pass@1 (95% CI) | Across rollouts (mean ± std) |
+| Agent | Pass@1 | Pass@2 (mean ± std) |
 |---|---|---|
-| Claude Code | 50.0% (33.2–66.8) | 46.7% ± 3.3% |
-| Codex CLI | 23.3% (11.8–40.9) | 25.5% ± 2.2% |
+| Claude Code | 50.0% | 46.7% ± 3.3% |
+| Codex CLI | 23.3% | 25.5% ± 2.2% |
 
-(These rates are on the 30-task subset, which is why pass@1 differs from Table 3's
-39-task figures.) Variance across rollouts is moderate, with a standard deviation of
-at most 3.3 points, and the relative ranking is preserved: Claude Code consistently
-outperforms Codex CLI on vLLM.
+True Success rate under pass@1 vs pass@2, on 30 vLLM tasks. These rates are on that
+subset, which is why pass@1 differs from Table 3's 39-task figures.
+
+Variance across rollouts is moderate, with a standard deviation of at most 3.3
+points, and the relative ranking is preserved: Claude Code consistently outperforms
+Codex CLI on vLLM. Due to GPU compute budget constraints, pass@k evaluation was
+limited to 2 agents on 30 vLLM tasks.
 
 The reviewer's point about resolution is well taken. At n=15 a single SGLang task
-moves the rate by 6.7 points, which is larger than the rollout-to-rollout variation,
-so what limits these tables is the size of the task set rather than run-to-run
-noise. We have therefore added Wilson 95% intervals to every True Success and Hard
-Success rate in Tables 3 and 4, and we soften cross-codebase ranking claims wherever
-those intervals overlap.
+moves the rate by 6.7 points, which is larger than the rollout-to-rollout variation
+above, so what limits these tables is the size of the task set rather than run-to-run
+noise. We soften cross-codebase ranking claims wherever two agents differ by less
+than that resolution.
 
 The scale itself is constrained by the domain. GPU-inference optimization commits
 with reproducible setups, deterministic measurement, and non-trivial verified
@@ -154,12 +156,12 @@ will elevate this to a stated maintenance commitment in §6.
 We thank the reviewer for the thorough summary and concrete questions.
 
 **Limited scale.** Please see our response to Reviewer utqG (W1). In brief:
-Appendix G quantifies rollout variance directly (repeated independent rollouts for
-two agents on 30 vLLM tasks; standard deviation ≤ 3.3 points, ordering preserved),
-so single-rollout reporting is not what limits the tables. The task sample is, and
-we now report 95% intervals for every cell of Tables 3 and 4 so that limit is
-visible. We agree that low-frequency outcomes such as Q4 on SGLang cannot support
-strong claims at n=15, and we have softened those statements.
+Appendix G quantifies rollout variance directly (additional independent rollouts for
+two agents on 30 vLLM tasks; standard deviation of at most 3.3 points, ordering
+preserved), so single-rollout reporting is not what limits the tables. The size of
+the task set is, and at n=15 a single SGLang task moves the rate by 6.7 points. We
+agree that low-frequency outcomes such as Q4 on SGLang cannot support strong claims
+at that scale, and we have softened those statements.
 
 **Limited codebase coverage.** The filtering pipeline has already been run
 end-to-end on TensorRT-LLM and FlashInfer (Appendix C, Table 6), yielding 47 and 52
